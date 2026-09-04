@@ -36,9 +36,11 @@ const ctxFor = (over: Partial<BoardToolContext> = {}): BoardToolContext => ({
 // Every board tool the agent is handed must also be one it may call without
 // stopping. This is the assertion that would have caught the shipped bug.
 const names = boardToolNames(DEFAULT_BOARD, tool)
-ok(names.length === 4, `four board tools are auto-allowed (${names.join(', ')})`)
+ok(names.length === 5, `five board tools are auto-allowed (${names.join(', ')})`)
 ok(names.includes(boardToolName('set_phase')), 'set_phase is among them — moving a card is the whole point')
 ok(names.includes(boardToolName('notify_user')), 'and notify_user, for when the agent is stuck mid-run')
+ok(names.includes(boardToolName('set_title')),
+   'and set_title — a card named from the first line of a request needs no permission to be corrected')
 
 // `split_task` starts other agents, so it is the one board tool the user is
 // asked about. The exclusion is by NAME, which is the same shape as the bug at
@@ -123,7 +125,7 @@ const byRunId = buildBoardTools(
   },
   tool,
 )
-const moved2 = await run(byRunId[0]!, { phase: 'implementing' })
+const moved2 = await run(byName(byRunId, 'set_phase')!, { phase: 'implementing' })
 ok(!moved2.isError && runPhase === 'implementing', 'a run with no session id yet can still move its own card')
 
 // A board with no human-only column must not invent one.
@@ -133,6 +135,82 @@ const open: BoardConfig = {
 }
 const [openPhase] = buildBoardTools(open, ctx, tool)
 ok(!(await run(openPhase!, { phase: 'b' })).isError, 'a board without an approval column lets the agent finish')
+
+// --- renaming its own card ---------------------------------------------------
+// The card is named from the first line of the request, and a request that
+// opens "Okay." named this repository's own session **Okay.** for its whole
+// life. The agent is the only party that knows what the work turned out to be,
+// so it gets to say — and it must not need permission to fix a name.
+{
+  const renames: string[] = []
+  const titleCtx: BoardToolContext = { ...ctx, onRename: (t) => { renames.push(t) } }
+  const setTitle = byName(buildBoardTools(DEFAULT_BOARD, titleCtx, tool), 'set_title')
+  ok(!!setTitle, 'set_title exists')
+
+  const done = await run(setTitle!, { title: 'Add SSO to the admin app' })
+  ok(!done.isError && renames[0] === 'Add SSO to the admin app', 'a title is written through')
+
+  await run(setTitle!, { title: '  "Fix the flaky snapshot test."  ' })
+  ok(renames[1] === 'Fix the flaky snapshot test',
+     `quotes and a trailing full stop are stripped, because models add both (${renames[1]})`)
+
+  const before = renames.length
+  const empty = await run(setTitle!, { title: '   ' })
+  ok(empty.isError === true, 'an empty title is refused')
+  ok(renames.length === before, 'and refused BEFORE anything is written')
+
+  await run(setTitle!, { title: 'w '.repeat(60) })
+  ok(renames[renames.length - 1]!.length <= 72 && renames[renames.length - 1]!.endsWith('…'),
+     `an over-long title is bounded the same way a derived one is (${renames[renames.length - 1]!.length} chars)`)
+
+  // The ask rides on the move into the started column, because that is the one
+  // a real agent actually reads. A brief paragraph asking for the same thing was
+  // ignored by a real run that moved its card TWICE without renaming it.
+  {
+    let p = 'planning'
+    const nudged: BoardToolContext = {
+      ...ctx,
+      store: {
+        get: async () => ({ phase: p, tags: [] }),
+        card: async () => ({ phase: p, tags: [] }),
+        setPhase: async (_id: string, next: string) => { p = next },
+        setTags: async () => {}, setTestPlan: async () => {}, list: async () => [],
+      } as never,
+      onRename: () => {},
+      derivedTitle: () => 'Okay.',
+    }
+    const phaseTool = byName(buildBoardTools(DEFAULT_BOARD, nudged, tool), 'set_phase')
+    const moved = await run(phaseTool!, { phase: 'implementing' })
+    ok(/set_title/.test(moved.content[0]!.text),
+       'moving into the started column asks the agent to name the card')
+    ok(/"Okay\."/.test(moved.content[0]!.text), 'and quotes the guess, so the agent can judge it')
+
+    // Once a title has been chosen, the ask must stop — nagging about a name
+    // somebody picked on purpose is worse than not asking.
+    p = 'planning'
+    const chosen = byName(
+      buildBoardTools(DEFAULT_BOARD, { ...nudged, derivedTitle: () => undefined }, tool),
+      'set_phase',
+    )
+    const again = await run(chosen!, { phase: 'implementing' })
+    ok(!/set_title/.test(again.content[0]!.text), 'and does not ask again once the agent has named it')
+
+    // A review column is not the moment: the work is over, and the move already
+    // has to carry a whole test plan.
+    p = 'planning'
+    const review = await run(phaseTool!, {
+      phase: 'validating',
+      howToTest: { summary: 's', steps: ['one'] },
+    })
+    ok(!/set_title/.test(review.content[0]!.text), 'the ask is on the started column only')
+  }
+
+  // No manager behind it — the tool must say so rather than report a rename
+  // that never happened.
+  const orphan = byName(buildBoardTools(DEFAULT_BOARD, ctx, tool), 'set_title')
+  ok((await run(orphan!, { title: 'Anything' })).isError === true,
+     'with nothing wired to rename it, the tool fails loudly')
+}
 
 // --- reaching a review column requires saying how to test ---------------------
 // A card that says "ready" and nothing else hands the user a puzzle: which

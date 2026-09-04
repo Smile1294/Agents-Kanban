@@ -602,6 +602,24 @@ export async function realResolveInWorktree(
   }
 }
 
+/** As many characters of the title as a directory name carries. */
+const SLUG_MAX = 40
+
+/**
+ * The readable half of a worktree directory and branch name.
+ *
+ * Cut on a hyphen, never mid-word: the fixed 40-character slice produced
+ * `...-review-this-repository-figur`, which reads as a corrupted name rather
+ * than a shortened one — and a worktree name can never be changed afterwards,
+ * because the session is running inside it.
+ */
 export function slug(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'task'
+  const full = s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  if (full.length <= SLUG_MAX) return full || 'task'
+  const room = full.slice(0, SLUG_MAX + 1)
+  const at = room.lastIndexOf('-')
+  // A single word longer than the budget has no boundary to cut on, so it is
+  // still cut short rather than left to run the directory name off the screen.
+  const cut = at > SLUG_MAX / 3 ? room.slice(0, at) : full.slice(0, SLUG_MAX)
+  return cut.replace(/-+$/, '') || 'task'
 }

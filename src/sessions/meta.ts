@@ -85,6 +85,39 @@ export interface TestPlan {
   at: number
 }
 
+/** As long as a card title gets to be before it is cut short. */
+export const MAX_TITLE = 72
+
+/**
+ * A card title fit to be shown and to be turned into a directory name.
+ *
+ * Shared by `titleFrom()`, which derives one from a prompt, and the `set_title`
+ * tool, which takes one from the agent — so a title the agent chose and a title
+ * we guessed are bounded the same way.
+ *
+ * Casing is left exactly as written. Capitalising the first letter turns `npm
+ * run verify` into `Npm run verify`, and a card title that looks mangled is
+ * worse than one that looks lowercase.
+ */
+export function normaliseTitle(raw: string): string {
+  const t = raw
+    .replace(/\s+/g, ' ')
+    .trim()
+    // Models quote titles about a third of the time. The quotes are not part of it.
+    .replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '')
+    .trim()
+    // A trailing full stop is noise on a card; `?` and `!` are not.
+    .replace(/[.,;:]+$/, '')
+    .trim()
+  if (t.length <= MAX_TITLE) return t
+  // Cut on a word boundary. The old slice left titles ending mid-word — "figure
+  // out how everything works a…" — which reads as a corrupted string rather
+  // than a shortened one.
+  const room = t.slice(0, MAX_TITLE - 1)
+  const at = room.lastIndexOf(' ')
+  return (at > MAX_TITLE / 3 ? room.slice(0, at) : room).replace(/[\s,;:.-]+$/, '') + '…'
+}
+
 export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
   if (!raw || typeof raw !== 'object') return undefined
   const r = raw as Record<string, unknown>

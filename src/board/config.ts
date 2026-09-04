@@ -97,6 +97,14 @@ export function isReviewColumn(board: BoardConfig, id: StatusId): boolean {
   return columnById(board, id)?.category === 'review'
 }
 
+/** A column meaning "the agent has started changing things". Moving into one is
+ *  the moment it has explored enough to know what the work is, which is why the
+ *  ask for a real card title rides on that move — so it is a rule, like the
+ *  others here, and a custom board can say where that moment is. */
+export function isStartedColumn(board: BoardConfig, id: StatusId): boolean {
+  return columnById(board, id)?.category === 'started'
+}
+
 /** A column meaning "this one is off the agent's plate" — handed back for
  *  review, or approved. What a subtask has to reach before its parent can say
  *  the whole task is ready. */

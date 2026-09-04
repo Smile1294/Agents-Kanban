@@ -12,14 +12,46 @@ let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
 
 // --- titles ------------------------------------------------------------------
+//
+// This name is not cosmetic. It is what the card says for the rest of the
+// session AND, through slug(), what the worktree directory and branch are
+// called — and those can never be renamed, because the agent is running inside
+// the directory. The two fixtures below are real prompts from this repository's
+// own board, which produced a card called "Okay." in a worktree called
+// `S2mtnf1lpa-okay`, and one cut off mid-word at `...-repository-figur`.
 ok(titleFrom('Fix the login flow') === 'Fix the login flow', 'a short prompt is the title')
-ok(titleFrom('Fix login. Then do more.') === 'Fix login.', 'only the first sentence is taken')
-ok(titleFrom('First line\nsecond line') === 'First line', 'only the first line is taken')
+ok(titleFrom('Fix login. Then do more.') === 'Fix login', 'the first sentence is taken, without its full stop')
+ok(titleFrom('First line\nsecond line') === 'First line', 'the first line wins, even though the second is longer')
 ok(titleFrom('   ') === 'Untitled session', 'an empty prompt still gets a name')
 ok(titleFrom('') === 'Untitled session', 'so does a blank one')
 const long = titleFrom('x'.repeat(200))
 ok(long.length <= 72 && long.endsWith('…'), `a long prompt is truncated with an ellipsis (${long.length} chars)`)
 ok(titleFrom('a\t b   c') === 'a b c', 'whitespace is collapsed')
+
+// The bug, as it was reported: "this session is basically just called Okay".
+const spoken = titleFrom(
+  'Okay. I want you to create a list of features based on how common are they ' +
+  'and how useful are they for harness like this one.',
+)
+ok(!/^okay/i.test(spoken), `a sentence that is only filler is skipped, not used as the name (got "${spoken}")`)
+ok(spoken.startsWith('create a list of features'),
+   `the request itself becomes the name (got "${spoken}")`)
+ok(titleFrom('okay start the implementation') === 'start the implementation',
+   'a leading discourse marker is dropped')
+ok(titleFrom('Okay. So can you please add SSO to the admin app?') === 'add SSO to the admin app?',
+   `stacked filler and a request wrapper are both dropped (got "${titleFrom('Okay. So can you please add SSO to the admin app?')}")`)
+ok(titleFrom('I want you to fix the flaky snapshot test') === 'fix the flaky snapshot test',
+   'so is "I want you to"')
+ok(titleFrom('Please add SSO') === 'add SSO',
+   'a two-word remainder is still better than the filler in front of it')
+// Casing is left alone on purpose: capitalising turns `npm run verify` into
+// `Npm run verify`, and a mangled title is worse than a lowercase one.
+ok(titleFrom('npm run verify is failing on main') === 'npm run verify is failing on main',
+   'a command keeps its own casing')
+// The degenerate case has nothing else to offer, and must still not throw.
+ok(titleFrom('Okay.') === 'Okay', 'a prompt that is nothing but filler falls back to it')
+ok(titleFrom('the just-in-time cache is cold') === 'the just-in-time cache is cold',
+   'a filler word inside a sentence is not touched')
 
 // --- the brief the agent is given -------------------------------------------
 // It must name the tool and both destinations, or the agent has no idea it owns
@@ -30,6 +62,7 @@ ok(brief.includes('implementing') && brief.includes('validating'), 'and both pha
 ok(brief.includes('task/S1-fix'), 'it tells the agent which branch it is on')
 ok(brief.includes('Fix login'), 'and which card is its own')
 ok(!brief.includes('complete'), 'it does NOT invite the agent to complete its own work')
+ok(brief.includes('set_title'), 'and it tells the agent the card name is a guess it can fix')
 
 // --- identity collision ------------------------------------------------------
 // Two live runs reporting the same session id must not become one card. Before
@@ -181,6 +214,54 @@ for (const kind of TERMINAL) {
   ok(b.includes('split_task'), 'the brief names the split tool')
   ok(/unrelated/i.test(b), 'and the condition that justifies it')
   ok(/before you change anything/i.test(b), 'and that it has to happen before any edits')
+}
+
+// --- the tools' side of a run is actually wired up ---------------------------
+//
+// The seam a mutation test found open: `set_title` existed, was auto-allowed and
+// was unit-tested, and NOTHING failed when the manager did not pass `onRename`
+// into the board server. Every optional callback on BoardToolContext degrades
+// silently — the tool answers "this session cannot be renamed from here" and the
+// agent carries on — which is the same failure as the auto-allow list that
+// drifted and left agents unable to move their own cards. So the wiring is
+// asserted here, and the assertion is about the CONTEXT the manager builds, not
+// about a tool in isolation.
+{
+  const renamed: { id: string; title: string }[] = []
+  const mgr = new AgentManager({
+    store: {
+      rename: async (id: string, title: string) => { renamed.push({ id, title }) },
+    } as never,
+    worktrees: {} as never,
+    board: DEFAULT_BOARD,
+    defaults: {},
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 3,
+  })
+  const internals = mgr as unknown as {
+    boardContext: (a: RunningAgent) => Record<string, unknown>
+  }
+  const agent: RunningAgent = {
+    runId: 'run-7-abc', title: 'Okay.',
+    state: { kind: 'working' }, worktreePath: '/tmp/wt', branch: 'task/run-7-abc',
+    live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
+  }
+  const ctx = internals.boardContext(agent)
+  for (const cb of ['onChanged', 'onNotice', 'onRename', 'onSplit']) {
+    ok(typeof ctx[cb] === 'function', `the run's board context wires ${cb}`)
+  }
+
+  // Renaming before Claude Code has assigned a session id: the card must follow
+  // immediately, and nothing may be written under the run id — there is no
+  // session file with that name to rename.
+  await (ctx.onRename as (t: string) => Promise<void>)('Name the cards properly')
+  ok(agent.title === 'Name the cards properly', 'a rename lands on the live card at once')
+  ok(renamed.length === 0, 'and writes nothing while the session id is still a run id')
+
+  agent.sessionId = 'sess-9'
+  await (ctx.onRename as (t: string) => Promise<void>)('Name the cards properly, again')
+  ok(renamed.length === 1 && renamed[0]!.id === 'sess-9', 'once there is a session id, the rename is persisted')
+  ok(renamed[0]!.title === 'Name the cards properly, again', 'with the title the agent chose')
 }
 
 // --- the environment a spawned CLI is given ----------------------------------

@@ -9,12 +9,12 @@
 import { EventEmitter } from 'node:events'
 import { loadSdk, type Options } from './sdk.ts'
 import type { WorktreeService } from '../git/worktree.ts'
-import { resolveEffort, resolveThinking, type EffortLevel, type ThinkingMode } from '../sessions/meta.ts'
+import { normaliseTitle, resolveEffort, resolveThinking, type EffortLevel, type ThinkingMode } from '../sessions/meta.ts'
 import { summariseTool, type Entry, type SessionStore } from '../sessions/store.ts'
 import type { AgentState, BoardConfig } from '../board/config.ts'
 import { AgentSession, type PermissionRequest } from './session.ts'
 import type { AttachedImage } from './images.ts'
-import { boardToolNames, createBoardServer, type BoardChange, type BoardNotice } from './tools.ts'
+import { boardToolNames, createBoardServer, type BoardChange, type BoardNotice, type BoardToolContext } from './tools.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
 
 export interface ManagerOptions {
@@ -162,6 +162,10 @@ export interface RunningAgent {
   resolvedProvider?: string
   /** Human label for `resolvedProvider`. */
   providerLabel?: string
+  /** True once the AGENT named this card, rather than `titleFrom()` guessing
+   *  from the prompt. It is what stops `set_phase` asking for a name a second
+   *  time, and what keeps the ask off a title somebody chose on purpose. */
+  titleChosen?: boolean
 }
 
 export class AgentManager extends EventEmitter {
@@ -368,6 +372,61 @@ export class AgentManager extends EventEmitter {
     await this.start(text, { resume: key, ...(existing?.title ? { title: existing.title } : {}) })
   }
 
+  /**
+   * The board tools' side of one run.
+   *
+   * Extracted from `launch()` so it can be tested without starting an agent.
+   * Every optional callback here degrades SILENTLY when it is missing — a tool
+   * whose callback is absent answers "this session cannot be renamed from here"
+   * and the agent moves on — which is the same shape as the auto-allow list
+   * that drifted and left agents unable to move their own cards. So the wiring
+   * is asserted, not assumed. See `manager.test.ts`.
+   */
+  private boardContext(agent: RunningAgent): BoardToolContext {
+    return {
+      store: this.opts.store,
+      key: () => agent.sessionId ?? agent.runId,
+      onChanged: (change?: BoardChange) => {
+        if (change?.phase) {
+          agent.live.push({ kind: 'phase', at: Date.now(), from: change.phase.from, to: change.phase.to })
+          // The moment the board exists for: an agent announcing where it got
+          // to. The host turns a move into a review column into a notification.
+          this.emit('phase', agent, change.phase.from, change.phase.to)
+        }
+        this.touch()
+      },
+      onNotice: (notice: BoardNotice) => {
+        agent.live.push({ kind: 'notice', at: Date.now(), message: notice.message, urgency: notice.urgency })
+        this.emit('notice', agent, notice)
+        this.touch()
+      },
+      derivedTitle: () => (agent.titleChosen ? undefined : agent.title),
+      onRename: async (title: string) => {
+        agent.title = title
+        agent.titleChosen = true
+        this.touch()
+        // Before Claude Code has assigned a session id there is no session file
+        // to rename. Nothing is lost: the id handler below writes `agent.title`
+        // when the id arrives, so a rename inside that window is picked up
+        // rather than dropped.
+        if (agent.sessionId) await this.opts.store.rename(agent.sessionId, title)
+      },
+      onSplit: async (subtasks) => {
+        const result = await this.split(agent.sessionId ?? agent.runId, subtasks)
+        if (result.ok) {
+          agent.live.push({
+            kind: 'notice', at: Date.now(), urgency: 'info',
+            message:
+              `Split into ${result.started.length} subtasks, each with its own worktree and card: ` +
+              result.started.map((t) => t.title).join(', ') + '.',
+          })
+          this.touch()
+        }
+        return result
+      },
+    }
+  }
+
   private async launch(runId: string, prompt: string, opts: LaunchOptions): Promise<void> {
     const title = opts.title ?? titleFrom(prompt)
 
@@ -426,37 +485,7 @@ export class AgentManager extends EventEmitter {
     }
     this.touch()
 
-    const boardServer = await createBoardServer(this.opts.board, {
-      store: this.opts.store,
-      key: () => agent.sessionId ?? agent.runId,
-      onChanged: (change?: BoardChange) => {
-        if (change?.phase) {
-          agent.live.push({ kind: 'phase', at: Date.now(), from: change.phase.from, to: change.phase.to })
-          // The moment the board exists for: an agent announcing where it got
-          // to. The host turns a move into a review column into a notification.
-          this.emit('phase', agent, change.phase.from, change.phase.to)
-        }
-        this.touch()
-      },
-      onNotice: (notice: BoardNotice) => {
-        agent.live.push({ kind: 'notice', at: Date.now(), message: notice.message, urgency: notice.urgency })
-        this.emit('notice', agent, notice)
-        this.touch()
-      },
-      onSplit: async (subtasks) => {
-        const result = await this.split(agent.sessionId ?? agent.runId, subtasks)
-        if (result.ok) {
-          agent.live.push({
-            kind: 'notice', at: Date.now(), urgency: 'info',
-            message:
-              `Split into ${result.started.length} subtasks, each with its own worktree and card: ` +
-              result.started.map((t) => t.title).join(', ') + '.',
-          })
-          this.touch()
-        }
-        return result
-      },
-    })
+    const boardServer = await createBoardServer(this.opts.board, this.boardContext(agent))
 
     // Derived from the tool definitions, so a rename can never leave the agent
     // unable to move its own card.
@@ -527,12 +556,14 @@ export class AgentManager extends EventEmitter {
         ...(wt.base ? { base: wt.base } : {}),
         ...(opts.parent ? { parent: opts.parent } : {}),
       }))
-        .then(() => this.opts.store.rename(id, title))
+        // `agent.title`, not the launch-time `title`: `set_title` may have already
+        // renamed the card during the window before this id existed.
+        .then(() => this.opts.store.rename(id, agent.title))
         .catch((e) => {
           // Never silent: a failed rename leaves the card under Claude Code's
           // own summary, and a failed patch leaves it with no worktree link at
           // all — both look like the board losing track of a session.
-          this.emit('warning', `Could not register "${title}" on the board: ${e instanceof Error ? e.message : String(e)}`)
+          this.emit('warning', `Could not register "${agent.title}" on the board: ${e instanceof Error ? e.message : String(e)}`)
         })
         .then(() => this.touch())
     })
@@ -814,6 +845,11 @@ export function buildBrief(board: BoardConfig, title: string, branch: string): s
     '',
     'Use `set_tags` once you know what this work touches, so it can be found later.',
     '',
+    'That card name was taken from the first line of the request, so it is often',
+    'not what the work turns out to be. Once you know, call `set_title` with six',
+    'words or fewer. It renames the CARD only — your branch and worktree keep the',
+    'names they started with.',
+    '',
     'If what you have been asked for is really two or more UNRELATED pieces of work,',
     'use `split_task` BEFORE you change anything. Each subtask gets its own agent,',
     'its own worktree and its own card under this one, so the user can test and merge',
@@ -823,15 +859,100 @@ export function buildBrief(board: BoardConfig, title: string, branch: string): s
   ].join('\n')
 }
 
-/** A card title from a free-form prompt: first sentence, trimmed. */
-export function titleFrom(prompt: string): string {
-  const first = prompt.trim().split(/\n/)[0]?.trim() ?? ''
-  const sentence = first.split(/(?<=[.?!])\s/)[0] ?? first
-  const t = (sentence || first).replace(/\s+/g, ' ').trim()
-  if (!t) return 'Untitled session'
-  return t.length > 72 ? t.slice(0, 69).trimEnd() + '…' : t
+/**
+ * Discourse markers that open a message without describing the work. Stripped
+ * from the FRONT of a sentence only.
+ *
+ * `just` is here for "just fix the login flow"; it is only ever dropped while
+ * it is the leading word, so "the just-in-time cache" keeps it.
+ */
+const OPENERS = new Set([
+  'okay', 'ok', 'k', 'alright', 'allright', 'right', 'so', 'well', 'hey', 'hi',
+  'hello', 'now', 'then', 'also', 'and', 'but', 'anyway', 'anyways', 'oh',
+  'hmm', 'um', 'uh', 'erm', 'yeah', 'yep', 'yes', 'no', 'nope', 'sure', 'cool',
+  'great', 'nice', 'perfect', 'thanks', 'please', 'actually', 'basically',
+  'just',
+])
+
+/** Ways of asking that say nothing about what is being asked for. */
+const WRAPPERS: RegExp[] = [
+  /^i(?:'d|'m| would| am)? ?(?:really )?(?:want|like|need|going) (?:you )?to /i,
+  /^i(?:'d| would)? (?:really )?(?:want|like|need) you (?:to )?/i,
+  /^(?:can|could|would|will) you (?:please |also )?/i,
+  /^(?:let'?s|lets|let us) /i,
+  /^we (?:should|need to|want to|could|have to) /i,
+  /^you (?:should|need to|must|can|could) /i,
+  /^(?:make sure to|be sure to|go ahead and|help me|try to|try and|start by) /i,
+  /^(?:your task is|the task is|task|todo|goal)[: ]+(?:to )?/i,
+  /^please /i,
+]
+
+/** How many words a cleaned sentence needs before it is preferred as a title. */
+const ENOUGH_WORDS = 3
+
+/** Strip leading filler until something substantial is in front. */
+function stripFiller(sentence: string): string {
+  let s = sentence.trim()
+  for (let pass = 0; pass < 6; pass++) {
+    const before = s
+    const words = s.split(' ')
+    const head = (words[0] ?? '').toLowerCase().replace(/[^a-z']/g, '')
+    if (head && OPENERS.has(head)) s = words.slice(1).join(' ').trim()
+    for (const w of WRAPPERS) s = s.replace(w, '').trim()
+    if (s === before) break
+  }
+  return s.replace(/^[,;:.\-–—\s]+/, '').trim()
 }
 
+/**
+ * A card title from a free-form prompt.
+ *
+ * It used to be the first sentence, full stop — so a session opening with
+ * "Okay." was called **Okay.** for the rest of its life, and its worktree was
+ * `S2mtnf1lpa-okay`, which cannot be renamed at all. Spoken and dictated
+ * prompts open with a discourse marker most of the time, and the name is minted
+ * at t=0, before anything has read a line of code. So: skip the filler, skip a
+ * sentence that is nothing but filler, and take the first one that actually
+ * says something.
+ *
+ * Deliberately dumb — no model call. This runs before the session exists, on
+ * the path that creates the worktree, and a title is not worth a round trip.
+ * `set_title` is how a name gets genuinely good, once the agent knows the work.
+ */
+export function titleFrom(prompt: string): string {
+  // Sentences, from the first 600 characters. Bounded because a prompt may open
+  // with a pasted stack trace, and there is nothing in one worth titling.
+  const sentences = prompt
+    .slice(0, 600)
+    .split(/\n+|(?<=[.?!])\s+/)
+    .map((s) => s.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+
+  const cleaned = sentences.slice(0, 6).map(stripFiller).filter(Boolean)
+  const words = (s: string) => s.split(' ').length
+  // Earliest usable sentence, never the longest: a two-word opening line must
+  // not lose the title to a two-word second line. "Please add SSO" is two words
+  // and still the best name available, so the bar drops rather than being
+  // abandoned — and a prompt of "Okay." has only its own filler to offer.
+  const picked =
+    cleaned.find((s) => words(s) >= ENOUGH_WORDS) ??
+    cleaned.find((s) => words(s) >= 2) ??
+    cleaned[0] ??
+    sentences[0] ??
+    ''
+  return normaliseTitle(picked) || 'Untitled session'
+}
+
+/**
+ * The prefix a worktree directory and branch carry, to keep two sessions with
+ * the same title apart.
+ *
+ * Short on purpose: it sits in front of the readable part of every directory
+ * name, and ten characters of base-36 clock (`S2mtnf1lpa-okay`) push the part a
+ * human reads off the end of the column. `WorktreeService.create()` already
+ * appends `-2` on a collision, so this only has to make them mostly unique.
+ */
 function shortId(runId: string): string {
-  return runId.replace(/^run-/, 'S').split('-').slice(0, 2).join('')
+  const [n = '', ts = ''] = runId.replace(/^run-/, '').split('-')
+  return `S${n}${ts.slice(-3)}`
 }

@@ -1,6 +1,6 @@
 /* The board's policy rules. These decide what an agent may do and when the user
    is interrupted, so they are code with tests rather than prose in a prompt. */
-import { DEFAULT_BOARD, columnById, isHumanOnly, isReviewColumn, type BoardConfig } from '../config.ts'
+import { DEFAULT_BOARD, columnById, isHumanOnly, isReviewColumn, isStartedColumn, type BoardConfig } from '../config.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -17,6 +17,18 @@ ok(!isHumanOnly(DEFAULT_BOARD, 'no-such-column'), 'an unknown column is not sile
 // Exactly one approval gate: two would mean an agent could be blocked somewhere
 // it was never told about.
 ok(DEFAULT_BOARD.columns.filter((c) => c.humanOnly).length === 1, 'there is exactly one approval column')
+
+// --- where the agent is asked to name its own card ---------------------------
+// The ask for a real title rides on the move into the started column: the first
+// moment the agent knows what the work is. A rule, not a hardcoded 'implementing',
+// so a renamed board still has a moment to ask at.
+ok(isStartedColumn(DEFAULT_BOARD, 'implementing'), 'the implementing column is where work starts')
+for (const c of DEFAULT_BOARD.columns.filter((x) => x.category !== 'started')) {
+  ok(!isStartedColumn(DEFAULT_BOARD, c.id), `"${c.id}" is not that moment`)
+}
+ok(!isStartedColumn(DEFAULT_BOARD, 'no-such-column'), 'and an unknown column is not either')
+ok(DEFAULT_BOARD.columns.filter((c) => c.category === 'started').length === 1,
+   'there is exactly one such moment, so the ask cannot fire twice')
 
 // --- the ready-to-test signal ------------------------------------------------
 ok(isReviewColumn(DEFAULT_BOARD, 'validating'), 'the review column is what "ready to test" means')
