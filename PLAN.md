@@ -198,7 +198,14 @@ You can still drag a card to Complete. The guard constrains the agent, not you.
 
 ## 7. Worktrees
 
-`git worktree add -b task/<id>-<slug> ../<repo>_worktrees/<name> <base>`
+`git worktree add -b task/<id>-<slug> .agentskanban/worktrees/<name> <base>`
+
+Worktrees live inside the repository, under the one directory this extension
+owns, and `.gitignore` is given `/.agentskanban/` before the first one is
+created. The ignore rule is load-bearing rather than tidy: `merge()` refuses on
+a dirty main worktree, so an unignored scratch directory would block every merge
+from the first session onwards. `agentsKanban.worktreeRoot` still moves it, and
+pointing it outside the repository writes nothing to your `.gitignore`.
 
 The session's `cwd` is that worktree — that is what makes parallel agents safe.
 Destructive git operations are serialised per repository, which matters more
@@ -206,7 +213,7 @@ here than in a standalone app because VS Code's built-in Git extension issues
 commands against the same repo.
 
 **No seeding**, matching Nimbalyst: no `.env` copy, no `node_modules` link.
-Copying secrets into a sibling directory should be a decision, not a default.
+Copying secrets into another checkout should be a decision, not a default.
 `onCreate` exists to opt in.
 
 ### Getting the work back out
@@ -415,7 +422,10 @@ item. Three things are genuinely not started:
 
 ### Milestone 5 — resume and durability
 
-- Rehydrate live agents after an extension host restart
+- ~~Rehydrate live agents after an extension host restart~~ — done, as far as it
+  can be: the CLI process dies with the host and cannot be re-attached, so a run
+  still marked running at startup is shown as interrupted and offered a resume.
+  See docs/DECISIONS.md.
 - Permission prompts that survive a window reload
 - Fail loudly when a resumed session comes back with a different id than the one
   we asked for, as Nimbalyst does

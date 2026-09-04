@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { promisify } from 'node:util'
-import { WorktreeService, findRepoRoot, realResolveInWorktree, resolveInWorktree, slug } from '../worktree.ts'
+import { KANBAN_DIR, WorktreeService, findRepoRoot, realResolveInWorktree, resolveInWorktree, slug } from '../worktree.ts'
 
 const exec = promisify(execFile)
 let fails = 0
@@ -30,9 +30,47 @@ ok((await svc.list()).length === 0, 'no worktrees initially (main excluded)')
 // create
 const wt = await svc.create({ taskId: 'TASK-001', title: 'Fix the login flow' })
 ok(wt.branch === 'task/TASK-001-fix-the-login-flow', `branch named from task: ${wt.branch}`)
-ok(path.basename(path.dirname(wt.path)) === 'proj_worktrees', `worktree in sibling dir: ${wt.path}`)
+ok(wt.path.startsWith(path.join(root!, KANBAN_DIR, 'worktrees') + path.sep),
+   `worktree lives inside the repo, under .${KANBAN_DIR.slice(1)}/worktrees: ${wt.path}`)
 ok((await fs.stat(path.join(wt.path, 'README.md'))).isFile(), 'worktree has repo contents')
 ok((await svc.list()).length === 1, 'list sees the new worktree')
+
+// --- the worktree directory must be IGNORED --------------------------------
+// This is the gate that makes living inside the repository survivable. An
+// unignored .agentskanban/ is an untracked directory in the main working tree,
+// and merge() and split() both refuse outright on a dirty tree — so without
+// this, creating one session blocks merging and splitting forever, and blames
+// a directory the user never made.
+const statusAfterCreate = (await g(['status', '--porcelain'])).stdout.split('\n').filter(Boolean)
+ok(statusAfterCreate.length === 1 && statusAfterCreate[0]!.endsWith('.gitignore'),
+   `creating a worktree dirties nothing but .gitignore: ${JSON.stringify(statusAfterCreate)}`)
+const ignoreText = await fs.readFile(path.join(repo, '.gitignore'), 'utf8')
+ok(ignoreText.includes(`/${KANBAN_DIR}/`), `the rule written is the whole directory: ${ignoreText.trim()}`)
+
+// Idempotent: a second worktree must not append the rule again.
+await svc.create({ taskId: 'TASK-IG', title: 'ignore twice' })
+const twice = await fs.readFile(path.join(repo, '.gitignore'), 'utf8')
+ok(twice.split(`/${KANBAN_DIR}/`).length - 1 === 1, 'the ignore rule is written once, not once per session')
+await svc.remove(path.join(root!, KANBAN_DIR, 'worktrees', 'TASK-IG-ignore-twice'), { force: true })
+
+// A rule that already exists elsewhere counts. git check-ignore is asked, not
+// the file, so .git/info/exclude and a global excludes file both satisfy it.
+const other = path.join(tmp, 'excluded')
+await fs.mkdir(other)
+const og = (args: string[]) => exec('git', args, { cwd: other })
+await og(['init', '-b', 'main'])
+await og(['config', 'user.email', 'test@example.com']); await og(['config', 'user.name', 'Test'])
+await fs.writeFile(path.join(other, 'README.md'), '# x\n')
+await og(['add', '-A']); await og(['commit', '-m', 'init'])
+await fs.writeFile(path.join(other, '.git', 'info', 'exclude'), `/${KANBAN_DIR}/\n`)
+const excludedSvc = new WorktreeService((await findRepoRoot(other))!)
+ok((await excludedSvc.ensureIgnored()) === undefined, 'an existing exclude rule is left alone')
+ok(!(await fs.access(path.join(other, '.gitignore')).then(() => true, () => false)),
+   'and no .gitignore is created just to repeat it')
+
+// A worktree root OUTSIDE the repository must not touch .gitignore at all.
+const outside = new WorktreeService((await findRepoRoot(other))!, path.join(tmp, 'elsewhere'))
+ok((await outside.ensureIgnored()) === undefined, 'a worktree root outside the repo writes no ignore rule')
 
 // NO seeding by default
 await fs.writeFile(path.join(repo, '.env'), 'SECRET=1\n')
@@ -96,6 +134,28 @@ ok(!(await svc.list()).some(w => w.path === wt3.path), 'remove recovers from a v
 // merge guards below read a dirty main worktree as a refusal — correctly — so
 // clear it, or every merge assertion tests the wrong thing.
 await fs.rm(path.join(repo, '.env'), { force: true })
+
+// The .gitignore rule we wrote for the worktree directory is itself an
+// uncommitted change, so the FIRST merge after the FIRST session is blocked by
+// a file the user never touched. That is real and unavoidable — the rule has to
+// be in the repository to be shared — so the refusal must at least say so
+// instead of talking about "your own changes".
+const selfInflicted = await svc.merge('main', 'main')
+const whyDirty = !selfInflicted.ok && 'message' in selfInflicted ? selfInflicted.message : ''
+ok(!selfInflicted.ok && selfInflicted.reason === 'dirty', 'an uncommitted ignore rule blocks the merge')
+ok(whyDirty.includes('.gitignore') && whyDirty.includes('Agents Kanban'),
+   `and the refusal names it rather than blaming the user: ${whyDirty}`)
+await g(['add', '.gitignore']); await g(['commit', '-m', 'Ignore agent worktrees'])
+
+// With a real edit of the user's own in the way, it goes back to the plain
+// message — and lists what is actually uncommitted.
+await fs.writeFile(path.join(repo, 'mine.txt'), 'mine\n')
+const theirs = await svc.merge('main', 'main')
+const whyTheirs = !theirs.ok && 'message' in theirs ? theirs.message : ''
+ok(!theirs.ok && theirs.reason === 'dirty' && whyTheirs.includes('mine.txt') &&
+   !whyTheirs.includes('Agents Kanban'),
+   `someone else's edit is never attributed to us: ${whyTheirs}`)
+await fs.rm(path.join(repo, 'mine.txt'))
 
 // wt already has one commit ('work' → new.txt) plus we add uncommitted edits.
 await fs.writeFile(path.join(wt.path, 'draft.txt'), 'not committed yet\n')
@@ -237,6 +297,13 @@ ok(slug('Fix THE login!! flow') === 'fix-the-login-flow', 'slug normalises')
   await fs.writeFile(path.join(proj, 'README.md'), '# split\n')
   await gs(['add', '-A']); await gs(['commit', '-m', 'init'])
   const svc2 = new WorktreeService((await findRepoRoot(proj))!)
+
+  // What `agentsKanban.init` does, and what a project is expected to commit
+  // once: the ignore rule for the worktree directory. Done up front, no merge
+  // below is ever blocked by it.
+  ok((await svc2.ensureIgnored()) === '/.agentskanban/', 'init writes the ignore rule before any session exists')
+  await gs(['add', '.gitignore']); await gs(['commit', '-m', 'Ignore agent worktrees'])
+  ok((await svc2.ensureIgnored()) === undefined, 'and says nothing the second time')
 
   // The parent: an ordinary session, which is all it is until it splits.
   const parent = await svc2.create({ taskId: 'S1', title: 'Add SSO and fix the flaky test' })

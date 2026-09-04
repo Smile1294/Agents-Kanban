@@ -226,5 +226,55 @@ for (const kind of TERMINAL) {
   ok(agentEnv({ FOO: 'a' }, { FOO: 'b' }).FOO === 'b', 'an explicit override beats the inherited value')
 }
 
+// --- what a killed run leaves behind ----------------------------------------
+//
+// A run is marked running on disk while it works and unmarked when it ends, so
+// a mark still there at the next launch means the extension host went away
+// mid-turn. The whole feature hangs on ONE distinction that nothing in the type
+// system can protect:
+//
+//   stop(key)  the user decided. Clear the mark, or the next launch accuses the
+//              editor of cutting off a run they stopped on purpose.
+//   stopAll()  the host is going away. Do NOT clear it. This IS the event.
+//
+// Get it backwards and the feature silently does nothing at all: every restart
+// erases its own evidence on the way out.
+{
+  const patched: { key: string; running?: number }[] = []
+  const mgr = new AgentManager({
+    store: {
+      patch: async (key: string, p: { running?: number }) => { patched.push({ key, ...p }) },
+    } as never,
+    worktrees: {} as never,
+    board: DEFAULT_BOARD,
+    defaults: {},
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 3,
+  })
+  const internals = mgr as unknown as { agents: Map<string, RunningAgent> }
+  const running = (runId: string, sessionId: string): RunningAgent => ({
+    runId, sessionId, title: runId,
+    state: { kind: 'working' }, worktreePath: '/tmp/wt/' + runId, branch: 'task/' + runId,
+    live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
+  })
+
+  internals.agents.set('r1', running('r1', 'sess-1'))
+  mgr.stop('sess-1')
+  await new Promise((r) => setImmediate(r))
+  ok(patched.some((p) => p.key === 'sess-1' && p.running === 0),
+     'a deliberate stop clears the running mark')
+  ok(patched.every((p) => p.running !== undefined),
+     'and clears it with 0, because a patch drops undefined and the mark would survive')
+
+  patched.length = 0
+  internals.agents.set('r2', running('r2', 'sess-2'))
+  internals.agents.set('r3', running('r3', 'sess-3'))
+  mgr.stopAll()
+  await new Promise((r) => setImmediate(r))
+  ok(patched.length === 0,
+     `the host going away leaves every mark in place — that is the whole signal (${JSON.stringify(patched)})`)
+  ok(internals.agents.size === 0, 'while still tearing every run down')
+}
+
 console.log(fails === 0 ? 'PASS — run identity, subtask boundaries and the agent brief hold' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

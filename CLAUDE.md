@@ -58,10 +58,17 @@ run, since each session needs a worktree.
 
 ## Rules for changing this codebase
 
-- **Nothing goes in the user's repository.** Sessions and transcripts belong to
-  Claude Code (`~/.claude/projects/`); phase, tags and worktree mapping go to a
-  sidecar in extension storage. v1 wrote `.kanban/*.md` into the working tree and
-  every agent turn produced a git diff. Do not reintroduce this.
+- **Nothing TRACKED goes in the user's repository.** Sessions and transcripts
+  belong to Claude Code (`~/.claude/projects/`); phase, tags and worktree
+  mapping go to a sidecar in extension storage. v1 wrote `.kanban/*.md` into the
+  working tree and every agent turn produced a git diff. Do not reintroduce
+  this. There is exactly one deliberate exception, and it is one line: worktrees
+  live in `<repo>/.agentskanban/worktrees/`, and `ensureIgnored()` puts
+  `/.agentskanban/` into `.gitignore` before the first one is created. That
+  ignore rule is load-bearing — `merge()` refuses on a dirty main worktree, so
+  an unignored scratch directory blocks every merge from the first session
+  onwards. Anything else you are tempted to write into the working tree belongs
+  in extension storage.
 - **The left side bar is not ours.** No command in this extension may open,
   close, collapse or resize it. `applyBoardFocus` takes the bottom panel and the
   secondary side bar, and those only, because they are the two areas nothing
@@ -80,6 +87,34 @@ run, since each session needs a worktree.
 - **Never show a signal that cannot say "bad".** A pulsing dot pulses over a
   wedged process too. Show the number the indicator is derived from — the board
   shows the age of the last CLI frame, which climbs when nothing is happening.
+- **The board's own state must outlive the extension's identity.** Phase, tags
+  and the worktree mapping live in `globalStorageUri`, whose path VS Code
+  derives from `<publisher>.<name>` — so renaming either hands the next install
+  an empty directory while Claude Code still has every session, and every card
+  falls to the default column. That happened: `david.claude-kanban` became
+  `smile1294.agents-kanban` and the whole board came back in Planning.
+  `MetaStore` folds in what sibling storage directories remember. The merge is
+  ADDITIVE and that is load-bearing: recovering only when our own file is
+  MISSING looks equivalent and fixes nothing, because the new install writes a
+  file the moment it is used. Ours always wins, only unknown session ids are
+  taken, once per source (`.recovered.json`, or a deleted session comes back
+  every time), only this workspace's file, and only from a directory named like
+  an extension.
+- **Anything persisted must be READ BACK by a test, not just written.**
+  `contextWindow` was written by every run and missing from the parse in
+  `all()`, so the number the context meter measures against was lost on every
+  launch — the exact failure that field was added to prevent, silently, for its
+  whole life. A write with no round trip is not persistence.
+- **A run that was killed must SAY so.** The CLI is a child of the extension
+  host and dies with it; nothing can re-attach. `SessionMeta.running` is written
+  when a run registers and cleared when it ends, so a mark still there at
+  startup means the host went away mid-turn, and the card says "Interrupted 9m
+  ago" instead of looking identical to a run that finished. Two things are
+  load-bearing and neither is visible to the type system: `stop()` clears the
+  mark because the user chose it, and `stopAll()` deliberately does NOT, because
+  that is the event being recorded — reverse them and every restart erases its
+  own evidence. And `0` clears it, never `undefined`, which `stripUndefined()`
+  drops.
 - **A number the board shows must not depend on a process being alive.** Context
   fill and spend both came off the live agent and nowhere else, so every session
   went blank when its process ended — which a VS Code restart does to all of them

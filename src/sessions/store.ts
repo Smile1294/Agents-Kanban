@@ -28,10 +28,40 @@ export interface BoardSession {
   base?: string
   /** The session this one was split out of. One level only. */
   parent?: string
+  /** When a run started, if one was still marked running. See SessionMeta.running. */
+  running?: number
+  contextWindow?: number
   testPlan?: TestPlan
   model?: string
   effort?: string
   thinking?: string
+}
+
+/**
+ * Sessions whose run was killed by the extension host going away.
+ *
+ * The mark is written when a run registers and cleared when that run reaches a
+ * terminal state or the user stops it, so a mark left on disk with no live
+ * agent to account for it means exactly one thing: the process is gone and was
+ * never told to stop. A window reload, a reinstall, a crash.
+ *
+ * A session with a LIVE agent is never interrupted however old its mark — that
+ * agent IS the run the mark refers to. Getting this backwards would put an
+ * "interrupted" banner on a card that is working in front of you.
+ *
+ * Pure, and separate from the host, because the alternative is asserting on it
+ * through VS Code.
+ */
+export function interruptedSessions(
+  sessions: readonly BoardSession[],
+  liveKeys: Iterable<string>,
+): Map<string, number> {
+  const live = new Set(liveKeys)
+  const out = new Map<string, number>()
+  for (const s of sessions) {
+    if (s.running && !live.has(s.id)) out.set(s.id, s.running)
+  }
+  return out
 }
 
 /** A transcript entry, already reduced to what the chat view draws. */
@@ -185,6 +215,8 @@ export class SessionStore {
         ...(m.branch ? { branch: m.branch } : {}),
         ...(m.base ? { base: m.base } : {}),
         ...(m.parent ? { parent: m.parent } : {}),
+        ...(m.running ? { running: m.running } : {}),
+        ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
         ...(m.testPlan ? { testPlan: m.testPlan } : {}),
         ...(m.model ? { model: m.model } : {}),
         ...(m.effort ? { effort: m.effort } : {}),

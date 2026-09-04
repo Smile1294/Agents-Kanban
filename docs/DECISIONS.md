@@ -94,6 +94,59 @@ audience, and the error message says exactly what to do.
 
 ---
 
+### Worktrees live inside the repository, ignored — not in a sibling directory
+
+Worktrees used to go in `<repo>_worktrees`, a sibling of the project. It kept
+the repository byte-for-byte pristine, which is the rule the rest of this
+extension is built on, and it was still the wrong place:
+
+- The checkouts landed in the user's `Projects/` folder, next to their actual
+  projects, named after this tool. Nothing relates them back, nothing cleans
+  them up, and a `Projects` listing gains a directory per repo you ever ran an
+  agent in.
+- A sibling directory is outside the workspace, so nothing in VS Code —
+  including this extension's own file and diff links — has a natural root for
+  them.
+- It assumed the parent directory is writable. A repository checked out at the
+  root of a share, or in a container mount, does not guarantee that.
+
+They are now `<repo>/.agentskanban/worktrees/<name>`, and `/.agentskanban/` goes
+into the repository's `.gitignore`.
+
+**The ignore rule is load-bearing, not tidiness.** `merge()` refuses to merge
+into a dirty main worktree, deliberately — it is where work gets lost. An
+unignored `.agentskanban/` is an untracked directory in that worktree, so
+without the rule, creating one session would block every merge from then on and
+blame a directory the user never made. `ensureIgnored()` therefore runs inside
+`create()`, before the first `git worktree add`, so the directory is never once
+visible as untracked. It asks `git check-ignore` rather than reading the file,
+so a rule already in `.git/info/exclude` or a global excludes file counts and no
+second copy is written; and it does nothing at all when `worktreeRoot` points
+outside the repository, because there would be nothing to ignore and editing
+someone's `.gitignore` anyway is a surprise.
+
+**The one unavoidable consequence:** the `.gitignore` edit is itself an
+uncommitted change, so the first merge after the first session is blocked by a
+file the user did not touch. That cannot be designed away — the rule has to be
+in the repository to be shared with the team, which is the reason for
+`.gitignore` over `.git/info/exclude` — so the refusal is made to say so. When
+the only uncommitted change is `.gitignore`, and its only added lines are our
+rule and its comment (compared against `HEAD`, so someone else's edit is never
+attributed to us), the message names it and says to commit that line. Otherwise
+the dirty files are listed, because a merge refused without saying what is in
+the way is a dead end either way. `agentsKanban.init` writes the rule too, which
+is how to get it committed before any agent runs.
+
+**Existing worktrees are untouched.** `list()` reads from git and sessions carry
+their worktree path in the sidecar, so anything already in `<repo>_worktrees`
+keeps working, reviewing and merging exactly as before. Only new ones move.
+
+**Also:** `.agentskanban/**` is in `.vscodeignore`. A worktree is a whole
+checkout of the repository, and `vsce` packages everything not listed — one live
+session would otherwise put the entire repo inside the `.vsix`.
+
+---
+
 ## Postmortems
 
 ### The board was blank and every command was "not found"
@@ -246,7 +299,7 @@ Measured: 0 entries scoped, 274 unscoped.
 
 **3. A failed run leaked its worktree.** A run that died at startup — a bad
 `claude` path, a permissions refusal — had already created a worktree and a
-branch, and nothing removed them. They accumulated in `<repo>_worktrees` with
+branch, and nothing removed them. They accumulated in the worktree directory with
 every failed start. Now reclaimed, but only when provably untouched (clean, and
 no commits ahead of base): a leaked directory is a nuisance, deleting someone's
 work is not.
@@ -936,7 +989,7 @@ screenshot of four rows. Three separate causes, all in `summariseTool`:
 |---|---|
 | `mcp__claude_ai_Atlassian__getJiraIssue` | `Atlassian · getJiraIssue  ACME-184` |
 | `ToolSearch` | `ToolSearch  jira atlassian` |
-| `Read /home/…/pim_worktrees/S1mtm…/.claude/knowledge/_domain-map.md` | `Read  …/.claude/knowledge/_domain-map.md` |
+| `Read /home/…/.agentskanban/worktrees/S1abc…/.claude/knowledge/_domain-map.md` | `Read  …/.claude/knowledge/_domain-map.md` |
 
 An unlisted argument key now falls back to the first short string in the input, so
 a newly-added MCP tool still says something. The server name keeps a capitalised
@@ -1562,6 +1615,115 @@ it is ever built, the version that earns its keep is a crop plus one
 rectangle/arrow, whose output is both the marked-up image AND an auto-inserted
 note naming the mark ("the red box"). It is deliberately not built yet.
 
+### Every card came back in Planning after a reinstall
+
+Reported as: "if I tried to reinstall now it basically didn't work at all, all
+the tasks were moved to planning".
+
+Exactly that, and the evidence was two directories:
+
+```
+globalStorage/david.claude-kanban/sessions/…-pim.json      5 entries, 14:57
+globalStorage/smile1294.agents-kanban/sessions/…-pim.json  1 entry,  15:20
+```
+
+VS Code derives `context.globalStorageUri` from `<publisher>.<name>`. This
+extension shipped as `david.claude-kanban` and became `smile1294.agents-kanban`,
+so the reinstall got an **empty storage directory**. Claude Code still had every
+session — it always does, that is the point of keeping them there — so every
+card came back with no sidecar entry and `list()` fell through to
+`this.defaultPhase`. Nothing threw. Nothing was actually lost. The board just
+forgot which column everything was in, which is the whole board.
+
+The failure is not the rename. It is that the board's state was keyed to a name
+that was always free to change, with no way back. So the sidecar now looks for
+previous incarnations of itself: sibling directories under `globalStorage/` are
+probed for `<id>/sessions/<this workspace>.json`, and anything they remember
+that we do not is folded in and written through.
+
+**Additive, not a swap** — which is the whole difference between fixing this and
+almost fixing it. The obvious version recovers only when our own file is
+MISSING, and that version would not have helped here at all: by the time it was
+noticed, the new install had already written a file with one entry in it, and a
+missing-file rule skips a file that exists. Meanwhile the other four sessions
+were sitting in the old directory. So an entry we already have always wins, and
+only ids we have never heard of are taken. A session id is globally unique, so
+an entry missing from our file cannot be about something else, and the
+alternative is rendering that card in the default column — the bug itself.
+
+Four things make it safe rather than clever:
+
+- **Ours always wins.** An entry we already have is never replaced, whatever the
+  date on the file it came from.
+- **Once per source**, recorded in `.recovered.json` beside the sidecar. Merging
+  on every load would resurrect a session the user deleted, every single time
+  they deleted it.
+- **Only this workspace's file.** The filename is the encoded workspace root, so
+  another folder's board is never adopted.
+- **Only a directory that could be an extension.** The candidate's name must
+  contain a dot, because VS Code names every extension's storage
+  `<publisher>.<name>`. That is not decoration: pointed at a temp directory
+  during testing, the scan cheerfully adopted a sibling left by an unrelated
+  run, and two existing tests started reading each other's state.
+
+Siblings are scanned rather than a list of old ids being hardcoded, so the next
+rename costs nothing. Verified against the real thing: the four stranded `pim`
+sessions come back with their phases and tags, and deleting one afterwards
+sticks.
+
+**Found while fixing it:** `contextWindow` was written by every run and never
+read back — it was missing from the parse in `all()`, so the figure the context
+meter measures against was lost on every launch. That field exists *specifically*
+so the meter survives a restart (see the postmortem above), and it had never
+worked. The `running` mark below would have gone the same way. Anything
+persisted is now read back at least once by a test.
+
+---
+
+### A run the editor killed looked exactly like one that finished
+
+The other half of the same report. Reloading the window, reinstalling the
+extension or crashing kills every agent process mid-turn, and nothing can
+re-attach to them: the CLI is a child of the extension host and dies with it.
+That part is not fixable and never will be.
+
+What was fixable is that the board said nothing. A card whose run was cut off
+three seconds into a twenty-minute task rendered identically to one that had
+finished and moved itself to Validating — same phase, same transcript, no agent
+strip. "It stopped and said nothing" and "it finished" are the same picture, and
+the difference is whether the work was ever done.
+
+So a run now leaves a mark. `SessionMeta.running` is written when a run
+registers and cleared when it reaches a terminal state, and a mark still on disk
+at startup with no live agent to account for it means the host went away
+mid-turn. The card says **"Interrupted 9m ago"** — the time, not a badge,
+because "2m ago" and "3 days ago" call for different reactions — and the chat
+page offers **Resume** or **Dismiss**.
+
+Load-bearing details, in the order they will break if touched:
+
+- **`stop()` clears the mark; `stopAll()` does not.** This one distinction is
+  the entire feature. `stopAll()` runs when the host is going away — which IS
+  the event the mark records — so clearing it there means every restart erases
+  its own evidence on the way out and the banner never appears once. It
+  typechecks perfectly either way; `manager.test.ts` is what catches it.
+- **Zero clears it, not `undefined`.** `stripUndefined()` drops undefined from a
+  patch, so `undefined` cannot clear anything and the mark would outlive every
+  run that set it. Same reason `worktree` uses an empty string.
+- **A live agent is never interrupted**, however old its mark — that agent *is*
+  the run the mark refers to. Backwards, this puts an "interrupted" banner over
+  an agent working in front of you.
+- **The mark is written when the SESSION ID arrives**, not at launch. A run that
+  dies before that has no transcript and nothing to resume, and
+  `discardIfUntouched()` takes its worktree back.
+- **Resume is a click, never automatic.** It starts a real process with a real
+  bill. Doing that to every interrupted session the moment VS Code opens is not
+  a decision this extension gets to make. The prompt tells the agent the truth —
+  that it was cut off part-way and must check its worktree rather than assume
+  its last action completed.
+
+---
+
 ## Still open
 
 - **`verify` tests before it builds, and one test reads the build.**
@@ -1573,9 +1735,10 @@ note naming the mark ("the red box"). It is deliberately not built yet.
   (playwright, this week) passes preflight and fails in the test that imports it.
 - **No syntax highlighting in code blocks.** Language label and monospace only.
 
-- **Rehydration after an extension host restart.** A live agent mid-turn when the
-  host restarts is lost. Follow-ups work (`options.resume` is passed and a real
-  run was verified end-to-end), but a running agent cannot be re-attached.
+- **A live process still cannot be re-attached after a restart**, and never will
+  be: it dies with the extension host. What exists now is the most that is
+  possible — the run is detected as interrupted and offered a resume. See the
+  postmortem above.
 - **A resumed session returning a *different* id is still not detected.** The
   reverse case — two runs sharing an id — now warns; this one does not.
   Nimbalyst fails loudly on the mismatch.

@@ -752,6 +752,25 @@ details.thinking summary::-webkit-details-marker { display: none; }
 }
 .queued-item:first-of-type { border-top: none; }
 
+/* A run the editor killed on its way out. Deliberately quieter than an error
+   badge and louder than nothing: the work is not lost, but it did not finish,
+   and only the user can decide whether to pick it up. */
+.interrupted {
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 8px 10px; margin: 6px 0;
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.interrupted-head { display: flex; align-items: center; gap: 6px; }
+.interrupted-icon { color: var(--warn); }
+.interrupted-title {
+  font-size: 0.8em; font-weight: 600;
+  color: var(--warn);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.interrupted-body { font-size: 0.84em; line-height: 1.45; color: var(--faint); margin-top: 6px; }
+.interrupted-actions { display: flex; gap: 8px; margin-top: 8px; }
+
 .slash-menu {
   display: flex; flex-direction: column;
   margin: 0 14px; border: 1px solid var(--line); border-radius: var(--radius);

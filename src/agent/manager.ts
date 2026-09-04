@@ -474,6 +474,11 @@ export class AgentManager extends EventEmitter {
         phase: prior?.phase ?? this.opts.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing',
         worktree: wt.path,
         branch: wt.branch,
+        // Written here because this is the moment the card becomes durable: a
+        // run that dies before this point has no transcript and no session to
+        // resume, and discardIfUntouched() takes its worktree back. From here
+        // on, a mark left behind means the host went away mid-turn.
+        running: agent.startedAt,
         ...(wt.base ? { base: wt.base } : {}),
         ...(opts.parent ? { parent: opts.parent } : {}),
       }))
@@ -587,6 +592,9 @@ export class AgentManager extends EventEmitter {
     const finish = () => {
       delete agent.streaming
       this.sessions.delete(runId)
+      // This run reached the end under its own power, so it was not cut off.
+      // Zero, not undefined: a patch drops undefined and the mark would stay.
+      if (agent.sessionId) void this.opts.store.patch(agent.sessionId, { running: 0 }).catch(() => {})
       this.touch()
       // A finished agent has left changes in its worktree; the host reloads the
       // review panel rather than making the user press Refresh to find out.
@@ -606,7 +614,7 @@ export class AgentManager extends EventEmitter {
       agent.live.push({ kind: 'error', at: Date.now(), message })
       // A run that failed before Claude Code ever gave it a session id never got
       // as far as working. Its worktree is a dead checkout and a dead branch
-      // that nothing references, and they accumulate in <repo>_worktrees with
+      // that nothing references, and they accumulate in the worktree directory with
       // every failed start. Reclaim it — but only once it is provably empty.
       if (!agent.sessionId) void this.discardIfUntouched(agent)
       finish()
@@ -685,6 +693,15 @@ export class AgentManager extends EventEmitter {
   stop(key: string): void {
     const a = this.byKey(key)
     if (!a) return
+    // A deliberate stop is not an interruption. Clear the mark, or the next
+    // launch greets the user with "the editor cut this off" about a run they
+    // stopped on purpose — a signal that lies is worse than no signal.
+    if (a.sessionId) void this.opts.store.patch(a.sessionId, { running: 0 }).catch(() => {})
+    this.halt(a)
+  }
+
+  /** Tear a run down without judging why. See stop() and stopAll(). */
+  private halt(a: RunningAgent): void {
     this.sessions.get(a.runId)?.stop()
     this.sessions.delete(a.runId)
     this.agents.delete(a.runId)
@@ -701,7 +718,17 @@ export class AgentManager extends EventEmitter {
     if (a && !this.sessions.has(a.runId)) { this.agents.delete(a.runId); this.touch() }
   }
 
-  stopAll(): void { for (const a of [...this.agents.values()]) this.stop(this.keyFor(a)) }
+  /**
+   * Stop every run because the host is going away — a window reload, a
+   * reinstall, a folder change.
+   *
+   * Deliberately does NOT clear the running mark, which is the whole difference
+   * between this and `stop()`. This IS the event the mark exists to record: the
+   * runs are being killed mid-turn through no decision of the user's, and the
+   * next launch has to be able to say so. A crash never reaches this line at
+   * all, and leaves the mark for the same reason.
+   */
+  stopAll(): void { for (const a of [...this.agents.values()]) this.halt(a) }
 }
 
 /** Appended to the Claude Code system prompt. Tells the agent it owns a card. */

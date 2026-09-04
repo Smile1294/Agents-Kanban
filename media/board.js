@@ -524,7 +524,41 @@
     n.append(meta)
 
     if (a) n.append(renderAgentStrip(c, a))
+    else if (c.interrupted) n.append(renderInterrupted(c, false))
     return n
+  }
+
+  /* A run the editor killed on its way out — a reload, a reinstall, a crash.
+     Nothing can re-attach to it: the process died with the old extension host.
+     But saying nothing is worse than saying that, because a cut-off run and a
+     finished one look identical on a board, and the difference is whether the
+     work was ever done.
+
+     The TIME is shown, not a badge, for the reason every other indicator here
+     shows its number: "cut off 2m ago" and "cut off 3 days ago" are different
+     situations and a bare word cannot tell them apart. */
+  function renderInterrupted(c, full) {
+    const box = el('div', 'interrupted')
+    const head = el('div', 'interrupted-head')
+    head.append(el('span', 'interrupted-icon', '⚠'))
+    head.append(el('span', 'interrupted-title', 'Interrupted ' + ago(c.interrupted)))
+    box.append(head)
+    if (!full) return box
+
+    box.append(el('div', 'interrupted-body',
+      'The editor restarted while this was running, so the turn was cut off part-way. ' +
+      'The process is gone, but the session can be picked up where it left off.'))
+    const actions = el('div', 'interrupted-actions')
+    const go = el('button', 'primary', 'Resume')
+    go.title = 'Start a new turn on this session, telling the agent it was cut off'
+    go.onclick = (e) => { stop(e); post('resume', { id: c.key }) }
+    actions.append(go)
+    const no = el('button', null, 'Dismiss')
+    no.title = 'Leave it stopped and clear this notice'
+    no.onclick = (e) => { stop(e); post('dismissInterrupted', { id: c.key }) }
+    actions.append(no)
+    box.append(actions)
+    return box
   }
 
   /* The parent's half of a split: what it was broken into, and how much of it
@@ -887,6 +921,7 @@
     // A parent's own transcript is short — it read, decided, and split. What
     // matters on its page is the subtasks, so they go first, where the test
     // plan would be on an ordinary card. They ARE its test plan.
+    if (c && c.interrupted && !c.agent) main.append(renderInterrupted(c, true))
     if (c && c.subtasks && c.subtasks.length) main.append(renderSubtasks(c))
     if (c && c.testPlan) main.append(renderTestPlan(c))
     if (c && c.worktree) main.append(renderReview(c))

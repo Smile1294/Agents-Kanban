@@ -164,6 +164,20 @@ export interface SessionMeta {
    * the right denominator instead of the model table's optimistic one.
    */
   contextWindow?: number
+  /**
+   * When a run started, while it is still running. `0` means "not running".
+   *
+   * Zero rather than `undefined` for the same reason `worktree` uses an empty
+   * string: `stripUndefined()` drops undefined from a patch, so `undefined`
+   * cannot CLEAR anything — the mark would outlive every run that set it.
+   *
+   * Written when a run registers, cleared when it reaches a terminal state or
+   * the user stops it. So a mark still on disk when the extension host starts
+   * up means that run was killed mid-turn: a window reload, a reinstall, a
+   * crash. The process cannot be re-attached — it is gone — but the session can
+   * be resumed, and the board can at least stop pretending nothing happened.
+   */
+  running?: number
   /** Per-session overrides; unset means fall through to the workspace default. */
   model?: string
   effort?: EffortLevel
@@ -189,19 +203,82 @@ export function normalise(m: SessionMeta): SessionMeta {
 
 export class MetaStore {
   private readonly file: string
+  private readonly recovered: string
+  private readonly log: ((message: string) => void) | undefined
   private cache: Record<string, SessionMeta> | undefined
   private writing: Promise<void> = Promise.resolve()
   private writeSeq = 0
 
   /** @param dir extension global storage; @param workspaceRoot scopes the file */
-  constructor(dir: string, workspaceRoot: string) {
+  constructor(dir: string, workspaceRoot: string, log?: (message: string) => void) {
     this.file = path.join(dir, 'sessions', `${encodeURIComponent(workspaceRoot)}.json`)
+    // Which previous installs have already been merged in. One file, one list,
+    // and the whole reason the merge below is safe to be additive.
+    this.recovered = path.join(dir, 'sessions', '.recovered.json')
+    this.log = log
+  }
+
+  /**
+   * The same sidecar, written by a PREVIOUS incarnation of this extension.
+   *
+   * VS Code derives the global-storage path from `<publisher>.<name>`, so
+   * renaming either gives the next install an empty directory — and the board
+   * comes back with every phase, tag and test plan gone while Claude Code still
+   * has all the sessions. Every card then falls to the default column, which is
+   * what "all my tasks moved to Planning after reinstalling" was: this
+   * extension shipped as `david.claude-kanban` and became
+   * `smile1294.agents-kanban`.
+   *
+   * Siblings are scanned rather than a list of old ids being hardcoded, so the
+   * NEXT rename costs nothing. It is a targeted probe, not a trawl of other
+   * extensions' data: the only path looked at is
+   * `<id>/sessions/<this workspace>.json`, a shape nothing but this code ever
+   * writes. Newest wins, because a rename can happen twice.
+   */
+  private async recover(): Promise<{ text: string; from: string; at: number }[]> {
+    // .../globalStorage/<publisher>.<name>/sessions/<workspace>.json
+    const mine = path.dirname(path.dirname(this.file))
+    const root = path.dirname(mine)
+    const name = path.basename(this.file)
+    const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => [])
+    const found: { text: string; from: string; at: number }[] = []
+    for (const e of entries) {
+      const dir = path.join(root, e.name)
+      if (!e.isDirectory() || dir === mine) continue
+      // VS Code names every extension's storage `<publisher>.<name>`, so a
+      // directory without a dot is not one and cannot be a previous us. Cheap,
+      // and it keeps the scan from ever reaching outside the shape it assumes —
+      // which is not hypothetical: pointed at a temp directory, this happily
+      // adopted a sibling left by an unrelated run.
+      if (!e.name.includes('.')) continue
+      const candidate = path.join(dir, 'sessions', name)
+      const stat = await fs.stat(candidate).catch(() => undefined)
+      if (!stat?.isFile()) continue
+      const text = await fs.readFile(candidate, 'utf8').catch(() => '')
+      if (!text.trim()) continue
+      found.push({ text, from: candidate, at: stat.mtimeMs })
+    }
+    // Newest FIRST: the merge takes the first entry it sees for an id and skips
+    // the rest, so ordering is what decides between two previous installs that
+    // both remember the same session.
+    return found.sort((a, b) => b.at - a.at)
+  }
+
+  /** The previous installs already merged in, so the merge happens once. */
+  private async alreadyRecovered(): Promise<Set<string>> {
+    const raw = await fs.readFile(this.recovered, 'utf8').catch(() => '')
+    try {
+      const parsed: unknown = raw ? JSON.parse(raw) : []
+      return new Set(Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [])
+    } catch {
+      return new Set()
+    }
   }
 
   private async all(): Promise<Record<string, SessionMeta>> {
     if (this.cache) return this.cache
     let raw = ''
-    try { raw = await fs.readFile(this.file, 'utf8') } catch { /* first run */ }
+    try { raw = await fs.readFile(this.file, 'utf8') } catch { /* first run, or renamed */ }
     let parsed: unknown
     try { parsed = raw ? JSON.parse(raw) : {} } catch { parsed = {} }
     const out: Record<string, SessionMeta> = {}
@@ -218,6 +295,8 @@ export class MetaStore {
           ...(typeof m.branch === 'string' ? { branch: m.branch } : {}),
           ...(typeof m.base === 'string' ? { base: m.base } : {}),
           ...(typeof m.parent === 'string' ? { parent: m.parent } : {}),
+          ...(typeof m.running === 'number' && m.running > 0 ? { running: m.running } : {}),
+          ...(typeof m.contextWindow === 'number' ? { contextWindow: m.contextWindow } : {}),
           ...(testPlan ? { testPlan } : {}),
           ...(typeof m.model === 'string' ? { model: m.model } : {}),
           ...(typeof m.effort === 'string' ? { effort: m.effort as EffortLevel } : {}),
@@ -227,7 +306,66 @@ export class MetaStore {
       }
     }
     this.cache = out
+    await this.mergePreviousInstalls(out)
     return out
+  }
+
+  /**
+   * Fold in the board state of any previous install we have not seen before.
+   *
+   * ADDITIVE, and that is the point: an entry we already have always wins, and
+   * only ids we have never heard of are taken. A session id is globally unique,
+   * so an entry missing from our file cannot be about something else — and the
+   * alternative is rendering that card in the default column, which is the bug.
+   * A wholesale swap would be wrong the moment the new install has been used at
+   * all, which is exactly the state the rename left behind: one session worked
+   * on afterwards, four stranded behind a file that now exists.
+   *
+   * ONCE per source, recorded in `.recovered.json`. Merging on every load would
+   * resurrect a session the user deleted, every single time they deleted it.
+   *
+   * Never fatal. The state is already in hand; failing here to report a copy
+   * would throw away the thing being reported.
+   */
+  private async mergePreviousInstalls(out: Record<string, SessionMeta>): Promise<void> {
+    try {
+      const done = await this.alreadyRecovered()
+      const found = (await this.recover()).filter((f) => !done.has(f.from))
+      if (!found.length) return
+
+      let added = 0
+      for (const f of found) {
+        done.add(f.from)
+        let parsed: unknown
+        try { parsed = JSON.parse(f.text) } catch { continue }
+        if (!parsed || typeof parsed !== 'object') continue
+        for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (out[id] || !v || typeof v !== 'object') continue
+          const m = v as Partial<SessionMeta>
+          if (typeof m.phase !== 'string') continue
+          out[id] = normalise({
+            ...emptyMeta(m.phase),
+            ...(v as SessionMeta),
+            tags: Array.isArray(m.tags) ? m.tags.filter((t): t is string => typeof t === 'string') : [],
+            activity: Array.isArray(m.activity) ? m.activity : [],
+          })
+          added++
+        }
+      }
+
+      if (added) {
+        this.log?.(
+          `Recovered ${added} board ${added === 1 ? 'card' : 'cards'} from a previous install of this ` +
+          `extension (${found.map((f) => path.basename(path.dirname(path.dirname(f.from)))).join(', ')}). ` +
+          'Renaming the extension moves its storage, and the phases were left behind.',
+        )
+        await this.flush()
+      }
+      await fs.mkdir(path.dirname(this.recovered), { recursive: true })
+      await fs.writeFile(this.recovered, JSON.stringify([...done], null, 2), 'utf8')
+    } catch (e) {
+      this.log?.(`Could not check for board state from a previous install: ${String(e)}`)
+    }
   }
 
   async get(id: string, defaultPhase = 'planning'): Promise<SessionMeta> {

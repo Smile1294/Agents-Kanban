@@ -44,8 +44,11 @@ Backlog → Planning → Implementing → Validating → Complete
 ```
 
 1. **You create a session** and describe the task.
-2. **The extension makes a git worktree** on a fresh `task/…` branch. That
-   worktree is the agent's entire world — its `cwd`, its files, its branch.
+2. **The extension makes a git worktree** on a fresh `task/…` branch, under
+   `.agentskanban/worktrees/` in the repository. That worktree is the agent's
+   entire world — its `cwd`, its files, its branch. The first session adds
+   `/.agentskanban/` to your `.gitignore`; commit that one line and git never
+   mentions the directory again.
 3. **The agent works**, moving its own card by calling three small tools
    (`set_phase`, `set_tags`, `list_board`) that only ever act on its own
    session.
@@ -121,7 +124,7 @@ Press **+ New session**, describe a task, and let it go.
 | `agentsKanban.model` | Model for agent sessions |
 | `agentsKanban.maxConcurrentAgents` | How many agents may run at once (default 3) |
 | `agentsKanban.permissionMode` | How much the agent may do unattended |
-| `agentsKanban.worktreeRoot` | Where worktrees go. Default: a sibling `<repo>_worktrees` |
+| `agentsKanban.worktreeRoot` | Where worktrees go. Default: `.agentskanban/worktrees` inside the repo |
 | `agentsKanban.focusMode` | `wide` (default), `zen`, or `off` — how much of the window the board takes |
 | `agentsKanban.closeOnClickAway` | Whether opening a file closes the board |
 | `agentsKanban.sideBarHome` | Which view your left side bar returns to |
@@ -150,10 +153,14 @@ the bugs that shaped them — see **[docs/DECISIONS.md](docs/DECISIONS.md)**.
 
 Working, and verified with real agents rather than only under test: agents run
 in parallel in their own worktrees, move their own cards, write test plans, take
-follow-up messages, and their work commits and merges back.
+follow-up messages, and their work commits and merges back. The board survives a
+restart — including a reinstall that renames the extension — and a run the editor
+cut off says so and offers to pick itself back up.
 
-Not yet built: rehydrating a live agent after an extension host restart, and
-support for agents other than Claude Code. See [PLAN.md](PLAN.md) §9.
+Not yet built: re-attaching to a *live* process after a restart (it dies with the
+extension host, so resuming the session is the most that is possible), permission
+prompts that survive a window reload, and support for agents other than Claude
+Code. See [PLAN.md](PLAN.md) §9.
 
 ## Credits and licence
 

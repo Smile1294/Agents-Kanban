@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { MetaStore } from '../meta.ts'
-import { SessionStore, summariseTool } from '../store.ts'
+import { SessionStore, interruptedSessions, summariseTool, type BoardSession } from '../store.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -158,7 +158,7 @@ ok(summariseTool('mcp__board__set_phase', { phase: 'implementing' }).includes('s
 
 // Absolute paths lose the part that is identical on every row.
 const read = summariseTool('Read', {
-  file_path: '/home/dev/Projects/app_worktrees/S1abc123-add-search/.claude/knowledge/_domain-map.md',
+  file_path: '/home/dev/Projects/app/.agentskanban/worktrees/S1abc123-add-search/.claude/knowledge/_domain-map.md',
 })
 ok(!read.includes('/home/dev'), `an absolute path loses its worktree prefix: ${read}`)
 ok(read.includes('_domain-map.md'), 'and keeps the filename')
@@ -236,6 +236,36 @@ ok(outcome !== undefined && typeof outcome === 'object',
 ok(typeof outcome.deleted === 'boolean', 'the outcome says whether it deleted')
 ok(outcome.deleted === true, 'an id that is not there counts as deleted, with no reason attached')
 ok(outcome.reason === undefined, 'and no spurious warning to show the user')
+
+// --- a run the extension host never got to finish ----------------------------
+//
+// Reinstalling the extension, reloading the window or a crash kills every agent
+// process mid-turn. Nothing can re-attach to them — they are gone — but the
+// board must not go on showing those cards as ordinary idle sessions, because
+// "it just stopped and said nothing" is indistinguishable from "it finished".
+{
+  const card = (id: string, extra: Partial<BoardSession> = {}): BoardSession => ({
+    id, title: id, phase: 'implementing', tags: [], archived: false, pinned: false,
+    updated: 0, ...extra,
+  })
+
+  const cut = interruptedSessions([
+    card('was-running', { running: 1_700_000_000_000 }),
+    card('finished-cleanly'),
+    card('still-running-now', { running: 1_700_000_000_001 }),
+  ], ['still-running-now'])
+
+  ok(cut.get('was-running') === 1_700_000_000_000, 'a mark with no live agent is an interrupted run')
+  ok(cut.has('finished-cleanly') === false, 'a run that ended cleared its mark, so it is not interrupted')
+  // The one that would put an "interrupted" banner on a card working in front
+  // of you. The live agent IS the run the mark refers to.
+  ok(cut.has('still-running-now') === false, 'a session with a live agent is never interrupted')
+  ok(cut.size === 1, `and nothing else is (${cut.size})`)
+
+  ok(interruptedSessions([], []).size === 0, 'no sessions, nothing to report')
+  ok(interruptedSessions([card('x', { running: 0 })], []).size === 0,
+     'zero is how the mark is CLEARED, so it must not read as running')
+}
 
 console.log(fails === 0 ? 'PASS — the board reads Claude Code\'s real sessions' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)
