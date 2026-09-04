@@ -17,9 +17,10 @@
  * rather than setting them false).
  */
 import {
-  ALL_EFFORTS, effortsFor, fastModeFor, mergeModels, thinkingFor, toChoices, ultracodeFor,
-  type SdkModelInfo,
+  ALL_EFFORTS, catalogueFor, effortsFor, fastModeFor, mergeModels, thinkingFor, toChoices,
+  ultracodeFor, type SdkModelInfo,
 } from '../models.ts'
+import type { ProviderProfile } from '../providers.ts'
 import { ultracodeWarning } from '../session.ts'
 import { MODEL_WINDOWS, normaliseModel } from '../../sessions/usage.ts'
 import { MODELS, windowLabel } from '../../sessions/meta.ts'
@@ -227,6 +228,55 @@ const by = (id: string) => choices.find((c) => c.id === id)
   ok(junk[0]?.label === 'ok', 'a model with no display name falls back to its id rather than an empty chip')
   ok(toChoices([], normaliseModel, MODEL_WINDOWS, windowLabel).length === 0,
      'an empty answer is empty, not an error — mergeModels decides what to do about it')
+}
+
+// --- the COMPOSITION: what the picker actually ends up showing ---------------
+//
+// This section exists because of a bug that shipped. Every unit above was green
+// and the picker still showed the built-in three, Fable missing, on an account
+// whose CLI reports five.
+//
+// The cause was two functions that both knew how to fall back.
+// `modelsForProfile` returned the built-in list when a profile declared no
+// models of its own, and `mergeModels`' first rule is "a list the profile
+// declares wins" — so the inherit profile handed it three entries, that branch
+// matched, and the CLI's real answer was discarded on every refresh. Discovery
+// worked perfectly; nothing ever looked at it.
+//
+// Neither function was wrong alone, which is exactly why testing them alone
+// found nothing. So these assertions run them TOGETHER, in the order the host
+// runs them.
+{
+  const builtin = MODELS.map((m) => ({
+    ...m, efforts: [...ALL_EFFORTS], thinking: true, ultracode: false, fastMode: false,
+  }))
+  const declares = (models?: string[]): ProviderProfile =>
+    ({ id: 'p', kind: 'inherit', ...(models ? { models } : {}) })
+
+  /** The single call `extension.ts` makes. Testing the composition rather than
+   *  its parts is the entire point of this section. */
+  const compose = (profile: ProviderProfile, discovered: typeof choices) =>
+    catalogueFor(profile, discovered, builtin,
+      { normaliseModel, windows: MODEL_WINDOWS, windowLabel })
+
+  const cli = compose(declares(), choices)
+  ok(cli.source === 'cli',
+     `a profile that declares no models must NOT outrank the CLI (got "${cli.source}")`)
+  ok(cli.choices.length === choices.length,
+     `so the picker shows all ${choices.length} models the CLI reported, not ${builtin.length}`)
+  ok(cli.choices.some((c) => c.label === 'Fable'),
+     'and Fable is in it — the bug this whole section is about')
+
+  // The declaring case still wins, which is the behaviour that made the wrong
+  // fallback look reasonable in the first place.
+  const declared = compose(declares(['qwen3-coder']), choices)
+  ok(declared.source === 'profile', 'a profile that DOES declare models still wins')
+  ok(declared.choices.length === 1, 'and shows only what it declared')
+
+  // And the floor still holds when there is nothing to show.
+  ok(compose(declares(), []).source === 'builtin',
+     'with no declaration and no CLI answer, the built-in list is the floor')
+  ok(compose(declares(), []).choices.length === builtin.length, 'and it is not empty')
 }
 
 // --- the ultracode read-back ------------------------------------------------

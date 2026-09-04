@@ -14,7 +14,7 @@
  */
 import {
   AMBIENT_CREDENTIAL_VARS, INHERIT_PROFILE, PROVIDER_KINDS, PROVIDER_PRESETS, PROVIDER_VARS,
-  activeProfile, credentialKey, describeProfile, envForProfile, hostOf, kindDef, modelsForProfile,
+  activeProfile, credentialKey, describeProfile, envForProfile, hostOf, kindDef,
   parseProfiles, profileLabel, reconcileProvider, resolvedLabel, serialiseHeaders, validateProfile,
   type ProviderKind, type ProviderProfile,
 } from '../providers.ts'
@@ -332,36 +332,10 @@ const SAMPLE: Record<string, ProviderProfile> = {
      'a provider we have never heard of shows its own name rather than being hidden')
 }
 
-// --- the model picker off first-party ---------------------------------------
-{
-  const base = modelsForProfile(INHERIT_PROFILE, MODELS, normaliseModel, MODEL_WINDOWS, windowLabel)
-  ok(base.length === MODELS.length, 'a profile with no model list offers the built-in one')
-
-  const bedrock = modelsForProfile(
-    profile({ kind: 'bedrock', models: ['us.anthropic.claude-haiku-4-5-20251001-v1:0'] }),
-    MODELS, normaliseModel, MODEL_WINDOWS, windowLabel,
-  )
-  ok(bedrock.length === 1, 'a declared list replaces the built-in one')
-  ok(bedrock[0]!.id === 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
-     'the id passed to the CLI is the one the provider understands, verbatim')
-  ok(bedrock[0]!.label === 'Haiku 4.5',
-     'but the label is derived, so a Bedrock inference profile reads as the model it is')
-  ok(bedrock[0]!.context === '200K',
-     'and its window comes from the same table the context meter measures against')
-
-  const unknown = modelsForProfile(
-    profile({ kind: 'gateway', baseUrl: 'http://x', models: ['qwen3-coder'], contextWindow: 128_000 }),
-    MODELS, normaliseModel, MODEL_WINDOWS, windowLabel,
-  )
-  ok(unknown[0]!.label === 'qwen3-coder', 'a model we have never heard of shows its own id')
-  ok(unknown[0]!.context === '128K', 'and takes its window from the profile, which is the only source there is')
-
-  const noWindow = modelsForProfile(
-    profile({ kind: 'gateway', baseUrl: 'http://x', models: ['mystery'] }),
-    MODELS, normaliseModel, MODEL_WINDOWS, windowLabel,
-  )
-  ok(noWindow[0]!.context === '?', 'with no window anywhere it says so rather than guessing one')
-}
+// NOTE: what the model picker offers moved to `models.test.ts`, together with
+// `modelsForProfile` itself. It belongs beside `mergeModels`, because the two
+// have to be tested COMPOSED — separately they were both green while the picker
+// showed the wrong list.
 
 // --- kind metadata drives the UI, so it must be complete --------------------
 {

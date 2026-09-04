@@ -196,6 +196,85 @@ export async function discoverModels(
 }
 
 /**
+ * The models a profile DECLARES, as picker entries.
+ *
+ * The built-in Claude list is right on first-party and wrong everywhere else:
+ * Bedrock wants `us.anthropic.claude-opus-5`, and behind a router serving Qwen
+ * the Claude ids name nothing at all. So a profile may name its own ids.
+ *
+ * Returns EMPTY when it declares nothing, and that is the entire contract: it
+ * answers "what did this profile declare", never "what should the picker show".
+ *
+ * That distinction is not pedantry — it is the bug this file now guards. This
+ * function used to fall back to the built-in list here, which read as helpful.
+ * But its caller composes it with `mergeModels`, whose FIRST rule is "a list the
+ * profile declares wins" — so a profile that declared nothing handed over the
+ * built-in three, that branch matched, and the CLI's real answer was thrown away
+ * on every refresh. Fable never appeared, and every unit test was green because
+ * neither function was wrong on its own.
+ *
+ * Labels and windows are DERIVED. `normaliseModel` already knows that
+ * `us.anthropic.claude-haiku-4-5-20251001-v1:0` is Haiku 4.5, so a Bedrock
+ * profile listing full inference-profile ids gets the same readable name and the
+ * same window as first-party, from the same table the context meter measures
+ * against. `known` is consulted for that and nothing else; it is never returned
+ * wholesale.
+ *
+ * Capabilities get the SAFE defaults, not the permissive ones: nobody asked this
+ * endpoint what it supports, so effort and thinking stay available (losing them
+ * only costs a control) while ultracode and fast mode stay off (offering them
+ * would spend money on a mode the model may not have).
+ */
+export function modelsForProfile(
+  profile: Pick<ProviderProfile, 'models' | 'contextWindow'>,
+  known: readonly ModelChoice[],
+  normalise: (id: string) => string,
+  windows: Record<string, number>,
+  windowLabel: (tokens: number | undefined) => string,
+): ModelChoice[] {
+  if (!profile.models?.length) return []
+  return profile.models.map((id) => {
+    const base = normalise(id)
+    const match = known.find((f) => f.id === base)
+    return {
+      id,
+      label: match?.label ?? id,
+      context: windowLabel(windows[base] ?? profile.contextWindow),
+      efforts: [...ALL_EFFORTS],
+      thinking: true,
+      ultracode: false,
+      fastMode: false,
+    }
+  })
+}
+
+/**
+ * The catalogue the picker shows: profile, then CLI, then built-in.
+ *
+ * ONE call, because the host used to compose two functions itself and got the
+ * order wrong in a way no unit test could see. There is now a single entry
+ * point, and `models.test.ts` exercises exactly it.
+ */
+export function catalogueFor(
+  profile: Pick<ProviderProfile, 'models' | 'contextWindow'>,
+  discovered: readonly ModelChoice[],
+  builtin: readonly ModelChoice[],
+  deps: {
+    normaliseModel: (id: string) => string
+    windows: Record<string, number>
+    windowLabel: (tokens: number | undefined) => string
+  },
+  problem?: string,
+): ModelCatalogue {
+  return mergeModels(
+    discovered,
+    modelsForProfile(profile, builtin, deps.normaliseModel, deps.windows, deps.windowLabel),
+    builtin,
+    problem,
+  )
+}
+
+/**
  * Decide which list is in force.
  *
  * Order, and the reasoning for it:

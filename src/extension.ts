@@ -28,13 +28,13 @@ import {
 } from './run/recipe.ts'
 import {
   INHERIT_PROFILE, PROVIDER_KINDS, PROVIDER_PRESETS, activeProfile, credentialKey,
-  describeProfile, envForProfile, kindDef, modelsForProfile, parseProfiles, profileLabel,
+  describeProfile, envForProfile, kindDef, parseProfiles, profileLabel,
   reconcileProvider, resolvedLabel, validateProfile,
   type ProviderEnv, type ProviderProfile,
 } from './agent/providers.ts'
 import { probeProvider } from './agent/probe.ts'
 import {
-  ALL_EFFORTS, discoverModels, effortsFor, fastModeFor, mergeModels, thinkingFor, ultracodeFor,
+  ALL_EFFORTS, catalogueFor, discoverModels, effortsFor, fastModeFor, thinkingFor, ultracodeFor,
   type ModelCatalogue, type ModelChoice,
 } from './agent/models.ts'
 
@@ -155,13 +155,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ultracode: false, fastMode: false,
     }))
 
-  /** A profile's declared ids, if any. Efforts and thinking are unknown for
-   *  these — nobody asked the endpoint — so they get the permissive default,
-   *  the same one `effortsFor` uses for an unrecognised selection. */
-  const profileChoices = (p: ProviderProfile): ModelChoice[] =>
-    modelsForProfile(p, MODELS, normaliseModel, MODEL_WINDOWS, windowLabel)
-      .map((m) => ({ ...m, efforts: [...ALL_EFFORTS], thinking: true, ultracode: false, fastMode: false }))
-
   let catalogue: ModelCatalogue = { choices: builtinChoices(), source: 'builtin' }
   /** In-flight discovery, so opening the picker twice does not spawn two CLIs. */
   let discovering: Promise<void> | undefined
@@ -176,7 +169,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const cached = discovered
       ?? context.globalState.get<ModelChoice[]>(catalogueKey(p.id))
       ?? []
-    catalogue = mergeModels(cached, profileChoices(p), builtinChoices(), problem)
+    catalogue = catalogueFor(p, cached, builtinChoices(),
+      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, problem)
   }
 
   /**
