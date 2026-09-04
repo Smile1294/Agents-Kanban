@@ -17,7 +17,7 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { loadBundle, makeContext, makeRepo, makeVscodeStub, repoRoot } from './test/harness.mjs'
-import { renderBoard } from './test/dom.mjs'
+import { renderBoard, walk as walkNodes } from './test/dom.mjs'
 
 let fails = 0
 const ok = (cond, msg) => { console.log(cond ? '  ok:' : 'FAIL:', msg); if (!cond) fails++ }
@@ -117,7 +117,15 @@ await fs.writeFile(
 const ctl = {
   repo,
   noFolder: false,
-  config: { model: 'claude-opus-5', maxConcurrentAgents: 3, permissionMode: 'acceptEdits', worktreeRoot: '' },
+  config: {
+    model: 'claude-opus-5', maxConcurrentAgents: 3, permissionMode: 'acceptEdits', worktreeRoot: '',
+    // Model discovery spawns a real `claude` process to ask what it can run.
+    // This gate seeds a throwaway CLAUDE_CONFIG_DIR precisely so it does not
+    // depend on the machine, so discovery is off here and the built-in list is
+    // what the view contract is checked against. The discovery mapping itself
+    // is pure and covered by src/agent/__tests__/models.test.ts.
+    discoverModels: false,
+  },
 }
 const stub = makeVscodeStub(ctl)
 const ext = loadBundle(stub.vscode)
@@ -656,6 +664,252 @@ console.log('\n— a burst of events does not become a burst of repaints')
   const drawn = paints() - before
   ok(drawn > 0, 'the burst still paints — coalescing must never mean silence')
   ok(drawn < events / 3, `${events} events produced ${drawn} paints, not one each`)
+}
+
+// -------------------------------------------------------------- 6. providers
+//
+// Two seams, and both are the kind that stay silent when they break.
+//
+// The first is a SECURITY seam: a provider profile is written to settings.json,
+// which syncs between machines and can be committed in a `.vscode/` directory,
+// and its credential must go to SecretStorage instead. Both stores are real in
+// the harness precisely so this can be checked in both directions — a stub that
+// swallowed writes would let "the API key went into settings" pass.
+//
+// The second is the usual host↔view one: the composer gained fields, and the
+// view reads them. Either side can be right alone while they disagree.
+
+console.log('\n— providers: the picker, and where the credential goes')
+{
+  await send({ type: 'setMode', mode: 'chat' })
+  await send({ type: 'ready' })
+  const before = latestState().composer
+  ok(before.provider === 'inherit',
+     'a fresh install is on "inherit" — it changes nothing about how the CLI resolves its provider')
+  ok((before.providers ?? []).some((p) => p.id === 'inherit'),
+     'and that profile is always offered, so there is never nothing to select')
+  ok(Array.isArray(before.models) && before.models.length > 0,
+     'the model picker still has entries on the default profile')
+
+  // Drive the real "Add a provider" flow through the real command, answering
+  // the quick pick and every input box the way a person would.
+  const CREDENTIAL = 'sk-smoke-secret-value'
+  ctl.quickPick = (items) => items.find((i) => i.label === 'LiteLLM proxy')
+  ctl.inputBox = (opts) => {
+    const t = String(opts?.title ?? '')
+    if (t.includes('Base URL')) return 'http://localhost:4000'
+    if (t.includes('Credential')) return CREDENTIAL
+    // A gateway that serves its own models — the case where the built-in Claude
+    // list is simply wrong, and the picker has to follow.
+    if (t.includes('Model ids')) return 'qwen3-coder, us.anthropic.claude-haiku-4-5-20251001-v1:0'
+    if (t.includes('Context window')) return '128000'
+    return ''
+  }
+  await stub.cmds.get('agentsKanban.addProvider')()
+
+  // --- where the credential went, and where it did NOT ---------------------
+  const saved = ctl.config.providers ?? []
+  ok(saved.length === 1, `the profile was written to settings (${saved.length} entry)`)
+  ok(saved[0]?.kind === 'gateway' && saved[0]?.baseUrl === 'http://localhost:4000',
+     'with the endpoint that was typed')
+  ok(saved[0]?.hasCredential === true, 'and a flag recording that a credential exists')
+  ok(!JSON.stringify(saved).includes(CREDENTIAL),
+     'but the credential itself is NOWHERE in settings — that file syncs, and can be committed')
+  ok(!saved.some((p) => 'inherit' === p.id),
+     'and the synthesised inherit profile is not written back, which would duplicate on every save')
+
+  // ctx3 is the live activation — section 4 re-activated onto it, and secret
+  // storage belongs to the context, as it does in the real editor.
+  const keys = [...ctx3._secrets.keys()]
+  ok(keys.length === 1, `the credential went to secret storage instead (${keys.length} key)`)
+  ok(ctx3._secrets.get(keys[0]) === CREDENTIAL,
+     'and it reads back intact — a write with no round trip is not persistence')
+  ok(!!keys[0]?.includes(saved[0].id),
+     'under a key derived from the profile, so two profiles cannot share one')
+
+  // --- and the board now offers it -----------------------------------------
+  await send({ type: 'ready' })
+  const after = latestState().composer
+  ok(after.provider === saved[0].id, 'the new provider became active')
+  ok((after.providers ?? []).some((p) => p.id === saved[0].id), 'and is listed in the picker')
+  ok((after.providers ?? []).some((p) => p.detail?.includes('localhost:4000')),
+     'described by where it is, which is the only distinguishing thing about a gateway')
+
+  // The model picker is per-provider, and the selection has to follow it. Left
+  // alone, `claude-opus-5` stays selected under a gateway that has never heard
+  // of it: a nameless entry in the picker, then a failure at the first API call
+  // phrased by somebody else's system.
+  ok(after.models.length === 2, `the picker now offers the gateway's own models (${after.models.length})`)
+  ok(after.models.some((m) => m.id === 'qwen3-coder'), 'including one that is not a Claude model at all')
+  ok(after.model === 'qwen3-coder',
+     `the selection followed the provider instead of being stranded (${after.model})`)
+  // Labels and windows stay derived, so a provider-shaped Claude id still reads
+  // as the model it is and measures against the same window as first-party.
+  const bedrockish = after.models.find((m) => m.id.startsWith('us.anthropic.'))
+  ok(bedrockish?.label === 'Haiku 4.5',
+     `a provider-shaped Claude id still reads as its model (${bedrockish?.label})`)
+  ok(bedrockish?.context === '200K', 'and against the window the context meter uses')
+  ok(after.models.find((m) => m.id === 'qwen3-coder')?.context === '128K',
+     'while an unknown model takes the window the profile declared')
+  ok(!JSON.stringify(after).includes(CREDENTIAL),
+     'and no credential is serialised to the webview, which is another program')
+
+  // --- the real view draws it ----------------------------------------------
+  try {
+    const view = await renderBoard(latestState(), { layout: 'full' })
+    const text = view.text()
+    ok(text.includes('LiteLLM'), 'the real view shows which provider the next session runs on')
+    ok(!text.includes(CREDENTIAL), 'and never the credential')
+  } catch (e) {
+    ok(false, `the view threw on a state with a provider — ${e.message}`)
+  }
+
+  // --- switching back -------------------------------------------------------
+  await send({ type: 'composer', provider: 'inherit' })
+  await send({ type: 'ready' })
+  const back = latestState().composer
+  ok(back.provider === 'inherit', 'the picker switches back')
+  ok(back.models.some((m) => m.id === 'claude-opus-5'), 'and the built-in model list comes back with it')
+  ok(back.models.some((m) => m.id === back.model),
+     `the selection is valid again rather than left on the gateway's id (${back.model})`)
+  ok(ctx3._secrets.size === 1,
+     'and switching away does not delete the credential — the profile is still there to switch back to')
+
+  // --- controls a model does not have must DISAPPEAR ------------------------
+  //
+  // Host↔view, and the reason it is here rather than only in a unit test: the
+  // host decides which controls apply and the view draws them, and both sides
+  // passed for months while Haiku 4.5 — which accepts no effort levels and has
+  // no adaptive thinking — was shown a five-level effort picker and an On/Off
+  // toggle. Two controls that could not say no.
+  try {
+    const base = latestState()
+    const capable = await renderBoard(base, { layout: 'full' })
+    ok(capable.text().includes('Extended:'), 'a model with adaptive thinking gets the toggle')
+
+    const limited = {
+      ...base,
+      composer: {
+        ...base.composer,
+        models: [{ id: 'haiku', label: 'Haiku', context: '200K', detail: 'Fastest for quick answers' }],
+        model: 'haiku',
+        efforts: [],
+        thinkingSupported: false,
+        modelSource: 'cli',
+      },
+    }
+    const view = await renderBoard(limited, { layout: 'full' })
+    const text = view.text()
+    ok(text.includes('Haiku'), 'the limited model still renders')
+    ok(!text.includes('Extended:'), 'but the thinking toggle is gone, not greyed out')
+    ok(!/\bxHigh\b/.test(text), 'and so is the effort picker it does not accept')
+  } catch (e) {
+    ok(false, `the view threw on a model with no effort or thinking — ${e.message}`)
+  }
+
+  // --- ultracode: offered only where it can actually run --------------------
+  //
+  // The flag path validates NOTHING — measured against a real CLI,
+  // `applyFlagSettings()` resolves for `ultracode: true` on a model with no
+  // xhigh, for `ultracode: 'banana'`, and for a key that does not exist. So the
+  // model's own capability is the only check available before the run starts,
+  // and it has to hold on both sides: the view must not draw the toggle, and
+  // the host must refuse it even if a stale webview posts one.
+  try {
+    const base = latestState()
+    const capable = {
+      ...base,
+      composer: {
+        ...base.composer,
+        models: [{ id: 'opus[1m]', label: 'Opus (1M context)', context: '1M' }],
+        model: 'opus[1m]', ultracodeSupported: true, ultracode: false,
+        fastModeSupported: true, fastMode: false,
+      },
+    }
+    ok((await renderBoard(capable, { layout: 'full' })).text().includes('Ultracode'),
+       'an xhigh-capable model is offered ultracode')
+    ok((await renderBoard(capable, { layout: 'full' })).text().includes('Fast'),
+       'and fast mode when the CLI reports it')
+
+    const incapable = {
+      ...base,
+      composer: {
+        ...base.composer,
+        models: [{ id: 'haiku', label: 'Haiku', context: '200K' }],
+        model: 'haiku', ultracodeSupported: false, ultracode: false,
+        fastModeSupported: false, fastMode: false, efforts: [], thinkingSupported: false,
+      },
+    }
+    const off = (await renderBoard(incapable, { layout: 'full' })).text()
+    ok(!off.includes('Ultracode'),
+       'and a model that cannot run xhigh is not offered it — the toggle would do nothing')
+    ok(!off.includes('Fast:'), 'nor fast mode')
+
+    // Turning it on replaces the effort picker rather than sitting beside it:
+    // ultracode IS xhigh, and two controls arguing over one value is worse
+    // than one.
+    const on = {
+      ...capable,
+      composer: { ...capable.composer, ultracode: true, efforts: [] },
+    }
+    const onText = (await renderBoard(on, { layout: 'full' })).text()
+    ok(onText.includes('Ultracode: On'), 'with it on, the chip says so')
+    ok(!/\bxHigh\b/.test(onText), 'and the effort picker steps aside, because ultracode owns effort')
+  } catch (e) {
+    ok(false, `the view threw on the ultracode toggle — ${e.message}`)
+  }
+
+  // The host half of the same gate. A webview rendered before a model switch
+  // can post a flag the new model cannot run; the host must not take its word.
+  await send({ type: 'composer', model: 'claude-opus-5' })
+  await send({ type: 'composer', ultracode: 'on' })
+  await send({ type: 'ready' })
+  ok(latestState().composer.ultracode !== true,
+     'the host refuses ultracode on a model it has not confirmed can run it')
+
+  // --- where the model list came from --------------------------------------
+  // Only shown when it is NOT the CLI's, because that is the only case with a
+  // question attached: "why is the model I use in Claude Code missing here?"
+  try {
+    const base = latestState()
+    const fallback = {
+      ...base,
+      composer: { ...base.composer, modelSource: 'builtin', modelNote: 'the CLI did not answer' },
+    }
+    const view = await renderBoard(fallback, { layout: 'full' })
+    // The note lives INSIDE the model menu, which is where the question gets
+    // asked — a permanent chip on the bar would be noise every other minute.
+    // So the menu has to be opened, which is also a check that the picker is
+    // clickable at all.
+    const buttons = walkNodes(view.root).filter(
+      (n) => (n.className || '').split(' ').includes('picker') && /Opus|Model|Haiku/.test(n.textContent ?? ''),
+    )
+    ok(buttons.length > 0, 'the model picker is on the bar')
+    buttons[0].onclick({ stopPropagation() {} })
+    const opened = view.text()
+    ok(opened.includes('Built-in list'),
+       'opening it says the list is the fallback, so a missing model is answerable rather than a mystery')
+    ok(opened.includes('the CLI did not answer'), 'and says why we could not ask')
+  } catch (e) {
+    ok(false, `the view threw on a fallback model list — ${e.message}`)
+  }
+
+  // --- a disagreement is shown, not swallowed ------------------------------
+  //
+  // The one signal that makes any of this trustworthy: the CLI can be on a
+  // different backend than the profile asked for, and the bar has to say so.
+  try {
+    const state = latestState()
+    const withNote = {
+      ...state,
+      composer: { ...state.composer, providerNote: 'asked for Amazon Bedrock, but the CLI is on Anthropic API' },
+    }
+    const view = await renderBoard(withNote, { layout: 'full' })
+    ok(view.text().includes('but the CLI is on'),
+       'a provider disagreement reaches the screen rather than only the log')
+  } catch (e) {
+    ok(false, `the view threw on a provider note — ${e.message}`)
+  }
 }
 
 // ---------------------------------------------------------------------- teardown

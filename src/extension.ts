@@ -15,7 +15,8 @@ import {
   type BoardHost, type FocusMode, type Mode, type UiCard, type UiState,
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
-import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveThinking, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
+import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveThinking, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
+import { MODEL_WINDOWS, normaliseModel } from './sessions/usage.ts'
 import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
@@ -25,6 +26,17 @@ import { describeImages, sanitiseImages } from './agent/images.ts'
 import {
   COMMON_DEV_PORTS, detect as detectRun, isListening, readWtRegistry, waitForPort,
 } from './run/recipe.ts'
+import {
+  INHERIT_PROFILE, PROVIDER_KINDS, PROVIDER_PRESETS, activeProfile, credentialKey,
+  describeProfile, envForProfile, kindDef, modelsForProfile, parseProfiles, profileLabel,
+  reconcileProvider, resolvedLabel, validateProfile,
+  type ProviderEnv, type ProviderProfile,
+} from './agent/providers.ts'
+import { probeProvider } from './agent/probe.ts'
+import {
+  ALL_EFFORTS, discoverModels, effortsFor, fastModeFor, mergeModels, thinkingFor, ultracodeFor,
+  type ModelCatalogue, type ModelChoice,
+} from './agent/models.ts'
 
 type AgentPermissionMode = AgentOptions['permissionMode']
 
@@ -79,10 +91,450 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let model = state.get<string>('model') ?? cfg().get<string>('model') ?? MODELS[0]!.id
   let effort: EffortLevel = (state.get<string>('effort') as EffortLevel) ?? 'high'
   let thinking: ThinkingMode = (state.get<string>('thinking') as ThinkingMode) ?? 'enabled'
+  /** Session flags. Default OFF: ultracode is xhigh effort plus a standing
+   *  instruction to fan out into workflows, which is a real bill nobody asked
+   *  for if it arrives by default. */
+  let ultracode = state.get<boolean>('ultracode') === true
+  let fastMode = state.get<boolean>('fastMode') === true
   /** Sections the user has collapsed. Persisted because "I closed that" should
    *  outlive the panel — closing the board and opening it again is not a
    *  request to be shown the diff panel afresh. */
   const disclosures: Record<string, boolean> = state.get<Record<string, boolean>>('disclosures') ?? {}
+
+  // --- which backend agents run on ------------------------------------------
+  // Profiles come from settings (hand-editable, syncable, no secrets in them);
+  // the credential comes from SecretStorage, keyed by profile id. That split is
+  // the reason `ProviderProfile` carries `hasCredential` rather than the value:
+  // `settings.json` syncs between machines and can end up committed in a
+  // `.vscode/` directory, and an API key is not configuration.
+  let providers: ProviderProfile[] = parseProfiles(cfg().get<unknown[]>('providers'))
+  let providerId: string =
+    state.get<string>('provider') ?? cfg().get<string>('provider') ?? INHERIT_PROFILE.id
+  /**
+   * The active profile compiled to an environment patch, cached.
+   *
+   * Cached because resolving it reads the keychain, which is async, and the
+   * manager is built synchronously. Every path that could change the answer —
+   * activation, a settings edit, the picker, setting a credential — refreshes
+   * this and hands it to the manager; and `newSession` awaits a refresh before
+   * starting, so a run can never begin on a stale patch. Starting an agent on
+   * the wrong backend is not a cosmetic bug: it bills someone else's account.
+   */
+  let providerEnv: ProviderEnv = { set: {}, clear: [] }
+  /** Set when the live run's CLI reported a backend this profile did not ask
+   *  for. The one signal that makes an outranked profile visible. */
+  let providerMismatch: string | undefined
+
+  const currentProvider = (): ProviderProfile => activeProfile(providers, providerId)
+
+  async function refreshProviderEnv(): Promise<void> {
+    const p = currentProvider()
+    const secret = p.hasCredential
+      ? await context.secrets.get(credentialKey(p.id)).then((v) => v ?? undefined, () => undefined)
+      : undefined
+    providerEnv = envForProfile(p, secret, process.env)
+    ws?.manager?.setProvider(p, providerEnv)
+  }
+
+  /**
+   * Which models the picker offers.
+   *
+   * Three sources, in `mergeModels`' order: a list the profile declares, what
+   * the CLI reported when we asked, and the built-in table as the floor. The
+   * catalogue is CACHED rather than recomputed, because asking costs a CLI
+   * round trip and `getState()` runs on the render path — ten times a second
+   * while an agent streams.
+   */
+  const builtinChoices = (): ModelChoice[] =>
+    MODELS.map((m) => ({
+      ...m, efforts: [...ALL_EFFORTS], thinking: true,
+      // The built-in list is a fallback, and it has NOT asked. Ultracode costs
+      // real money — xhigh effort plus a standing instruction to fan out into
+      // workflows — so it is offered only when the CLI has confirmed the model
+      // can run it, never on a guess.
+      ultracode: false, fastMode: false,
+    }))
+
+  /** A profile's declared ids, if any. Efforts and thinking are unknown for
+   *  these — nobody asked the endpoint — so they get the permissive default,
+   *  the same one `effortsFor` uses for an unrecognised selection. */
+  const profileChoices = (p: ProviderProfile): ModelChoice[] =>
+    modelsForProfile(p, MODELS, normaliseModel, MODEL_WINDOWS, windowLabel)
+      .map((m) => ({ ...m, efforts: [...ALL_EFFORTS], thinking: true, ultracode: false, fastMode: false }))
+
+  let catalogue: ModelCatalogue = { choices: builtinChoices(), source: 'builtin' }
+  /** In-flight discovery, so opening the picker twice does not spawn two CLIs. */
+  let discovering: Promise<void> | undefined
+
+  const catalogueKey = (id: string) => `models:${id}`
+
+  /** Rebuild the catalogue from whatever is already known — no CLI round trip.
+   *  Called whenever the profile changes, so the picker is never showing the
+   *  previous provider's models while discovery runs. */
+  function recomputeCatalogue(discovered?: readonly ModelChoice[], problem?: string): void {
+    const p = currentProvider()
+    const cached = discovered
+      ?? context.globalState.get<ModelChoice[]>(catalogueKey(p.id))
+      ?? []
+    catalogue = mergeModels(cached, profileChoices(p), builtinChoices(), problem)
+  }
+
+  /**
+   * Ask the CLI which models it can run.
+   *
+   * Deliberately NOT on the activation path. It spawns a CLI process, and the
+   * launch gate seeds a throwaway `CLAUDE_CONFIG_DIR` precisely so it does not
+   * depend on the machine — so this is driven by the events that can actually
+   * change the answer (a provider switch, an explicit refresh) and is skipped
+   * entirely when `agentsKanban.discoverModels` is off.
+   *
+   * Never rejects: the caller is a picker, and "we could not ask" has to end in
+   * a usable list. The reason is kept and shown, because a silent fallback is
+   * how "why is Fable missing?" becomes unanswerable.
+   */
+  async function refreshModels(force = false): Promise<void> {
+    if (cfg().get<boolean>('discoverModels') === false) { recomputeCatalogue(); return }
+    const p = currentProvider()
+    if (!force && context.globalState.get<ModelChoice[]>(catalogueKey(p.id))?.length) {
+      recomputeCatalogue()
+      return
+    }
+    if (discovering) return discovering
+    discovering = (async () => {
+      const { choices, problem } = await discoverModels(p, providerEnv, {
+        normaliseModel, windows: MODEL_WINDOWS, windowLabel,
+      }, {
+        ...(cfg().get<string>('claudeExecutable') ? { claudeExecutable: cfg().get<string>('claudeExecutable')! } : {}),
+        ...(ws?.root ? { cwd: ws.root } : {}),
+      })
+      if (choices.length) {
+        await context.globalState.update(catalogueKey(p.id), choices)
+        log.info(`Models for ${profileLabel(p)}: ${choices.map((c) => c.id).join(', ')}`)
+      } else if (problem) {
+        log.warn(`Could not read the model list for ${profileLabel(p)}: ${problem}`)
+      }
+      recomputeCatalogue(choices, problem)
+      alignModelToProvider()
+    })().finally(() => { discovering = undefined })
+    return discovering
+  }
+
+  /**
+   * Keep the selected model on something the active provider actually serves.
+   *
+   * The model list is per-provider, so any change of provider can strand the
+   * selection on an id the new backend does not know — a Bedrock inference
+   * profile still selected after switching to first-party, or the built-in
+   * `claude-opus-5` under a profile that only declares `us.anthropic.*` ids.
+   * Left alone that shows a nameless model in the picker and then fails at the
+   * first API call with somebody else's error message.
+   *
+   * Called from all three places the pairing can break: the picker, activation,
+   * and a profile edited by hand in settings.json. Returns true when it moved
+   * the selection, so the caller can log it rather than silently re-pointing
+   * something the user chose.
+   */
+  const alignModelToProvider = (): boolean => {
+    const allowed = catalogue.choices
+    if (!allowed.length || allowed.some((m) => m.id === model)) return false
+    const from = model
+    model = allowed[0]!.id
+    void state.update('model', model)
+    log.info(`Model ${from} is not served by ${profileLabel(currentProvider())}; using ${model}.`)
+    return true
+  }
+
+  /**
+   * Make a profile the active one.
+   *
+   * The single switch site, because the four steps have to happen in this
+   * order and getting it wrong is invisible. `addProvider` originally saved the
+   * profile (which aligned the model) and only then set `providerId`, so the
+   * alignment ran against the profile being replaced and the selection stayed
+   * on `claude-opus-5` under a gateway that had never heard of it. The smoke
+   * gate caught it; nothing else would have.
+   */
+  async function setActiveProvider(id: string): Promise<void> {
+    providerId = id
+    await state.update('provider', providerId)
+    // The mismatch was a statement about the profile just replaced. Leaving it
+    // up would warn about a configuration nobody is on any more.
+    providerMismatch = undefined
+    await refreshProviderEnv()
+    // Recompute from what is already cached BEFORE the round trip, so the
+    // picker never shows the previous provider's models while we ask. The
+    // refresh then fills in anything we have not asked this profile about.
+    recomputeCatalogue()
+    alignModelToProvider()
+    ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode })
+    refreshModels()
+      .then(() => refreshAll())
+      .catch((e: unknown) => log.error(`Could not read the model list: ${String(e)}`))
+  }
+
+  /** Why this profile cannot start a session, or undefined. */
+  const providerProblem = (): string | undefined => {
+    const p = currentProvider()
+    const problems = validateProfile(p)
+    if (!problems.length) return undefined
+    return `${profileLabel(p)}: ${problems.join(' ')}`
+  }
+
+  /**
+   * Persist the profile list.
+   *
+   * `inherit` is dropped on the way out: it is synthesised by `parseProfiles`
+   * and always present, so writing it would grow a duplicate entry in
+   * `settings.json` on every save. Global rather than workspace by default,
+   * because a gateway URL and a region are properties of the machine, not of
+   * one checkout — and because a workspace-scoped provider would land in a
+   * `.vscode/settings.json` that people commit.
+   */
+  async function saveProfiles(list: readonly ProviderProfile[]): Promise<void> {
+    const out = list.filter((p) => p.id !== INHERIT_PROFILE.id)
+    await cfg().update('providers', out, vscode.ConfigurationTarget.Global)
+    providers = parseProfiles(out)
+    await refreshProviderEnv()
+    alignModelToProvider()
+    refreshAll()
+  }
+
+  /** Ask for one field of a profile. Returns undefined only when cancelled, so
+   *  an empty answer stays distinguishable from a dismissed box — the
+   *  difference between "no region, use my AWS profile's" and "never mind". */
+  async function askField(
+    profile: ProviderProfile,
+    field: (typeof PROVIDER_KINDS)[number]['fields'][number],
+  ): Promise<string | undefined> {
+    const current = (() => {
+      const v = (profile as unknown as Record<string, unknown>)[field.key]
+      if (Array.isArray(v)) return v.join(', ')
+      return v === undefined || typeof v === 'boolean' ? '' : String(v)
+    })()
+    return vscode.window.showInputBox({
+      title: `${profileLabel(profile)} — ${field.label}`,
+      prompt: field.detail ?? `${field.label} for ${kindDef(profile.kind).label}`,
+      ...(field.placeholder ? { placeHolder: field.placeholder } : {}),
+      ...(field.secret ? { password: true } : { value: current }),
+      ignoreFocusOut: true,
+    })
+  }
+
+  /**
+   * Walk a profile's fields and write the answers onto it.
+   *
+   * Driven by `kindDef().fields` rather than a form per kind, which is what
+   * makes a new provider one entry in `PROVIDER_KINDS` instead of a new dialog.
+   * The secret never lands on the profile: it goes to SecretStorage and only
+   * `hasCredential` is recorded.
+   */
+  async function fillProfile(profile: ProviderProfile): Promise<boolean> {
+    for (const field of kindDef(profile.kind).fields) {
+      const answer = await askField(profile, field)
+      if (answer === undefined) return false
+      const value = answer.trim()
+      if (field.secret) {
+        if (value) {
+          await context.secrets.store(credentialKey(profile.id), value)
+          profile.hasCredential = true
+        } else {
+          await context.secrets.delete(credentialKey(profile.id))
+          delete profile.hasCredential
+        }
+        continue
+      }
+      const rec = profile as unknown as Record<string, unknown>
+      if (!value) { delete rec[field.key]; continue }
+      if (field.key === 'models') {
+        rec.models = value.split(',').map((m) => m.trim()).filter(Boolean)
+      } else if (field.key === 'contextWindow') {
+        const n = Number(value.replace(/[_,\s]/g, ''))
+        if (Number.isFinite(n) && n > 0) rec.contextWindow = n
+        else delete rec.contextWindow
+      } else {
+        rec[field.key] = value
+      }
+    }
+    return true
+  }
+
+  /** Add a provider, starting from a preset so the common cases need no typing.
+   *  A preset is only a pre-filled profile — it adds no code path, so it cannot
+   *  behave differently from one configured by hand. */
+  async function addProvider(): Promise<void> {
+    const pick = await vscode.window.showQuickPick(
+      PROVIDER_PRESETS.map((preset) => ({
+        label: preset.label,
+        description: kindDef(preset.profile.kind).support === 'community' ? 'community proxy' : '',
+        detail: preset.needs ?? kindDef(preset.profile.kind).blurb,
+        preset,
+      })),
+      {
+        title: 'Add a provider',
+        placeHolder: 'Which backend should agents run on?',
+        ignoreFocusOut: true,
+      },
+    )
+    if (!pick) return
+
+    // Ids must be unique and are used as the SecretStorage key, so a second
+    // "Ollama" cannot be allowed to share the first one's credential.
+    const taken = new Set(providers.map((p) => p.id))
+    let id = pick.preset.id
+    for (let n = 2; taken.has(id); n++) id = `${pick.preset.id}-${n}`
+
+    const profile: ProviderProfile = { ...pick.preset.profile, id }
+    if (!(await fillProfile(profile))) return
+
+    const problems = validateProfile(profile)
+    if (problems.length) {
+      const choice = await vscode.window.showWarningMessage(
+        `That provider is not usable yet: ${problems.join(' ')}`,
+        'Save anyway', 'Discard',
+      )
+      if (choice !== 'Save anyway') return
+    }
+
+    await saveProfiles([...providers, profile])
+    await setActiveProvider(id)
+    refreshAll()
+    log.info(`Provider added: ${profileLabel(profile)} (${describeProfile(profile)})`)
+    // Offered, not run. A probe spawns a CLI process and can wait 20 seconds on
+    // an unreachable host, so doing it unasked after every add is a surprise —
+    // and this way the prerequisite and the way to check it arrive together,
+    // which is the moment they are both relevant.
+    const next = await vscode.window.showInformationMessage(
+      `Provider "${profileLabel(profile)}" added.` +
+      (pick.preset.needs ? ` It needs: ${pick.preset.needs}` : ''),
+      'Test connection',
+    )
+    if (next === 'Test connection') await testProvider()
+  }
+
+  /** Connect with the active profile and report what the CLI resolved. Costs
+   *  nothing — see `probeProvider`, which never sends a prompt. */
+  async function testProvider(): Promise<void> {
+    const profile = currentProvider()
+    const problems = validateProfile(profile)
+    if (problems.length) {
+      vscode.window.showErrorMessage(`${profileLabel(profile)}: ${problems.join(' ')}`)
+      return
+    }
+    await refreshProviderEnv()
+    const result = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Testing ${profileLabel(profile)}…` },
+      () => probeProvider(profile, providerEnv, {
+        ...(cfg().get<string>('claudeExecutable') ? { claudeExecutable: cfg().get<string>('claudeExecutable')! } : {}),
+        ...(ws?.root ? { cwd: ws.root } : {}),
+      }),
+    )
+    log.info(`Provider test — ${profileLabel(profile)}: ${result.message}`)
+    // A probe that found the models is worth keeping: it is the only
+    // authoritative list for a backend whose ids we cannot know, and it turns
+    // the model picker from a guess into something the endpoint confirmed.
+    if (result.ok && result.models?.length && profile.kind !== 'inherit' && !profile.models?.length) {
+      const choice = await vscode.window.showInformationMessage(
+        `${result.message} Use these ${result.models.length} models in the picker?`,
+        'Use them', 'No thanks',
+      )
+      if (choice === 'Use them') {
+        const updated = providers.map((p) => (p.id === profile.id ? { ...p, models: result.models } : p))
+        await saveProfiles(updated)
+      }
+      return
+    }
+    if (result.ok) vscode.window.showInformationMessage(result.message)
+    else vscode.window.showErrorMessage(`${profileLabel(profile)}: ${result.message}`)
+  }
+
+  /** Remove a profile, and its credential with it. Leaving an orphaned secret
+   *  in the keychain is invisible and outlives the thing that explained it. */
+  async function removeProvider(profile: ProviderProfile): Promise<void> {
+    if (profile.id === INHERIT_PROFILE.id) {
+      vscode.window.showInformationMessage('"Inherit from environment" is always available and cannot be removed.')
+      return
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Remove the provider "${profileLabel(profile)}"?`,
+      { modal: true, detail: 'Its stored credential is deleted too.' },
+      'Remove',
+    )
+    if (choice !== 'Remove') return
+    await context.secrets.delete(credentialKey(profile.id))
+    await saveProfiles(providers.filter((p) => p.id !== profile.id))
+    if (providerId === profile.id) await setActiveProvider(INHERIT_PROFILE.id)
+    refreshAll()
+  }
+
+  /** The one entry point: choose a provider, or manage the list. */
+  async function selectProvider(): Promise<void> {
+    type Item = vscode.QuickPickItem & { profile?: ProviderProfile; action?: string }
+    const items: Item[] = providers.map((p) => ({
+      label: (p.id === providerId ? '$(check) ' : '$(blank) ') + profileLabel(p),
+      description: describeProfile(p),
+      detail:
+        kindDef(p.kind).support === 'community'
+          ? 'Community proxy — not a configuration Anthropic supports.'
+          : validateProfile(p).join(' ') || kindDef(p.kind).blurb,
+      profile: p,
+    }))
+    const active = currentProvider()
+    items.push({ label: '', kind: vscode.QuickPickItemKind.Separator })
+    items.push({ label: '$(add) Add a provider…', action: 'add' })
+    if (active.id !== INHERIT_PROFILE.id) {
+      items.push({ label: `$(pencil) Edit "${profileLabel(active)}"…`, action: 'edit' })
+      items.push({ label: `$(beaker) Test "${profileLabel(active)}"`, action: 'test' })
+    }
+    if (cfg().get<boolean>('discoverModels') !== false) {
+      items.push({
+        label: '$(sync) Refresh the model list',
+        description: catalogue.source === 'cli' ? 'from the CLI' : `currently: ${catalogue.source}`,
+        action: 'models',
+      })
+    }
+    if (active.id !== INHERIT_PROFILE.id) {
+      items.push({ label: `$(trash) Remove "${profileLabel(active)}"…`, action: 'remove' })
+    }
+    items.push({ label: '$(link-external) Provider documentation', action: 'docs' })
+
+    const pick = await vscode.window.showQuickPick(items, {
+      title: 'Which backend should agents run on?',
+      placeHolder: providerMismatch ?? providerProblem() ?? describeProfile(active),
+      ignoreFocusOut: true,
+    })
+    if (!pick) return
+    switch (pick.action) {
+      case 'add': return addProvider()
+      case 'test': return testProvider()
+      case 'models': {
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'Asking Claude Code which models it can run…' },
+          () => refreshModels(true),
+        )
+        refreshAll()
+        const note = catalogue.problem
+        if (note) vscode.window.showWarningMessage(`Using the built-in model list: ${note}`)
+        else vscode.window.showInformationMessage(
+          `${catalogue.choices.length} models: ${catalogue.choices.map((c) => c.label).join(', ')}`,
+        )
+        return
+      }
+      case 'remove': return removeProvider(active)
+      case 'edit': {
+        const edited: ProviderProfile = { ...active }
+        if (!(await fillProfile(edited))) return
+        await saveProfiles(providers.map((p) => (p.id === edited.id ? edited : p)))
+        providerMismatch = undefined
+        return
+      }
+      case 'docs':
+        await vscode.env.openExternal(vscode.Uri.parse(kindDef(active.kind).docs))
+        return
+    }
+    if (!pick.profile) return
+    host.setComposer({ provider: pick.profile.id })
+    refreshAll()
+  }
 
   /**
    * Repaint both surfaces from ONE state, at most ten times a second.
@@ -171,13 +623,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         store: w.store,
         worktrees: w.worktrees,
         board: w.board,
-        defaults: { model, effort, thinking },
+        defaults: { model, effort, thinking, ultracode, fastMode },
         permissionMode,
         maxConcurrent: cfg().get<number>('maxConcurrentAgents') ?? 3,
         claudeExecutable: cfg().get<string>('claudeExecutable') || undefined,
+        provider: currentProvider(),
+        providerEnv,
         log: (m: string) => log.warn(m),
       })
       w.manager.on('change', () => refreshAll())
+      // Where the tokens actually went. Checked once per run against the
+      // profile that was requested: a disagreement means something outranked
+      // the profile — a managed settings file, an apiKeyHelper, an env block in
+      // ~/.claude/settings.json — and the board must say so rather than keep
+      // naming the provider we asked for. See providers.ts.
+      w.manager.on('provider', (agent: RunningAgent, resolved: string | undefined) => {
+        const p = currentProvider()
+        const { ok, message } = reconcileProvider(p, resolved)
+        providerMismatch = ok ? undefined : message
+        if (message) log.warn(`${agent.title}: ${message}`)
+        else log.info(`${agent.title} is running on ${resolvedLabel(resolved) ?? 'an unknown provider'}.`)
+        refreshAll()
+      })
       // An agent asking for attention mid-run, via notify_user. Distinct from
       // the phase move: the work is NOT done, it is stuck or needs a decision.
       w.manager.on('notice', (agent: RunningAgent, notice: { message: string; urgency: string }) => {
@@ -231,7 +698,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       })
     }
     // Picker changes apply to the next run without rebuilding the manager.
-    w.manager.setDefaults({ model, effort, thinking })
+    w.manager.setDefaults({ model, effort, thinking, ultracode, fastMode })
     return w.manager
   }
 
@@ -361,9 +828,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const host: BoardHost = {
     async getState(): Promise<UiState> {
+      const active = currentProvider()
+      // The effort levels are the SELECTED MODEL's, not a global list. Haiku 4.5
+      // accepts none, and was being offered all five — a control that could not
+      // say no, which is the same class of bug as a spinner over a wedged
+      // process.
+      const levels = effortsFor(catalogue.choices, model)
       const composer = {
         model, effort, thinking,
-        models: MODELS, efforts: EFFORT_LEVELS,
+        models: catalogue.choices.map((m) => ({
+          id: m.id, label: m.label, context: m.context, ...(m.detail ? { detail: m.detail } : {}),
+        })),
+        // Ultracode owns effort — it IS xhigh — so the effort picker steps aside
+        // rather than showing a level that is being overridden.
+        efforts: ultracode ? [] : EFFORT_LEVELS.filter((e) => levels.includes(e.key)),
+        thinkingSupported: thinkingFor(catalogue.choices, model),
+        ultracode, fastMode,
+        ultracodeSupported: ultracodeFor(catalogue.choices, model),
+        fastModeSupported: fastModeFor(catalogue.choices, model),
+        modelSource: catalogue.source,
+        ...(catalogue.problem ? { modelNote: catalogue.problem } : {}),
+        provider: active.id,
+        providers: providers.map((p) => ({
+          id: p.id,
+          label: profileLabel(p),
+          detail: describeProfile(p),
+          support: kindDef(p.kind).support,
+        })),
+        // The mismatch wins over the configuration problem: a profile that
+        // cannot start is a warning about the future, a profile the CLI already
+        // overrode is a statement about the run on screen.
+        ...(() => {
+          const note = providerMismatch ?? providerProblem()
+          return note ? { providerNote: note } : {}
+        })(),
         contextTokens: 0 as number,
         contextWindow: undefined as number | undefined,
         spentUsd: undefined as number | undefined,
@@ -538,6 +1036,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       enterBoard()
     },
 
+    async selectProvider() { await selectProvider() },
+
     async newSessionPrompt() {
       const text = await vscode.window.showInputBox({
         prompt: 'What should the agent do?', ignoreFocusOut: true,
@@ -560,7 +1060,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
 
     setComposer(patch) {
-      if (patch.model) { model = patch.model; void state.update('model', model) }
+      if (patch.model) {
+        model = patch.model
+        void state.update('model', model)
+        // Effort is per model, so a switch can strand it on a level the new one
+        // does not accept — `max` selected, then a move to Haiku, which has no
+        // levels at all. The picker would then show a value the run ignores.
+        const levels = effortsFor(catalogue.choices, model)
+        if (levels.length && !levels.includes(effort)) {
+          effort = levels.includes('high') ? 'high' : levels[levels.length - 1]!
+          void state.update('effort', effort)
+        }
+      }
       if (patch.effort) { effort = patch.effort as EffortLevel; void state.update('effort', effort) }
       if (patch.thinking) { thinking = patch.thinking as ThinkingMode; void state.update('thinking', thinking) }
       if (patch.permissionMode && PERMISSION_MODES.some((m) => m.key === patch.permissionMode)) {
@@ -574,14 +1085,68 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ws?.manager?.setPermissionMode(permissionMode, patch.forKey)
           .catch((e) => log.warn(`Could not change permission mode: ${String(e)}`))
       }
-      ws?.manager?.setDefaults({ model, effort, thinking })
+      if (patch.provider && patch.provider !== providerId && providers.some((p) => p.id === patch.provider)) {
+        setActiveProvider(patch.provider)
+          .then(() => refreshAll())
+          .catch((e: unknown) => log.error(`Could not apply the provider: ${String(e)}`))
+      }
+      if (patch.ultracode) ultracode = patch.ultracode === 'on'
+      if (patch.fastMode) fastMode = patch.fastMode === 'on'
+
+      /*
+       * ONE gate, after the assignments rather than on them, because it has two
+       * jobs and they are the same job:
+       *
+       *  - a stale webview posting `ultracode: on` for a model that cannot run
+       *    it (the request path validates NOTHING — measured against a real
+       *    CLI, `applyFlagSettings()` resolves for `ultracode: true` on a model
+       *    with no xhigh, for `ultracode: 'banana'`, and for a key that does
+       *    not exist), and
+       *  - a MODEL switch revoking a flag that was legitimately on: Opus
+       *    supports fast mode, Fable does not.
+       *
+       * Checking on the assignment as well looked like belt and braces and was
+       * simply unreachable — breaking it deliberately failed no test, which is
+       * how it was found. A guard that cannot be shown to fire is not a guard.
+       */
+      if (ultracode && !ultracodeFor(catalogue.choices, model)) {
+        ultracode = false
+        log.info(`Ultracode is not available on ${model}, which is not xhigh-capable.`)
+      }
+      if (fastMode && !fastModeFor(catalogue.choices, model)) {
+        fastMode = false
+        log.info(`Fast mode is not available on ${model}.`)
+      }
+      if (patch.ultracode || patch.model) void state.update('ultracode', ultracode)
+      if (patch.fastMode || patch.model) void state.update('fastMode', fastMode)
+      ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode })
     },
 
     async newSession(prompt, images) {
       const { images: ok, dropped } = sanitiseImages(images ?? [])
       if (!prompt.trim() && !ok.length) return
       if (dropped.length) reportDroppedImages(dropped)
+      // Refuse rather than improvise. A half-configured provider does not fail
+      // here, it fails at the first API call with a message from somebody
+      // else's system — after a worktree has been created and a card has
+      // appeared — and the user has no way to connect that to a missing field.
+      const problem = providerProblem()
+      if (problem) {
+        log.error(`Not starting a session: ${problem}`)
+        const choice = await vscode.window.showErrorMessage(
+          `Agents Kanban cannot start a session: ${problem}`,
+          'Configure provider',
+        )
+        if (choice === 'Configure provider') {
+          await vscode.commands.executeCommand('agentsKanban.selectProvider')
+        }
+        return
+      }
+      // Await it: the cached patch is what the manager was built with, and a
+      // credential set moments ago must be in this run rather than the next.
+      await refreshProviderEnv()
       const mgr = ensureManager()
+      mgr.setProvider(currentProvider(), providerEnv)
       log.info(
         `Starting session: ${prompt.slice(0, 80)}` +
         (ok.length ? ` (+${describeImages(ok.length)})` : ''),
@@ -1203,6 +1768,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (text?.trim()) { BoardPanel.show(context.extensionUri, host); await host.newSession(text) }
     }),
     vscode.commands.registerCommand('agentsKanban.init', () => host.init()),
+    vscode.commands.registerCommand('agentsKanban.selectProvider', () => selectProvider()),
+    vscode.commands.registerCommand('agentsKanban.addProvider', () => addProvider()),
+    vscode.commands.registerCommand('agentsKanban.testProvider', () => testProvider()),
+    vscode.commands.registerCommand('agentsKanban.refreshModels', async () => {
+      await refreshModels(true)
+      refreshAll()
+    }),
     vscode.commands.registerCommand('agentsKanban.stopTask', async () => {
       const id = await pickSession(requireWs().store, 'Stop agent')
       if (id) await host.stop(id)
@@ -1221,6 +1793,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => void rebuild()),
     vscode.workspace.onDidChangeConfiguration((e) => {
+      // A profile edited by hand in settings.json must take effect without a
+      // reload, and the cached environment patch is derived from it — so this
+      // re-parses AND re-resolves rather than only re-reading the list.
+      if (e.affectsConfiguration('agentsKanban.providers') || e.affectsConfiguration('agentsKanban.provider')) {
+        providers = parseProfiles(cfg().get<unknown[]>('providers'))
+        if (!providers.some((p) => p.id === providerId)) {
+          providerId = cfg().get<string>('provider') ?? INHERIT_PROFILE.id
+        }
+        providerMismatch = undefined
+        refreshProviderEnv()
+          .then(() => { alignModelToProvider(); refreshAll() })
+          .catch((err: unknown) => log.error(`Could not apply the provider: ${String(err)}`))
+      }
       if (e.affectsConfiguration('agentsKanban.focusMode')) {
         setBoardFocusMode(cfg().get<FocusMode>('focusMode') ?? 'wide')
       }
@@ -1228,6 +1813,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     { dispose: () => ws?.manager?.stopAll() },
     { dispose: () => paint.dispose() },
   )
+
+  // Resolve the provider once at activation, so the first session started in
+  // this window runs on the configured backend rather than on whatever the
+  // empty cache defaults to. Logged, because "which provider am I on" is the
+  // first question when a run bills the wrong account.
+  await refreshProviderEnv()
+  // From the cache only — see refreshModels: asking spawns a CLI, and the
+  // launch gate must not depend on one. The first provider switch or an
+  // explicit refresh fills it in.
+  recomputeCatalogue()
+  alignModelToProvider()
+  const startupProfile = currentProvider()
+  log.info(
+    `Provider: ${profileLabel(startupProfile)} — ${describeProfile(startupProfile)}` +
+    (Object.keys(providerEnv.set).length
+      ? ` (sets ${Object.keys(providerEnv.set).sort().join(', ')})`
+      : ' (inherits the environment)'),
+  )
+  const startupProblem = providerProblem()
+  if (startupProblem) log.warn(startupProblem)
 
   await rebuild()
 }

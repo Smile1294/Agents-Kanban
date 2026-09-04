@@ -30,9 +30,20 @@ part.
   versa.
 - **Live cost and context.** Both survive the agent process ending — and a
   VS Code restart.
+- **The model picker shows what your CLI actually has.** It is read from Claude
+  Code rather than hardcoded, so a newly released model is simply there — and
+  the effort levels, thinking toggle, **Ultracode** and **fast mode** are the
+  selected model's, so they disappear for a model that does not support them
+  instead of doing nothing.
 - **Interrupt, queue follow-ups, change permissions mid-run.**
 - **Subagents are visible**, nested under the `Task` that spawned them.
 - **Attach screenshots** — paste an image straight into the composer.
+- **Run on your own backend.** Anthropic, Amazon Bedrock, Google Cloud's Agent
+  Platform, Microsoft Foundry, Claude Platform on AWS, an LLM gateway, or a
+  local model behind a translation proxy. Credentials go to VS Code's secret
+  storage, never to `settings.json` — and the bar shows the provider the CLI
+  *actually resolved*, so a config that was silently overridden says so instead
+  of being believed. See [docs/PROVIDERS.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/PROVIDERS.md).
 
 ---
 
@@ -109,6 +120,10 @@ aside; your left side bar never moves, because it is how you get back.
   ~190MB copy. Set `agentsKanban.claudeExecutable` if it lives somewhere unusual.
 - **A git repository open.** The board renders without one, but agents need a
   worktree to run in.
+- **Nothing extra for a different provider.** If your Claude Code is already
+  pointed at Bedrock, Vertex or a gateway, that keeps working untouched: the
+  default provider profile inherits whatever the CLI resolves. Configure one
+  from inside the editor with **Agents Kanban: Select Model Provider**.
 - **Node 22.6+** — only if you are building from source.
 
 ## Getting started
@@ -122,6 +137,8 @@ Press **+ New session**, describe a task, and let it go.
 | Setting | What it does |
 |---|---|
 | `agentsKanban.model` | Model for agent sessions |
+| `agentsKanban.discoverModels` | Ask the CLI which models it can run, so new ones appear without an extension update (default on) |
+| `agentsKanban.provider` / `providers` | Which backend agents run on. Default `inherit` changes nothing — see [docs/PROVIDERS.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/PROVIDERS.md) |
 | `agentsKanban.maxConcurrentAgents` | How many agents may run at once (default 3) |
 | `agentsKanban.permissionMode` | How much the agent may do unattended |
 | `agentsKanban.worktreeRoot` | Where worktrees go. Default: `.agentskanban/worktrees` inside the repo |

@@ -15,6 +15,7 @@ stream reference, current state, and what to build next.
 | How does Nimbalyst do X? | [docs/NIMBALYST.md](docs/NIMBALYST.md) — don't re-clone the repo, it's already been analysed |
 | What's the real Agent SDK API? | [docs/SDK-NOTES.md](docs/SDK-NOTES.md) — **the public docs are wrong in places** |
 | Why is it built this way? | [docs/DECISIONS.md](docs/DECISIONS.md) — decisions and bug postmortems |
+| How do I run agents on Bedrock, Vertex, a gateway or a local model? | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | How do I run it? | [README.md](README.md) |
 
 ## Commands
@@ -34,7 +35,7 @@ npm run screenshots    # render the real view in headless Chromium -> docs/scree
 
 Press <kbd>F5</kbd> for an Extension Development Host. It runs `verify` first —
 including the install, so F5 works on a fresh clone —
-(about six seconds) rather than only building, because building alone will
+(about thirteen seconds) rather than only building, because building alone will
 happily launch an extension whose manifest and code disagree — which is exactly
 the "I pressed F5 and nothing worked" failure. Use **Run Extension (skip
 checks)** when the gates are what you are changing.
@@ -167,6 +168,95 @@ run, since each session needs a worktree.
   a plausible `localhost:8000` belonging to the main checkout shows the OLD code
   and reads as "the change did nothing". The browser opens only once something
   actually answers on the port.
+- **A provider is environment on the CLI, and an explicit one CLEARS what it
+  does not set.** This extension never talks to a model API — it spawns the
+  Claude Code CLI, and every backend the CLI can reach is selected by
+  environment variables on that child process. So `providers.ts` is a pure
+  reducer from a profile to an environment patch, and the only place that knows
+  a variable name. Two halves are load-bearing. The default profile is
+  `inherit`, which writes NOTHING: `agentEnv()` spreads `process.env`, so a
+  shell that already exports `CLAUDE_CODE_USE_BEDROCK=1` was already on Bedrock
+  before this feature existed, and forcing first-party would have broken every
+  enterprise setup silently. And provider selection is a SET OF INDEPENDENT
+  FLAGS, not one field — so an explicit profile returns `clear` alongside `set`
+  and `agentEnv()` drops those keys entirely, or a gateway's `ANTHROPIC_BASE_URL`
+  layered over an ambient Bedrock flag yields a session still on Bedrock with
+  the board naming the wrong provider. Dropped, never set empty: a future CLI
+  reading `''` as "set" would turn the guard into the bug. What is deliberately
+  NOT cleared is the user's cloud credential chain (`AWS_PROFILE`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `HTTPS_PROXY`) — that is how Bedrock and
+  Vertex are documented to authenticate.
+- **A provider readout must come from the CLI, not from our own config.**
+  Writing environment variables is a request; a managed settings file, an
+  `apiKeyHelper` or `~/.claude/settings.json` all outrank it. So every run asks
+  `Query.accountInfo()` ONCE — fire-and-forget, never in the message loop — and
+  reconciles `apiProvider` against the profile, and a disagreement becomes an
+  amber note naming both sides. This is "never show a signal that cannot say
+  bad" applied to provider selection: a readout that could only repeat our own
+  configuration back would be decorative.
+- **A credential goes to `SecretStorage`, never to settings.** A
+  `ProviderProfile` is written to `agentsKanban.providers`, which syncs between
+  machines and gets committed in `.vscode/` directories, so the profile records
+  only `hasCredential: true` and `envForProfile()` takes the secret as an
+  argument. `smoke.mjs` checks BOTH stores in BOTH directions, because a
+  harness that swallowed writes would let "the key went into settings.json"
+  pass. And `authStyle` is not cosmetic: `ANTHROPIC_AUTH_TOKEN` sends
+  `Authorization: Bearer` and `ANTHROPIC_API_KEY` sends `x-api-key`, so the
+  wrong one is a correct key that 401s.
+- **Off first-party, a model id is not one of ours.** `MODEL_RATES` and
+  `MODEL_WINDOWS` are keyed by Anthropic's ids and no other provider uses them:
+  Bedrock says `us.anthropic.claude-haiku-4-5-20251001-v1:0`, Vertex says
+  `claude-sonnet-4-6@20260115`. `normaliseModel()` strips the prefixes and
+  suffixes rather than the price table being copied per provider — without it a
+  whole Bedrock deployment reports `≥ $0.00` and a `?` window, which is honest
+  (`priced: false` IS "unknown model") and useless. An inference-profile ARN
+  stays unpriced on purpose: it names a profile, not a model.
+- **Switching provider applies to the NEXT session only.** A provider is chosen
+  when the CLI process starts, because it *is* environment on that process, so
+  there is no honest way to move a live run — unlike model and effort, which
+  genuinely take effect next turn. The switch also re-checks the model
+  selection, because the model list is per-provider and would otherwise strand
+  it on an id the new backend does not serve.
+- **A provider check must be able to say "bad", and `accountInfo()` cannot.**
+  `Query.accountInfo()` reports the backend the CLI *would* use — at
+  `initialize` time it has made no API request, so a gateway pointed at a dead
+  port comes back `firstParty` and looks fine. The first probe said "Connected"
+  to `http://127.0.0.1:1`. So `checkEndpoint()` tests a gateway's URL directly:
+  a TCP connect, then the `max_tokens: 1` request the gateway docs prescribe,
+  and the answers are FOUR cases because they have four different fixes — start
+  the proxy, correct the path, fix the credential, or move it to the other
+  header. The `401` message names `Bearer` vs `x-api-key` explicitly, because a
+  right key in the wrong header is the most common cause and "401" alone sends
+  people off to regenerate a working key. Cloud kinds say "configured for X, the
+  first request will confirm the credentials", never "connected" — they have not
+  asked. See [docs/DECISIONS.md](docs/DECISIONS.md).
+- **The model list comes from the CLI, not from a table here.** `MODELS` in
+  `sessions/meta.ts` is the FALLBACK; `Query.supportedModels()` is the answer.
+  The hardcoded table was wrong three ways at once and none were visible from
+  inside the extension: Fable 5 shipped and the picker did not have it;
+  `claude-opus-5[1m]` and `claude-opus-5` are different windows and it knew one;
+  and every model got five effort levels and a thinking toggle when Haiku 4.5
+  accepts NEITHER — `supportsEffort` is ABSENT on it, not false, so gate on
+  `=== true`. Effort and thinking are per model and DISAPPEAR when unsupported,
+  never greyed out. Discovery is cached per provider in `globalState`, is never
+  on the render path or the activation path (it spawns a CLI, and `smoke.mjs`
+  must stay hermetic — it sets `discoverModels: false`), and its fallback is
+  never an empty picker: empty reads as a broken extension and the cause would
+  be something as ordinary as being offline. When the built-in list is in force
+  the picker SAYS so, because "why is Fable missing?" is otherwise unanswerable.
+- **A session flag is a request the CLI never refuses.** `ultracode` and
+  `fastMode` go through `Options.settings` / `applyFlagSettings()`, which
+  validates NOTHING — measured against a real CLI it resolves for
+  `ultracode: true` on a model with no xhigh, for `ultracode: 'banana'`, and for
+  a key that does not exist. So a toggle needs both halves. Before the run, the
+  model's own capability from `supportedModels()` is the gate, and it is
+  enforced HOST-side in one place, after the assignment, so a model switch that
+  revokes a flag and a stale webview posting one are the same check — a second
+  copy on the assignment was unreachable and failed no test when broken. After
+  the run starts, `ultracodeWarning()` looks for the `Workflow` tool on
+  `system/init`. That check is deliberately ONE-SIDED: `Workflow` is present on
+  ordinary sessions too, so its presence proves nothing and is never reported as
+  success. A signal must be able to say bad; it need not be able to say good.
 - **Safety boundaries go in code, not prompts.** The tool description tells the
   agent what to do; `isHumanOnly()` makes it impossible. Both, always.
 - **A question is not a permission request.** `AskUserQuestion` arrives through

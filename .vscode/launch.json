@@ -5,7 +5,7 @@
       // preLaunchTask is `verify`, not `build`, on purpose. Building alone will
       // happily launch an extension whose manifest and code disagree — which is
       // exactly the "I pressed F5 and nothing worked" failure. The whole suite
-      // takes about four seconds, and its first step installs dependencies if
+      // takes about thirteen seconds, and its first step installs dependencies if
       // this is a fresh clone, so F5 works before `npm install` ever runs.
       "name": "Run Extension",
       "type": "extensionHost",

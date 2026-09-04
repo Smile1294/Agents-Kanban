@@ -178,6 +178,12 @@ export interface UiCard {
     costUsd?: number
     contextTokens: number
     contextWindow?: number
+    /** The backend the CLI reported this run is ACTUALLY on, and its label.
+     *  Not the profile that was requested — see AgentSession.checkProvider. A
+     *  card only carries it once the CLI has answered, so an older CLI shows
+     *  nothing rather than the provider we hoped for. */
+    resolvedProvider?: string
+    providerLabel?: string
     /** `questions` is set only for AskUserQuestion, and turns the Allow/Deny
      *  prompt into a real picker. Without it the view has nothing to show but
      *  the tool's name, which is how a question could be "allowed" and never
@@ -225,8 +231,29 @@ export interface UiState {
     model: string
     effort: string
     thinking: string
-    models: { id: string; label: string; context: string }[]
+    models: { id: string; label: string; context: string; detail?: string }[]
+    /** The effort levels THIS model accepts. Empty means it accepts none, and
+     *  the control must disappear: Haiku 4.5 was being shown a five-level
+     *  picker it ignores, which is a control that cannot say "no". */
     efforts: { key: string; label: string }[]
+    /** False when the selected model has no adaptive thinking, so the toggle
+     *  should not be drawn either. */
+    thinkingSupported?: boolean
+    /** Ultracode: xhigh effort plus standing workflow orchestration. Offered
+     *  ONLY when the CLI says this model can run it — the flag itself is
+     *  accepted without validation, so the capability gate is the only check
+     *  available before the run starts. */
+    ultracode?: boolean
+    ultracodeSupported?: boolean
+    fastMode?: boolean
+    fastModeSupported?: boolean
+    /** Where the model list came from — `cli` (asked), `profile` (declared in
+     *  settings), or `builtin` (the fallback). Shown in the picker, because
+     *  "why is Fable missing?" is only answerable if you can see whether we
+     *  managed to ask. */
+    modelSource?: string
+    /** Why the CLI's list is not in use, when it is not. */
+    modelNote?: string
     contextTokens: number
     contextWindow?: number
     /** What the selected session has cost so far, in USD. Present whether or
@@ -238,6 +265,22 @@ export interface UiState {
     spendPriced?: boolean
     permissionMode: string
     permissionModes: { key: string; label: string; detail: string }[]
+    /** The provider profile the NEXT session will run on. */
+    provider: string
+    /** Everything selectable. `support` is carried so the view can mark a
+     *  community setup as one, rather than listing it beside Bedrock as though
+     *  Anthropic supported it. */
+    providers: { id: string; label: string; detail: string; support: string }[]
+    /**
+     * Something the user needs to know about the provider, in one sentence.
+     *
+     * Carries the two cases a picker cannot: a profile that is missing a
+     * required field (so no session can start on it), and a live run whose CLI
+     * reported a DIFFERENT backend from the one this profile asked for. The
+     * second is the important one — it is the only way an outranked profile
+     * becomes visible instead of being believed.
+     */
+    providerNote?: string
   }
   running: number
   waiting: number
@@ -282,7 +325,10 @@ export interface BoardHost {
   /** The user opened or closed a collapsible section. Remembered so it stays
    *  that way — including across closing and reopening the board. */
   setDisclosure(key: string, open: boolean): void
-  setComposer(patch: { model?: string; effort?: string; thinking?: string; permissionMode?: string; forKey?: string }): void
+  setComposer(patch: {
+    model?: string; effort?: string; thinking?: string; permissionMode?: string
+    provider?: string; ultracode?: string; fastMode?: string; forKey?: string
+  }): void
   toggleArchived(): void
   /** Give the board the whole window, or hand it back. */
   toggleFocus(): Promise<void>
@@ -294,6 +340,11 @@ export interface BoardHost {
   openSession(key: string): Promise<void>
   /** Ask for a prompt, then start a session. */
   newSessionPrompt(): Promise<void>
+  /** Open the provider quick pick. Reached from the last entry of the composer's
+   *  provider menu, which is how a FIRST provider gets configured — a picker
+   *  that could only choose between profiles that already exist would leave the
+   *  feature reachable only from the command palette. */
+  selectProvider(): Promise<void>
 }
 
 /** Shared message plumbing for both the sidebar view and the editor panel. */
@@ -340,6 +391,9 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
             ...(msg.effort ? { effort: String(msg.effort) } : {}),
             ...(msg.thinking ? { thinking: String(msg.thinking) } : {}),
             ...(msg.permissionMode ? { permissionMode: String(msg.permissionMode) } : {}),
+            ...(msg.provider ? { provider: String(msg.provider) } : {}),
+            ...(msg.ultracode ? { ultracode: String(msg.ultracode) } : {}),
+            ...(msg.fastMode ? { fastMode: String(msg.fastMode) } : {}),
             ...(msg.id ? { forKey: id() } : {}),
           })
           refresh()
@@ -350,6 +404,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'closeBoard': await host.closeBoard(); break
         case 'openSession': await host.openSession(id()); await refresh(); break
         case 'newSessionPrompt': await host.newSessionPrompt(); break
+        case 'selectProvider': await host.selectProvider(); break
         case 'permission':
           host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))
           break
@@ -599,6 +654,8 @@ export function toUiAgent(a: RunningAgent): NonNullable<UiCard['agent']> {
     ...(a.costUsd !== undefined ? { costUsd: a.costUsd } : {}),
     contextTokens: a.contextTokens,
     ...(a.contextWindow !== undefined ? { contextWindow: a.contextWindow } : {}),
+    ...(a.resolvedProvider ? { resolvedProvider: a.resolvedProvider } : {}),
+    ...(a.providerLabel ? { providerLabel: a.providerLabel } : {}),
     ...(a.pendingPermission
       ? {
           pendingPermission: {

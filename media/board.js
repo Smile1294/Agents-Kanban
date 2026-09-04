@@ -1111,14 +1111,56 @@
 
     const bar = el('div', 'composer-bar')
     bar.append(el('span', 'agent-badge', 'AGENT'))
+    /* The menu carries the CLI's own one-liner for each model. That is what
+       makes "Default (recommended) — Opus 5 with 1M context" a choice rather
+       than a list of ids, and it costs nothing: the description arrived with
+       the model list. */
     bar.append(picker('model', modelLabel(s.composer.model), s.composer.models.map((m) => ({
-      value: m.id, label: `${m.label} (${m.context})`,
-    }))))
-    bar.append(picker('effort', effortLabel(), s.composer.efforts.map((e) => ({ value: e.key, label: e.label }))))
-    bar.append(picker('thinking', 'Extended: ' + (s.composer.thinking === 'disabled' ? 'Off' : 'On'), [
-      { value: 'enabled', label: 'Extended: On' },
-      { value: 'disabled', label: 'Extended: Off' },
-    ]))
+      value: m.id,
+      label: `${m.label} (${m.context})` + (m.detail ? ' — ' + m.detail : ''),
+    })), undefined, modelSourceNote()))
+    /* Which backend the NEXT session runs on. Always shown, even with only the
+       inherit profile configured, because its last entry is how a first
+       provider gets added at all — the alternative is a feature reachable only
+       from the command palette by someone who already knows it exists. */
+    bar.append(picker('provider', '🔌 ' + providerName(), (s.composer.providers || []).map((p) => ({
+      value: p.id,
+      label: p.label + (p.detail && p.detail !== p.label ? ' — ' + p.detail : '') +
+        (p.support === 'community' ? '  (community proxy)' : ''),
+    })).concat([{ command: 'selectProvider', label: '⚙  Configure providers…' }])))
+    /* Both of these are per MODEL, and both DISAPPEAR when the selected model
+       does not have them. Haiku 4.5 accepts no effort levels and has no
+       adaptive thinking, and it was being shown the full five-level picker and
+       an On/Off toggle — two controls that could not say no, which is the same
+       class of bug as a spinner over a wedged process. Hidden rather than
+       greyed out: "why is this disabled" has no answer worth reading. */
+    if (s.composer.efforts.length) {
+      bar.append(picker('effort', effortLabel(), s.composer.efforts.map((e) => ({ value: e.key, label: e.label }))))
+    }
+    if (s.composer.thinkingSupported !== false) {
+      bar.append(picker('thinking', 'Extended: ' + (s.composer.thinking === 'disabled' ? 'Off' : 'On'), [
+        { value: 'enabled', label: 'Extended: On' },
+        { value: 'disabled', label: 'Extended: Off' },
+      ]))
+    }
+    /* Ultracode: xhigh effort plus standing workflow orchestration. Offered
+       ONLY on a model the CLI says can run it, because the flag itself is
+       accepted without validation — `applyFlagSettings` resolves for a made-up
+       key — so the capability gate is the only check available before the run.
+       It replaces the effort picker rather than sitting beside it: ultracode
+       IS xhigh, and two controls arguing over one value is worse than one. */
+    if (s.composer.ultracodeSupported) {
+      bar.append(picker('ultracode', '⚡ Ultracode: ' + (s.composer.ultracode ? 'On' : 'Off'), [
+        { value: 'off', label: 'Ultracode: Off' },
+        { value: 'on', label: 'Ultracode: On — xhigh effort, and it orchestrates workflows' },
+      ], undefined, undefined, s.composer.ultracode ? 'on' : 'off'))
+    }
+    if (s.composer.fastModeSupported) {
+      bar.append(picker('fastMode', '🚀 Fast: ' + (s.composer.fastMode ? 'On' : 'Off'), [
+        { value: 'off', label: 'Fast mode: Off' },
+        { value: 'on', label: 'Fast mode: On — same model, faster output' },
+      ], undefined, undefined, s.composer.fastMode ? 'on' : 'off'))
+    }
     // Changeable mid-run: the SDK applies it to a live session, not just the next.
     const modes = s.composer.permissionModes || []
     const cur = modes.find((m) => m.key === s.composer.permissionMode)
@@ -1128,6 +1170,18 @@
       modes.map((m) => ({ value: m.key, label: m.label + ' — ' + m.detail })),
       c ? c.key : undefined,
     ))
+    /* The provider warning, and the reason this feature is trustworthy rather
+       than decorative. Two cases reach here: a profile missing a required field
+       (no session can start on it), and a LIVE RUN whose CLI reported a
+       different backend than the profile asked for. The second is the one that
+       matters — a managed settings file or an apiKeyHelper outranks anything we
+       put in the environment, and without this the bar would keep naming the
+       provider we requested while somebody else's account was billed. */
+    if (s.composer.providerNote) {
+      const note = el('span', 'provider-note', '⚠ ' + s.composer.providerNote)
+      note.title = s.composer.providerNote
+      bar.append(note)
+    }
     bar.append(el('div', 'spacer'))
     /* Context fill and spend, and they STAY. Both used to come only from a
        live run, so restarting VS Code — or opening a session that finished
@@ -1323,7 +1377,16 @@
     return box
   }
 
-  function picker(key, label, options, forKey) {
+  /** `note` is a non-clickable footer under the menu — used to say where a list
+   *  came from, which is the only way "why is my model missing?" is answerable.
+   *
+   *  `selected` overrides how the tick is decided. The default — "the composer
+   *  field named `key` holds the chosen value" — holds for model, effort and
+   *  thinking, but not for a BOOLEAN field offered as on/off options: comparing
+   *  `true` to `'on'` is never equal, so the menu would open with nothing
+   *  ticked and no way to tell which way the switch is set. */
+  function picker(key, label, options, forKey, note, selected) {
+    const chosen = selected === undefined ? s.composer[key] : selected
     const wrap = el('span', 'picker-wrap')
     const b = el('button', 'picker', label + ' ▾')
     b.onclick = (e) => { stop(e); openMenu = openMenu === 'composer:' + key ? null : 'composer:' + key; render() }
@@ -1332,25 +1395,61 @@
       const menu = el('div', 'menu up')
       menu.onclick = stop
       for (const o of options) {
-        const i = el('button', 'menu-item' + (s.composer[key] === o.value ? ' on' : ''), o.label)
-        i.onclick = (e) => {
-          stop(e); openMenu = null
-          post('composer', forKey ? { [key]: o.value, id: forKey } : { [key]: o.value })
-        }
+        const i = el('button', 'menu-item' + (chosen === o.value ? ' on' : ''), o.label)
+        /* An option may be an ACTION rather than a value — "Configure
+           providers…" opens a quick pick host-side. Without this the provider
+           picker could only ever choose between profiles that already exist,
+           so the first one would have to be created from the command palette
+           by somebody who already knew it was there. */
+        i.onclick = o.command
+          ? (e) => { stop(e); openMenu = null; post(o.command) }
+          : (e) => {
+              stop(e); openMenu = null
+              post('composer', forKey ? { [key]: o.value, id: forKey } : { [key]: o.value })
+            }
         menu.append(i)
       }
+      if (note) menu.append(el('div', 'menu-note', note))
       wrap.append(menu)
     }
     return wrap
   }
 
+  /* The prefix used to be the literal string "Claude Agent". That is no longer
+     something we know: the session may be running on Bedrock, on a gateway, or
+     through a proxy in front of a local model, and a bar that says "Claude"
+     over a Qwen session is simply wrong. So the prefix is the ACTIVE PROVIDER —
+     and when a run has told us what it actually resolved, that wins over the
+     profile we asked for, because the CLI is the only witness that counts. */
+  function providerName() {
+    const id = s.composer.provider
+    const p = (s.composer.providers || []).find((x) => x.id === id)
+    if (!p) return 'Provider'
+    /* The inherit profile makes no claim about the backend, so its chip must
+       not make one either: it says where the answer comes FROM rather than
+       naming a provider we have not been told about. */
+    return p.id === 'inherit' ? 'Inherited' : p.label
+  }
   function modelLabel(id) {
     const m = s.composer.models.find((x) => x.id === id)
-    return m ? `Claude Agent · ${m.label}` : 'Claude Agent'
+    return m ? m.label : 'Model'
+  }
+  /* Where the model list came from. Only shown when it is NOT the CLI's, because
+     that is the only case with a question attached: "why is the model I use in
+     Claude Code missing from this picker?" is unanswerable unless you can see
+     that we fell back. */
+  function modelSourceNote() {
+    const src = s.composer.modelSource
+    if (!src || src === 'cli') return undefined
+    if (src === 'profile') return 'Models listed by this provider profile'
+    return 'Built-in list' + (s.composer.modelNote ? ' — ' + s.composer.modelNote : '') +
+      '. Refresh from the provider menu.'
   }
   function effortLabel() {
     const e = s.composer.efforts.find((x) => x.key === s.composer.effort)
-    return e ? e.label : 'High'
+    // Falling back to the literal "High" would name a level that may not be
+    // selected. The first offered level is at least one this model has.
+    return e ? e.label : (s.composer.efforts[0] ? s.composer.efforts[0].label : 'Effort')
   }
   // Matches how the CLI reads: 82k/1M (8%). A million-token window shown as
   // "1000k" is technically right and reads wrong.

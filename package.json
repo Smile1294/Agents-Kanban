@@ -75,6 +75,24 @@
         "command": "agentsKanban.toggleFocus",
         "title": "Agents Kanban: Toggle Full-Window Board",
         "icon": "$(screen-full)"
+      },
+      {
+        "command": "agentsKanban.selectProvider",
+        "title": "Agents Kanban: Select Model Provider",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "agentsKanban.addProvider",
+        "title": "Agents Kanban: Add Model Provider"
+      },
+      {
+        "command": "agentsKanban.testProvider",
+        "title": "Agents Kanban: Test Model Provider Connection"
+      },
+      {
+        "command": "agentsKanban.refreshModels",
+        "title": "Agents Kanban: Refresh Model List",
+        "icon": "$(sync)"
       }
     ],
     "configuration": {
@@ -157,6 +175,150 @@
           "type": "string",
           "default": "",
           "markdownDescription": "URL to open once `agentsKanban.runCommand` is serving, e.g. `http://localhost:3000`. Leave empty to use the port the detected launcher assigned. Only used alongside a custom `runCommand`."
+        },
+        "agentsKanban.provider": {
+          "type": "string",
+          "default": "inherit",
+          "markdownDescription": "Id of the provider profile agent sessions run on, from `#agentsKanban.providers#`. The default, `inherit`, changes nothing: the `claude` CLI resolves its own provider from the environment, so an existing Bedrock or gateway setup keeps working. Switch it from the board's provider picker, or with **Agents Kanban: Select Model Provider**."
+        },
+        "agentsKanban.providers": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Model backends agent sessions can run on. Each profile compiles to environment variables on the `claude` process — the same variables the CLI documents — so anything Claude Code supports works here. **Credentials are never stored in settings**: they live in VS Code's secret storage, and `hasCredential` only records that one is set. Use **Agents Kanban: Add Model Provider** rather than editing this by hand. See [docs/PROVIDERS.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/PROVIDERS.md).",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable id. Referenced by agentsKanban.provider and used as the secret-storage key."
+              },
+              "label": {
+                "type": "string",
+                "description": "What the picker shows."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "inherit",
+                  "anthropic",
+                  "bedrock",
+                  "vertex",
+                  "foundry",
+                  "anthropicAws",
+                  "gateway"
+                ],
+                "enumDescriptions": [
+                  "Change nothing — the CLI resolves its own provider from the environment.",
+                  "Anthropic's API: your Claude subscription, or a Console API key.",
+                  "Amazon Bedrock, through the AWS SDK credential chain.",
+                  "Google Cloud's Agent Platform (formerly Vertex AI).",
+                  "Microsoft Foundry.",
+                  "Claude Platform on AWS, billed through AWS Marketplace.",
+                  "Anything serving the Anthropic Messages API at a URL: an LLM gateway, a self-hosted proxy, or a local model behind a translation proxy."
+                ],
+                "description": "Which backend this profile selects."
+              },
+              "baseUrl": {
+                "type": "string",
+                "description": "ANTHROPIC_BASE_URL for a gateway; the per-provider endpoint override otherwise."
+              },
+              "resource": {
+                "type": "string",
+                "description": "Microsoft Foundry resource name, when baseUrl is not given."
+              },
+              "region": {
+                "type": "string",
+                "description": "AWS_REGION for Bedrock, CLOUD_ML_REGION for Vertex."
+              },
+              "projectId": {
+                "type": "string",
+                "description": "ANTHROPIC_VERTEX_PROJECT_ID."
+              },
+              "regionPrefix": {
+                "type": "string",
+                "enum": [
+                  "us",
+                  "eu",
+                  "apac",
+                  "jp",
+                  "au",
+                  "global"
+                ],
+                "description": "ANTHROPIC_BEDROCK_REGION_PREFIX — which cross-region inference profile prefix to try first."
+              },
+              "workspaceId": {
+                "type": "string",
+                "description": "ANTHROPIC_AWS_WORKSPACE_ID, for Claude Platform on AWS."
+              },
+              "authStyle": {
+                "type": "string",
+                "enum": [
+                  "bearer",
+                  "apiKey"
+                ],
+                "enumDescriptions": [
+                  "Send the credential as Authorization: Bearer (ANTHROPIC_AUTH_TOKEN). The default, and what most gateways want.",
+                  "Send the credential as x-api-key (ANTHROPIC_API_KEY)."
+                ],
+                "description": "Which header the credential goes in. The wrong one reaches the gateway in a header it does not read, and returns 401."
+              },
+              "hasCredential": {
+                "type": "boolean",
+                "description": "Set automatically when a credential is stored in secret storage. Not the credential itself."
+              },
+              "credentialFromEnv": {
+                "type": "string",
+                "description": "Read the credential from this environment variable instead of secret storage."
+              },
+              "headers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Extra request headers, sent as ANTHROPIC_CUSTOM_HEADERS."
+              },
+              "gatewayAuth": {
+                "type": "boolean",
+                "description": "The gateway authenticates upstream itself, so the CLI sends no SigV4 signature or key of its own (CLAUDE_CODE_SKIP_*_AUTH)."
+              },
+              "disableBetas": {
+                "type": "boolean",
+                "description": "Stop sending Anthropic's experimental anthropic-beta header values. The documented fix for 'Unexpected value(s) for the anthropic-beta header', which most translation proxies return."
+              },
+              "disableNonessentialTraffic": {
+                "type": "boolean",
+                "description": "Set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1, as the gateway documentation advises."
+              },
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Model ids to offer in the picker instead of the built-in Claude ones. Needed off first-party: Bedrock wants us.anthropic.claude-opus-5, and a router serving another model needs its own id."
+              },
+              "contextWindow": {
+                "type": "number",
+                "description": "Context window for this profile's models, so the context meter has a denominator when the model is not one we know."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Extra environment variables, applied last. The escape hatch for anything not covered above."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "agentsKanban.discoverModels": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Ask the `claude` CLI which models it can actually run, instead of using a built-in list. This is what puts newly released models — and the ones your provider serves — in the picker without waiting for an extension update, and it is where the per-model effort levels and extended-thinking support come from. The answer is cached per provider; refresh it with **Agents Kanban: Refresh Model List**. Turn this off to use the built-in list only."
         }
       }
     },

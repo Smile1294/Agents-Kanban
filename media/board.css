@@ -450,6 +450,31 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
   border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
 }
 
+/* A menu footer: where the list above came from. Muted and non-interactive —
+   it is an explanation, not another choice. */
+.menu-note {
+  padding: 6px 10px; border-top: 1px solid var(--line);
+  color: var(--faint); font-size: 0.76em; line-height: 1.4;
+  max-width: 34ch; white-space: normal;
+}
+
+/* Provider disagreement, on the bar.
+   `min-width: 0` is not optional and this project has the postmortem: a flex
+   item defaults to `min-width: auto`, which refuses to shrink below its content
+   and so defeats `text-overflow: ellipsis` entirely — the note would push the
+   readouts off the bar instead of truncating, exactly as a card title once
+   overflowed its box by 94px with every text assertion green. The full sentence
+   lives in `title`. */
+.provider-note {
+  min-width: 0; max-width: 34ch; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  padding: 1px 7px; border-radius: 999px;
+  font-size: 0.78em; cursor: help;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+
 /* ---------------------------------------------- composer bar & controls */
 
 .composer-wrap { border-top: 1px solid var(--line); }

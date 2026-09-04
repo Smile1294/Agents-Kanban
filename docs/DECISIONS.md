@@ -1724,6 +1724,83 @@ Load-bearing details, in the order they will break if touched:
 
 ---
 
+### "Test connection" said Connected to a port with nothing on it
+
+Provider profiles compile to environment variables on the CLI, and writing an
+environment variable is a request, not a result. So the feature shipped with a
+probe: press **Test connection**, and it asks the CLI — through
+`Query.accountInfo()` — which backend it actually resolved.
+
+That is a genuinely good check, and it is nearly free. `query()` completes its
+`initialize` control request *before* reading any prompt, and the response
+already carries the account and the model list, so the probe hands `query()` a
+prompt iterable that never yields, asks its two questions and aborts. Against a
+real CLI: 460ms, no tokens.
+
+Every unit test passed. Then it was run for real, against a gateway profile
+pointed at `http://127.0.0.1:1`:
+
+```
+--- 2. a gateway pointed at a port nothing is on ---
+{ "ok": true, "message": "Connected on Anthropic API, 6 models available." }
+```
+
+**`ok: true`.** Nothing was listening on that port, and the probe said
+Connected.
+
+The reason is obvious in hindsight and invisible from inside the module: at
+`initialize` time the CLI has not made a single API request. It has read the
+environment, decided which backend it *would* use, and reported that. It cannot
+know the endpoint is dead, because it has not spoken to it. `accountInfo()`
+describes configuration, not connectivity — and the probe had quietly treated
+one as the other.
+
+This is the ["never show a signal that cannot say bad"](#) rule, in a check
+whose entire purpose was to be able to say bad. The board would have shown a
+green result and then failed every agent run afterwards, which is worse than
+having no button at all: a user who pressed Test connection and saw Connected
+now has a *reason* to look somewhere else for the problem.
+
+The fix has two halves, and the second half is why it is four cases rather than
+one. A gateway is the only kind whose endpoint belongs to us, so it is checked
+directly:
+
+| Result | Fix it implies | Cost |
+|---|---|---|
+| nothing listening | start the proxy, or correct the port | free (TCP connect) |
+| `404` | wrong path, or not an Anthropic-format endpoint | free |
+| `401` / `403` | wrong credential — or a right one in the header this gateway does not read | free |
+| `5xx` | the gateway answered; its upstream failed | free |
+| `400` | it speaks this API but objected, usually an unserved model id. A pass | free |
+| `200` | it answered and took the credential | one token |
+
+Those are separate cases because they have **different fixes**. A single "could
+not connect" covering all four is unactionable, and the `401` row in particular
+has to name the other credential style: `ANTHROPIC_AUTH_TOKEN` sends
+`Authorization: Bearer` and `ANTHROPIC_API_KEY` sends `x-api-key`, so the most
+common cause of a `401` is a correct key in the wrong header — and a message
+that does not say so sends the user off to regenerate a key that was always
+fine.
+
+For the cloud kinds the endpoint and the credentials are the provider's, reached
+through their own SDK chain, so there is nothing of ours to test. Those now say
+what they actually know — *"Claude Code is configured for Amazon Bedrock. The
+first request will confirm the credentials."* — rather than "Connected".
+
+Two things worth keeping from this:
+
+- **The overclaim was in the wording, and the wording was the feature.** The
+  code did exactly what it said; "Connected" was a claim nobody had checked the
+  probe was entitled to make. Every message in `probe.ts` is now scoped to what
+  that particular path verified.
+- **No unit test could have found it.** The failure was in an assumption about
+  someone else's process, and the only way to it was to run the thing. This is
+  the same lesson as "run a real agent before believing the suite", arriving
+  from a new direction: the suite was green, and had been mutation-tested, and
+  was checking the wrong claim. `probe.test.ts` now covers the matrix with
+  `fetch` and the TCP connect injected, because those states cannot be
+  reproduced on demand.
+
 ## Still open
 
 - **`verify` tests before it builds, and one test reads the build.**

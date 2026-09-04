@@ -15,18 +15,33 @@ import type { AgentState, BoardConfig } from '../board/config.ts'
 import { AgentSession, type PermissionRequest } from './session.ts'
 import type { AttachedImage } from './images.ts'
 import { boardToolNames, createBoardServer, type BoardChange, type BoardNotice } from './tools.ts'
+import type { ProviderEnv, ProviderProfile } from './providers.ts'
 
 export interface ManagerOptions {
   store: SessionStore
   worktrees: WorktreeService
   board: BoardConfig
-  defaults: { model?: string; effort?: EffortLevel; thinking?: ThinkingMode }
+  defaults: {
+    model?: string; effort?: EffortLevel; thinking?: ThinkingMode
+    /** Session flags. Offered only when the CLI says the model supports them —
+     *  see `ultracodeFor` — because the request path validates nothing. */
+    ultracode?: boolean; fastMode?: boolean
+  }
   /** All six the SDK accepts. It used to list four, and only compiled because
    *  extension.ts cast every value to 'acceptEdits' — a type that was a lie
    *  about values that were real at runtime. */
   permissionMode: NonNullable<Options['permissionMode']>
   maxConcurrent: number
   claudeExecutable?: string
+  /** Which backend sessions run against. Mutable through `setProvider()`,
+   *  because the picker changes it between runs and the manager outlives them.
+   *  Undefined means "inherit the environment", which is the default. */
+  provider?: ProviderProfile
+  /** The environment patch that profile amounts to, already resolved against
+   *  SecretStorage. Kept beside the profile rather than derived here, so this
+   *  file never touches a credential and `providers.ts` stays the only place
+   *  that knows a variable name. */
+  providerEnv?: ProviderEnv
   /** Passed to every session, for diagnostics the user cannot act on. */
   log?: (message: string) => void
 }
@@ -138,6 +153,15 @@ export interface RunningAgent {
    *  the difference between telling the user it is working and letting them
    *  see that it is. */
   lastEventAt?: number
+  /** The backend the CLI reported it is ACTUALLY on, once it has said.
+   *
+   *  Never the profile we asked for. The board shows this, so a profile that was
+   *  outranked by a managed settings file reads as the provider actually billing
+   *  the tokens rather than the one we requested. Undefined until the control
+   *  round trip lands, and on a CLI too old to answer it. */
+  resolvedProvider?: string
+  /** Human label for `resolvedProvider`. */
+  providerLabel?: string
 }
 
 export class AgentManager extends EventEmitter {
@@ -156,6 +180,21 @@ export class AgentManager extends EventEmitter {
 
   /** Picker changes apply to the next run; a running session keeps its settings. */
   setDefaults(d: ManagerOptions['defaults']): void { this.opts.defaults = d }
+
+  /** Switch which backend the NEXT session runs against.
+   *
+   *  Deliberately not applied to running agents. A provider is chosen when the
+   *  CLI process starts — it is environment on that process — so there is no
+   *  honest way to move a live run to a different backend, and pretending
+   *  otherwise would show a card claiming a provider it is not on. `setDefaults`
+   *  can be loose about this because a model change genuinely does take effect
+   *  next turn; this cannot. */
+  setProvider(provider: ProviderProfile | undefined, env: ProviderEnv | undefined): void {
+    if (provider) this.opts.provider = provider
+    else delete this.opts.provider
+    if (env) this.opts.providerEnv = env
+    else delete this.opts.providerEnv
+  }
 
   /** Find a live run by either key — the UI may hold whichever it saw first. */
   byKey(key: string): RunningAgent | undefined {
@@ -433,9 +472,15 @@ export class AgentManager extends EventEmitter {
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(this.opts.claudeExecutable ? { claudeExecutable: this.opts.claudeExecutable } : {}),
       ...(this.opts.log ? { log: this.opts.log } : {}),
+      ...(this.opts.provider ? { provider: this.opts.provider } : {}),
+      ...(this.opts.providerEnv?.set && Object.keys(this.opts.providerEnv.set).length
+        ? { env: this.opts.providerEnv.set } : {}),
+      ...(this.opts.providerEnv?.clear?.length ? { envClear: this.opts.providerEnv.clear } : {}),
       ...(this.opts.defaults.model ? { model: this.opts.defaults.model } : {}),
       ...(resolveEffort(undefined, this.opts.defaults.effort) ? { effort: resolveEffort(undefined, this.opts.defaults.effort)! } : {}),
       ...(resolveThinking(undefined, this.opts.defaults.thinking) === 'disabled' ? { thinking: 'disabled' as const } : {}),
+      ...(this.opts.defaults.ultracode ? { ultracode: true } : {}),
+      ...(this.opts.defaults.fastMode ? { fastMode: true } : {}),
     })
     this.sessions.set(runId, session)
 
@@ -530,6 +575,22 @@ export class AgentManager extends EventEmitter {
       else agent.live.push({ kind: 'text', at: Date.now(), text: chunk })
       this.touch()
     })
+    // A flag the CLI could not honour. Surfaced like any other warning, because
+    // the alternative is a toggle sitting there looking on while doing nothing.
+    session.on('flagWarning', (message: string) => { this.emit('warning', message) })
+
+    session.on('provider', (resolved: string | undefined, label: string | undefined) => {
+      const a = this.agents.get(runId)
+      if (!a) return
+      if (resolved) a.resolvedProvider = resolved
+      if (label) a.providerLabel = label
+      // Emitted as its own event, not left to the repaint, because the host
+      // reconciles it against the requested profile and that check must run
+      // ONCE per run rather than on every frame the agent produces.
+      this.emit('provider', a, resolved)
+      this.touch()
+    })
+
     session.on('thinking', (chunk: string) => {
       const last = agent.live[agent.live.length - 1]
       if (last?.kind === 'thinking') last.text += chunk

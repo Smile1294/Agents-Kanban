@@ -94,15 +94,52 @@ export const MODEL_WINDOWS: Record<string, number> = {
 export const SYNTHETIC_MODEL = '<synthetic>'
 
 /**
- * Reduce a model id to the one the price table is keyed by.
+ * Reduce a model id to the one the price and window tables are keyed by.
  *
  * Dated snapshots (`claude-haiku-4-5-20251001`) are the same model at the same
  * price as the undated alias, and the CLI writes whichever form it was invoked
  * with. Matching only the exact string made a perfectly ordinary session
  * unpriced.
+ *
+ * The same is true, harder, off first-party. The tables above are keyed by
+ * Anthropic's ids, and no other provider uses them:
+ *
+ *     us.anthropic.claude-haiku-4-5-20251001-v1:0   Bedrock, cross-region profile
+ *     global.anthropic.claude-opus-5                Bedrock, global profile
+ *     anthropic.claude-sonnet-5                     Bedrock Mantle
+ *     claude-sonnet-4-6@20260115                    Vertex
+ *     claude-sonnet-4-6[1m]                         a pinned 1M-window variant
+ *
+ * Every one of those is the same model at the same price as its bare id, so
+ * without this a whole Bedrock deployment reported `≥ $0.00` and a `?` context
+ * window — technically honest, since `priced: false` is exactly what "we do not
+ * know this model" means, and completely useless. The prefixes are stripped
+ * rather than the table being duplicated per provider, because five copies of a
+ * price list is five things to forget when a price moves.
+ *
+ * `[1m]` maps to the base model deliberately. The 1M window carries a premium
+ * above 200K tokens that these two-number rates cannot express, so the estimate
+ * runs low on a long session — but low-by-a-known-mechanism is better than a
+ * total that gives up, and `settleTurn` already compares every turn against the
+ * CLI's own `total_cost_usd` and says so when the gap exceeds 20%.
+ *
+ * What is deliberately NOT unwrapped is an inference-profile ARN
+ * (`arn:aws:bedrock:…:application-inference-profile/…`). It names a profile, not
+ * a model, and the mapping lives in the user's AWS account — so it stays
+ * unpriced, which is the truth.
  */
 export function normaliseModel(model: string): string {
-  return model.replace(/-\d{8}$/, '')
+  return model
+    // Bedrock cross-region inference profile prefix, then the vendor segment.
+    // `us-gov` before `us` is not an accident: alternation is first-match.
+    .replace(/^(us-gov|global|apac|us|eu|jp|au)\./, '')
+    .replace(/^anthropic\./, '')
+    // Bedrock foundation-model version suffix.
+    .replace(/-v\d+:\d+$/, '')
+    // A pinned 1M-window variant, and Vertex's `@`-dated form.
+    .replace(/\[1m\]$/i, '')
+    .replace(/@\d{8}$/, '')
+    .replace(/-\d{8}$/, '')
 }
 
 /** What one assistant message cost, or `undefined` if the model has no rate. */

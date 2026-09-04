@@ -113,6 +113,9 @@ export function makeVscodeStub(ctl) {
     },
     EventEmitter: class { constructor() { this.event = () => disposable } fire() {} dispose() {} },
     ViewColumn: { Active: -1, One: 1, Beside: -2 },
+    ProgressLocation: { SourceControl: 1, Window: 10, Notification: 15 },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    QuickPickItemKind: { Separator: -1, Default: 0 },
     StatusBarAlignment: { Left: 1, Right: 2 },
     window: {
       createWebviewPanel: (id) => {
@@ -200,8 +203,24 @@ export function makeVscodeStub(ctl) {
       showErrorMessage: (m) => { errors.push('showErrorMessage: ' + m); return Promise.resolve(undefined) },
       showInformationMessage: () => Promise.resolve(undefined),
       showWarningMessage: () => Promise.resolve(undefined),
-      showInputBox: async () => ctl.inputBox,
-      showQuickPick: async () => ctl.quickPick,
+      showInputBox: async (opts) => {
+        calls.push('inputBox:' + (opts?.title ?? opts?.prompt ?? ''))
+        // A function lets a test answer a MULTI-STEP form differently per
+        // field, which is what the provider flow is. A plain value still works
+        // for the single-box cases that were here first.
+        return typeof ctl.inputBox === 'function' ? ctl.inputBox(opts) : ctl.inputBox
+      },
+      showQuickPick: async (items, opts) => {
+        calls.push('quickPick:' + (opts?.title ?? ''))
+        return typeof ctl.quickPick === 'function' ? ctl.quickPick(items, opts) : ctl.quickPick
+      },
+      // Runs the task rather than faking it: every provider probe and merge goes
+      // through here, so a stub that only resolved would make those code paths
+      // invisible to the smoke test.
+      withProgress: async (opts, task) => {
+        calls.push('progress:' + (opts?.title ?? ''))
+        return task({ report() {} }, { isCancellationRequested: false, onCancellationRequested: () => disposable })
+      },
       // What the editor really does with a document: opened into the ACTIVE
       // group it takes that group, and a webview panel living there stops being
       // visible — which is the very event the board reads as "clicked away".
@@ -224,7 +243,16 @@ export function makeVscodeStub(ctl) {
       get workspaceFolders() { return ctl.noFolder ? undefined : folders },
       onDidChangeWorkspaceFolders: () => disposable,
       onDidChangeConfiguration: () => disposable,
-      getConfiguration: () => ({ get: (k) => (ctl.config ?? {})[k] }),
+      getConfiguration: () => ({
+        get: (k) => (ctl.config ?? {})[k],
+        // Writes go back into the same object a test reads, so "saved the
+        // profile" is checkable — and so a credential accidentally written
+        // here instead of into SecretStorage is VISIBLE to a test rather than
+        // being a quiet security bug. See providers in smoke.mjs.
+        update: async (k, v) => { (ctl.config ??= {})[k] = v; calls.push('config:' + k) },
+        inspect: () => undefined,
+        has: (k) => k in (ctl.config ?? {}),
+      }),
       createFileSystemWatcher: () => ({
         onDidCreate: () => disposable, onDidChange: () => disposable,
         onDidDelete: () => disposable, dispose() {},
@@ -278,11 +306,26 @@ export function loadBundle(vscode) {
 }
 
 export async function makeContext(storage) {
+  /** A real store, not a no-op.
+   *
+   *  A credential is the one piece of provider configuration that must NOT end
+   *  up in settings, and the only way to check that is to have somewhere else
+   *  for it to go and then look in both places. A stub that swallowed writes
+   *  would make "the key went into settings.json" pass. */
+  const secretStore = new Map()
   return {
     subscriptions: [],
     extensionUri: { fsPath: repoRoot },
     globalStorageUri: { fsPath: storage ?? (await fs.mkdtemp(path.join(os.tmpdir(), 'ck-storage-'))) },
     workspaceState: { get: () => undefined, update: async () => {} },
     globalState: { get: () => undefined, update: async () => {} },
+    secrets: {
+      get: async (k) => secretStore.get(k),
+      store: async (k, v) => { secretStore.set(k, v) },
+      delete: async (k) => { secretStore.delete(k) },
+      onDidChange: () => ({ dispose() {} }),
+    },
+    /** Test handle: what is in the keychain. */
+    _secrets: secretStore,
   }
 }

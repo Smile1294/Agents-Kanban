@@ -18,6 +18,7 @@ import { EventEmitter } from 'node:events'
 import type { EffortLevel, ThinkingMode } from '../sessions/meta.ts'
 import type { AgentState } from '../board/config.ts'
 import { buildAskAnswers, parseAskQuestions } from '../board/questions.ts'
+import { reconcileProvider, resolvedLabel, type ProviderProfile } from './providers.ts'
 
 export interface PermissionRequest {
   id: string
@@ -50,6 +51,16 @@ export interface SessionEvents {
   committed: () => void
   permission: (req: PermissionRequest) => void
   sessionId: (id: string) => void
+  /** Which backend the CLI says it is ACTUALLY on, once per run.
+   *
+   *  Not the profile we configured — that is only a request, and a managed
+   *  settings file or an `apiKeyHelper` can outrank it. The board shows this one,
+   *  because a provider readout that cannot disagree with reality is the
+   *  "never show a signal that cannot say bad" rule broken in a new place. */
+  provider: (resolved: string | undefined, label: string | undefined) => void
+  /** A session flag we asked for that the CLI could not honour. See
+   *  `checkFlagSettings`: the request path itself never refuses anything. */
+  flagWarning: (message: string) => void
   done: (summary: string, costUsd?: number) => void
   error: (message: string) => void
 }
@@ -128,16 +139,32 @@ export const HOST_SESSION_VARS = [
   'CLAUDE_PID',
 ] as const
 
-/** The environment for a spawned CLI: everything we have, minus the identity of
- *  the session we are running inside. Pure, so it can be tested without one. */
+/**
+ * The environment for a spawned CLI: everything we have, minus the identity of
+ * the session we are running inside. Pure, so it can be tested without one.
+ *
+ * `clear` is how a provider profile says "this variable is not mine". It has to
+ * exist because provider selection is a set of independent flags rather than one
+ * field: with `CLAUDE_CODE_USE_BEDROCK=1` in the ambient environment, setting
+ * `ANTHROPIC_BASE_URL` for a gateway profile produces a session that is STILL on
+ * Bedrock, and the board would then name a provider that is not billing the
+ * tokens. A cleared key is dropped from the child's environment entirely rather
+ * than set empty, because a future CLI reading `''` as "present" would turn this
+ * guard into the bug it prevents. See `envForProfile()` in `providers.ts`.
+ *
+ * `extra` is applied last and wins, so a profile can re-set something it also
+ * asked to clear without the order mattering to the caller.
+ */
 export function agentEnv(
   base: Record<string, string | undefined>,
   extra: Record<string, string> = {},
+  clear: readonly string[] = [],
 ): Record<string, string> {
+  const dropped = new Set([...HOST_SESSION_VARS, ...clear])
   const out: Record<string, string> = {}
   for (const [k, v] of Object.entries(base)) {
     if (v === undefined) continue
-    if ((HOST_SESSION_VARS as readonly string[]).includes(k)) continue
+    if (dropped.has(k)) continue
     out[k] = v
   }
   // Nimbalyst shipped this as a bug fix (NIM-1573): the CLI's in-place
@@ -170,6 +197,36 @@ export function AUTO_ALLOWED_FOR_TEST(name: string): boolean {
   return AUTO_ALLOW_BUILTIN.has(name)
 }
 
+/**
+ * Did the ultracode flag we asked for actually get what it needs?
+ *
+ * Pulled out as a pure function because the interesting cases cannot be
+ * reproduced on demand — they need an account with workflows disabled — and
+ * because it is the whole safety argument for the toggle, so it must be
+ * checkable.
+ *
+ * Returns a sentence to show, or undefined when there is nothing to say. Note
+ * what it does NOT do: it never reports success. `Workflow` is present on
+ * ordinary sessions too (verified against a real CLI), so its presence proves
+ * nothing about ultracode. Only its ABSENCE is evidence, because ultracode is
+ * xhigh effort plus standing WORKFLOW orchestration and without the tool the
+ * second half cannot happen whatever the setting says.
+ *
+ * A one-sided indicator is still worth having. This project's rule is that a
+ * signal must be able to say "bad"; it does not require that it also be able to
+ * say "good".
+ */
+export function ultracodeWarning(requested: boolean, tools: unknown): string | undefined {
+  if (!requested) return undefined
+  // A CLI that reported no tool list tells us nothing either way, and inventing
+  // a warning from silence is its own kind of lying.
+  if (!Array.isArray(tools)) return undefined
+  if (tools.includes('Workflow')) return undefined
+  return 'Ultracode was requested, but this session has no Workflow tool — so its ' +
+    'workflow orchestration cannot run. Workflows are off for this account, plan, ' +
+    'or settings file. The xhigh effort part still applies.'
+}
+
 export interface AgentSessionOptions {
   taskId: string
   /** The worktree directory. Everything the agent does happens here. */
@@ -188,10 +245,31 @@ export interface AgentSessionOptions {
   claudeExecutable?: string
   /** Extra environment for the CLI process; merged over the update guards. */
   env?: Record<string, string>
+  /** Variables to DROP from the inherited environment — how a provider profile
+   *  says "not mine". Without it an ambient provider flag survives a switch and
+   *  the session runs somewhere the board is not naming. See `agentEnv`. */
+  envClear?: readonly string[]
+  /** The provider profile this run was started under, so the run can check what
+   *  the CLI actually resolved against what we asked for. Not used to configure
+   *  anything — `env`/`envClear` already carry that. */
+  provider?: ProviderProfile
   model?: string
   effort?: EffortLevel
   /** 'enabled' means OMIT the option and keep the model's adaptive default. */
   thinking?: ThinkingMode
+  /**
+   * Ultracode: xhigh effort plus standing dynamic-workflow orchestration.
+   *
+   * Passed through `Options.settings`, which is a LAYER over the user's
+   * settings files rather than a replacement — it sits above user/project/local
+   * and below managed policy, so an organisation that disables workflows still
+   * wins. Only offered on a model whose effort levels include `xhigh`; see
+   * `ultracodeFor` and `checkFlagSettings` for why that gate and the read-back
+   * are both needed.
+   */
+  ultracode?: boolean
+  /** Claude Code's fast mode. Only offered when the model reports it. */
+  fastMode?: boolean
   /** Where to report something the user cannot act on but a maintainer can —
    *  currently a spend estimate that disagrees with the bill. */
   log?: (message: string) => void
@@ -206,6 +284,9 @@ export class AgentSession extends EventEmitter {
   private q?: Query
   private _state: AgentState = { kind: 'idle' }
   private _sessionId?: string
+  /** `AccountInfo.apiProvider` — where the tokens are actually going. Asked once
+   *  per run, never per frame. */
+  private _resolvedProvider?: string
   private text = ''
   private readonly toolNames = new Map<string, string>()
   private sawCommit = false
@@ -292,7 +373,16 @@ export class AgentSession extends EventEmitter {
       ...(this.opts.resume ? { resume: this.opts.resume } : {}),
     }
 
-    options.env = agentEnv(process.env, this.opts.env ?? {})
+    // A LAYER, not a replacement: `Options.settings` sits above the user's
+    // settings files and below managed policy, so this cannot override an
+    // organisation that has turned workflows off — which is the correct
+    // precedence and the reason it is safe to send at all.
+    const flags: Record<string, boolean> = {}
+    if (this.opts.ultracode) flags.ultracode = true
+    if (this.opts.fastMode) flags.fastMode = true
+    if (Object.keys(flags).length) options.settings = flags
+
+    options.env = agentEnv(process.env, this.opts.env ?? {}, this.opts.envClear ?? [])
 
     const exe = await resolveClaudeExecutable(this.opts.claudeExecutable)
     if (!exe) {
@@ -308,6 +398,7 @@ export class AgentSession extends EventEmitter {
     try {
       const { query } = await loadSdk()
       this.q = query({ prompt: this.queue, options })
+      this.checkProvider(this.q)
       for await (const msg of this.q) this.handle(msg)
     } catch (e) {
       if (this.abort.signal.aborted || this.interrupted) {
@@ -325,6 +416,75 @@ export class AgentSession extends EventEmitter {
       }
       this.permissions.clear()
     }
+  }
+
+  /**
+   * Ask the CLI which backend it actually ended up on.
+   *
+   * Everything in `envForProfile()` writes environment variables and hopes.
+   * This is the half that closes the loop: `accountInfo()` reports the resolved
+   * `apiProvider`, so a profile that was silently outranked — by a managed
+   * settings file, an `apiKeyHelper`, or an `env` block in
+   * `~/.claude/settings.json` — shows up as a disagreement instead of a board
+   * that confidently names the wrong provider.
+   *
+   * Deliberately fire-and-forget, and deliberately once:
+   *
+   *  - Not awaited before the message loop, because it is a control round trip
+   *    to the child and blocking the loop on it would delay the first token of
+   *    every turn for a number that is only ever displayed.
+   *  - Never in `handle()`. That runs per streamed frame, and this is exactly
+   *    the kind of per-token work the repaint budget exists to keep out.
+   *  - Failure is silent by design. An older CLI has no `accountInfo` control
+   *    request at all, and "we could not determine the provider" must not turn
+   *    into a failed agent run. The board simply shows nothing rather than a
+   *    guess.
+   */
+  private checkProvider(q: Query): void {
+    Promise.resolve(q.accountInfo?.())
+      .then((info) => {
+        const actual = (info as { apiProvider?: string } | undefined)?.apiProvider
+        if (!actual) return
+        this._resolvedProvider = actual
+        this.emit('provider', actual, resolvedLabel(actual))
+        const profile = this.opts.provider
+        if (!profile) return
+        const { ok, message } = reconcileProvider(profile, actual)
+        if (!ok && message) this.opts.log?.(message)
+      })
+      .catch(() => { /* older CLI, or the run ended first. Not worth a word. */ })
+  }
+
+  /** Where this run's tokens are actually going, or undefined before the CLI
+   *  has said. Never inferred from the profile — see `checkProvider`. */
+  get resolvedProvider(): string | undefined { return this._resolvedProvider }
+
+  /**
+   * Did the flag settings we asked for actually take?
+   *
+   * They are a REQUEST, and nothing about the request path can refuse: measured
+   * against a real CLI, `applyFlagSettings()` resolves for `ultracode: true` on
+   * a model with no xhigh, for `ultracode: 'banana'`, and for a key that does
+   * not exist. So a toggle wired straight to it would be a control that cannot
+   * say no — which is what this project forbids everywhere else.
+   *
+   * The one observable is the tool list on `system/init`. Ultracode is xhigh
+   * effort plus standing WORKFLOW orchestration, and it requires workflows to
+   * be enabled — so if the `Workflow` tool is absent from the session the CLI
+   * just built, ultracode cannot do the half it is named for, whatever the
+   * setting says. That is reported rather than assumed.
+   *
+   * Deliberately narrow. It does NOT claim ultracode is active when `Workflow`
+   * IS present — the tool is there on ordinary sessions too (verified), so its
+   * presence proves nothing. Only its absence is evidence, and only absence is
+   * reported. An indicator that can say "bad" and nothing else is still worth
+   * more than one that can only say "fine".
+   */
+  private checkFlagSettings(init: { tools?: unknown }): void {
+    const message = ultracodeWarning(this.opts.ultracode === true, init.tools)
+    if (!message) return
+    this.opts.log?.(message)
+    this.emit('flagWarning', message)
   }
 
   /**
@@ -378,6 +538,7 @@ export class AgentSession extends EventEmitter {
         if ('subtype' in msg && msg.subtype === 'init' && 'session_id' in msg) {
           this._sessionId = msg.session_id as string
           this.emit('sessionId', this._sessionId)
+          this.checkFlagSettings(msg as unknown as { tools?: unknown })
         }
         // After a compaction there is no assistant message, so the meter would
         // stay pinned at the pre-compaction figure. Reset it explicitly.

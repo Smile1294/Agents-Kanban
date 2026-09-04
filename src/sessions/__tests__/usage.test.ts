@@ -118,6 +118,46 @@ ok(normaliseModel('claude-haiku-4-5-20251001') === 'claude-haiku-4-5', 'dated mo
 ok(costOfUsage('claude-haiku-4-5-20251001', { output_tokens: 1000 }) !== undefined,
    'so a dated id is priced, not reported as unknown')
 
+// The same model, named the way each provider names it.
+//
+// These tables are keyed by Anthropic's ids and no other provider uses them, so
+// without this a whole Bedrock or Vertex deployment reports `≥ $0.00` and a `?`
+// context window — technically honest (`priced: false` IS "we do not know this
+// model") and completely useless. Every form below is the same model at the same
+// price as its bare id.
+const SAME_MODEL: [string, string][] = [
+  ['us.anthropic.claude-opus-5', 'claude-opus-5'],
+  ['eu.anthropic.claude-opus-5', 'claude-opus-5'],
+  ['apac.anthropic.claude-sonnet-5', 'claude-sonnet-5'],
+  ['global.anthropic.claude-opus-5', 'claude-opus-5'],
+  ['us-gov.anthropic.claude-opus-5', 'claude-opus-5'],
+  ['anthropic.claude-sonnet-5', 'claude-sonnet-5'],
+  ['us.anthropic.claude-haiku-4-5-20251001-v1:0', 'claude-haiku-4-5'],
+  ['claude-sonnet-4-6@20260115', 'claude-sonnet-4-6'],
+  ['claude-sonnet-4-6[1m]', 'claude-sonnet-4-6'],
+  ['us.anthropic.claude-sonnet-4-6[1m]', 'claude-sonnet-4-6'],
+]
+for (const [provider, bare] of SAME_MODEL) {
+  ok(normaliseModel(provider) === bare, `${provider} is ${bare}`)
+  ok(costOfUsage(provider, { output_tokens: 1000 }) === costOfUsage(bare, { output_tokens: 1000 }),
+     `and costs the same, so the provider's naming does not change the bill`)
+  ok(!!MODEL_WINDOWS[normaliseModel(provider)],
+     `and has a context window, so the meter has a denominator`)
+}
+
+// `us-gov` must be tried before `us`, or the GovCloud prefix half-strips to
+// `-gov.anthropic.…` and stops matching anything. Alternation is first-match,
+// so this is an ordering constraint in the regex rather than an accident.
+ok(normaliseModel('us-gov.anthropic.claude-opus-5') === 'claude-opus-5',
+   'the GovCloud prefix is stripped whole, not left as "-gov."')
+
+// An inference-profile ARN names a profile, not a model, and the mapping lives
+// in the user's AWS account. Staying unpriced is the truth; inventing a rate
+// from a substring would be a confident wrong number.
+const arn = 'arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/opus-prod'
+ok(costOfUsage(arn, { output_tokens: 1000 }) === undefined,
+   'an inference-profile ARN stays unpriced rather than being guessed at')
+
 // Every priced model needs a window, or the meter has no denominator.
 for (const id of Object.keys(MODEL_RATES)) {
   ok(!!MODEL_WINDOWS[id], `${id} has a context window`)
