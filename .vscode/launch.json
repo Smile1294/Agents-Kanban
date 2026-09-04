@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // preLaunchTask is `verify`, not `build`, on purpose. Building alone will
+      // happily launch an extension whose manifest and code disagree — which is
+      // exactly the "I pressed F5 and nothing worked" failure. The whole suite
+      // takes about four seconds, and its first step installs dependencies if
+      // this is a fresh clone, so F5 works before `npm install` ever runs.
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "verify"
+    },
+    {
+      // For when the gates themselves are what you are changing. Still runs the
+      // preflight, because nothing can build without dependencies.
+      "name": "Run Extension (skip checks)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "build"
+    }
+  ]
+}

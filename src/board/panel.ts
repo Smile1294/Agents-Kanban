@@ -1,0 +1,604 @@
+/** The webview surface, in two places and two modes.
+ *
+ * Places: a compact WebviewView in the sidebar, and a full WebviewPanel in the
+ * editor area. Both render the same app.
+ *
+ * Modes: `kanban` (every session as a card, grouped by phase) and `chat` (one
+ * session's transcript). A card and a session are the same thing seen at two
+ * zoom levels, which is why switching modes never changes what exists.
+ *
+ * Neither surface holds state. They render what the host hands them.
+ */
+import * as vscode from 'vscode'
+import type { RunningAgent } from '../agent/manager.ts'
+import type { WorktreeReview } from '../git/worktree.ts'
+import type { Entry } from '../sessions/store.ts'
+import type { AttachedImage } from '../agent/images.ts'
+import type { TestPlan } from '../sessions/meta.ts'
+import type { SlashCommand } from '../sessions/commands.ts'
+import type { ColumnDef } from './config.ts'
+import { parseAskQuestions, type AskQuestion } from './questions.ts'
+
+export type Mode = 'kanban' | 'chat'
+
+/**
+ * How much of the window the board takes when it is open.
+ *
+ * The board is a workspace of its own — five columns, a session rail and a
+ * transcript — and squeezed into the editor area beside a terminal and a chat
+ * panel it is too narrow to use. Nimbalyst gets a full window for free by being
+ * a whole application; here it has to be asked for.
+ *
+ *  - `off`   never touch the layout
+ *  - `wide`  while the board is open the terminal and the secondary side bar
+ *            step aside, and both come back when it closes
+ *  - `zen`   VS Code's own Zen Mode, which also hides the activity and status
+ *            bars and restores the previous layout itself
+ *
+ * THE PRIMARY SIDE BAR IS NOT TOUCHED. Not closed, not collapsed, not resized.
+ * It is the one part of the window that is never this extension's to take: it
+ * is where your files are and it is how you get back.
+ *
+ * That is a correction, not a preference. A previous version collapsed it on the
+ * way in and ran `toggleSidebarVisibility` on the way out, and the two do not
+ * cancel — because the icon click that closes the board ALSO reopens the side
+ * bar, so the toggle that was meant to restore it closed it instead. Worse,
+ * clicking Explorer while the board was open opened the side bar, closed the
+ * board, and the restore then collapsed the Explorer you had just asked for.
+ * The left bar disappeared on almost every path through this code.
+ *
+ * Only two of the four workbench areas are ours, so only two commands appear
+ * here. Handing the side bar back to the view the icon click stole it from is a
+ * separate job, done by `showSideBarView` below.
+ */
+export type FocusMode = 'off' | 'wide' | 'zen'
+
+let focusMode: FocusMode = 'off'
+/** Whether WE changed the layout, so we only ever undo our own change. */
+let focusApplied = false
+
+export function setBoardFocusMode(mode: FocusMode): void {
+  focusMode = mode
+}
+
+export function boardFocusApplied(): boolean {
+  return focusApplied
+}
+
+/** Test seam: forget any applied state between activations. */
+export function _resetBoardFocus(): void {
+  focusApplied = false
+}
+
+/**
+ * Take the window, or give it back.
+ *
+ * Closing uses the `close*` commands, which do nothing when the thing is already
+ * closed; restoring uses the `toggle*` ones, which is safe precisely because we
+ * are the ones who closed them, and because nothing else in the window can have
+ * reopened them in between. VS Code exposes no way to read the current layout,
+ * so `focusApplied` is the only record that the change was ours.
+ *
+ * That "nothing else can have reopened them" is exactly what stopped being true
+ * of the side bar once it was added here, and why it is no longer in this list.
+ * The activity-bar icon reopens the side bar as part of the very click that
+ * closes the board, so the restoring toggle found it open and closed it.
+ */
+export async function applyBoardFocus(on: boolean, mode: FocusMode = focusMode): Promise<void> {
+  if (mode === 'off') return
+  const run = async (...ids: string[]) => {
+    for (const id of ids) {
+      try { await vscode.commands.executeCommand(id) } catch { /* older VS Code */ }
+    }
+  }
+
+  if (mode === 'zen') {
+    // Zen Mode is a single toggle, so it is the one case that must not repeat.
+    if (on === focusApplied) return
+    focusApplied = on
+    await run('workbench.action.toggleZenMode')
+    return
+  }
+
+  if (on) {
+    // Not guarded by `focusApplied`: these are `close*` commands, so repeating
+    // them on something already closed does nothing, and re-running is harmless.
+    focusApplied = true
+    await run('workbench.action.closePanel', 'workbench.action.closeAuxiliaryBar')
+    return
+  }
+
+  // Restoring, by contrast, uses toggles and must happen exactly once.
+  if (!focusApplied) return
+  focusApplied = false
+  await run('workbench.action.togglePanel', 'workbench.action.toggleAuxiliaryBar')
+}
+
+/**
+ * Hand the primary side bar back to the view it was showing.
+ *
+ * Clicking an activity-bar icon makes VS Code show that extension's view in the
+ * side bar. There is no API to prevent it and no API to ask what was there
+ * before — so the board's icon unavoidably evicts your Explorer for as long as
+ * it takes us to put it back, which is what this does.
+ *
+ * `which` is a `workbench.view.*` command id and comes from a setting, not from
+ * a guess. An earlier version hardcoded the Explorer, which was wrong for
+ * anyone who lives in Source Control; empty means "leave it wherever the click
+ * put it", which is the honest option for anyone who would rather we did not
+ * choose at all.
+ */
+export async function showSideBarView(which: string): Promise<void> {
+  const id = which.trim()
+  if (!id) return
+  await vscode.commands.executeCommand(id)
+}
+
+export interface UiCard {
+  /** sessionId when Claude Code has assigned one, else the local run id. */
+  key: string
+  sessionId?: string
+  title: string
+  phase: string
+  tags: string[]
+  updated: number
+  archived?: boolean
+  pinned?: boolean
+  branch?: string
+  worktree?: string
+  /** The card this one was split out of, and its title — so a subtask says
+   *  where it came from without the view having to look it up. */
+  parent?: string
+  parentTitle?: string
+  /** The cards split out of THIS one. Present only on a parent, and the answer
+   *  to "what do I test, and when": each subtask is tested on its own, and the
+   *  parent is ready when all of them are. */
+  subtasks?: { key: string; title: string; phase: string; ready: boolean }[]
+  /** How to test this session's work, if the agent said. */
+  testPlan?: TestPlan
+  /** Follow-ups typed while this turn is still running. */
+  queued?: string[]
+  agent?: {
+    kind: string
+    tool?: string
+    /** What a Task's subagent is running, so a long Task is not a dead row. */
+    subagent?: string
+    /** When the CLI last emitted anything. The view shows its AGE — a claim the
+     *  user can check, unlike a dot that pulses whether or not anything moved. */
+    lastEventAt?: number
+    message?: string
+    costUsd?: number
+    contextTokens: number
+    contextWindow?: number
+    /** `questions` is set only for AskUserQuestion, and turns the Allow/Deny
+     *  prompt into a real picker. Without it the view has nothing to show but
+     *  the tool's name, which is how a question could be "allowed" and never
+     *  answered. See board/questions.ts. */
+    pendingPermission?: { id: string; summary: string; questions?: AskQuestion[] }
+  }
+}
+
+export interface UiState {
+  ready: boolean
+  /** No folder is open, so there is nothing to show yet. */
+  noWorkspace?: boolean
+  /** A folder is open but it is not a git repository, so agents cannot run. */
+  noRepo?: boolean
+  mode: Mode
+  selectedKey?: string
+  showArchived?: boolean
+  columns: ColumnDef[]
+  cards: UiCard[]
+  /** Only for the selected session — sending every transcript would be wasteful. */
+  transcript?: Entry[]
+  /** The block currently streaming in, appended after `transcript`. */
+  streaming?: string
+  /** What the selected session changed in its worktree. Computed on demand, not
+   *  on every refresh — it costs four git calls and refreshes fire per token. */
+  review?: WorktreeReview
+  /** Set while a merge is in progress so the view can disable the button. */
+  busy?: string
+  /** True while the board has taken over the window. */
+  focused?: boolean
+  /** True while the board is open in the editor — what the side bar toggles. */
+  boardOpen?: boolean
+  /** `.claude/commands/*.md`, for the composer's `/` autocomplete. */
+  commands?: SlashCommand[]
+  /**
+   * Which collapsible sections the user has opened or closed.
+   *
+   * Seeds the view's own map on the FIRST state message and is ignored after
+   * that. It has to be one-way: the view is where the clicks happen, and a
+   * host copy that kept being applied would race the click that produced it —
+   * which is the bug this whole mechanism exists to fix, in a new place.
+   */
+  disclosures?: Record<string, boolean>
+  composer: {
+    model: string
+    effort: string
+    thinking: string
+    models: { id: string; label: string; context: string }[]
+    efforts: { key: string; label: string }[]
+    contextTokens: number
+    contextWindow?: number
+    /** What the selected session has cost so far, in USD. Present whether or
+     *  not it is running: a finished session's figure is totalled from its
+     *  transcript, which is why it survives a restart. */
+    spentUsd?: number
+    /** False when a model with no published rate contributed, so `spentUsd` is
+     *  a floor. The view must show it as "at least". */
+    spendPriced?: boolean
+    permissionMode: string
+    permissionModes: { key: string; label: string; detail: string }[]
+  }
+  running: number
+  waiting: number
+}
+
+export interface BoardHost {
+  getState(): Promise<UiState>
+  init(): Promise<void>
+  openFolder(): Promise<void>
+  setMode(mode: Mode): void
+  select(id: string | undefined): void
+  newSession(prompt: string, images?: AttachedImage[]): Promise<void>
+  sendMessage(id: string, text: string, images?: AttachedImage[]): Promise<void>
+  move(key: string, phase: string): Promise<void>
+  stop(key: string): Promise<void>
+  /** End this turn, keep the session. Distinct from stop(), which ends the run. */
+  interrupt(key: string): Promise<void>
+  clearQueue(key: string): Promise<void>
+  openWorktree(key: string): Promise<void>
+  /** Start the app in this session's worktree and open it in the browser. */
+  runWorktree(key: string): Promise<void>
+  /** `selections` is set only when the user filled in an AskUserQuestion
+   *  picker. The answer strings are built host-side; see agent/session.ts. */
+  answerPermission(
+    key: string,
+    requestId: string,
+    allow: boolean,
+    selections?: Record<string, string[]>,
+  ): void
+  refreshReview(key: string): Promise<void>
+  openDiff(key: string, file: string): Promise<void>
+  openTestLink(key: string, kind: string, target: string): Promise<void>
+  commitWorktree(key: string): Promise<void>
+  mergeWorktree(key: string): Promise<void>
+  archive(key: string, archived: boolean): Promise<void>
+  remove(key: string): Promise<void>
+  rename(key: string, title: string): Promise<void>
+  /** The user opened or closed a collapsible section. Remembered so it stays
+   *  that way — including across closing and reopening the board. */
+  setDisclosure(key: string, open: boolean): void
+  setComposer(patch: { model?: string; effort?: string; thinking?: string; permissionMode?: string; forKey?: string }): void
+  toggleArchived(): void
+  /** Give the board the whole window, or hand it back. */
+  toggleFocus(): Promise<void>
+  /** Open the full board in the editor area. */
+  openBoard(): Promise<void>
+  /** Close it and put the panels back. */
+  closeBoard(): Promise<void>
+  /** Open the board on one session's transcript. */
+  openSession(key: string): Promise<void>
+  /** Ask for a prompt, then start a session. */
+  newSessionPrompt(): Promise<void>
+}
+
+/** Shared message plumbing for both the sidebar view and the editor panel. */
+function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<void>): vscode.Disposable {
+  return webview.onDidReceiveMessage(async (msg: Record<string, unknown>) => {
+    try {
+      const id = () => String(msg.id ?? '')
+      switch (msg.type) {
+        case 'ready': await refresh(); break
+        case 'init': await host.init(); break
+        case 'openFolder': await host.openFolder(); break
+        case 'setMode': host.setMode(msg.mode === 'chat' ? 'chat' : 'kanban'); refresh(); break
+        case 'select': host.select(msg.id ? String(msg.id) : undefined); await refresh(); break
+        case 'newSession':
+          await host.newSession(String(msg.text ?? ''), readImages(msg.images))
+          break
+        case 'send':
+          await host.sendMessage(id(), String(msg.text ?? ''), readImages(msg.images))
+          break
+        case 'move': await host.move(id(), String(msg.phase)); break
+        case 'stop': await host.stop(id()); break
+        case 'interrupt': await host.interrupt(id()); await refresh(); break
+        case 'clearQueue': await host.clearQueue(id()); await refresh(); break
+        case 'openWorktree': await host.openWorktree(id()); break
+        case 'run': await host.runWorktree(id()); break
+        case 'review': await host.refreshReview(id()); await refresh(); break
+        case 'diff': await host.openDiff(id(), String(msg.file ?? '')); break
+        case 'testLink':
+          await host.openTestLink(id(), String(msg.kind ?? ''), String(msg.target ?? ''))
+          break
+        case 'commit': await host.commitWorktree(id()); await refresh(); break
+        case 'merge': await host.mergeWorktree(id()); await refresh(); break
+        case 'archive': await host.archive(id(), msg.archived !== false); break
+        case 'remove': await host.remove(id()); break
+        case 'rename': await host.rename(id(), String(msg.title ?? '')); break
+        case 'disclosure':
+          host.setDisclosure(String(msg.key ?? ''), msg.open !== false)
+          break
+        case 'composer':
+          host.setComposer({
+            ...(msg.model ? { model: String(msg.model) } : {}),
+            ...(msg.effort ? { effort: String(msg.effort) } : {}),
+            ...(msg.thinking ? { thinking: String(msg.thinking) } : {}),
+            ...(msg.permissionMode ? { permissionMode: String(msg.permissionMode) } : {}),
+            ...(msg.id ? { forKey: id() } : {}),
+          })
+          refresh()
+          break
+        case 'toggleArchived': host.toggleArchived(); await refresh(); break
+        case 'focus': await host.toggleFocus(); await refresh(); break
+        case 'openBoard': await host.openBoard(); break
+        case 'closeBoard': await host.closeBoard(); break
+        case 'openSession': await host.openSession(id()); await refresh(); break
+        case 'newSessionPrompt': await host.newSessionPrompt(); break
+        case 'permission':
+          host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))
+          break
+      }
+    } catch (e) {
+      vscode.window.showErrorMessage(`Agents Kanban: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  })
+}
+
+function html(webview: vscode.Webview, extensionUri: vscode.Uri, layout: 'board' | 'control' = 'board'): string {
+  const uri = (f: string) => webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', f))
+  const nonce = nonceString()
+  return `<!DOCTYPE html>
+<html lang="en" data-layout="${layout}">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}'; img-src ${webview.cspSource} data:;">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="${uri('board.css')}" rel="stylesheet">
+<title>Agents Kanban</title>
+</head>
+<body>
+<div id="root"></div>
+<script nonce="${nonce}" src="${uri('board.js')}"></script>
+</body>
+</html>`
+}
+
+/**
+ * The side bar view: a control, deliberately not a board.
+ *
+ * Its real job is the TOGGLE. Clicking the activity-bar icon shows it, clicking
+ * it again collapses the side bar and hides it — and those two events are what
+ * open and close the board. That works only because nothing here closes the side
+ * bar itself; a view we hid could never report being switched away from, which
+ * is the trap every earlier version fell into.
+ */
+export class BoardViewProvider implements vscode.WebviewViewProvider {
+  static readonly viewType = 'agentsKanban.board'
+
+  private readonly extensionUri: vscode.Uri
+  private readonly host: BoardHost
+  private readonly disposables: vscode.Disposable[] = []
+  private view?: vscode.WebviewView
+  private readonly onVisibility?: (visible: boolean) => void
+
+  constructor(extensionUri: vscode.Uri, host: BoardHost, onVisibility?: (visible: boolean) => void) {
+    this.extensionUri = extensionUri
+    this.host = host
+    this.onVisibility = onVisibility
+  }
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
+    }
+    view.webview.html = html(view.webview, this.extensionUri, 'control')
+    this.disposables.push(wire(view.webview, this.host, () => this.refresh()))
+    view.onDidChangeVisibility(() => {
+      if (view.visible) void this.refresh()
+      this.onVisibility?.(view.visible)
+    })
+    view.onDidDispose(() => { for (const d of this.disposables.splice(0)) d.dispose() })
+  }
+
+  async refresh(): Promise<void> {
+    // No visibility guard: posting to a hidden webview is harmless, and an early
+    // return here is how the view ends up blank when the state message is the
+    // only thing that ever paints it.
+    if (!this.view) return
+    await this.post(await this.host.getState())
+  }
+
+  /** Paint a state someone else has already computed.
+   *
+   *  Both surfaces used to call `getState()` for themselves, so every repaint
+   *  did the work twice — and `getState()` reads Claude Code's whole session
+   *  index. One state, two views. */
+  async post(state: UiState): Promise<void> {
+    if (!this.view) return
+    await this.view.webview.postMessage({ type: 'state', state })
+  }
+}
+
+/** The editor-area panel. This is the main surface. */
+export class BoardPanel {
+  private static current?: BoardPanel
+  /** Set by the host: the board has actually closed, so put the layout back. */
+  static onClosed?: () => void
+  /** Set by the host: the user clicked away from the board. */
+  static onLeft?: () => void
+
+  private readonly panel: vscode.WebviewPanel
+  private readonly host: BoardHost
+  private readonly disposables: vscode.Disposable[] = []
+
+  static show(extensionUri: vscode.Uri, host: BoardHost, column?: vscode.ViewColumn): BoardPanel {
+    if (BoardPanel.current) {
+      BoardPanel.current.panel.reveal(column ?? vscode.ViewColumn.Active)
+      void BoardPanel.current.refresh()
+      return BoardPanel.current
+    }
+    const panel = vscode.window.createWebviewPanel(
+      'agentsKanban.panel',
+      'Agents Kanban',
+      column ?? vscode.ViewColumn.Active,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')],
+      },
+    )
+    panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'board.svg')
+    BoardPanel.current = new BoardPanel(panel, extensionUri, host)
+    return BoardPanel.current
+  }
+
+  static get isOpen(): boolean { return BoardPanel.current !== undefined }
+
+  /** Is the board actually on screen right now? A `visible: false` event that
+   *  arrives while it still is was a transient reshuffle, not the user leaving. */
+  static get isVisible(): boolean { return BoardPanel.current?.panel.visible === true }
+
+  /** Close the board outright. The board is a mode, not a document: leaving it
+   *  should not park it in the editor area where your code belongs. */
+  static close(): void {
+    const open = BoardPanel.current
+    // Cleared first, so the dispose it triggers does not come back round here.
+    BoardPanel.current = undefined
+    open?.panel.dispose()
+  }
+  static refreshCurrent(onError?: (e: unknown) => void): void {
+    BoardPanel.current?.refresh().catch((e) => onError?.(e))
+  }
+
+  /** Paint a state the caller already has. See BoardViewProvider.post(). */
+  static postCurrent(state: UiState): Promise<void> {
+    return BoardPanel.current?.post(state) ?? Promise.resolve()
+  }
+
+  private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, host: BoardHost) {
+    this.panel = panel
+    this.host = host
+    panel.webview.html = html(panel.webview, extensionUri)
+    this.disposables.push(wire(panel.webview, host, () => this.refresh()))
+    panel.onDidChangeViewState(() => {
+      if (panel.visible) { void this.refresh(); return }
+      // Clicking away — a file, another tab — closes the board, the same as the
+      // icon or the X. Guarded by the host, because closing three things at once
+      // reshuffles focus and the webview reports `visible: false` while that
+      // settles, which once closed the board immediately after opening it.
+      BoardPanel.onLeft?.()
+    }, null, this.disposables)
+    panel.onDidDispose(() => this.dispose(), null, this.disposables)
+  }
+
+  async refresh(): Promise<void> {
+    await this.post(await this.host.getState())
+  }
+
+  async post(state: UiState): Promise<void> {
+    await this.panel.webview.postMessage({ type: 'state', state })
+  }
+
+  private dispose(): void {
+    // Cleared before onLeave, so a host that responds by closing the board finds
+    // nothing left to close rather than recursing.
+    BoardPanel.current = undefined
+    for (const d of this.disposables.splice(0)) d.dispose()
+    this.panel.dispose()
+    BoardPanel.onClosed?.()
+  }
+}
+
+/**
+ * Attachments as they arrive from the webview.
+ *
+ * Shaped here rather than trusted: the webview is another program by the time
+ * this runs, and this data is about to be embedded in a message to a child
+ * process. `sanitiseImages` does the format and size checks; this only gets it
+ * into the right shape to be checked.
+ */
+export function readImages(raw: unknown): AttachedImage[] {
+  if (!Array.isArray(raw)) return []
+  const out: AttachedImage[] = []
+  for (const item of raw.slice(0, 32)) {
+    if (!item || typeof item !== 'object') continue
+    const o = item as Record<string, unknown>
+    if (typeof o.data !== 'string' || typeof o.mediaType !== 'string') continue
+    out.push({
+      name: typeof o.name === 'string' ? o.name : 'image',
+      mediaType: o.mediaType,
+      data: o.data,
+    })
+  }
+  return out
+}
+
+/** Narrow a `selections` payload posted by the webview.
+ *
+ * Checked rather than cast, because it decides what the agent is told the user
+ * chose. Only arrays of non-blank strings survive; `undefined` when there is
+ * nothing usable, so the session passes the original input straight through.
+ * The selections are turned into answer strings host-side, against the tool's
+ * own questions — see AgentSession.inputWith. */
+function selectionsOf(raw: unknown): Record<string, string[]> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const out: Record<string, string[]> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(v)) continue
+    const vals = v.filter((x): x is string => typeof x === 'string' && !!x.trim())
+    if (vals.length) out[k] = vals
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+export function summarise(toolName: string, input: Record<string, unknown>): string {
+  const name = toolName.replace(/^mcp__[^_]+__/, '')
+  const detail =
+    (typeof input.command === 'string' && input.command) ||
+    (typeof input.file_path === 'string' && input.file_path) ||
+    (typeof input.path === 'string' && input.path) ||
+    (typeof input.url === 'string' && input.url) ||
+    ''
+  return detail ? `${name} — ${String(detail).slice(0, 200)}` : name
+}
+
+function nonceString(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  let out = ''
+  for (let i = 0; i < 32; i++) out += chars[Math.floor(Math.random() * chars.length)]
+  return out
+}
+
+/** Map a live agent onto the card shape the UI renders. */
+export function toUiAgent(a: RunningAgent): NonNullable<UiCard['agent']> {
+  const s = a.state
+  return {
+    kind: s.kind,
+    ...(s.kind === 'working' && s.tool ? { tool: s.tool } : {}),
+    ...(s.kind === 'working' && s.subagent ? { subagent: s.subagent } : {}),
+    ...(s.kind === 'error' ? { message: s.message } : {}),
+    ...(a.lastEventAt ? { lastEventAt: a.lastEventAt } : {}),
+    ...(a.costUsd !== undefined ? { costUsd: a.costUsd } : {}),
+    contextTokens: a.contextTokens,
+    ...(a.contextWindow !== undefined ? { contextWindow: a.contextWindow } : {}),
+    ...(a.pendingPermission
+      ? {
+          pendingPermission: {
+            id: a.pendingPermission.id,
+            summary: summarise(a.pendingPermission.toolName, a.pendingPermission.input),
+            ...(() => {
+              const questions = parseAskQuestions(
+                a.pendingPermission.toolName,
+                a.pendingPermission.input,
+              )
+              return questions ? { questions } : {}
+            })(),
+          },
+        }
+      : {}),
+  }
+}

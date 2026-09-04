@@ -1,0 +1,241 @@
+/* Exercises the store against Claude Code's REAL session data. This is the
+   assumption the whole rewrite rests on, so it is checked against disk rather
+   than a mock. */
+import { promises as fs } from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import { MetaStore } from '../meta.ts'
+import { SessionStore, summariseTool } from '../store.ts'
+
+let fails = 0
+const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
+
+const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-sess-'))
+const repo = process.cwd()
+const store = new SessionStore(repo, new MetaStore(tmp, repo))
+
+const list = await store.list()
+ok(Array.isArray(list), 'list() returns sessions from Claude Code without throwing')
+console.log(`      (${list.length} real session(s) found for ${repo})`)
+
+if (list.length) {
+  const first = list[0]!
+  ok(typeof first.id === 'string' && first.id.length > 8, 'session has a real id')
+  ok(typeof first.title === 'string' && first.title.length > 0, `title resolved: ${JSON.stringify(first.title.slice(0, 40))}`)
+  ok(first.phase === 'planning', 'a session with no metadata gets the default phase')
+  ok(first.tags.length === 0, 'and no tags until we add some')
+
+  // our metadata attaches to Claude Code's session without touching it
+  await store.setPhase(first.id, 'implementing')
+  await store.setTags(first.id, ['auth', 'ui'])
+  const after = await store.get(first.id)
+  ok(after?.phase === 'implementing', 'phase attaches to a real session')
+  ok(after?.tags.join(',') === 'auth,ui', 'multiple tags attach to a real session')
+
+  // archive hides from the board but keeps the session
+  await store.archive(first.id, true)
+  ok(!(await store.list()).some((x) => x.id === first.id), 'archived session leaves the board')
+  ok((await store.list({ includeArchived: true })).some((x) => x.id === first.id), 'but is still there when asked for')
+  await store.archive(first.id, false)
+  ok((await store.list()).some((x) => x.id === first.id), 'unarchive brings it straight back')
+
+  // transcript comes from Claude Code's JSONL
+  const t = await store.transcript(first.id, 40)
+  ok(Array.isArray(t), 'transcript reads from Claude Code without throwing')
+  console.log(`      (${t.length} entries; kinds: ${[...new Set(t.map((e) => e.kind))].join(', ') || 'none'})`)
+  if (t.length) {
+    ok(t.every((e) => typeof e.kind === 'string'), 'every entry is a tagged union member')
+    const tools = t.filter((e) => e.kind === 'tool')
+    ok(tools.every((e) => e.kind === 'tool' && ['running', 'ok', 'error'].includes(e.status)),
+       `tool entries carry a resolved status (${tools.length} tool rows)`)
+  }
+}
+
+// --- what it cost, and how full its context was ------------------------------
+//
+// The numbers that used to exist ONLY inside a live run. Against real session
+// data, because the whole point is that they are read back off disk after the
+// process that produced them is gone.
+if (list.length) {
+  const id = list[0]!.id
+  const u = await store.usage(id)
+  ok(u.responses > 0, `usage() finds API responses in a real transcript (${u.responses})`)
+  ok(u.costUsd > 0, `and prices them: $${u.costUsd.toFixed(4)} over ${u.responses} responses`)
+  ok(u.priced, `every model in a real session has a published rate${u.priced ? '' : ' — MISSING: ' + u.unpriced.join(', ')}`)
+  ok(u.contextTokens > 0, `context fill read back from disk: ${u.contextTokens} tokens`)
+  ok(!!u.contextWindow && u.contextTokens < u.contextWindow,
+     `and it fits in the window it is measured against (${u.contextTokens}/${u.contextWindow})`)
+  console.log(`      (model ${u.model}; in ${u.input} out ${u.output} cache w${u.cacheWrite} r${u.cacheRead})`)
+
+  // Deduplication, on real data, against the RAW frames rather than the
+  // rendered transcript: the transcript is windowed to the newest messages
+  // while usage totals the whole file, so counting entries compares two
+  // different populations — which is exactly how the first version of this
+  // assertion passed for months and then went red as the session grew.
+  const { getSessionMessages } = await import('../../agent/sdk.ts').then((m) => m.loadSdk())
+  const raw = await getSessionMessages(id)
+  const frames = raw.filter((m) => m.type === 'assistant' &&
+    !!(m.message as { usage?: unknown } | undefined)?.usage)
+  const ids = new Set(frames.map((m) => (m.message as { id?: string }).id).filter(Boolean))
+  ok(u.responses <= frames.length,
+     `responses (${u.responses}) never exceed the frames that carried them (${frames.length})`)
+  ok(u.responses === ids.size,
+     `and equal the number of distinct response ids (${u.responses} vs ${ids.size})`)
+  if (frames.length > ids.size) {
+    ok(u.responses < frames.length,
+       `a real streamed session has repeat frames, and they are NOT billed twice ` +
+       `(${frames.length} frames, ${ids.size} responses — ${(frames.length / ids.size).toFixed(1)}x)`)
+  }
+
+  // Usage is totalled over the whole file, so it cannot depend on the window
+  // the chat view renders.
+  ok((await store.usage(id)).responses === u.responses,
+     'usage is unchanged by the transcript window — it totals the whole session')
+}
+
+// --- the transcript window keeps the NEWEST messages -------------------------
+//
+// The SDK's own `limit` takes the FIRST n, not the last — verified against a
+// 425-message session, where `{limit: 400}` returned the first 400 and silently
+// dropped the 25 most recent: the ones anyone opening a transcript came for. So
+// the read is unbounded and the window is applied to the tail.
+//
+// Deliberately NOT on list[0]. That is the most recently touched session, which
+// on a machine running Claude Code is very often being written to right now —
+// two reads of a growing file legitimately disagree, and the assertion would
+// flake for a reason that has nothing to do with what it tests.
+const settled = list.filter((x) => Date.now() - x.updated > 120_000)
+if (settled.length) {
+  const id = settled[0]!.id
+  const full = await store.transcript(id)
+  const tail = await store.transcript(id, 3)
+  ok(tail.length <= 3, `a limit bounds the transcript (${tail.length} of ${full.length} entries)`)
+  if (full.length > 3) {
+    // Compared on CONTENT, not by deep equality: a rehydrated entry's `at` is
+    // stamped when it was parsed, so two reads of the same message differ by
+    // however many milliseconds apart they happened.
+    const shape = (es: typeof full) => es.map((e) =>
+      e.kind + '|' + ('text' in e ? e.text : 'summary' in e ? e.summary : '')).join('\n')
+    ok(shape(tail) === shape(full.slice(full.length - tail.length)),
+       'and it keeps the LAST entries, not the first — the newest work is what is shown')
+  }
+} else {
+  console.log('      (no settled session to check the transcript window against)')
+}
+
+// an unknown session must return empty, not throw
+ok((await store.transcript('00000000-0000-0000-0000-000000000000')).length === 0, 'unknown session yields an empty transcript')
+const noUsage = await store.usage('00000000-0000-0000-0000-000000000000')
+ok(noUsage.costUsd === 0 && noUsage.responses === 0, 'and an unknown session costs nothing rather than throwing')
+ok((await store.get('nope')) === undefined, 'unknown session id returns undefined')
+
+// --- what a tool row actually says -------------------------------------------
+//
+// Reported as "I literally can't tell from the UI what the agent is doing",
+// with a screenshot of four rows: a raw `mcp__claude_ai_Atlassian__getJiraIssue`
+// with no arguments, a bare `ToolSearch`, and a `Read` whose 70-character
+// worktree prefix pushed the filename off the end of the row.
+ok(summariseTool('Bash', { command: 'git status' }) === 'Bash  git status', 'tool summary shows the command')
+
+// The old prefix strip was `^mcp__[^_]+__`, which requires a server name with
+// no underscore in it — so every real MCP server defeated it and the whole
+// mangled identifier was printed.
+const jira = summariseTool('mcp__claude_ai_Atlassian__getJiraIssue', { issueIdOrKey: 'ACME-184' })
+ok(!jira.includes('mcp__'), `an MCP server with underscores still gets stripped: ${jira}`)
+ok(jira.includes('getJiraIssue'), 'the tool name survives')
+ok(jira.includes('Atlassian'), 'and says which server it is')
+ok(jira.includes('ACME-184'), 'and WHICH ISSUE — the point of the row')
+
+// A tool whose argument key is not one we listed must still say something.
+const unknown = summariseTool('mcp__thing__do_it', { somethingNew: 'the-target' })
+ok(unknown.includes('the-target'), `an unlisted argument key still yields a detail: ${unknown}`)
+
+// A server name with no capitalised segment is its own name, not its last word.
+ok(summariseTool('mcp__some_server__go', {}).startsWith('some_server · go'),
+   'a lowercase server name is not truncated to its last segment')
+ok(summariseTool('mcp__board__set_phase', { phase: 'implementing' }).includes('set_phase'),
+   'the board tools still read as themselves')
+
+// Absolute paths lose the part that is identical on every row.
+const read = summariseTool('Read', {
+  file_path: '/home/dev/Projects/app_worktrees/S1abc123-add-search/.claude/knowledge/_domain-map.md',
+})
+ok(!read.includes('/home/dev'), `an absolute path loses its worktree prefix: ${read}`)
+ok(read.includes('_domain-map.md'), 'and keeps the filename')
+ok(summariseTool('Read', { file_path: 'src/a.ts' }) === 'Read  src/a.ts',
+   'a short relative path is left exactly as it is')
+
+// --- rename survives the session-file race -----------------------------------
+//
+// The id arrives on the `init` message; the file it names is written a moment
+// later. Renaming immediately reported "Session <id> not found in any project
+// directory" as a popup, on every single new session.
+const { retryWhileMissing } = await import('../store.ts')
+let calls = 0
+const slept: number[] = []
+const eventually = await retryWhileMissing(async () => {
+  calls++
+  if (calls < 3) throw new Error(`Session abc not found in any project directory`)
+  return 'renamed'
+}, { sleep: async (ms) => { slept.push(ms) } })
+ok(eventually === 'renamed', `a "not found" is waited out, not reported (${calls} attempts)`)
+ok(slept.length === 2 && slept[0] === 100 && slept[1] === 200, `it backs off: ${slept.join(', ')}ms`)
+
+let otherCalls = 0
+const other = await retryWhileMissing(async () => {
+  otherCalls++
+  throw new Error('permission denied')
+}, { sleep: async () => {} }).then(() => 'resolved', (e: Error) => e.message)
+ok(other === 'permission denied', 'any OTHER error is reported at once')
+ok(otherCalls === 1, `and not retried (${otherCalls} attempt)`)
+
+const givesUp = await retryWhileMissing(
+  async () => { throw new Error('not found') },
+  { attempts: 3, sleep: async () => {} },
+).then(() => 'resolved', (e: Error) => e.message)
+ok(givesUp === 'not found', 'a session that never appears is still reported in the end')
+
+await fs.rm(tmp, { recursive: true, force: true })
+// An agent's session is filed under its WORKTREE, not under the workspace root,
+// because that is the cwd it runs with. Reading it back must therefore not be
+// scoped to the workspace directory — a session id is globally unique and the
+// SDK searches every project when `dir` is omitted.
+//
+// This was wrong: transcript() passed `dir: workspaceRoot`, so it returned an
+// empty transcript for exactly the agent sessions the board exists to show, and
+// the chat view looked like a session that had never said anything.
+if (list.length) {
+  const id = list[0]!.id
+  const fromHere = await store.transcript(id)
+  // A store rooted somewhere with no sessions of its own must still find it.
+  const elsewhere = new SessionStore(
+    path.join(tmp, 'a-directory-with-no-sessions'),
+    new MetaStore(tmp, 'other'),
+  )
+  const fromElsewhere = await elsewhere.transcript(id)
+  ok(fromElsewhere.length === fromHere.length,
+     `a session reads back the same from any workspace root (${fromElsewhere.length} vs ${fromHere.length} entries)`)
+  if (fromHere.length) ok(fromElsewhere.length > 0, 'and is not silently empty — the bug this guards')
+}
+
+// --- delete reports whether it actually deleted -------------------------------
+//
+// This used to be `catch {}` returning void, so "Delete permanently" claimed the
+// transcript was gone from Claude Code with no way of knowing. It can genuinely
+// fail: delete a session another Claude Code window has OPEN and that window
+// writes its state back out afterwards, leaving a stub that still shows in its
+// history. The card left the board, the dialog said done, the session was there.
+//
+// Deleting a real session here would destroy the user's data, so this checks the
+// contract on an id that does not exist — which is enough to catch a return to
+// `Promise<void>` or a swallowed result.
+const ghost = `ck-no-such-session-${Date.now()}`
+const outcome = await store.delete(ghost)
+ok(outcome !== undefined && typeof outcome === 'object',
+   'delete() reports an outcome rather than returning void')
+ok(typeof outcome.deleted === 'boolean', 'the outcome says whether it deleted')
+ok(outcome.deleted === true, 'an id that is not there counts as deleted, with no reason attached')
+ok(outcome.reason === undefined, 'and no spurious warning to show the user')
+
+console.log(fails === 0 ? 'PASS — the board reads Claude Code\'s real sessions' : `${fails} FAILURES`)
+process.exit(fails === 0 ? 0 : 1)

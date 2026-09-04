@@ -1,0 +1,233 @@
+{
+  "name": "agents-kanban",
+  "displayName": "Agents Kanban",
+  "description": "A kanban board your coding agents run themselves — each task in its own git worktree. Powered by Claude Code.",
+  "version": "0.0.1",
+  "publisher": "Smile1294",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=22.6.0"
+  },
+  "categories": [
+    "AI",
+    "SCM Providers",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentsKanban",
+          "title": "Agents Kanban",
+          "icon": "media/board.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentsKanban": [
+        {
+          "type": "webview",
+          "id": "agentsKanban.board",
+          "name": "Board"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentsKanban.openBoard",
+        "title": "Agents Kanban: Open Board",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "agentsKanban.init",
+        "title": "Agents Kanban: Initialise Board In This Repo",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "agentsKanban.stopTask",
+        "title": "Agents Kanban: Stop Agent"
+      },
+      {
+        "command": "agentsKanban.openWorktree",
+        "title": "Agents Kanban: Open Session Worktree"
+      },
+      {
+        "command": "agentsKanban.newSession",
+        "title": "Agents Kanban: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentsKanban.archiveSession",
+        "title": "Agents Kanban: Archive Session",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "agentsKanban.deleteSession",
+        "title": "Agents Kanban: Delete Session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentsKanban.toggleFocus",
+        "title": "Agents Kanban: Toggle Full-Window Board",
+        "icon": "$(screen-full)"
+      }
+    ],
+    "configuration": {
+      "title": "Agents Kanban",
+      "properties": {
+        "agentsKanban.worktreeRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Where to create worktrees. Empty means a sibling directory named <repo>_worktrees."
+        },
+        "agentsKanban.focusMode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "wide",
+            "zen"
+          ],
+          "enumDescriptions": [
+            "Never change your layout.",
+            "Hide the panel and the secondary side bar while the board is in front, and restore them when you switch away.",
+            "Use VS Code's Zen Mode, which also hides the activity and status bars."
+          ],
+          "default": "wide",
+          "description": "How much of the window the board takes while it is in front. The primary side bar is never touched — it is how you get back."
+        },
+        "agentsKanban.sideBarHome": {
+          "type": "string",
+          "default": "workbench.view.explorer",
+          "description": "Which view the left side bar is handed back to after you press the Kanban icon. VS Code answers a click on an activity-bar icon by showing that extension's view, and offers no way to decline; this is what puts yours back. Any 'workbench.view.*' command id works — workbench.view.explorer, workbench.view.scm, workbench.view.search, workbench.view.extension.<id>. Leave it empty to let the side bar stay on the Kanban control instead."
+        },
+        "agentsKanban.closeOnClickAway": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close the board when you click away from it — open a file, switch to another tab — putting the terminal and the right-hand chat back. Turn this off to make the board a pure toggle that only the icon, Ctrl+Alt+K or its tab's X can close, which is what you want if you like to glance at a file and come straight back."
+        },
+        "agentsKanban.model": {
+          "type": "string",
+          "default": "claude-opus-5",
+          "description": "Model for agent sessions."
+        },
+        "agentsKanban.maxConcurrentAgents": {
+          "type": "number",
+          "default": 3,
+          "description": "How many agent sessions may run at once."
+        },
+        "agentsKanban.permissionMode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "acceptEdits",
+            "bypassPermissions",
+            "plan",
+            "dontAsk",
+            "auto"
+          ],
+          "default": "acceptEdits",
+          "description": "Permission mode for agent sessions. Agents run in isolated worktrees, so acceptEdits is a reasonable default."
+        },
+        "agentsKanban.notifyOnReview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a notification when an agent moves its card into a review column — its way of saying the work is ready for you to test."
+        },
+        "agentsKanban.claudeExecutable": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `claude` executable. Leave empty to auto-detect (PATH, then the usual install locations)."
+        },
+        "agentsKanban.statusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an Agents Kanban item in the status bar. A second way in, alongside the activity-bar icon and Ctrl+Alt+K, and the one that shows how many agents are running."
+        },
+        "agentsKanban.runCommand": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Shell command that starts the app, run inside the session's worktree. Leave empty to detect it — a per-worktree launcher (`wt`) is preferred, then Laravel, then a `package.json` script. `${worktree}` is replaced with the worktree's path."
+        },
+        "agentsKanban.runUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "URL to open once `agentsKanban.runCommand` is serving, e.g. `http://localhost:3000`. Leave empty to use the port the detected launcher assigned. Only used alongside a custom `runCommand`."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentsKanban.openBoard",
+          "when": "view == agentsKanban.board",
+          "group": "navigation"
+        },
+        {
+          "command": "agentsKanban.newSession",
+          "when": "view == agentsKanban.board",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "agentsKanban.openBoard",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node scripts/preflight.mjs && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "node scripts/run-bin.mjs typescript tsc --noEmit",
+    "test": "node scripts/test.mjs",
+    "package": "node scripts/run-bin.mjs @vscode/vsce vsce package",
+    "smoke": "node smoke.mjs",
+    "verify": "node scripts/preflight.mjs && npm run typecheck && npm run build && npm run test && npm run smoke",
+    "verify:package": "node scripts/preflight.mjs && npm run build && node test/package.test.mjs",
+    "screenshots": "node test/screenshots.mjs",
+    "install-local": "node scripts/install-local.mjs",
+    "preflight": "node scripts/preflight.mjs --verbose",
+    "icon": "node scripts/make-icon.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.259",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.24.0",
+    "playwright": "^1.49.1",
+    "typescript": "^5.7.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Smile1294/Agents-Kanban.git"
+  },
+  "icon": "media/icon.png",
+  "keywords": [
+    "kanban",
+    "agent",
+    "claude",
+    "worktree",
+    "ai",
+    "board",
+    "automation"
+  ],
+  "galleryBanner": {
+    "color": "#1f2430",
+    "theme": "dark"
+  },
+  "bugs": {
+    "url": "https://github.com/Smile1294/Agents-Kanban/issues"
+  },
+  "homepage": "https://github.com/Smile1294/Agents-Kanban#readme"
+}

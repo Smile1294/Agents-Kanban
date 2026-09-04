@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  // Every task runs through scripts/with-node.sh, which finds a Node 22.6+ and
+  // puts it on PATH before running npm.
+  //
+  // Not belt-and-braces: VS Code runs tasks in a NON-INTERACTIVE shell, and
+  // nvm/fnm/asdf install themselves in ~/.bashrc, which returns early for
+  // exactly that kind of shell. Whether F5 worked therefore depended on how
+  // VS Code itself was started — from a terminal it inherited a good PATH, from
+  // the desktop or the dock it did not, and F5 died with `npm: command not
+  // found` before the extension host was ever asked to start. Same checkout,
+  // same code, different launcher.
+  "tasks": [
+    {
+      // What F5 waits for. Finds node, then installs dependencies on a fresh
+      // clone rather than failing with "tsc: not found".
+      "label": "verify",
+      "type": "shell",
+      "command": "./scripts/with-node.sh npm run verify",
+      "windows": { "command": "npm run verify" },
+      "problemMatcher": ["$tsc", "$esbuild"],
+      "group": { "kind": "build", "isDefault": true },
+      "detail": "find node, install if needed, typecheck, tests, build, launch gates (~6s once installed)",
+      // `silent` still reveals the terminal when the task exits non-zero, which
+      // is the only time there is anything to read.
+      "presentation": { "reveal": "silent", "revealProblems": "onProblem", "clear": true }
+    },
+    {
+      "label": "preflight",
+      "type": "shell",
+      "command": "./scripts/with-node.sh npm run preflight",
+      "windows": { "command": "npm run preflight" },
+      "problemMatcher": [],
+      "detail": "check Node version and dependencies, installing them if missing"
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "./scripts/with-node.sh npm run build",
+      "windows": { "command": "npm run build" },
+      "problemMatcher": "$esbuild"
+    },
+    {
+      "label": "watch",
+      "type": "shell",
+      "command": "./scripts/with-node.sh npm run watch",
+      "windows": { "command": "npm run watch" },
+      "problemMatcher": "$esbuild",
+      "isBackground": true
+    }
+  ]
+}

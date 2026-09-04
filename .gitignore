@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-test/
+*.vsix
+.DS_Store
+
+# v1 wrote board state here. Sessions now come from Claude Code; nothing
+# belongs in the repo.
+.kanban/

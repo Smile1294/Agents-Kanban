@@ -1,0 +1,33 @@
+.vscode/**
+.github/**
+src/**
+test/**
+node_modules/.bin/**
+esbuild.mjs
+smoke.mjs
+tsconfig.json
+.gitignore
+# Screenshots are for the repo, not for the installed extension — the
+# Marketplace listing pulls them from GitHub by absolute URL instead.
+docs/screenshots/**
+
+# Development documentation. Useful in the repo, ~150KB on every user's disk if
+# it ships. README.md and LICENSE are added by vsce regardless of this file.
+docs/**
+CLAUDE.md
+PLAN.md
+**/*.map
+**/*.ts
+**/*.vsix
+
+# The Agent SDK ships a ~190MB native binary per platform. We use the Claude Code
+# CLI already on the machine instead (see resolveClaudeExecutable), which keeps
+# the extension small and lets the CLI update on its own schedule.
+node_modules/@anthropic-ai/claude-agent-sdk-*/**
+
+# vsce pulls in dev dependencies' trees; none of these are needed at runtime.
+node_modules/@vscode/**
+node_modules/typescript/**
+node_modules/esbuild/**
+node_modules/@esbuild/**
+node_modules/@types/**

@@ -1,0 +1,248 @@
+# Agents Kanban
+
+A VS Code extension: a kanban board that Claude agents run themselves, each
+session in its own git worktree. Modelled on
+[Nimbalyst](https://github.com/nimbalyst/nimbalyst).
+
+**Read [PLAN.md](PLAN.md) first.** It carries the architecture, the message
+stream reference, current state, and what to build next.
+
+## Where things are documented
+
+| Question | File |
+|---|---|
+| How does this work, what's next? | [PLAN.md](PLAN.md) |
+| How does Nimbalyst do X? | [docs/NIMBALYST.md](docs/NIMBALYST.md) — don't re-clone the repo, it's already been analysed |
+| What's the real Agent SDK API? | [docs/SDK-NOTES.md](docs/SDK-NOTES.md) — **the public docs are wrong in places** |
+| Why is it built this way? | [docs/DECISIONS.md](docs/DECISIONS.md) — decisions and bug postmortems |
+| How do I run it? | [README.md](README.md) |
+
+## Commands
+
+**Node 22.6+** — the tests run through `node --experimental-strip-types`. Every
+script starts with `scripts/preflight.mjs`, which checks that, installs
+dependencies when `node_modules` is missing, and names the fix when it is only
+partial. Never add a script that skips it.
+
+```bash
+npm run verify         # preflight → typecheck → build → tests → launch gates. Run before committing.
+npm run verify:package # package a .vsix and check what is inside it. Run before installing.
+npm run watch          # rebuild on change
+npm run install-local  # package and install into VS Code (reload the window after)
+npm run screenshots    # render the real view in headless Chromium -> docs/screenshots
+```
+
+Press <kbd>F5</kbd> for an Extension Development Host. It runs `verify` first —
+including the install, so F5 works on a fresh clone —
+(about six seconds) rather than only building, because building alone will
+happily launch an extension whose manifest and code disagree — which is exactly
+the "I pressed F5 and nothing worked" failure. Use **Run Extension (skip
+checks)** when the gates are what you are changing.
+
+Every task goes through `scripts/with-node.sh`, which finds a Node 22.6+ and puts
+it on PATH. VS Code runs tasks in a non-interactive shell and nvm/fnm/asdf live
+in `~/.bashrc`, which returns early for exactly that kind of shell — so without
+it, F5 works or fails depending on whether VS Code was started from a terminal or
+from the desktop. Add a task, route it through the script.
+
+**Open a git repository** — the board renders without one, but agents cannot
+run, since each session needs a worktree.
+
+## The two ideas everything rests on
+
+1. **A card and a session are the same thing at two zoom levels.** Kanban shows
+   every session by phase; chat shows one transcript. Switching never changes
+   what exists.
+2. **A session's column *is* its `phase`.** No move operation, no reorder tool.
+   Writing `phase` is the move.
+
+## Rules for changing this codebase
+
+- **Nothing goes in the user's repository.** Sessions and transcripts belong to
+  Claude Code (`~/.claude/projects/`); phase, tags and worktree mapping go to a
+  sidecar in extension storage. v1 wrote `.kanban/*.md` into the working tree and
+  every agent turn produced a git diff. Do not reintroduce this.
+- **The left side bar is not ours.** No command in this extension may open,
+  close, collapse or resize it. `applyBoardFocus` takes the bottom panel and the
+  secondary side bar, and those only, because they are the two areas nothing
+  else in the window reopens behind our back mid-gesture — the property the
+  whole close-then-toggle scheme depends on. The side bar does not have it: the
+  icon click that closes the board reopens the side bar first, so a restoring
+  `toggleSidebarVisibility` closed it instead. Nine attempts; see
+  [docs/DECISIONS.md](docs/DECISIONS.md).
+- **Nothing expensive may run per streamed token.** `refreshAll()` fires on every
+  frame an agent produces. It used to do a full `getState()` — a session-index
+  scan and a transcript parse — twice over, which cost more per minute than the
+  minute contained and slowed the agent down, because the CLI's stdout is
+  drained on the same event loop. Repaints go through `board/coalesce.ts`, one
+  state serves both surfaces, and anything that cannot have changed since the
+  run started is captured once rather than re-read.
+- **Never show a signal that cannot say "bad".** A pulsing dot pulses over a
+  wedged process too. Show the number the indicator is derived from — the board
+  shows the age of the last CLI frame, which climbs when nothing is happening.
+- **A number the board shows must not depend on a process being alive.** Context
+  fill and spend both came off the live agent and nowhere else, so every session
+  went blank when its process ended — which a VS Code restart does to all of them
+  at once. Both are derived from Claude Code's transcript
+  (`sessions/usage.ts`), and the live path uses the same arithmetic so the figure
+  does not change when a run ends. Two traps, both load-bearing: a streaming
+  response is written as one assistant record per content block and **each
+  repeats the whole response's usage**, so costs deduplicate by `message.id` or
+  come out ~2.7x high; and the SDK's `getSessionMessages` `limit` takes the
+  FIRST n messages, so the window is applied to the tail instead. Spend is our
+  arithmetic over published rates, so it is checked against the CLI's
+  `total_cost_usd` every turn and says `≥` when a model has no rate.
+- **Subagent frames carry `parent_tool_use_id`.** They must never be merged into
+  the main thread (their text is not the agent's answer) and must never be
+  dropped (a Task then looks frozen for minutes). Route on it, nest under the
+  Task, collapse by default.
+- **Run the CLI on the machine, never the SDK's bundled binary.** It is excluded
+  from the .vsix, it is a Bun executable that SIGBUSes on some Linux boxes, and
+  reaching for it means a dev checkout runs a different Claude Code from the one
+  the user maintains.
+- **Assert on the layout, not on the commands.** A pair of workbench commands
+  can look symmetric and not cancel. `test/harness.mjs` models the four
+  workbench areas as state and derives webview visibility from it; test what the
+  window looks like afterwards.
+- **Keep `vscode` imports confined** to `extension.ts` and `board/panel.ts`.
+  Everything else is plain Node and unit-tested without VS Code.
+- **Never swallow a promise rejection with a bare `void`.** A broken `getState()`
+  once became a silently blank panel with no error anywhere.
+- **Registration must not depend on workspace state.** Commands and the webview
+  provider register unconditionally; an early return in `activate()` made every
+  command report "command not found".
+- **No parameter properties in constructors.** Tests run through
+  `node --experimental-strip-types`, which rejects them — they emit code, not
+  just types.
+- **An attachment goes to the model, never to a file.** A user message is an
+  Anthropic `MessageParam`, so a pasted image rides inside it as an image
+  content block (`agent/images.ts`). Nimbalyst stages attachments as files and
+  hands over paths, which needs a staging directory, a `.gitignore` entry when
+  it is inside the workspace, and a tool call to read each one back — all three
+  of which this project's "nothing goes in the user's repository" rule forbids
+  or makes pointless. Two things are load-bearing: the webview downscales to
+  1568px on the long edge before sending, because an image costs ~`w*h/750`
+  tokens and beyond that the service downscales anyway; and the transcript
+  entry keeps the COUNT, never the bytes, because that array is serialised to
+  the webview on every repaint.
+- **Starting the app is one button, and it waits for the port.** `run/recipe.ts`
+  prefers the project's own per-worktree launcher (`wt`) over anything guessed,
+  because it owns the port, the database and the session cookie — none of which
+  is inferable from a file tree — and it never returns a URL it cannot justify:
+  a plausible `localhost:8000` belonging to the main checkout shows the OLD code
+  and reads as "the change did nothing". The browser opens only once something
+  actually answers on the port.
+- **Safety boundaries go in code, not prompts.** The tool description tells the
+  agent what to do; `isHumanOnly()` makes it impossible. Both, always.
+- **A question is not a permission request.** `AskUserQuestion` arrives through
+  `canUseTool` like `Bash` does, but allowing it does not answer it — the tool
+  reads its answer out of `updatedInput.answers`, keyed by question text. Every
+  `canUseTool` call was rendered as one Allow/Deny pair, so a question appeared
+  as `Claude wants to run AskUserQuestion` with the question itself nowhere on
+  screen, the user pressed Allow, and the input went back untouched. The tool
+  then reported that nobody had answered and the agent invented the decision it
+  had deliberately stopped to ask about — silently, every time. Parsing lives in
+  `board/questions.ts` and is defensive, because the input is model-written; a
+  shape it cannot render falls back to Allow/Deny rather than showing an empty
+  picker. The choices are module-level in `board.js` for the usual reason: a
+  half-finished answer held in the DOM is destroyed by the next repaint.
+- **A session may split into subtasks, but only downwards and only once.** An
+  agent that decides its brief is two unrelated jobs calls `split_task`; each
+  subtask is a real session with its own worktree. Every limit is in
+  `AgentManager.split()`, never in the description: at most four, one level deep
+  (a subtask cannot split), once per session, and refused outright once the
+  parent's worktree is dirty or has commits — that last one is what makes it
+  safe for subtasks to fork from the parent's BASE rather than its branch, which
+  in turn is what keeps a subtask an ordinary task branch that the existing
+  diff, merge and cleanup paths already handle. It is also the one board tool
+  that is not auto-allowed: starting processes that cost money is worth a click.
+- **Verify SDK APIs against the `.d.ts`**, at
+  `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts`. See
+  [docs/SDK-NOTES.md](docs/SDK-NOTES.md) for cases where the published docs
+  disagree with reality.
+- **Every new `vscode` API goes into `test/harness.mjs` too.** The stub is
+  deliberately incomplete: calling an API it does not have fails the smoke test
+  the same way a wrong API name fails activation in the real editor. That is the
+  point, not an obstacle.
+- **npm scripts run through `sh`, not bash.** No `**` globbing, no `for` loops,
+  no platform-specific paths — put the logic in a `scripts/*.mjs` file instead.
+  `smoke.mjs` asserts this, because a bashism silently ran zero tests on Linux.
+- **Never invoke a dependency's binary by name, or use `npx`.** Both go through
+  `node_modules/.bin`, which npm fills with symlinks that do not exist on a
+  filesystem without them (WSL on a Windows drive, network shares) or after
+  `--no-bin-links`. Use `node scripts/run-bin.mjs <package> <bin> …`, which
+  resolves through Node. Every script must start with `node` or `npm`.
+- **A new test gate must be shown to fail.** Break the thing it guards, watch it
+  go red, put it back. A gate that has never failed has not been tested.
+- **Run a real agent before believing the suite.** Every unit test was green
+  while agents could not move their own cards and transcripts came back empty.
+  The scripts under `docs/DECISIONS.md` "the first real agent run" are the
+  shape to copy: drive `AgentManager` against a temp git repo and read what
+  actually happened.
+- **Anything the USER put into a state, and `render()` rebuilds, carries a key.**
+  The webview replaces the whole tree several times a second while an agent
+  works, so any state living only in the DOM is destroyed on the next frame.
+  Scroll containers carry `data-scroll`; a `<details>` carries `data-open` and
+  goes through `disclosure()`; the composer's draft and its pasted attachments
+  are module-level, not DOM-held. "Changes" and "How to test this" were rebuilt
+  with `open = true` every frame, so collapsing them lasted a few hundred
+  milliseconds — reported as "it keeps reopening, I want it toggled by me only".
+  A closed panel is also told to the host, so it outlives the panel itself.
+- **Anything that scrolls and is rebuilt by `render()` carries `data-scroll`.**
+  The webview repaints by replacing the whole tree, and an agent at work does
+  that several times a second. A scroll container without the attribute is
+  recreated at the top on every frame — which is how scrolling down a busy
+  column kept snapping back. `render()` restores every `[data-scroll]` by its
+  key; `scroll.test.mjs` and the Chromium gate in `layout.test.mjs` check it.
+- **An editor opened from the board opens BESIDE it, inside `ownLayoutChange`.**
+  The board is a webview in an editor group. A file or diff opened into that
+  group takes the group, the webview reports `visible: false`, and that is the
+  very event the click-away rule closes on — so a button on the board made the
+  board vanish, and the file appearing in its place read as "nothing happened".
+  `smoke.mjs` presses a test-plan link and a changed-file row against a session
+  whose worktree is the repo itself and asserts the board is still there.
+- **No `innerHTML` in `board.js`, ever.** The transcript is another program's
+  output, rendered as markdown, and the webview can post `move`, `send` and
+  `remove` to the host. `renderMarkdown` builds nodes and sets text; anything in
+  an answer that looks like HTML is shown as characters. `markdown.test.mjs`
+  asserts a `<script>` or `<img onerror>` in an answer creates no element. Links
+  are `http(s)` and `mailto` only; everything else renders as its text.
+
+## Testing conventions
+
+Tests are plain Node scripts that print `ok:` / `FAIL:` lines and exit non-zero.
+No framework. Run one directly:
+
+```bash
+node --experimental-strip-types --no-warnings src/sessions/__tests__/store.test.ts
+```
+
+Six of them are load-bearing and worth understanding before you change things:
+
+- `sessions/store.test.ts` runs against **real Claude Code session data**, not a
+  mock. If the SDK's session API changes, this fails first.
+- `git/worktree.test.ts` runs against **real git repositories**. It is what found
+  the porcelain-trimming bug that had been silently truncating a filename.
+- `board/webview.test.mjs` runs `media/board.js` in a `vm` against a stub DOM.
+  The view layer has no type checking, so a runtime throw there shows up as a
+  silently blank panel and nothing else.
+- `board/layout.test.mjs` renders the real `board.css` and `board.js` in real
+  Chromium and **measures**. It is the only gate that can fail on a stylesheet:
+  every other view test asserts on text, and text is not layout. It found a card
+  title overflowing its box by 94px while every text assertion was green — and
+  later a chat transcript squeezed to **0px wide** by one long session title,
+  with all of its text present and correct in a box nobody could read. Both were
+  a flex item's default `min-width: auto` defeating `text-overflow: ellipsis`.
+- `agent/executable.test.ts` asserts against the **built bundle**, not the
+  source, because the bug it guards used `__filename` — which exists in the CJS
+  esbuild emits and does not exist in the ESM the test runner uses. The code path
+  was invisible to any unit test and crashed every agent run in the real editor.
+- `smoke.mjs` is the launch gate, and the one to read first. It activates the
+  **built bundle**, cross-checks the manifest against the code, drives the real
+  message flow, and renders the host's **real** state through the **real**
+  `board.js`. Every "it didn't even launch" bug so far lived in one of those
+  seams, and no unit test crossed any of them. It is **hermetic**: it seeds a
+  real Claude Code transcript with known token counts into a throwaway
+  `CLAUDE_CONFIG_DIR`, so it neither reads nor depends on the sessions on your
+  machine. Assert against those known numbers rather than adding a
+  `if (sessions.length)` guard — a gate that skips is not a gate.
