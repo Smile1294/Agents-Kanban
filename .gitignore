@@ -7,3 +7,7 @@ dist-test/
 # v1 wrote board state here. Sessions now come from Claude Code; nothing
 # belongs in the repo.
 .kanban/
+
+# Agent worktrees, when this extension is pointed at its own repository.
+# Written automatically on first session; kept here so a fresh clone is covered.
+/.agentskanban/

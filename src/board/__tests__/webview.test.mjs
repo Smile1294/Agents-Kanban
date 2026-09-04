@@ -520,5 +520,44 @@ ok(!findByTag(plain.root, 'button', (n) => (n.className || '').includes('subtask
 const parentChat = run({ ...base, mode: 'chat', selectedKey: 'p1', cards: [PARENT, CHILD], transcript: [] })
 ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with its subtasks")
 
+// --- a run the editor killed on its way out ----------------------------------
+//
+// Reinstalling the extension or reloading the window kills every agent process
+// mid-turn. Nothing can re-attach to them. The failure this guards is the
+// SILENT one: without a word on screen, a cut-off run looks exactly like a
+// finished one, and the difference is whether the work was ever done.
+{
+  const CUT = {
+    key: 'cut-1', sessionId: 'cut-1', title: 'Migrate the store', phase: 'implementing',
+    tags: [], updated: Date.now() - 9 * 60_000, branch: 'task/S9-migrate',
+    interrupted: Date.now() - 9 * 60_000,
+  }
+  const board = run({ ...base, cards: [CUT] })
+  ok(board.text().includes('Interrupted'), 'the board says a cut-off run was interrupted')
+  // The number, not just the word: "2m ago" and "3 days ago" are different
+  // situations, and this board's rule is that an indicator shows what it is
+  // derived from.
+  ok(/Interrupted\s+9m ago/.test(board.text()), `and how long ago (${board.text().match(/Interrupted[^,<]{0,14}/)})`)
+
+  const page = run({ ...base, mode: 'chat', selectedKey: 'cut-1', cards: [CUT], transcript: [] })
+  const pt = page.text()
+  ok(pt.includes('Resume'), 'the chat page offers to pick it back up')
+  ok(pt.includes('Dismiss'), 'and to accept that it is not coming back')
+  ok(/process is gone/.test(pt), 'and says plainly that the process cannot be re-attached')
+
+  const resume = findButton(page.root, 'Resume')
+  const dismiss = findButton(page.root, 'Dismiss')
+  ok(!!resume && !!dismiss, 'both are real buttons, not decoration')
+  resume.onclick({ stopPropagation() {} })
+  ok(page.posted.some((m) => m.type === 'resume' && m.id === 'cut-1'), 'Resume asks the host to resume THIS session')
+  dismiss.onclick({ stopPropagation() {} })
+  ok(page.posted.some((m) => m.type === 'dismissInterrupted' && m.id === 'cut-1'), 'Dismiss clears it')
+
+  // The one that would put an "interrupted" banner over a working agent: a live
+  // run is the run the mark refers to, not a casualty of a restart.
+  const live = run({ ...base, cards: [{ ...CUT, agent: CARD.agent }] })
+  ok(!live.text().includes('Interrupted'), 'a card with a LIVE agent never shows the banner')
+}
+
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

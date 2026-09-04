@@ -22,9 +22,23 @@ let fails = 0
 const ok = (cond, msg) => { console.log(cond ? '  ok:' : 'FAIL:', msg); if (!cond) fails++ }
 
 const out = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'ck-vsix-')), 'test.vsix')
+
+// A worktree is a whole checkout of this repository, and it now lives INSIDE
+// it. vsce packages everything not listed in .vscodeignore, so a developer who
+// happens to have one live session open would otherwise ship the entire repo
+// inside the .vsix — and find out from the download size, if at all. Seed one
+// so the assertion below has something to catch.
+const worktreeProbe = path.join(repoRoot, '.agentskanban', 'worktrees', 'probe')
+await fs.mkdir(worktreeProbe, { recursive: true })
+await fs.writeFile(path.join(worktreeProbe, 'leaked.txt'), 'this must not ship\n')
+
 console.log('— packaging (this is the slow part)')
-await exec(process.execPath, [path.join(repoRoot, 'scripts', 'run-bin.mjs'), '@vscode/vsce', 'vsce', 'package', '--out', out],
-  { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024 })
+try {
+  await exec(process.execPath, [path.join(repoRoot, 'scripts', 'run-bin.mjs'), '@vscode/vsce', 'vsce', 'package', '--out', out],
+    { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024 })
+} finally {
+  await fs.rm(path.join(repoRoot, '.agentskanban'), { recursive: true, force: true })
+}
 
 const { stdout } = await exec('unzip', ['-l', out], { maxBuffer: 64 * 1024 * 1024 })
 const entries = stdout.split('\n')
@@ -58,6 +72,10 @@ for (const d of ['CLAUDE.md', 'PLAN.md', 'docs/DECISIONS.md', 'docs/NIMBALYST.md
 // Screenshots are pulled from GitHub by absolute URL, so shipping them again
 // would only pad the download. See docs/PUBLISHING.md.
 ok(!hasPrefix('docs/screenshots/'), 'screenshots stay out of the package')
+
+// Agent worktrees live in the repository now. They are somebody's task branch,
+// not part of the extension.
+ok(!hasPrefix('.agentskanban/'), 'agent worktrees stay out of the package')
 
 // The externals. These are the ones a packaging mistake silently drops.
 ok(has('node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs'),

@@ -1,5 +1,9 @@
 .vscode/**
 .github/**
+# Agent worktrees are whole checkouts of this repository. vsce packages
+# everything not listed here, so one live session would put the entire repo
+# inside the .vsix, twice over.
+.agentskanban/**
 src/**
 test/**
 node_modules/.bin/**

@@ -83,7 +83,7 @@
         "agentsKanban.worktreeRoot": {
           "type": "string",
           "default": "",
-          "description": "Where to create worktrees. Empty means a sibling directory named <repo>_worktrees."
+          "markdownDescription": "Where to create agent worktrees. A relative path resolves against the repository root. Empty means `.agentskanban/worktrees` inside the repository, which is added to `.gitignore` automatically. Point it outside the repository and nothing is written to your `.gitignore`."
         },
         "agentsKanban.focusMode": {
           "type": "string",

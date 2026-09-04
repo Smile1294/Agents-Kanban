@@ -16,7 +16,7 @@ import {
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveThinking, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
-import { SessionStore, type Entry } from './sessions/store.ts'
+import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
 import { linkSubtasks } from './board/subtasks.ts'
@@ -129,7 +129,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Board metadata lives in extension storage, never in the repository:
     // board state is not source code, and writing it into the working tree made
     // every agent turn produce a git diff.
-    const meta = new MetaStore(context.globalStorageUri.fsPath, root)
+    const meta = new MetaStore(context.globalStorageUri.fsPath, root, (m) => log.info(m))
     const planning = board.columns.find((c) => c.category === 'unstarted')?.id ?? 'planning'
 
     ws = {
@@ -407,6 +407,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           agent: toUiAgent(a),
         })
       }
+      // Runs that were still marked running with no agent to account for them:
+      // the host went away mid-turn and killed them. Their processes cannot be
+      // re-attached, so the honest thing is to say so on the card rather than
+      // let a cut-off run look exactly like a finished one.
+      const cutOff = interruptedSessions(stored, seen)
       for (const s of stored) {
         if (seen.has(s.id)) continue
         cards.push({
@@ -416,6 +421,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...(s.worktree ? { worktree: s.worktree } : {}),
           ...(s.parent ? { parent: s.parent } : {}),
           ...(s.testPlan ? { testPlan: s.testPlan } : {}),
+          ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
         })
       }
 
@@ -493,8 +499,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     async openFolder() { await vscode.commands.executeCommand('vscode.openFolder') },
 
     async init() {
-      // Nothing to create: Claude Code owns the session store. Just show it.
+      // Claude Code owns the session store, so there is nothing to scaffold —
+      // except the one thing that DOES live in the repository: the ignore rule
+      // for the worktree directory. Worktree creation writes it too, so this is
+      // the way to get it in place (and committed alongside the rest of the
+      // project's config) before the first agent ever runs.
+      // Rebuild first: the service that knows where worktrees go is built there,
+      // from the current folder and the current setting.
       await rebuild()
+      const added = await ws?.worktrees?.ensureIgnored()
+      if (added) {
+        log.info(`Added "${added}" to .gitignore — agent worktrees live there.`)
+        void vscode.window.showInformationMessage(
+          `Agents Kanban: added "${added}" to .gitignore. Agent worktrees live there; commit the line to share it.`,
+        )
+      }
     },
 
     setMode(next) { mode = next },
@@ -608,6 +627,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      *  was implemented and unreachable — nothing in the UI called it. */
     async interrupt(key) {
       await ws?.manager?.interrupt(key)
+      refreshAll()
+    },
+
+    /**
+     * Pick a session back up after the editor restarted out from under it.
+     *
+     * There is nothing to re-attach to: the CLI process died with the old
+     * extension host. What survives is Claude Code's session, so this is an
+     * ordinary resumed run — the same path a follow-up message takes — with a
+     * prompt that tells the agent the truth about why it is being restarted.
+     * It must not assume its last action completed, because the process was
+     * killed at an unknown point.
+     *
+     * A click, never automatic: this starts a real process with a real bill,
+     * and doing that to every interrupted session the moment VS Code opens is
+     * not a decision this extension gets to make.
+     */
+    async resume(key) {
+      const w = requireWs()
+      await w.store.patch(key, { running: 0 }).catch(() => {})
+      await this.sendMessage(
+        key,
+        'The editor restarted while you were working, so your last turn was cut off part-way ' +
+        'through. Check the current state of your worktree before doing anything — your last ' +
+        'action may or may not have completed — then carry on from there.',
+      )
+    },
+
+    /** The other honest answer: it is not coming back, and I know. */
+    async dismissInterrupted(key) {
+      await requireWs().store.patch(key, { running: 0 })
       refreshAll()
     },
 

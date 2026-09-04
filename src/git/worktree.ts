@@ -119,17 +119,102 @@ export async function findRepoRoot(cwd: string): Promise<string | undefined> {
   }
 }
 
+/**
+ * The one directory this extension owns inside a repository.
+ *
+ * Worktrees used to live in a sibling `<repo>_worktrees`, which kept the
+ * repository pristine but scattered checkouts around the parent directory,
+ * where nothing cleans them up and nothing relates them back to the project.
+ * They are project scratch space, so they live in the project — ignored, so
+ * they are still not part of it. See `ensureIgnored()` for why the ignore rule
+ * is load-bearing rather than tidy.
+ */
+export const KANBAN_DIR = '.agentskanban'
+
+/** Where worktrees go by default, relative to the repository root. */
+export const DEFAULT_WORKTREE_ROOT = `${KANBAN_DIR}/worktrees`
+
 export class WorktreeService {
   readonly repoRoot: string
-  private readonly worktreeRoot: string
+  readonly worktreeRoot: string
 
-  /** @param worktreeRoot where checkouts go; defaults to `<repo>_worktrees` alongside the repo. */
+  /** @param worktreeRoot where checkouts go; relative paths resolve against the
+   *  repository root. Defaults to `<repo>/.agentskanban/worktrees`. */
   constructor(repoRoot: string, worktreeRoot?: string) {
     this.repoRoot = repoRoot
-    this.worktreeRoot =
-      worktreeRoot && worktreeRoot.trim()
-        ? path.resolve(repoRoot, worktreeRoot)
-        : `${repoRoot}_worktrees`
+    this.worktreeRoot = path.resolve(
+      repoRoot,
+      worktreeRoot && worktreeRoot.trim() ? worktreeRoot : DEFAULT_WORKTREE_ROOT,
+    )
+  }
+
+  /**
+   * The worktree root as a repo-relative POSIX path, or undefined if it is
+   * outside the repository (the user pointed the setting elsewhere).
+   */
+  private relativeRoot(): string | undefined {
+    const rel = path.relative(this.repoRoot, this.worktreeRoot)
+    if (!rel || path.isAbsolute(rel) || rel.split(path.sep)[0] === '..') return undefined
+    return rel.split(path.sep).join('/')
+  }
+
+  /**
+   * The `.gitignore` line that covers the worktree root, or undefined when the
+   * root is outside the repository.
+   *
+   * The whole directory we own, not just the worktrees inside it, so anything
+   * added under it later is covered without a second edit to someone's file.
+   */
+  private ignoreEntry(): string | undefined {
+    const rel = this.relativeRoot()
+    if (!rel) return undefined
+    const owned = rel === KANBAN_DIR || rel.startsWith(`${KANBAN_DIR}/`)
+    return `/${owned ? KANBAN_DIR : rel}/`
+  }
+
+  /**
+   * Make sure git ignores the worktree root, adding it to the repository's
+   * `.gitignore` when nothing already does.
+   *
+   * This is load-bearing, not tidiness. Worktrees live INSIDE the repository,
+   * so an unignored `.agentskanban/` is an untracked directory in the main
+   * working tree — and `merge()` refuses outright on a dirty tree. Without the
+   * rule, creating one session blocks every merge from then on, and blames a
+   * directory the user never made. It also puts a permanently-growing pile of
+   * untracked checkouts in front of the user's own `git status`. This runs
+   * before the first `git worktree add`, so the directory is never once visible
+   * as untracked.
+   *
+   * Idempotent, and quiet about it: `git check-ignore` is asked rather than the
+   * file read, so a rule already living in `.git/info/exclude` or a global
+   * excludes file counts too and no second copy is written. Does nothing at all
+   * when the worktree root is outside the repository — there would be nothing
+   * to ignore, and editing someone's `.gitignore` anyway is a surprise.
+   *
+   * @returns the line it added, or undefined if nothing needed doing.
+   */
+  async ensureIgnored(): Promise<string | undefined> {
+    const rel = this.relativeRoot()
+    const entry = this.ignoreEntry()
+    if (!rel || !entry) return undefined
+
+    // Probe the worktree ROOT, not the `.agentskanban` directory above it: git
+    // will not call a non-existent path a directory, so a `/.agentskanban/`
+    // rule does not match `.agentskanban` before the folder exists — but it
+    // does match anything beneath it, which is what we actually care about.
+    const ignored = await exec('git', ['check-ignore', '-q', '--', rel], { cwd: this.repoRoot })
+      .then(() => true, () => false)
+    if (ignored) return undefined
+
+    const file = path.join(this.repoRoot, '.gitignore')
+    const current = await fs.readFile(file, 'utf8').catch(() => '')
+    const prefix = !current ? '' : current.endsWith('\n') ? '\n' : '\n\n'
+    await fs.writeFile(
+      file,
+      `${current}${prefix}# Agents Kanban: one git worktree per agent session lives under here.\n` +
+        `# Generated, never yours — safe to delete when no session is running.\n${entry}\n`,
+    )
+    return entry
   }
 
   async currentBranch(): Promise<string> {
@@ -188,6 +273,8 @@ export class WorktreeService {
       for (let n = 2; taken.has(name); n++) name = `${stem}-${n}`
 
       const dir = path.join(this.worktreeRoot, name)
+      // Before the directory exists, so it is never seen as untracked.
+      await this.ensureIgnored()
       await fs.mkdir(this.worktreeRoot, { recursive: true })
 
       try {
@@ -351,6 +438,46 @@ export class WorktreeService {
   }
 
   /**
+   * Why the main worktree is dirty, phrased so the user can act on it.
+   *
+   * Worth the extra round trip because of one specific and self-inflicted case:
+   * the ignore rule for the worktree directory is written by THIS extension, so
+   * the first merge after the first session is very often blocked by a
+   * `.gitignore` the user never touched. Generic advice to "commit your own
+   * changes" is then advice about someone else's edit, and reads as a bug in
+   * the merge button. Naming the files is the fallback, because a merge refused
+   * without saying what is in the way is a dead end either way.
+   */
+  private async dirtyMessage(): Promise<string> {
+    const porcelain = await gitRaw(this.repoRoot, ['status', '--porcelain']).catch(() => '')
+    const files = porcelain.split('\n').filter((l) => l.trim())
+      .map((l) => l.slice(3).trim().replace(/^.* -> /, ''))
+    if (files.length === 1 && files[0] === '.gitignore' && (await this.onlyIgnoreRuleAdded())) {
+      return `The only uncommitted change is the "${this.ignoreEntry()}" rule Agents Kanban added ` +
+        'to .gitignore for its worktree directory. Commit that line and merge again.'
+    }
+    const shown = files.slice(0, 5).join(', ')
+    const more = files.length > 5 ? `, and ${files.length - 5} more` : ''
+    return 'Commit or stash your own changes first — merging into a dirty working tree is how ' +
+      `work gets lost.${files.length ? ` Uncommitted: ${shown}${more}.` : ''}`
+  }
+
+  /** Is the working copy of `.gitignore` HEAD's, plus our block and nothing
+   *  else? Compared against HEAD rather than pattern-matched, so a user who
+   *  edited the same file for their own reasons is never told it was us. */
+  private async onlyIgnoreRuleAdded(): Promise<boolean> {
+    const entry = this.ignoreEntry()
+    if (!entry) return false
+    const lines = (t: string) => t.split('\n').map((l) => l.trim()).filter(Boolean)
+    const now = lines(await fs.readFile(path.join(this.repoRoot, '.gitignore'), 'utf8').catch(() => ''))
+    const before = new Set(lines(await git(this.repoRoot, ['show', 'HEAD:.gitignore']).catch(() => '')))
+    const added = now.filter((l) => !before.has(l))
+    // Comments cannot ignore anything, so they only ride along; the rule itself
+    // must be one of the added lines, or this was someone else's edit.
+    return added.includes(entry) && added.every((l) => l === entry || l.startsWith('#'))
+  }
+
+  /**
    * Merge a task branch back into `base`, in the MAIN worktree.
    *
    * Serialised on the repo lock, because VS Code's own Git extension issues
@@ -369,7 +496,7 @@ export class WorktreeService {
         return { ok: false, reason: 'wrong-branch', message: `The repository is on "${current}", not "${base}". Switch to ${base} first.` }
       }
       if (!(await this.isClean(this.repoRoot))) {
-        return { ok: false, reason: 'dirty', message: 'Commit or stash your own changes first — merging into a dirty working tree is how work gets lost.' }
+        return { ok: false, reason: 'dirty', message: await this.dirtyMessage() }
       }
       const ahead = await git(this.repoRoot, ['rev-list', '--count', `${base}..${branch}`]).catch(() => '0')
       if (!Number(ahead)) {

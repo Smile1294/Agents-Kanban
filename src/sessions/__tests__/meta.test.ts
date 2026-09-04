@@ -6,7 +6,13 @@ import { MetaStore, resolveEffort, resolveThinking } from '../meta.ts'
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
 
-const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-meta-'))
+// One level deeper than the temp directory on purpose. The store looks for a
+// previous install among its SIBLINGS, and the system temp directory is full of
+// siblings left by earlier runs of this very file — which is how these tests
+// started reading each other's state.
+const box = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-meta-'))
+const dir = path.join(box, 'test.agents-kanban')
+await fs.mkdir(dir, { recursive: true })
 const root = '/Users/x/proj'
 const meta = new MetaStore(dir, root)
 
@@ -200,6 +206,127 @@ for (const m of MODELS) {
 // snapshots move. `claude-haiku-4-5-20251001` was one.
 for (const m of MODELS) {
   ok(!/-\d{8}$/.test(m.id), `${m.label} uses the canonical undated id: ${m.id}`)
+}
+
+// --- fields that must survive a reload, not just a write ---------------------
+//
+// `contextWindow` was written by every run and dropped by the reader, so the
+// figure the meter measures against was lost on the next launch — the exact
+// failure it was added to prevent. The running mark would have gone the same
+// way. Anything persisted is worth reading back at least once.
+await meta.update('s-reload', { contextWindow: 200_000, running: 1_700_000_000_000 })
+{
+  const reloaded = await new MetaStore(dir, root).get('s-reload')
+  ok(reloaded.contextWindow === 200_000, `the context window survives a reload (${reloaded.contextWindow})`)
+  ok(reloaded.running === 1_700_000_000_000, `and the running mark (${reloaded.running})`)
+}
+// Zero is how the mark is cleared, and `undefined` cannot do it: stripUndefined
+// drops it from the patch, so the old value would simply stay.
+await meta.update('s-reload', { running: 0 })
+ok(!(await new MetaStore(dir, root).get('s-reload')).running, 'and zero clears it, through a reload too')
+
+// --- surviving the extension changing its own identity -----------------------
+//
+// The board's phases live in VS Code's global storage, whose path is derived
+// from `<publisher>.<name>`. Rename either — as this extension did, from
+// `david.claude-kanban` to `smile1294.agents-kanban` — and the next install
+// reads an EMPTY sidecar while Claude Code still has every session. Every card
+// then falls back to the default phase, which is what "all my tasks moved to
+// Planning after reinstalling" actually was. So a missing sidecar looks for a
+// previous incarnation of itself before concluding this is a first run.
+{
+  const gs = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-gs-'))
+  const ws = '/Users/x/proj'
+  const file = `${encodeURIComponent(ws)}.json`
+
+  const old1 = path.join(gs, 'david.claude-kanban', 'sessions')
+  await fs.mkdir(old1, { recursive: true })
+  await fs.writeFile(path.join(old1, file), JSON.stringify({
+    s1: { phase: 'complete', tags: ['done'], archived: false, pinned: false, activity: [] },
+    s2: { phase: 'validating', tags: [], archived: false, pinned: false, activity: [] },
+  }))
+
+  const renamed = new MetaStore(path.join(gs, 'smile1294.agents-kanban'), ws)
+  ok((await renamed.get('s1')).phase === 'complete', 'a renamed extension recovers the phase it recorded before')
+  ok((await renamed.get('s2')).phase === 'validating', 'for every session, not just the first')
+  ok((await renamed.get('s1')).tags.join(',') === 'done', 'and the tags with it')
+
+  // Recovered once and written through, so the next launch has its own copy
+  // and does not depend on the old install still being on disk.
+  const copied = path.join(gs, 'smile1294.agents-kanban', 'sessions', file)
+  ok(await fs.access(copied).then(() => true, () => false), 'the recovered state is written to the new location')
+  await fs.rm(path.join(gs, 'david.claude-kanban'), { recursive: true, force: true })
+  ok((await new MetaStore(path.join(gs, 'smile1294.agents-kanban'), ws).get('s1')).phase === 'complete',
+     'and survives the old install being removed')
+
+  // The newest wins: renamed twice, the board should come back as it was left.
+  const gs2 = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-gs2-'))
+  for (const [id, phase, age] of [['a.one', 'backlog', 20_000], ['b.two', 'complete', 1_000]] as const) {
+    const d = path.join(gs2, id, 'sessions')
+    await fs.mkdir(d, { recursive: true })
+    const f = path.join(d, file)
+    await fs.writeFile(f, JSON.stringify({ s1: { phase, tags: [], archived: false, pinned: false, activity: [] } }))
+    const when = new Date(Date.now() - age)
+    await fs.utimes(f, when, when)
+  }
+  ok((await new MetaStore(path.join(gs2, 'c.three'), ws).get('s1')).phase === 'complete',
+     'the most recently written previous install wins')
+
+  // Never at the expense of state we already have.
+  const gs3 = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-gs3-'))
+  const mineDir = path.join(gs3, 'mine.ext')
+  const theirs = path.join(gs3, 'other.ext', 'sessions')
+  await fs.mkdir(theirs, { recursive: true })
+  await fs.writeFile(path.join(theirs, file), JSON.stringify({
+    s1: { phase: 'backlog', tags: [], archived: false, pinned: false, activity: [] },
+    // Sessions the new install never heard of. This is the real shape of the
+    // bug: the rename happened, one session was worked on afterwards, and the
+    // other four were left behind in a directory nothing reads.
+    s2: { phase: 'complete', tags: ['old'], archived: false, pinned: false, activity: [] },
+    s3: { phase: 'validating', tags: [], archived: false, pinned: false, activity: [] },
+  }))
+  // Written straight to disk, NOT through a store: the new install's file must
+  // already exist before anything reads it, or the first store to touch it
+  // adopts the old file wholesale and the case under test never happens. That
+  // is the user's actual situation — reinstall, work on one session, and the
+  // other four are stranded behind a file that now exists.
+  await fs.mkdir(path.join(mineDir, 'sessions'), { recursive: true })
+  await fs.writeFile(path.join(mineDir, 'sessions', file), JSON.stringify({
+    s1: { phase: 'implementing', tags: [], archived: false, pinned: false, activity: [] },
+  }))
+  {
+    const merged = new MetaStore(mineDir, ws)
+    ok((await merged.get('s1')).phase === 'implementing',
+       'an existing sidecar is never overwritten by an older one')
+    // ...but a session it has NEVER heard of is not a conflict. Session ids are
+    // globally unique, so an entry we do not have cannot be about something
+    // else — and the alternative is showing it in the default column, which is
+    // the bug. Without this the four sessions stranded by the real rename stay
+    // stranded, because the new install had already written a file.
+    ok((await merged.get('s2')).phase === 'complete', 'a session only the old install knew about is adopted')
+    ok((await merged.get('s2')).tags.join(',') === 'old', 'with its tags')
+    ok((await merged.get('s3')).phase === 'validating', 'all of them, not just the first')
+  }
+
+  // Once, and only once. Merging on every load would resurrect a session the
+  // user deleted, every time they deleted it.
+  await new MetaStore(mineDir, ws).remove('s2')
+  ok((await new MetaStore(mineDir, ws).get('s2')).phase === 'planning',
+     'a deleted session stays deleted — the merge does not run again')
+
+  // A genuine first run stays a first run.
+  const gs4 = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-gs4-'))
+  ok((await new MetaStore(path.join(gs4, 'mine.ext'), ws).get('s1')).phase === 'planning',
+     'with nothing to recover, a first run is still a first run')
+
+  // Another WORKSPACE's file is not this workspace's, however old this one is.
+  const gs5 = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-gs5-'))
+  const strangers = path.join(gs5, 'old.ext', 'sessions')
+  await fs.mkdir(strangers, { recursive: true })
+  await fs.writeFile(path.join(strangers, `${encodeURIComponent('/Users/x/somewhere-else')}.json`),
+    JSON.stringify({ s1: { phase: 'complete', tags: [], archived: false, pinned: false, activity: [] } }))
+  ok((await new MetaStore(path.join(gs5, 'new.ext'), ws).get('s1')).phase === 'planning',
+     'recovery is per workspace — another folder\'s board is not adopted')
 }
 
 console.log(fails === 0 ? 'PASS — session metadata persists outside the repo, with multiple tags' : `${fails} FAILURES`)

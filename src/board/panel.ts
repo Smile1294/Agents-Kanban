@@ -156,6 +156,14 @@ export interface UiCard {
   subtasks?: { key: string; title: string; phase: string; ready: boolean }[]
   /** How to test this session's work, if the agent said. */
   testPlan?: TestPlan
+  /**
+   * When a run was cut off by the extension host going away — a reload, a
+   * reinstall, a crash. The process is gone and cannot be re-attached; the
+   * session can be resumed. The TIME is carried, not a flag, because "cut off
+   * 3 minutes ago" and "cut off last Tuesday" call for different reactions and
+   * a bare badge cannot tell them apart.
+   */
+  interrupted?: number
   /** Follow-ups typed while this turn is still running. */
   queued?: string[]
   agent?: {
@@ -247,6 +255,10 @@ export interface BoardHost {
   stop(key: string): Promise<void>
   /** End this turn, keep the session. Distinct from stop(), which ends the run. */
   interrupt(key: string): Promise<void>
+  /** Pick a session back up after its run was killed by a host restart. */
+  resume(key: string): Promise<void>
+  /** Accept that a killed run is not coming back, and clear its banner. */
+  dismissInterrupted(key: string): Promise<void>
   clearQueue(key: string): Promise<void>
   openWorktree(key: string): Promise<void>
   /** Start the app in this session's worktree and open it in the browser. */
@@ -304,6 +316,8 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'move': await host.move(id(), String(msg.phase)); break
         case 'stop': await host.stop(id()); break
         case 'interrupt': await host.interrupt(id()); await refresh(); break
+        case 'resume': await host.resume(id()); await refresh(); break
+        case 'dismissInterrupted': await host.dismissInterrupted(id()); await refresh(); break
         case 'clearQueue': await host.clearQueue(id()); await refresh(); break
         case 'openWorktree': await host.openWorktree(id()); break
         case 'run': await host.runWorktree(id()); break

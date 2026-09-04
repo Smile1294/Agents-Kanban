@@ -95,13 +95,23 @@ const STORED_CONTEXT = 100 + 200_000 + 4_000
 }
 
 const SEEDED = 'seeded-session-with-worktree'
+const INTERRUPTED_AT = 1_700_000_000_000
 await fs.mkdir(path.join(storage, 'sessions'), { recursive: true })
 await fs.writeFile(
   path.join(storage, 'sessions', encodeURIComponent(repo) + '.json'),
-  JSON.stringify({ [SEEDED]: {
-    phase: 'validating', tags: [], archived: false, pinned: false, activity: [],
-    worktree: repo, branch: 'task/seeded', base: 'main',
-  } }),
+  JSON.stringify({
+    [SEEDED]: {
+      phase: 'validating', tags: [], archived: false, pinned: false, activity: [],
+      worktree: repo, branch: 'task/seeded', base: 'main',
+    },
+    // A run that was still marked running when the extension host went away.
+    // This is what a reload, a reinstall or a crash leaves behind: the CLI
+    // process died with the old host and nothing can re-attach to it.
+    [STORED_SESSION]: {
+      phase: 'implementing', tags: [], archived: false, pinned: false, activity: [],
+      running: INTERRUPTED_AT,
+    },
+  }),
 )
 
 const ctl = {
@@ -561,6 +571,35 @@ try {
   ok(view.posted.some((m) => m.type === 'ready'), 'full: the view announces itself')
 } catch (e) {
   ok(false, `full: the view threw on the host's own state — ${e.message}`)
+}
+
+// --- a run the host never got to finish -------------------------------------
+//
+// The whole path, because every layer of it was capable of dropping the signal
+// silently: the sidecar reader (which was already dropping contextWindow the
+// same way), the host's derivation, the state it posts, and the view. A run
+// killed by a restart that says nothing is indistinguishable from one that
+// finished, and the difference is whether the work was ever done.
+{
+  const cut = (live.cards ?? []).find((c) => c.sessionId === STORED_SESSION)
+  ok(cut?.interrupted === INTERRUPTED_AT,
+     `a run still marked running, with no agent, comes back interrupted: ${cut?.interrupted}`)
+  try {
+    const view = await renderBoard(live, { layout: 'full' })
+    ok(view.text().includes('Interrupted'), 'and the real view says so on the board')
+  } catch (e) {
+    ok(false, `the view threw on an interrupted card — ${e.message}`)
+  }
+
+  // Dismissing it is the user saying "I know" — and it must actually stick, in
+  // the sidecar, or the banner is back on the next launch.
+  await send({ type: 'dismissInterrupted', id: STORED_SESSION })
+  await send({ type: 'ready' })
+  const after = (latestState().cards ?? []).find((c) => c.sessionId === STORED_SESSION)
+  ok(!after?.interrupted, 'dismissing it clears the banner')
+  const onDisk = JSON.parse(await fs.readFile(
+    path.join(storage, 'sessions', encodeURIComponent(repo) + '.json'), 'utf8'))
+  ok(!onDisk[STORED_SESSION]?.running, 'and clears the mark on disk, so it stays dismissed')
 }
 
 // The side bar renders a control, not a board.

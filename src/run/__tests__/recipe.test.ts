@@ -36,9 +36,9 @@ const mkWorktree = async (name: string, files: Record<string, string>) => {
 // ---------------------------------------------------------------------------
 // 1. The slug must match the launcher's own, or a provisioned worktree reads as
 // unprovisioned and the button offers to provision it a second time.
-ok(wtSlug('/x/S1mtmsjdd3-okay-we-are-on-branch-feature-pb-295-sso') ===
-   's1mtmsjdd3_okay_we_are_on_branch_feature',
-   `slug lowercases, replaces punctuation and TRUNCATES at 40: ${wtSlug('/x/S1mtmsjdd3-okay-we-are-on-branch-feature-pb-295-sso')}`)
+ok(wtSlug('/x/S1abc12345-okay-we-are-on-branch-feature-abc-295-sso') ===
+   's1abc12345_okay_we_are_on_branch_feature',
+   `slug lowercases, replaces punctuation and TRUNCATES at 40: ${wtSlug('/x/S1abc12345-okay-we-are-on-branch-feature-abc-295-sso')}`)
 ok(wtSlug('/x/Simple') === 'simple', 'a plain name is just lowercased')
 ok(wtSlug('/x/a.b-c_d') === 'a_b_c_d', 'dots, dashes and underscores all become underscores')
 
@@ -47,7 +47,7 @@ ok(wtSlug('/x/a.b-c_d') === 'a_b_c_d', 'dots, dashes and underscores all become 
 const provisioned = await mkWorktree('S1-provisioned', { artisan: '#!/usr/bin/env php\n' })
 await fs.writeFile(
   path.join(home, '.wt', wtSlug(provisioned)),
-  `SLUG=${wtSlug(provisioned)}\nDIR=${provisioned}\nAPP_PORT=8007\nVITE_PORT=5187\nDB=pim\nMODE=shared\n`,
+  `SLUG=${wtSlug(provisioned)}\nDIR=${provisioned}\nAPP_PORT=8007\nVITE_PORT=5187\nDB=app_s1\nMODE=shared\n`,
 )
 const reg = await readWtRegistry(provisioned, home)
 ok(reg?.APP_PORT === '8007', `the registry is read back (APP_PORT=${reg?.APP_PORT})`)
@@ -81,7 +81,7 @@ ok(r2?.port === undefined,
 // Reported verbatim: running it in the main checkout printed "not provisioned
 // yet" and the user could not tell whether the tool or the change was broken.
 // Offering `wt` there would reproduce that inside the button.
-const mainCheckout = await mkWorktree('pim-main', { artisan: '#!/usr/bin/env php\n' })
+const mainCheckout = await mkWorktree('app-main', { artisan: '#!/usr/bin/env php\n' })
 const r3 = await detect({ worktree: mainCheckout, repoRoot: mainCheckout, home, pathEnv: '' })
 ok(!/wt/.test(r3?.steps.map((s) => s.command).join(' ') ?? ''),
    `the main checkout is never handed to the per-worktree launcher: ${r3?.steps[0]?.command}`)

@@ -44,6 +44,11 @@ const state = {
     // A single unbroken 200-character token — nothing may escape the card.
     { key: 'b', sessionId: 'b', title: 'x'.repeat(200), phase: 'implementing', tags: [], updated: Date.now(),
       parent: 'a', parentTitle: NASTY },
+    // A run the host killed. Its banner is another flex row inside the card, so
+    // it is measured with the rest rather than trusted — the two bugs this gate
+    // has caught were both a flex item's default min-width: auto.
+    { key: 'c', sessionId: 'c', title: NASTY, phase: 'implementing', tags: [], updated: Date.now(),
+      interrupted: Date.now() - 3 * 24 * 60 * 60 * 1000 },
   ],
   composer: {
     model: 'claude-opus-5', effort: 'high', thinking: 'enabled',
