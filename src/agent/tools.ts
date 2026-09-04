@@ -20,8 +20,8 @@
  */
 import { z } from 'zod'
 import type { SessionStore } from '../sessions/store.ts'
-import { isHumanOnly, isReviewColumn, type BoardConfig } from '../board/config.ts'
-import { normaliseTestPlan } from '../sessions/meta.ts'
+import { isHumanOnly, isReviewColumn, isStartedColumn, type BoardConfig } from '../board/config.ts'
+import { normaliseTestPlan, normaliseTitle } from '../sessions/meta.ts'
 import { loadSdk } from './sdk.ts'
 
 /** The MCP namespace these tools are mounted under; `mcpServers: { board: … }`. */
@@ -84,6 +84,28 @@ export interface BoardToolContext {
    * fence.
    */
   onSplit?: (subtasks: SubtaskProposal[]) => Promise<SplitOutcome>
+  /**
+   * Rename this session's card.
+   *
+   * A callback rather than a `store.rename()` from in here, because the title
+   * lives in two places while a run is in flight: Claude Code's own session
+   * record, and `RunningAgent.title`, which is what the board shows for a run
+   * whose session id has not arrived yet. The manager owns both.
+   */
+  onRename?: (title: string) => Promise<void> | void
+  /**
+   * The card's title while it is still the one GUESSED from the prompt, and
+   * `undefined` once the agent has chosen one.
+   *
+   * Exists because of a real run: every unit test passed, the tool was
+   * auto-allowed, the brief asked for it — and the agent moved its card twice
+   * without ever renaming it. A paragraph in an appended system prompt is read
+   * once, at the start, when the agent does not yet know what the work is. A
+   * TOOL RESULT is read at the moment it acts. So the ask is attached to the
+   * move into the started column, which every agent makes, at the point where
+   * it has just learned enough to name the thing.
+   */
+  derivedTitle?: () => string | undefined
 }
 
 type Content = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -199,9 +221,15 @@ export function buildBoardTools(
       }
       await ctx.store.setPhase(id, args.phase)
       ctx.onChanged({ sessionId: id, phase: { from, to: args.phase } })
+      const guessed = isStartedColumn(board, args.phase) ? ctx.derivedTitle?.() : undefined
       return ok(
         `Moved: ${from} -> ${args.phase}.` +
-        (plan ? ` Test plan recorded (${plan.steps.length} step(s), ${plan.links.length} link(s)).` : ''),
+        (plan ? ` Test plan recorded (${plan.steps.length} step(s), ${plan.links.length} link(s)).` : '') +
+        (guessed && ctx.onRename
+          ? `\n\nThis card is still called "${guessed}", which was taken from the first line of the ` +
+            'request rather than from the work. You now know what the work is, so give it a name: ' +
+            'call `set_title` with six words or fewer. If that title is already right, carry on.'
+          : ''),
       )
     },
   )
@@ -221,6 +249,38 @@ export function buildBoardTools(
         tagsRemoved: before.filter((t) => !next.includes(t)),
       })
       return ok(`Tags: ${next.join(', ') || '(none)'}`)
+    },
+  )
+
+  const setTitle = tool(
+    'set_title',
+    [
+      'Rename your own card.',
+      '',
+      'The card was named automatically from the first line of the request, and a',
+      'request often opens with something that is not a description of the work —',
+      '"Okay.", "So I want you to…". Once you know what this session is actually',
+      'doing, say so here. This is the name the user reads when scanning a column,',
+      'so it is worth one call.',
+      '',
+      'Six words or fewer, saying what the work IS: "Add SSO to the admin app",',
+      '"Fix the flaky snapshot test". Not a restatement of the brief, not a status',
+      '("working on auth"), and no trailing full stop.',
+      '',
+      'This renames the CARD ONLY. Your git branch and worktree directory keep the',
+      'names they were given when the session started, because you are running',
+      'inside that directory — so do not expect them to follow, and do not try to',
+      'move them yourself.',
+    ].join('\n'),
+    {
+      title: z.string().describe('What this session is doing, in a few words.'),
+    },
+    async (args) => {
+      const title = normaliseTitle(args.title)
+      if (!title) return err('A title needs at least one word.')
+      if (!ctx.onRename) return err('This session cannot be renamed from here.')
+      await ctx.onRename(title)
+      return ok(`Card renamed to "${title}".`)
     },
   )
 
@@ -339,7 +399,7 @@ export function buildBoardTools(
     },
   )
 
-  return [setPhase, setTags, listBoard, splitTask, notifyUser]
+  return [setPhase, setTitle, setTags, listBoard, splitTask, notifyUser]
 }
 
 /**

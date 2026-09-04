@@ -278,6 +278,18 @@ ok(await svc.isClean(repo), 'and leaves the repository clean')
 
 ok(slug('Fix THE login!! flow') === 'fix-the-login-flow', 'slug normalises')
 
+// A worktree name can never be changed — the session is running inside the
+// directory — so the one chance to make it readable is here. The fixed
+// 40-character slice cut this real title mid-word, and the directory on disk
+// still reads `...-review-this-repository-figur`.
+const cut = slug('Plan is now review this repository, figure out how everything works')
+ok(cut.length <= 40, `a long title is still bounded (${cut.length} chars: ${cut})`)
+ok(!cut.endsWith('-'), 'and does not trail a separator')
+ok(cut.split('-').every((w) => 'plan is now review this repository figure out how everything works'.split(' ').includes(w)),
+   `every segment is a whole word, never a fragment like "figur" (${cut})`)
+ok(slug('x'.repeat(60)).length === 40, 'a single word longer than the budget is cut short rather than dropped')
+ok(slug('!!!') === 'task', 'a title with nothing sluggable still names the directory')
+
 // --- the branch model a SPLIT task produces, against real git ----------------
 //
 // The claim `split_task` rests on: a subtask forks from what the PARENT forked
