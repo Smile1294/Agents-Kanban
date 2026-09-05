@@ -16,6 +16,10 @@ import { AgentSession, type PermissionRequest } from './session.ts'
 import type { AttachedImage } from './images.ts'
 import { boardToolNames, createBoardServer, type BoardChange, type BoardNotice, type BoardToolContext } from './tools.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
+import {
+  DEFAULT_RUNTIME, getRuntime, type AgentRun, type Meter, type RuntimeId,
+} from './runtime.ts'
+import { startBoardBridge, type BoardBridge } from './board-bridge.ts'
 
 export interface ManagerOptions {
   store: SessionStore
@@ -26,6 +30,11 @@ export interface ManagerOptions {
     /** Session flags. Offered only when the CLI says the model supports them —
      *  see `ultracodeFor` — because the request path validates nothing. */
     ultracode?: boolean; fastMode?: boolean
+    /** Which agent program new sessions run on. Per session in the end — the
+     *  whole point is that a Claude card and a Codex card sit on the same board
+     *  and run at the same time — this is only the default for a session that
+     *  does not say. */
+    runtime?: RuntimeId
   }
   /** All six the SDK accepts. It used to list four, and only compiled because
    *  extension.ts cast every value to 'acceptEdits' — a type that was a lie
@@ -33,6 +42,16 @@ export interface ManagerOptions {
   permissionMode: NonNullable<Options['permissionMode']>
   maxConcurrent: number
   claudeExecutable?: string
+  /** Explicit path to the `codex` binary; detected when omitted. */
+  codexExecutable?: string
+  /**
+   * Where a runtime that cannot take an in-process MCP server gets the board's
+   * tools from: a directory to put its socket in, and the bundled server script
+   * to spawn. Absent means such a runtime runs WITHOUT board tools, which the
+   * launch says out loud rather than leaving the agent to discover that it
+   * cannot move its own card.
+   */
+  boardBridge?: { dir: string; script: string }
   /** Which backend sessions run against. Mutable through `setProvider()`,
    *  because the picker changes it between runs and the manager outlives them.
    *  Undefined means "inherit the environment", which is the default. */
@@ -102,11 +121,18 @@ interface LaunchOptions {
   /** Images attached to the FIRST message. Held only until the run starts —
    *  they ride inside the message to the model and are stored nowhere. */
   images?: AttachedImage[]
+  /** Which agent program to run this session on. Falls back to the workspace
+   *  default. A resumed session keeps whatever it was started on, because its
+   *  transcript belongs to that runtime and nothing else can read it. */
+  runtime?: RuntimeId
 }
 
 export interface RunningAgent {
   runId: string
-  /** Set once Claude Code assigns one. Until then the card is keyed by runId. */
+  /** Which agent program is running this. Fixed for the life of the session:
+   *  the transcript, the model ids and the login all belong to it. */
+  runtime: RuntimeId
+  /** Set once the runtime assigns one. Until then the card is keyed by runId. */
   sessionId?: string
   title: string
   state: AgentState
@@ -147,6 +173,17 @@ export interface RunningAgent {
    *  floor. The board says "at least" rather than showing a total it knows is
    *  short. */
   spendPriced?: boolean
+  /**
+   * What this session has consumed, in the unit its runtime can justify.
+   *
+   * Beside `spentUsd` rather than replacing it, because they are not the same
+   * claim. `spentUsd` is dollars and only a runtime that prices per request has
+   * any. A Codex session on a ChatGPT subscription has no per-request price at
+   * all, so its meter is a percentage of a rolling rate-limit window — and
+   * rendering that as `$0.00` would be a number that cannot say "bad". See
+   * `Meter` in runtime.ts.
+   */
+  meter?: Meter
   pendingPermission?: PermissionRequest
   startedAt: number
   /** When the CLI last emitted anything. The board renders its age, which is
@@ -170,7 +207,12 @@ export interface RunningAgent {
 
 export class AgentManager extends EventEmitter {
   private opts: ManagerOptions
-  private readonly sessions = new Map<string, AgentSession>()
+  /** Keyed by run id. `AgentRun`, not `AgentSession`: the manager drives every
+   *  runtime through the one contract, which is the line a new agent program is
+   *  added at. */
+  private readonly sessions = new Map<string, AgentRun>()
+  /** Board-tool bridges, one per Codex-like session, torn down with the run. */
+  private readonly bridges = new Map<string, BoardBridge>()
   private readonly agents = new Map<string, RunningAgent>()
   private readonly queue: Array<{ runId: string; prompt: string; opts: LaunchOptions }> = []
   private counter = 0
@@ -461,8 +503,15 @@ export class AgentManager extends EventEmitter {
       ? await this.opts.store.usage(opts.resume).then((u) => u.costUsd).catch(() => 0)
       : 0
 
+    // Fixed for the life of the session. A resumed one keeps what it was
+    // started on: its transcript lives in that runtime's own store and no other
+    // runtime can read it, so "resume on a different agent" is not a thing that
+    // can be honestly offered.
+    const runtime: RuntimeId =
+      (opts.resume ? prior?.runtime : undefined) ?? opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME
+
     const agent: RunningAgent = {
-      runId, title, history, priorUsd,
+      runId, runtime, title, history, priorUsd,
       state: { kind: 'starting' },
       worktreePath: wt.path, branch: wt.branch,
       ...(wt.base ? { base: wt.base } : {}),
@@ -485,32 +534,20 @@ export class AgentManager extends EventEmitter {
     }
     this.touch()
 
-    const boardServer = await createBoardServer(this.opts.board, this.boardContext(agent))
-
-    // Derived from the tool definitions, so a rename can never leave the agent
-    // unable to move its own card.
-    const { tool } = await loadSdk()
-
-    const session = new AgentSession({
-      taskId: runId,
-      cwd: wt.path,
-      permissionMode: this.opts.permissionMode,
-      boardServer,
-      boardTools: boardToolNames(this.opts.board, tool),
-      appendSystemPrompt: buildBrief(this.opts.board, title, wt.branch),
-      ...(opts.resume ? { resume: opts.resume } : {}),
-      ...(this.opts.claudeExecutable ? { claudeExecutable: this.opts.claudeExecutable } : {}),
-      ...(this.opts.log ? { log: this.opts.log } : {}),
-      ...(this.opts.provider ? { provider: this.opts.provider } : {}),
-      ...(this.opts.providerEnv?.set && Object.keys(this.opts.providerEnv.set).length
-        ? { env: this.opts.providerEnv.set } : {}),
-      ...(this.opts.providerEnv?.clear?.length ? { envClear: this.opts.providerEnv.clear } : {}),
-      ...(this.opts.defaults.model ? { model: this.opts.defaults.model } : {}),
-      ...(resolveEffort(undefined, this.opts.defaults.effort) ? { effort: resolveEffort(undefined, this.opts.defaults.effort)! } : {}),
-      ...(resolveThinking(undefined, this.opts.defaults.thinking) === 'disabled' ? { thinking: 'disabled' as const } : {}),
-      ...(this.opts.defaults.ultracode ? { ultracode: true } : {}),
-      ...(this.opts.defaults.fastMode ? { fastMode: true } : {}),
-    })
+    let session: AgentRun
+    try {
+      session = await this.startRun(runtime, runId, agent, wt, title, opts)
+    } catch (e) {
+      // A runtime that cannot start must SAY why on the card, naming the fix —
+      // "Codex is not installed" is actionable, a card stuck in `starting`
+      // forever is not. The worktree is reclaimed if nothing was written to it.
+      const message = e instanceof Error ? e.message : String(e)
+      agent.live.push({ kind: 'error', at: Date.now(), message })
+      agent.state = { kind: 'error', message }
+      void this.discardIfUntouched(agent)
+      this.touch()
+      return
+    }
     this.sessions.set(runId, session)
 
     session.on('sessionId', (id: string) => {
@@ -676,6 +713,13 @@ export class AgentManager extends EventEmitter {
       agent.spendPriced = priced
       this.touch()
     })
+    // The runtime-neutral view of the same thing. Every runtime emits this;
+    // only the ones that price per request also emit `spend`, so a Codex card
+    // gets a rate-limit meter and no dollar figure rather than a made-up zero.
+    session.on('meter', (m: Meter) => {
+      agent.meter = m
+      this.touch()
+    })
     session.on('permission', (req: PermissionRequest) => {
       agent.pendingPermission = req
       this.touch()
@@ -684,6 +728,12 @@ export class AgentManager extends EventEmitter {
     const finish = () => {
       delete agent.streaming
       this.sessions.delete(runId)
+      // The board-tool socket is deliberately NOT closed here. `finish()` runs
+      // when a TURN ends, and the session is still alive and still able to take
+      // a follow-up — closing it would leave the agent's process running with
+      // its board tools silently gone, so the next turn could not move its own
+      // card and nothing would say why. It is closed in `halt()` and
+      // `release()`, which are the two places a session actually ends.
       // This run reached the end under its own power, so it was not cut off.
       // Zero, not undefined: a patch drops undefined and the mark would stay.
       if (agent.sessionId) void this.opts.store.patch(agent.sessionId, { running: 0 }).catch(() => {})
@@ -713,6 +763,118 @@ export class AgentManager extends EventEmitter {
     })
 
     void session.run(prompt, opts.images ?? []).catch(() => finish())
+  }
+
+  /**
+   * Start one run, on whichever agent program the card is set to.
+   *
+   * There is no branch on the runtime's identity here, deliberately. Everything
+   * that differs between Claude Code and Codex — how to find the binary, how to
+   * take the board's tools, what a model id means — is behind the descriptor in
+   * `agent/runtimes/`. What is left is what is true of all of them, and that is
+   * the test of whether the abstraction is real: a third runtime should need no
+   * edit to this method.
+   */
+  private async startRun(
+    id: RuntimeId,
+    runId: string,
+    agent: RunningAgent,
+    wt: { path: string; branch: string },
+    title: string,
+    opts: LaunchOptions,
+  ): Promise<AgentRun> {
+    const rt = getRuntime(id)
+    if (!rt) {
+      throw new Error(
+        `This build of Agents Kanban does not know how to run "${id}". ` +
+        'Pick a different agent on the composer bar.',
+      )
+    }
+
+    const configured = id === 'claude' ? this.opts.claudeExecutable
+      : id === 'codex' ? this.opts.codexExecutable
+      : undefined
+    const location = await rt.detect(configured)
+    if (!location) {
+      throw new Error(
+        `${rt.label} was not found on this machine. Install it with \`${rt.installHint}\`, then ` +
+        'sign in — the board uses the login you already have and never asks for a key.',
+      )
+    }
+
+    const boardTools = await this.boardToolsFor(rt.capabilities.boardTools, runId, agent, title, rt.label)
+
+    // Provider profiles steer the backend of a runtime whose backend IS
+    // environment on the child process. Handing them to one that authenticates
+    // as itself would be configuring something that cannot take effect, and the
+    // board would then name a provider that is not billing anything.
+    const provider = rt.capabilities.providerProfiles
+      ? {
+          ...(this.opts.provider ? { provider: this.opts.provider } : {}),
+          ...(this.opts.providerEnv?.set && Object.keys(this.opts.providerEnv.set).length
+            ? { env: this.opts.providerEnv.set } : {}),
+          ...(this.opts.providerEnv?.clear?.length ? { envClear: this.opts.providerEnv.clear } : {}),
+        }
+      : {}
+
+    const effort = resolveEffort(undefined, this.opts.defaults.effort)
+    return rt.start({
+      taskId: runId,
+      cwd: wt.path,
+      permissionMode: this.opts.permissionMode,
+      executable: location.command,
+      appendSystemPrompt: buildBrief(this.opts.board, title, wt.branch),
+      ...(opts.resume ? { resume: opts.resume } : {}),
+      ...(boardTools ? { boardTools } : {}),
+      ...(this.opts.log ? { log: this.opts.log } : {}),
+      ...provider,
+      ...(this.opts.defaults.model ? { model: this.opts.defaults.model } : {}),
+      ...(effort ? { effort } : {}),
+      // Only sent when the runtime has the concept. `thinking` is Claude's
+      // adaptive-thinking switch; Codex expresses the same thing through effort
+      // and would be receiving an option it has no meaning for.
+      ...(rt.capabilities.thinkingToggle
+        && resolveThinking(undefined, this.opts.defaults.thinking) === 'disabled'
+        ? { thinking: 'disabled' as const } : {}),
+      ...(this.opts.defaults.ultracode ? { ultracode: true } : {}),
+      ...(this.opts.defaults.fastMode ? { fastMode: true } : {}),
+    })
+  }
+
+  /**
+   * The board's tools, in whichever form this runtime can take them.
+   *
+   * One set of definitions, two transports — see `board-bridge.ts`. The failure
+   * this guards is not subtle: an agent that cannot call `set_phase` cannot move
+   * its own card, which is the entire product, and it fails SILENTLY because a
+   * missing tool looks to the model exactly like a tool it was never given.
+   */
+  private async boardToolsFor(
+    transport: 'inProcess' | 'stdio',
+    runId: string,
+    agent: RunningAgent,
+    title: string,
+    label: string,
+  ): Promise<{ autoAllow: string[]; inProcess?: unknown; stdio?: { command: string; args: string[]; env?: Record<string, string> } } | undefined> {
+    if (transport === 'inProcess') {
+      const inProcess = await createBoardServer(this.opts.board, this.boardContext(agent))
+      // Derived from the tool definitions, so a rename can never leave the agent
+      // unable to move its own card.
+      const { tool } = await loadSdk()
+      return { autoAllow: boardToolNames(this.opts.board, tool), inProcess }
+    }
+
+    if (!this.opts.boardBridge) {
+      this.emit(
+        'warning',
+        `"${title}" is running on ${label} without the board tools, so it cannot move its own card ` +
+        'or write a test plan. You will need to move it yourself.',
+      )
+      return undefined
+    }
+    const bridge = await startBoardBridge(this.opts.board, this.boardContext(agent), this.opts.boardBridge)
+    this.bridges.set(runId, bridge)
+    return { autoAllow: bridge.autoAllow, stdio: bridge.descriptor }
   }
 
   /** Remove a worktree only if nothing was ever done in it. Anything else —
@@ -796,6 +958,10 @@ export class AgentManager extends EventEmitter {
   private halt(a: RunningAgent): void {
     this.sessions.get(a.runId)?.stop()
     this.sessions.delete(a.runId)
+    // Same reason as in `finish()`. `stopAll()` runs on host teardown, so this
+    // is also what stops a window reload leaving a socket per agent behind.
+    this.bridges.get(a.runId)?.dispose()
+    this.bridges.delete(a.runId)
     this.agents.delete(a.runId)
     const i = this.queue.findIndex((q) => q.runId === a.runId)
     if (i >= 0) this.queue.splice(i, 1)
@@ -807,7 +973,15 @@ export class AgentManager extends EventEmitter {
   /** Forget a finished run so the board falls back to the on-disk transcript. */
   release(key: string): void {
     const a = this.byKey(key)
-    if (a && !this.sessions.has(a.runId)) { this.agents.delete(a.runId); this.touch() }
+    if (a && !this.sessions.has(a.runId)) {
+      this.agents.delete(a.runId)
+      // The run is gone from the board, so its board-tool socket has nothing
+      // left to serve. One per session, so not closing it leaks a descriptor
+      // and a socket file per agent the user has ever run.
+      this.bridges.get(a.runId)?.dispose()
+      this.bridges.delete(a.runId)
+      this.touch()
+    }
   }
 
   /**

@@ -265,6 +265,13 @@ export interface UiState {
     spendPriced?: boolean
     permissionMode: string
     permissionModes: { key: string; label: string; detail: string }[]
+    /** Which agent program the NEXT session runs on. */
+    runtime: string
+    /** Every agent program this build can drive. `providerProfiles` is carried
+     *  so the chip can name a backend only where one is a real choice — a Codex
+     *  session has nothing behind it to name, and inventing one would be the
+     *  board claiming a provider that is not billing anything. */
+    runtimes: { id: string; label: string; detail?: string; providerProfiles: boolean }[]
     /** The provider profile the NEXT session will run on. */
     provider: string
     /** Everything selectable. `support` is carried so the view can mark a
@@ -327,7 +334,7 @@ export interface BoardHost {
   setDisclosure(key: string, open: boolean): void
   setComposer(patch: {
     model?: string; effort?: string; thinking?: string; permissionMode?: string
-    provider?: string; ultracode?: string; fastMode?: string; forKey?: string
+    provider?: string; runtime?: string; ultracode?: string; fastMode?: string; forKey?: string
   }): void
   toggleArchived(): void
   /** Give the board the whole window, or hand it back. */
@@ -345,6 +352,9 @@ export interface BoardHost {
    *  that could only choose between profiles that already exist would leave the
    *  feature reachable only from the command palette. */
   selectProvider(): Promise<void>
+  /** Open the settings tab: agents, backends and logins. Synchronous because
+   *  showing a panel is not something to await — the page fills itself in. */
+  openSettings(): void
 }
 
 /** Shared message plumbing for both the sidebar view and the editor panel. */
@@ -392,6 +402,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
             ...(msg.thinking ? { thinking: String(msg.thinking) } : {}),
             ...(msg.permissionMode ? { permissionMode: String(msg.permissionMode) } : {}),
             ...(msg.provider ? { provider: String(msg.provider) } : {}),
+            ...(msg.runtime ? { runtime: String(msg.runtime) } : {}),
             ...(msg.ultracode ? { ultracode: String(msg.ultracode) } : {}),
             ...(msg.fastMode ? { fastMode: String(msg.fastMode) } : {}),
             ...(msg.id ? { forKey: id() } : {}),
@@ -405,6 +416,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'openSession': await host.openSession(id()); await refresh(); break
         case 'newSessionPrompt': await host.newSessionPrompt(); break
         case 'selectProvider': await host.selectProvider(); break
+        case 'openSettings': host.openSettings(); break
         case 'permission':
           host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))
           break

@@ -1119,15 +1119,21 @@
       value: m.id,
       label: `${m.label} (${m.context})` + (m.detail ? ' — ' + m.detail : ''),
     })), undefined, modelSourceNote()))
-    /* Which backend the NEXT session runs on. Always shown, even with only the
-       inherit profile configured, because its last entry is how a first
-       provider gets added at all — the alternative is a feature reachable only
-       from the command palette by someone who already knows it exists. */
-    bar.append(picker('provider', '🔌 ' + providerName(), (s.composer.providers || []).map((p) => ({
-      value: p.id,
-      label: p.label + (p.detail && p.detail !== p.label ? ' — ' + p.detail : '') +
-        (p.support === 'community' ? '  (community proxy)' : ''),
-    })).concat([{ command: 'selectProvider', label: '⚙  Configure providers…' }])))
+    /* WHICH AGENT PROGRAM the next session runs on — Claude Code, Codex.
+       This replaced the backend picker that used to sit here, because the two
+       are different questions and only one of them belongs on a composer bar:
+       the agent is chosen per session, beside the prompt, like the model; the
+       backend is configuration, and configuration in a menu that closes when
+       you look away is configuration you lose halfway through typing.
+
+       For a runtime whose backend IS selectable, the chip still says which one
+       is active, because that is a statement about the run you are about to
+       start rather than a control. The menu's last entry opens the settings
+       page, which is now the only place a backend is edited. */
+    bar.append(picker('runtime', '🤖 ' + agentName(), (s.composer.runtimes || []).map((r) => ({
+      value: r.id,
+      label: r.label + (r.detail ? ' — ' + r.detail : ''),
+    })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }])))
     /* Both of these are per MODEL, and both DISAPPEAR when the selected model
        does not have them. Haiku 4.5 accepts no effort levels and has no
        adaptive thinking, and it was being shown the full five-level picker and
@@ -1421,6 +1427,20 @@
      over a Qwen session is simply wrong. So the prefix is the ACTIVE PROVIDER —
      and when a run has told us what it actually resolved, that wins over the
      profile we asked for, because the CLI is the only witness that counts. */
+  /* The chip on the agent picker.
+     Names the runtime, and — only where a backend is a real choice — the
+     backend beside it. A Codex session gets no second half rather than an
+     invented one: it signs in as itself and there is nothing behind it to
+     name. */
+  function agentName() {
+    const id = s.composer.runtime || 'claude'
+    const r = (s.composer.runtimes || []).find((x) => x.id === id)
+    const label = r ? r.label : id
+    if (r && r.providerProfiles === false) return label
+    const backend = providerName()
+    return backend && backend !== 'Provider' ? label + ' · ' + backend : label
+  }
+
   function providerName() {
     const id = s.composer.provider
     const p = (s.composer.providers || []).find((x) => x.id === id)

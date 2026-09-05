@@ -11,9 +11,13 @@
 import { loadSdk, type SDKSessionInfo } from '../agent/sdk.ts'
 import { MetaStore, type SessionMeta, type TestPlan } from './meta.ts'
 import { emptyTotals, summariseUsage, type UsageMessage, type UsageTotals } from './usage.ts'
+import { allRuntimes, getRuntime, type HistoricSession, type Meter, type RuntimeHistory, type RuntimeId } from '../agent/runtime.ts'
 
 export interface BoardSession {
   id: string
+  /** Which agent program this session runs on. Undefined on a session written
+   *  before the board had more than one, which is Claude Code. */
+  runtime?: RuntimeId
   title: string
   phase: string
   tags: string[]
@@ -134,6 +138,8 @@ export class SessionStore {
   /** The last index scan, and when it started. Shared by every caller inside
    *  the window — including the two that arrive together on every repaint. */
   private scan?: { at: number; infos: Promise<SDKSessionInfo[]> }
+  /** The same one-second window over every OTHER runtime's session store. */
+  private foreignScan?: { at: number; sessions: Promise<Array<HistoricSession & { runtime: RuntimeId }>> }
   /**
    * One parse of a session's JSONL, serving both the transcript and its usage
    * totals. Keyed by session id and swept on write so it cannot grow into a
@@ -183,7 +189,7 @@ export class SessionStore {
 
   /** Drop the cached scan. Called from anything that changes what it returns —
    *  a rename or a delete — so the board never shows an old title. */
-  private invalidate(): void { this.scan = undefined }
+  private invalidate(): void { this.scan = undefined; this.foreignScan = undefined }
 
   /**
    * Every session for this project, newest first.
@@ -192,7 +198,9 @@ export class SessionStore {
    * board the moment it starts.
    */
   async list(opts: { includeArchived?: boolean } = {}): Promise<BoardSession[]> {
-    const [infos, metas] = await Promise.all([this.infos(), this.meta.getAll()])
+    const [infos, metas, foreign] = await Promise.all([
+      this.infos(), this.meta.getAll(), this.foreign(),
+    ])
 
     const out: BoardSession[] = []
     for (const i of infos) {
@@ -221,9 +229,68 @@ export class SessionStore {
         ...(m.model ? { model: m.model } : {}),
         ...(m.effort ? { effort: m.effort } : {}),
         ...(m.thinking ? { thinking: m.thinking } : {}),
+        ...(m.runtime ? { runtime: m.runtime } : {}),
       })
     }
+
+    // Sessions belonging to another runtime, from ITS store. Claude Code's
+    // index does not know about them, so without this pass a Codex card
+    // disappears from the board the moment its process ends — which a window
+    // reload does to all of them at once. Same rule as the context meter: what
+    // the board shows must not depend on a process being alive.
+    for (const f of foreign) {
+      const m = metas[f.id]
+      if (m?.archived && !opts.includeArchived) continue
+      out.push({
+        id: f.id,
+        runtime: f.runtime,
+        title: f.title || 'Untitled session',
+        phase: m?.phase ?? this.defaultPhase,
+        tags: m?.tags ?? [],
+        archived: m?.archived ?? false,
+        pinned: m?.pinned ?? false,
+        updated: f.updatedAt,
+        ...(f.cwd ? { cwd: f.cwd } : {}),
+        ...(f.model ? { model: f.model } : {}),
+        ...(m?.worktree ? { worktree: m.worktree } : {}),
+        ...(m?.branch ? { branch: m.branch } : {}),
+        ...(m?.base ? { base: m.base } : {}),
+        ...(m?.parent ? { parent: m.parent } : {}),
+        ...(m?.running ? { running: m.running } : {}),
+        ...(m?.contextWindow ? { contextWindow: m.contextWindow } : {}),
+        ...(m?.testPlan ? { testPlan: m.testPlan } : {}),
+        ...(m?.effort ? { effort: m.effort } : {}),
+      })
+    }
+
     return out.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.updated - a.updated)
+  }
+
+  /**
+   * Sessions belonging to a runtime other than Claude Code.
+   *
+   * Cached on the same one-second window as the Claude scan, and for the same
+   * reason: `getState()` runs ten times a second while an agent streams, and
+   * this walks a directory tree. It is deliberately forgiving — a runtime whose
+   * store cannot be read contributes nothing rather than failing the whole
+   * board, because the alternative is one broken agent program blanking the
+   * cards of every other.
+   */
+  private foreign(): Promise<Array<HistoricSession & { runtime: RuntimeId }>> {
+    const now = Date.now()
+    if (!this.foreignScan || now - this.foreignScan.at >= SCAN_TTL_MS) {
+      this.foreignScan = {
+        at: now,
+        sessions: Promise.all(
+          allRuntimes()
+            .filter((rt) => rt.id !== 'claude' && rt.history)
+            .map((rt) => rt.history!.list(this.dir)
+              .then((list) => list.map((s) => ({ ...s, runtime: rt.id })))
+              .catch(() => [])),
+        ).then((lists) => lists.flat()),
+      }
+    }
+    return this.foreignScan.sessions
   }
 
   /**
@@ -326,7 +393,40 @@ export class SessionStore {
    * opposite direction: there the scope must be widened, here it must be dropped.
    */
   async transcript(id: string, limit = TRANSCRIPT_LIMIT): Promise<Entry[]> {
+    const rt = await this.runtimeOf(id)
+    if (rt) return (await rt.transcript(id)) as Entry[]
     return (await this.parse(id, limit)).entries
+  }
+
+  /**
+   * The history reader for a session that is NOT Claude Code's, or undefined.
+   *
+   * Routed on the session's own recorded runtime rather than on which store
+   * happens to have a file with that id. Ids are uuids and could not realistically
+   * collide, but "whichever store answers first" is a rule that silently picks
+   * the wrong reader the day one does — and the symptom would be an empty
+   * transcript, which reads as a lost session.
+   */
+  private async runtimeOf(id: string): Promise<RuntimeHistory | undefined> {
+    const meta = (await this.meta.getAll())[id]
+    if (!meta?.runtime || meta.runtime === 'claude') return undefined
+    return getRuntime(meta.runtime)?.history
+  }
+
+  /**
+   * What this session has consumed, in the unit its runtime can justify.
+   *
+   * Separate from `usage()` because they are not the same claim and collapsing
+   * them would produce the exact number this project forbids: a Codex session
+   * on a ChatGPT subscription is billed nothing per request, so folding it into
+   * `UsageTotals.costUsd` would put `$0.00` — or worse, `≥ $0.00` — on a card
+   * that has just spent 13% of a five-hour window. See `Meter`.
+   */
+  async meter(id: string): Promise<Meter> {
+    const rt = await this.runtimeOf(id)
+    if (rt) return (await rt.usage(id)).meter
+    const totals = await this.usage(id)
+    return { kind: 'usd', spentUsd: totals.costUsd, priced: totals.priced }
   }
 
   /**
@@ -338,6 +438,20 @@ export class SessionStore {
    * spend readout with nothing to add up. See `sessions/usage.ts`.
    */
   async usage(id: string): Promise<UsageTotals> {
+    const rt = await this.runtimeOf(id)
+    if (rt) {
+      // Context fill and its window are real for every runtime; the token
+      // BREAKDOWN and the price are not, so they stay at their empty values
+      // rather than being invented. `priced: true` with `costUsd: 0` is the
+      // honest pair here — nothing was billed per request, so the dollar total
+      // is exactly zero and is not a floor. The real figure is `meter()`.
+      const u = await rt.usage(id)
+      return {
+        ...emptyTotals(),
+        contextTokens: u.contextTokens,
+        ...(u.contextWindow ? { contextWindow: u.contextWindow } : {}),
+      }
+    }
     return (await this.parse(id, TRANSCRIPT_LIMIT)).usage
   }
 

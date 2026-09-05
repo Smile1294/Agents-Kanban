@@ -1,7 +1,7 @@
 {
   "name": "agents-kanban",
   "displayName": "Agents Kanban",
-  "description": "A kanban board your coding agents run themselves — each task in its own git worktree. Powered by Claude Code.",
+  "description": "A kanban board your coding agents run themselves \u2014 each task in its own git worktree. Powered by Claude Code.",
   "version": "0.0.1",
   "publisher": "Smile1294",
   "license": "MIT",
@@ -42,6 +42,10 @@
         "command": "agentsKanban.openBoard",
         "title": "Agents Kanban: Open Board",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "agentsKanban.openSettings",
+        "title": "Agents Kanban: Settings \u2014 Agents, Backends and Logins"
       },
       {
         "command": "agentsKanban.init",
@@ -116,17 +120,17 @@
             "Use VS Code's Zen Mode, which also hides the activity and status bars."
           ],
           "default": "wide",
-          "description": "How much of the window the board takes while it is in front. The primary side bar is never touched — it is how you get back."
+          "description": "How much of the window the board takes while it is in front. The primary side bar is never touched \u2014 it is how you get back."
         },
         "agentsKanban.sideBarHome": {
           "type": "string",
           "default": "workbench.view.explorer",
-          "description": "Which view the left side bar is handed back to after you press the Kanban icon. VS Code answers a click on an activity-bar icon by showing that extension's view, and offers no way to decline; this is what puts yours back. Any 'workbench.view.*' command id works — workbench.view.explorer, workbench.view.scm, workbench.view.search, workbench.view.extension.<id>. Leave it empty to let the side bar stay on the Kanban control instead."
+          "description": "Which view the left side bar is handed back to after you press the Kanban icon. VS Code answers a click on an activity-bar icon by showing that extension's view, and offers no way to decline; this is what puts yours back. Any 'workbench.view.*' command id works \u2014 workbench.view.explorer, workbench.view.scm, workbench.view.search, workbench.view.extension.<id>. Leave it empty to let the side bar stay on the Kanban control instead."
         },
         "agentsKanban.closeOnClickAway": {
           "type": "boolean",
           "default": true,
-          "description": "Close the board when you click away from it — open a file, switch to another tab — putting the terminal and the right-hand chat back. Turn this off to make the board a pure toggle that only the icon, Ctrl+Alt+K or its tab's X can close, which is what you want if you like to glance at a file and come straight back."
+          "description": "Close the board when you click away from it \u2014 open a file, switch to another tab \u2014 putting the terminal and the right-hand chat back. Turn this off to make the board a pure toggle that only the icon, Ctrl+Alt+K or its tab's X can close, which is what you want if you like to glance at a file and come straight back."
         },
         "agentsKanban.model": {
           "type": "string",
@@ -154,7 +158,7 @@
         "agentsKanban.notifyOnReview": {
           "type": "boolean",
           "default": true,
-          "description": "Show a notification when an agent moves its card into a review column — its way of saying the work is ready for you to test."
+          "description": "Show a notification when an agent moves its card into a review column \u2014 its way of saying the work is ready for you to test."
         },
         "agentsKanban.claudeExecutable": {
           "type": "string",
@@ -169,7 +173,7 @@
         "agentsKanban.runCommand": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Shell command that starts the app, run inside the session's worktree. Leave empty to detect it — a per-worktree launcher (`wt`) is preferred, then Laravel, then a `package.json` script. `${worktree}` is replaced with the worktree's path."
+          "markdownDescription": "Shell command that starts the app, run inside the session's worktree. Leave empty to detect it \u2014 a per-worktree launcher (`wt`) is preferred, then Laravel, then a `package.json` script. `${worktree}` is replaced with the worktree's path."
         },
         "agentsKanban.runUrl": {
           "type": "string",
@@ -184,7 +188,7 @@
         "agentsKanban.providers": {
           "type": "array",
           "default": [],
-          "markdownDescription": "Model backends agent sessions can run on. Each profile compiles to environment variables on the `claude` process — the same variables the CLI documents — so anything Claude Code supports works here. **Credentials are never stored in settings**: they live in VS Code's secret storage, and `hasCredential` only records that one is set. Use **Agents Kanban: Add Model Provider** rather than editing this by hand. See [docs/PROVIDERS.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/PROVIDERS.md).",
+          "markdownDescription": "Model backends agent sessions can run on. Each profile compiles to environment variables on the `claude` process \u2014 the same variables the CLI documents \u2014 so anything Claude Code supports works here. **Credentials are never stored in settings**: they live in VS Code's secret storage, and `hasCredential` only records that one is set. Use **Agents Kanban: Add Model Provider** rather than editing this by hand. See [docs/PROVIDERS.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/PROVIDERS.md).",
           "items": {
             "type": "object",
             "required": [
@@ -212,7 +216,7 @@
                   "gateway"
                 ],
                 "enumDescriptions": [
-                  "Change nothing — the CLI resolves its own provider from the environment.",
+                  "Change nothing \u2014 the CLI resolves its own provider from the environment.",
                   "Anthropic's API: your Claude subscription, or a Console API key.",
                   "Amazon Bedrock, through the AWS SDK credential chain.",
                   "Google Cloud's Agent Platform (formerly Vertex AI).",
@@ -248,7 +252,7 @@
                   "au",
                   "global"
                 ],
-                "description": "ANTHROPIC_BEDROCK_REGION_PREFIX — which cross-region inference profile prefix to try first."
+                "description": "ANTHROPIC_BEDROCK_REGION_PREFIX \u2014 which cross-region inference profile prefix to try first."
               },
               "workspaceId": {
                 "type": "string",
@@ -318,7 +322,25 @@
         "agentsKanban.discoverModels": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Ask the `claude` CLI which models it can actually run, instead of using a built-in list. This is what puts newly released models — and the ones your provider serves — in the picker without waiting for an extension update, and it is where the per-model effort levels and extended-thinking support come from. The answer is cached per provider; refresh it with **Agents Kanban: Refresh Model List**. Turn this off to use the built-in list only."
+          "markdownDescription": "Ask the `claude` CLI which models it can actually run, instead of using a built-in list. This is what puts newly released models \u2014 and the ones your provider serves \u2014 in the picker without waiting for an extension update, and it is where the per-model effort levels and extended-thinking support come from. The answer is cached per provider; refresh it with **Agents Kanban: Refresh Model List**. Turn this off to use the built-in list only."
+        },
+        "agentsKanban.runtime": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "enumDescriptions": [
+            "Claude Code. Its backend is chosen by a provider profile.",
+            "Codex. Uses the login already on this machine \u2014 a ChatGPT subscription or an OpenAI API key. No proxy."
+          ],
+          "default": "claude",
+          "markdownDescription": "Which agent program new sessions run on. Each session keeps the one it started on, so a Claude Code card and a Codex card can run side by side. Change it per session on the composer bar, or for good here."
+        },
+        "agentsKanban.codexExecutable": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `codex` binary. Leave empty to find it on your PATH, then in the usual install locations. Never resolved from `node_modules` \u2014 the board runs the Codex you maintain, not a bundled copy."
         }
       }
     },

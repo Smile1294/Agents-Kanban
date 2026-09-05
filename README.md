@@ -38,6 +38,12 @@ part.
 - **Interrupt, queue follow-ups, change permissions mid-run.**
 - **Subagents are visible**, nested under the `Task` that spawned them.
 - **Attach screenshots** — paste an image straight into the composer.
+- **Claude Code *and* Codex, side by side.** Pick which agent runs each session;
+  they run at the same time, in their own worktrees, on their own models. Codex
+  is driven natively through its own `app-server` — **no proxy, nothing to
+  configure**. If you have run `codex login`, it works, ChatGPT subscription
+  included. A subscription session shows the rate-limit window it is actually
+  spending rather than a made-up `$0.00`. See [docs/RUNTIMES.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/RUNTIMES.md).
 - **Run on your own backend.** Anthropic, Amazon Bedrock, Google Cloud's Agent
   Platform, Microsoft Foundry, Claude Platform on AWS, an LLM gateway, or a
   local model behind a translation proxy. Credentials go to VS Code's secret
@@ -120,10 +126,14 @@ aside; your left side bar never moves, because it is how you get back.
   ~190MB copy. Set `agentsKanban.claudeExecutable` if it lives somewhere unusual.
 - **A git repository open.** The board renders without one, but agents need a
   worktree to run in.
+- **[Codex](https://developers.openai.com/codex) — optional.** Only if you want
+  to run sessions on it. `npm install -g @openai/codex`, then `codex login`;
+  the board uses that login and never asks for a key. Set
+  `agentsKanban.codexExecutable` if it lives somewhere unusual.
 - **Nothing extra for a different provider.** If your Claude Code is already
   pointed at Bedrock, Vertex or a gateway, that keeps working untouched: the
-  default provider profile inherits whatever the CLI resolves. Configure one
-  from inside the editor with **Agents Kanban: Select Model Provider**.
+  default provider profile inherits whatever the CLI resolves. Everything —
+  agents, backends and logins — is on one page: **Agents Kanban: Settings**.
 - **Node 22.6+** — only if you are building from source.
 
 ## Getting started
@@ -136,6 +146,8 @@ Press **+ New session**, describe a task, and let it go.
 
 | Setting | What it does |
 |---|---|
+| `agentsKanban.runtime` | Which agent program new sessions run on: `claude` or `codex`. Per session on the composer bar — see [docs/RUNTIMES.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/RUNTIMES.md) |
+| `agentsKanban.codexExecutable` | Path to `codex`, if it is not on your `PATH` |
 | `agentsKanban.model` | Model for agent sessions |
 | `agentsKanban.discoverModels` | Ask the CLI which models it can run, so new ones appear without an extension update (default on) |
 | `agentsKanban.provider` / `providers` | Which backend agents run on. Default `inherit` changes nothing — see [docs/PROVIDERS.md](https://github.com/Smile1294/Agents-Kanban/blob/main/docs/PROVIDERS.md) |

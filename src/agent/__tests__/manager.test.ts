@@ -130,7 +130,7 @@ for (const kind of TERMINAL) {
   // A live parent, without launching a real agent. `split()` reads it through
   // byKey(); everything else it touches is faked above.
   const parent: RunningAgent = {
-    runId: 'run-1', sessionId: 'sess-parent', title: 'Do two things',
+    runId: 'run-1', runtime: 'claude', sessionId: 'sess-parent', title: 'Do two things',
     state: { kind: 'working' }, worktreePath: '/tmp/wt/parent', branch: 'task/parent',
     base: 'main', live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
   }
@@ -242,7 +242,7 @@ for (const kind of TERMINAL) {
     boardContext: (a: RunningAgent) => Record<string, unknown>
   }
   const agent: RunningAgent = {
-    runId: 'run-7-abc', title: 'Okay.',
+    runId: 'run-7-abc', runtime: 'claude', title: 'Okay.',
     state: { kind: 'working' }, worktreePath: '/tmp/wt', branch: 'task/run-7-abc',
     live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
   }
@@ -334,7 +334,7 @@ for (const kind of TERMINAL) {
   })
   const internals = mgr as unknown as { agents: Map<string, RunningAgent> }
   const running = (runId: string, sessionId: string): RunningAgent => ({
-    runId, sessionId, title: runId,
+    runId, runtime: 'claude', sessionId, title: runId,
     state: { kind: 'working' }, worktreePath: '/tmp/wt/' + runId, branch: 'task/' + runId,
     live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
   })

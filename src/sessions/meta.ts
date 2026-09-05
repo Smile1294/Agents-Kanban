@@ -15,6 +15,7 @@
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { MODEL_WINDOWS } from './usage.ts'
+import { parseRuntimeId, type RuntimeId } from '../agent/runtime.ts'
 
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type ThinkingMode = 'enabled' | 'disabled'
@@ -164,6 +165,19 @@ export interface ActivityEntry {
 
 export interface SessionMeta {
   phase: string
+  /**
+   * Which agent program this session runs on — `claude`, `codex`.
+   *
+   * Persisted rather than defaulted, because a session's transcript lives in
+   * its runtime's OWN store and no other runtime can read it: a card that came
+   * back on the wrong agent after a restart would show an empty history and
+   * resume nothing. Absent means the session predates this field, and the
+   * default is Claude Code, which is what every existing session is.
+   *
+   * Read back in `all()` below. A field written and never parsed is not
+   * persistence — `contextWindow` was exactly that for its whole life.
+   */
+  runtime?: RuntimeId
   tags: string[]
   archived: boolean
   pinned: boolean
@@ -330,6 +344,10 @@ export class MetaStore {
           ...(typeof m.parent === 'string' ? { parent: m.parent } : {}),
           ...(typeof m.running === 'number' && m.running > 0 ? { running: m.running } : {}),
           ...(typeof m.contextWindow === 'number' ? { contextWindow: m.contextWindow } : {}),
+          // Parsed, not cast. This file outlives the extension VERSION that
+          // wrote it, so an id from a build that served a runtime this one does
+          // not is another program's output — and it is read on the render path.
+          ...(parseRuntimeId(m.runtime) ? { runtime: parseRuntimeId(m.runtime)! } : {}),
           ...(testPlan ? { testPlan } : {}),
           ...(typeof m.model === 'string' ? { model: m.model } : {}),
           ...(typeof m.effort === 'string' ? { effort: m.effort as EffortLevel } : {}),

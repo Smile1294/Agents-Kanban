@@ -50,9 +50,20 @@ const hasPrefix = (p) => entries.some((e) => e.startsWith('extension/' + p))
 console.log('\n— what the user installs')
 const manifest = JSON.parse(await fs.readFile(path.join(repoRoot, 'package.json'), 'utf8'))
 ok(has(manifest.main.replace(/^\.\//, '')), `the bundle is in the package: ${manifest.main}`)
-for (const f of ['media/board.js', 'media/board.css', 'media/board.svg']) {
+for (const f of ['media/board.js', 'media/board.css', 'media/board.svg', 'media/settings.js', 'media/settings.css']) {
   ok(has(f), `webview asset is in the package: ${f}`)
 }
+
+/* The board's MCP server, as its own program.
+ *
+ * A SECOND bundle, spawned by Codex as `node dist/board-mcp.js`. It is asserted
+ * separately because its failure mode is the quietest one in the whole package:
+ * an extension shipped without it installs perfectly, runs Claude sessions
+ * perfectly, and leaves every Codex agent unable to move its own card — with
+ * the reason in a log nobody reads. `**\/*.ts` and `**\/*.map` are ignored by
+ * .vscodeignore, so this is exactly the sort of file a glob change would drop.
+ */
+ok(has('dist/board-mcp.js'), 'the board MCP server ships, or Codex agents cannot move their own cards')
 
 // The listing's own assets. A missing icon does not fail the build — the
 // Marketplace just shows a grey placeholder next to everyone else's artwork,

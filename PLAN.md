@@ -28,6 +28,12 @@ transcript. Switching modes never changes what exists.
 reorder tool. Writing `phase` is the move. Lane order is the order of `columns`
 in [`src/board/config.ts`](src/board/config.ts).
 
+**A session's RUNTIME is the agent program running it, and it never changes.**
+Claude Code and Codex are siblings — different processes, different protocols,
+different logins, different transcript stores. Two cards can be on two agents at
+once; one card cannot change agent mid-life, because its history belongs to the
+one it started on. See [docs/RUNTIMES.md](docs/RUNTIMES.md).
+
 ```
 Backlog → Planning → Implementing → Validating → Complete
                                                  └── humanOnly: agents cannot reach this
@@ -65,14 +71,26 @@ src/
   board/
     config.ts           Columns, phases, the humanOnly rule, AgentState
     panel.ts            Editor WebviewPanel + side bar control view, focus layout
+    settings.ts         The settings TAB: agents, backends, logins
   sessions/
     meta.ts             Sidecar metadata; effort/thinking resolution order
-    store.ts            Claude Code's sessions + our metadata, merged
+    store.ts            Every runtime's sessions + our metadata, merged
+    codex-store.ts      Codex's own rollout transcripts, read back off disk
   agent/
+    runtime.ts          WHAT AN AGENT PROGRAM IS: the contract + the registry
+    runtimes/
+      claude.ts         Claude Code, behind the contract
+      codex.ts          Codex, over `codex app-server` JSON-RPC
+      index.ts          The one file that names them all
+    jsonrpc.ts          Newline-delimited JSON-RPC 2.0 over a child's stdio
+    board-bridge.ts     The board's tools over a socket, for a runtime that
+                        spawns MCP servers rather than taking one in-process
     sdk.ts              Lazy ESM loader; resolves the `claude` binary
     tools.ts            In-process MCP tools the agent uses on its own card
     session.ts          One query() run: streaming, permissions, usage, interrupt
     manager.ts          N concurrent agents, one worktree each
+  board-mcp.ts          Its own bundle (dist/board-mcp.js). Spawned BY Codex;
+                        forwards to board-bridge and holds no board logic
   git/
     lock.ts             Per-repo mutex
     worktree.ts         Worktree lifecycle, review, commit and merge back
@@ -286,6 +304,25 @@ Working:
   launcher, provisions it if it has never been provisioned, waits for the port
   to actually answer, then opens the browser on it. See
   [`src/run/recipe.ts`](src/run/recipe.ts)
+- **Two agent programs, on one board, at once.** Claude Code and Codex, each
+  session in its own worktree on its own model, picked from the 🤖 control on the
+  composer bar. Codex is driven natively over `codex app-server` — the same
+  JSON-RPC interface its own VS Code extension uses — with **no proxy and
+  nothing to configure**: if `codex login` has been run on this machine,
+  sessions work. That is not a convenience, it is the only thing that can work,
+  because a ChatGPT subscription cannot be spent through a translation proxy at
+  all. A Codex card moves itself, writes a test plan and splits like any other,
+  through the same board tools served over a socket. See
+  [docs/RUNTIMES.md](docs/RUNTIMES.md)
+- **A meter that does not pretend to be dollars.** A subscription session is
+  billed nothing per request, so its readout is the rate-limit window it is
+  actually spending — `13% of 5h · Plus` — rather than `$0.00`. `Meter` is a
+  union for this reason, and `unknown` renders as `—`
+- **A settings page, in an editor tab.** Agents, backends and logins, with
+  `retainContextWhenHidden`, because the quick pick it replaced closed on a
+  misclick and took the half-typed gateway URL with it. Whether each agent is
+  installed and signed in comes from ASKING it, and "could not tell" is never
+  shown as "signed out"
 - Archive (soft, reversible) and permanent delete
 - Permission prompts inline on the card
 - Multiple tags per session
@@ -407,6 +444,26 @@ Notable tests:
 ---
 
 ## 9. What to build next
+
+### Runtimes: what is not done
+
+Codex is driven natively and the abstraction is real (`startRun()` has no branch
+on runtime identity), but three things are honest gaps rather than decisions:
+
+- **No real Codex run has been made from the board yet.** The protocol path is
+  covered against a stand-in app-server — handshake, streaming, tool rows,
+  approvals, interrupt, usage, and both known item spellings — and the store
+  path against a rollout fixture in Codex's real format. Nothing local can
+  prove the live CLI spells its methods the way this adapter does; that is why
+  it reads both spellings and reports what it could not read. **Install Codex
+  and run one**, as [DECISIONS.md](docs/DECISIONS.md) "the first real agent run"
+  did for Claude.
+- **Images do not reach a Codex session.** It takes `local_image` by path, and
+  this board writes nothing to the user's repository. The composer says so
+  rather than dropping them.
+- **One app-server per session.** A single shared server could host every thread
+  (`thread/start` takes a `cwd`), which would be cheaper; per-session matches the
+  existing lifecycle exactly, so it is where this starts.
 
 ### The remaining Nimbalyst gaps
 

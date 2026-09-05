@@ -15,6 +15,7 @@ stream reference, current state, and what to build next.
 | How does Nimbalyst do X? | [docs/NIMBALYST.md](docs/NIMBALYST.md) — don't re-clone the repo, it's already been analysed |
 | What's the real Agent SDK API? | [docs/SDK-NOTES.md](docs/SDK-NOTES.md) — **the public docs are wrong in places** |
 | Why is it built this way? | [docs/DECISIONS.md](docs/DECISIONS.md) — decisions and bug postmortems |
+| Which AGENT PROGRAM runs a session — Claude Code, Codex? How do I add a third? | [docs/RUNTIMES.md](docs/RUNTIMES.md) |
 | How do I run agents on Bedrock, Vertex, a gateway or a local model? | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | How do I run it? | [README.md](README.md) |
 
@@ -168,6 +169,68 @@ run, since each session needs a worktree.
   a plausible `localhost:8000` belonging to the main checkout shows the OLD code
   and reads as "the change did nothing". The browser opens only once something
   actually answers on the port.
+- **A RUNTIME is not a provider, and the difference is which process.** A
+  provider is the backend *behind* Claude Code, selected by environment
+  variables on the child we spawn — adding one is a row in a reducer. A runtime
+  is the agent program *itself*: a different process, a different protocol, its
+  own login, its own transcript store. Codex is a runtime, not a provider, and
+  the old advice (a translation proxy in front of Claude Code) could never have
+  worked, because **a ChatGPT subscription cannot be spent through a proxy** —
+  LiteLLM needs an OpenAI API key, a different credential on a different meter.
+  Everything a runtime must provide is declared in `agent/runtime.ts`, so a
+  third is one module plus one line in `agent/runtimes/index.ts`;
+  `AgentManager.startRun()` has no branch on runtime identity, deliberately,
+  and that is the test of whether the abstraction is real. A runtime with no
+  provider concept returns `providerProfiles: false` and the backend controls
+  DISAPPEAR — offering a setting that cannot take effect is the same class of
+  bug as a control that cannot say no.
+- **A session keeps the runtime it started on, and that is not a limitation to
+  work around.** Its transcript lives in that runtime's own store, its model ids
+  are that runtime's, and its login is that runtime's — so there is no honest
+  way to move a live session across. Two cards on two agents at once is the
+  supported thing; one card changing agent mid-run is not. `SessionMeta.runtime`
+  is persisted for this reason and is PARSED on the way back, never cast: a card
+  that came back on the wrong agent would show an empty history and resume
+  nothing.
+- **Dollars are not a universal unit of agent spend.** A Claude Code session
+  priced against published rates has a figure it can defend; a Codex session on
+  a ChatGPT subscription has none — no request is billed, and the only real
+  quantity is how full a rolling rate-limit window is. So `Meter` is a UNION
+  (`usd` / `plan` / `unknown`), and `unknown` renders as `—` and never as zero.
+  Showing `$0.00` on a subscription card is "never show a signal that cannot say
+  bad" broken in a new place: it is not zero spend, it is not a dollar quantity.
+- **One set of board tools, two transports, and the guard stays host-side.**
+  Claude Code takes an in-process MCP server; Codex takes a command to spawn. So
+  `board-bridge.ts` serves the same `buildBoardTools` definitions over a socket
+  and `board-mcp.ts` (its own bundle, `dist/board-mcp.js`) forwards to it —
+  holding NO board logic, because a boundary enforced inside a process the
+  agent's runtime spawned is not a boundary. `isHumanOnly()` runs in the host;
+  `board-bridge.test.ts` asserts `set_phase('complete')` is refused across the
+  socket, and that gate has been shown to fail. A socket rather than a port,
+  plus a token: these tools write to the board and can start agents that cost
+  money.
+- **Another runtime's protocol WILL drift, so read both spellings and say what
+  you could not read.** Codex's own two published surfaces already disagree —
+  the exec stream says `agent_message`, the app-server says `agentMessage`.
+  Reading one gives a working transcript on one version and a silently empty one
+  on the next. The adapter normalises case and separators, and reports
+  unrecognised messages once per turn rather than per frame (that path is the
+  streaming path) and never zero times (that is a transcript quietly losing half
+  its rows).
+- **Cached-token accounting is per vendor and getting it backwards doubles the
+  meter.** Anthropic's `input_tokens` and `cache_read_input_tokens` are DISJOINT
+  and are summed. Codex's `cached_input_tokens` is a SUBSET of `input_tokens`,
+  already counted — so its fill is the turn total. Verified against a real
+  rollout: `total_tokens` 14270 == `input_tokens` 14041 + `output_tokens` 229,
+  with `cached_input_tokens` 12160 inside the input figure.
+- **Configuration goes on the settings PAGE; per-session choices stay on the
+  composer.** A quick pick closes when focus moves and takes a half-typed
+  gateway URL with it, which is a control that loses your work. So agents,
+  backends and logins live in a webview editor tab with
+  `retainContextWhenHidden`; model, effort, thinking and the session flags stay
+  on the bar, because they are chosen per card beside the card. The page's
+  hardest rule is the ordinary one: four `LoginState` cases render as four
+  different things, and "could not tell" is NEVER rendered as "signed out".
 - **A provider is environment on the CLI, and an explicit one CLEARS what it
   does not set.** This extension never talks to a model API — it spawns the
   Claude Code CLI, and every backend the CLI can reach is selected by

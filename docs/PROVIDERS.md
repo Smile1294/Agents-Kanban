@@ -1,4 +1,16 @@
-# Providers — which backend agents run on
+# Providers — which backend Claude Code runs on
+
+> **There are two axes, and this page is one of them.**
+>
+> A **runtime** is the agent program itself — Claude Code, Codex. It is what you
+> sign into, and it owns the transcript, the tool loop and the login. See
+> [RUNTIMES.md](RUNTIMES.md).
+>
+> A **provider** is what stands *behind* Claude Code: Anthropic directly,
+> Bedrock, Vertex, Foundry, a gateway. That is this page.
+>
+> Codex has no provider setting and never will, because it authenticates as
+> itself. Offering one would be a control that cannot take effect.
 
 Agents Kanban does not talk to a model API. It spawns the **Claude Code CLI**,
 and the CLI talks to the provider. That one fact decides the whole design, so
@@ -71,67 +83,55 @@ plainly that routing Claude Code to non-Claude models through any gateway is
 not supported. The picker marks those presets `community proxy` for that reason
 — listing them beside Bedrock with no distinction would be lying by omission.
 
-#### Connecting to OpenAI or Codex, concretely
+#### Codex, and a ChatGPT subscription
 
-Pointing the base URL at `api.openai.com` can never work, and the profile
-validator now refuses it by name: Claude Code sends Anthropic Messages requests,
-and OpenAI does not serve that protocol. The working shape is a proxy that
-translates:
+**This is no longer a provider question, and it no longer involves a proxy.**
 
-1. **Run a translation proxy.** Quickest is LiteLLM, whose proxy serves an
-   Anthropic-format `/v1/messages` alongside the OpenAI routes:
+Codex is not a backend that stands behind Claude Code — it is a *sibling of*
+Claude Code, an agent runtime you sign into, with its own protocol, its own
+transcript store and its own login. The board now drives it directly. See
+[RUNTIMES.md](RUNTIMES.md).
 
-   ```bash
-   pip install 'litellm[proxy]'
-   export OPENAI_API_KEY=sk-…        # your OpenAI key lives with the PROXY
-   litellm --model openai/<model> --port 4000
-   ```
+What that means in practice: if you have run `codex login` on this machine,
+Codex sessions work. There is nothing to configure, no endpoint to point at and
+no key to paste. Pick **Codex** from the 🤖 picker on the composer bar, or make
+it the default on the settings page.
 
-   [claude-code-router](https://github.com/musistudio/claude-code-router) does
-   the same job with per-task routing across OpenAI, Gemini, DeepSeek and
-   OpenRouter.
+The old advice on this page — run LiteLLM or claude-code-router in front of
+Claude Code — was poor advice for a concrete reason, and it is worth stating
+because it is the reason the runtime work happened at all:
 
-2. **Add the "OpenAI / Codex (via proxy)" preset** from the provider picker.
-   Base URL `http://localhost:4000`; the credential field is whatever the proxy
-   itself requires (LiteLLM's `--master-key` if you set one — not your OpenAI
-   key, which the proxy already holds).
+> **A ChatGPT subscription cannot be spent through a proxy.** LiteLLM and
+> claude-code-router need an OpenAI **API key**, which is a different credential
+> on a different billing meter. The subscription's tokens live in
+> `~/.codex/auth.json` and only the Codex runtime can spend them.
 
-3. **Press Test connection.** A pass means the proxy answered `/v1/messages`
-   and took the credential. Then use *Refresh the model list* — the proxy
-   reports what it serves, so the picker offers the OpenAI models by their own
-   ids.
-
-The board's cost figures stay honest rather than helpful here: OpenAI models
-have no entry in the Anthropic rate table, so spend shows as `≥ $…` (a floor
-covering any Claude usage) instead of a guessed OpenAI price, and the context
-meter uses the window the profile declares.
-
-#### What about Codex, or a ChatGPT subscription?
-
-**Codex is not a provider — it is a sibling of Claude Code.** The Codex CLI and
-its VS Code extension work the same way this extension does: an agent runtime
-you sign into, which drives a model behind its own protocol. There is no API
-endpoint to point a profile at, and a ChatGPT subscription's login tokens are
-usable only by Codex itself — a translation proxy cannot borrow them, because
-LiteLLM and claude-code-router need an OpenAI **API key**, which is a different
-credential on a different billing meter.
-
-So the honest matrix is:
+So the honest matrix is now:
 
 | You have | What works |
 |---|---|
-| An OpenAI **API key** | The recipe above — LiteLLM in front, today |
-| A ChatGPT / Codex **subscription** | Only the Codex runtime can spend it. Putting Codex sessions on this board would mean driving `codex exec --json` as a SECOND agent runtime beside Claude Code — a real feature, sketched below, not a profile |
+| A ChatGPT / Codex **subscription** | Codex sessions, natively. No proxy. |
+| An OpenAI **API key** | Codex sessions too — `codex login` takes either. |
+| A non-Claude model behind an Anthropic-shaped endpoint | A `gateway` profile, as below. Still a community setup. |
 
-Running Codex as a second runtime is architecturally plausible — the CLI has a
-headless JSON mode (`codex exec --json`), session resume, and MCP support — but
-it is a subsystem, not a setting: its own spawn/stream adapter, board tools
-served over stdio MCP instead of the in-process SDK server, a transcript reader
-for `~/.codex`'s session store, and an approval-mode mapping. Nothing in the
-provider layer is reusable for it, deliberately: providers select what stands
-BEHIND Claude Code, and Codex stands beside it.
+#### Non-Claude models behind Claude Code
 
-Two settings exist because of this path, and the presets turn them on:
+The gateway path still exists and is still unsupported by Anthropic, but it is
+now for one case only: putting a model that is neither Claude nor GPT — a local
+Llama, a vLLM deployment, DeepSeek — behind Claude Code through a translation
+proxy such as [LiteLLM](https://github.com/BerriAI/litellm) or
+[claude-code-router](https://github.com/musistudio/claude-code-router).
+
+Pointing a base URL at `api.openai.com` can never work and the profile validator
+refuses it by name: Claude Code sends Anthropic Messages requests and OpenAI does
+not serve that protocol. If you want OpenAI models, use the Codex runtime — that
+is what it is for.
+
+The board's cost figures stay honest rather than helpful on a gateway: a model
+with no entry in the Anthropic rate table shows spend as `≥ $…` instead of a
+guessed price, and the context meter uses the window the profile declares.
+
+Two settings exist for this path, and the presets turn them on:
 
 - `disableBetas` → `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. The documented
   fix for `Unexpected value(s) for the anthropic-beta header`, which is what
@@ -143,8 +143,12 @@ Two settings exist because of this path, and the presets turn them on:
 
 ## How to set one up
 
-From the board: the **🔌 picker** on the composer bar → *Configure providers…*.
-From the palette: **Agents Kanban: Add Model Provider**.
+From the board: the **🤖 picker** on the composer bar → *Agents, backends and
+logins…*, which opens the settings tab. From the palette: **Agents Kanban:
+Settings — Agents, Backends and Logins**.
+
+It is a tab rather than a quick pick on purpose: a quick pick closes when focus
+moves, and it took a half-typed gateway URL with it every time.
 
 Pick a preset, answer the fields, and — because a provider that looks
 configured and is not is the whole problem — press **Test connection**.

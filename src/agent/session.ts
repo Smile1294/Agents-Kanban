@@ -19,6 +19,7 @@ import type { EffortLevel, ThinkingMode } from '../sessions/meta.ts'
 import type { AgentState } from '../board/config.ts'
 import { buildAskAnswers, parseAskQuestions } from '../board/questions.ts'
 import { reconcileProvider, resolvedLabel, type ProviderProfile } from './providers.ts'
+import type { AgentRun, Meter } from './runtime.ts'
 
 export interface PermissionRequest {
   id: string
@@ -47,6 +48,8 @@ export interface SessionEvents {
    *  the turn runs, so the readout climbs instead of jumping at the end.
    *  `priced` is false when a model with no published rate contributed. */
   spend: (spentUsd: number, priced: boolean) => void
+  /** The same figure as `spend`, in the shape every runtime reports. */
+  meter: (m: Meter) => void
   /** A `git commit` ran in the worktree — the host should read the new HEAD. */
   committed: () => void
   permission: (req: PermissionRequest) => void
@@ -275,8 +278,11 @@ export interface AgentSessionOptions {
   log?: (message: string) => void
 }
 
-export class AgentSession extends EventEmitter {
+export class AgentSession extends EventEmitter implements AgentRun {
   readonly taskId: string
+  /** Which agent program this session runs on. Fixed here; `AgentManager`
+   *  reads it rather than assuming, so a card can say what it is running. */
+  readonly runtime = 'claude' as const
   private readonly opts: AgentSessionOptions
   private readonly queue = new MessageQueue()
   private readonly abort = new AbortController()
@@ -685,7 +691,28 @@ export class AgentSession extends EventEmitter {
     // No id means nothing to deduplicate against, so it is counted once under
     // a key of its own rather than overwriting the previous response.
     this.turnCosts.set(id || `@${this.turnCosts.size}`, cost ?? 0)
-    this.emit('spend', this.spentUsd, this.unpricedModels.size === 0)
+    this.emitSpend()
+  }
+
+  /**
+   * Both spend readouts, from one place.
+   *
+   * `spend` is the original event and is unchanged. `meter` is the same figure
+   * in the runtime-neutral shape every agent runtime reports — see `Meter` in
+   * `runtime.ts`, which is a union because a subscription session has no dollar
+   * figure it can defend and must not be shown a fabricated one. Claude Code
+   * sessions are always the `usd` case; emitting both keeps the board's two
+   * paths reading the same number rather than two arithmetics that can drift.
+   */
+  private emitSpend(): void {
+    const priced = this.unpricedModels.size === 0
+    this.emit('spend', this.spentUsd, priced)
+    this.emit('meter', { kind: 'usd', spentUsd: this.spentUsd, priced } satisfies Meter)
+  }
+
+  /** The runtime-neutral view of this session's spend. */
+  get meter(): Meter {
+    return { kind: 'usd', spentUsd: this.spentUsd, priced: this.unpricedModels.size === 0 }
   }
 
   /** What this session has spent, ended turns plus the one in progress. */
@@ -720,7 +747,7 @@ export class AgentSession extends EventEmitter {
         )
       }
     }
-    this.emit('spend', this.spentUsd, this.unpricedModels.size === 0)
+    this.emitSpend()
   }
 
   /** Is this a tool the agent may use without stopping to ask? */

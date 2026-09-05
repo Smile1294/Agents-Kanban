@@ -34,6 +34,18 @@ import {
 } from './agent/providers.ts'
 import { probeProvider } from './agent/probe.ts'
 import {
+  collectRuntimeStatus, SettingsPanel,
+  type SettingsHost, type SettingsMessage, type SettingsState,
+} from './board/settings.ts'
+// Imported for effect: this is what puts Claude Code and Codex in the registry.
+// See agent/runtimes/index.ts for why registration is explicit rather than
+// happening wherever an implementation happens to be imported first.
+import './agent/runtimes/index.ts'
+import {
+  allRuntimes, DEFAULT_RUNTIME, getRuntime, parseRuntimeId,
+  type LoginState, type Meter, type RuntimeId, type RuntimeStatus,
+} from './agent/runtime.ts'
+import {
   ALL_EFFORTS, catalogueFor, discoverModels, effortsFor, fastModeFor, parseCachedChoices,
   thinkingFor, ultracodeFor,
   type ModelCatalogue, type ModelChoice,
@@ -89,6 +101,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     'acceptEdits'
 
   // Composer defaults, remembered per workspace.
+  /**
+   * Which agent program NEW sessions run on.
+   *
+   * Parsed rather than cast, like every other value read back out of storage:
+   * a build that served a runtime this one does not would otherwise put an id
+   * nothing can start onto the render path. Falls back to Claude Code, which is
+   * what every session written before this existed is.
+   */
+  let runtime: RuntimeId = parseRuntimeId(state.get<string>('runtime'))
+    ?? parseRuntimeId(cfg().get<string>('runtime'))
+    ?? DEFAULT_RUNTIME
   let model = state.get<string>('model') ?? cfg().get<string>('model') ?? MODELS[0]!.id
   let effort: EffortLevel = (state.get<string>('effort') as EffortLevel) ?? 'high'
   let thinking: ThinkingMode = (state.get<string>('thinking') as ThinkingMode) ?? 'enabled'
@@ -160,7 +183,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   /** In-flight discovery, so opening the picker twice does not spawn two CLIs. */
   let discovering: Promise<void> | undefined
 
-  const catalogueKey = (id: string) => `models:${id}`
+  /**
+   * Where a model list is cached.
+   *
+   * Keyed by RUNTIME as well as provider profile. The models are per agent
+   * program *and* per backend, and keying on the profile alone would file
+   * Codex's `gpt-5.5` under `inherit` and hand it back the next time a Claude
+   * session asked — a picker offering ids the running agent does not serve,
+   * which fails at the first request with somebody else's error message.
+   *
+   * The `claude:` prefix is written out rather than interpolated for the
+   * default so that entries cached by builds before runtimes existed are simply
+   * missed and re-asked, instead of being read as another runtime's.
+   */
+  const catalogueKey = (id: string, rt: RuntimeId = runtime) => `models:${rt}:${id}`
 
   /** Rebuild the catalogue from whatever is already known — no CLI round trip.
    *  Called whenever the profile changes, so the picker is never showing the
@@ -180,6 +216,73 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   /**
+   * The model list for a runtime that is not Claude Code.
+   *
+   * Same three-source rule as the Claude path and in the same order — the
+   * runtime's own answer, then a cache, then a built-in list that the picker
+   * DISCLOSES as a fallback. It is a separate function only because the
+   * transport differs; the fallback logic still lives in one place per runtime,
+   * inside `rt.models()`, because two functions that both know how to fall back
+   * is the bug that made the picker discard the CLI's answer for a whole
+   * release.
+   *
+   * Never rejects. The caller is a picker, and an empty picker reads as a broken
+   * extension when the cause is being offline.
+   */
+  async function refreshRuntimeModels(force = false): Promise<void> {
+    const rt = getRuntime(runtime)
+    if (!rt) { recomputeCatalogue(); return }
+    const key = catalogueKey(runtime, runtime)
+    if (!force) {
+      const cached = parseCachedChoices(context.globalState.get(key))
+      // `cli`, not a fourth source: a remembered answer is still the answer the
+      // runtime gave, and that is how the Claude path already reports its own
+      // cache. A `cache` label would suggest a fallback the user should worry
+      // about.
+      if (cached.length) { catalogue = { choices: cached, source: 'cli' }; return }
+    }
+    try {
+      const loc = await rt.detect(configuredPathFor(runtime))
+      const cat = loc ? await rt.models(loc) : { models: rt.builtinModels(), source: 'builtin' as const, note: `${rt.label} is not installed.` }
+      const choices: ModelChoice[] = cat.models.map((m) => ({
+        id: m.id,
+        label: m.label,
+        // Derived from the window the runtime declared, so the label under the
+        // picker and the denominator the meter measures against cannot
+        // disagree — the rule `MODELS` already exists to enforce.
+        context: windowLabel(m.contextWindow),
+        ...(m.description ? { detail: m.description } : {}),
+        efforts: m.supportedEffort ?? [],
+        // Extended thinking is Claude's switch. A runtime without it must not
+        // show a toggle that does nothing.
+        thinking: rt.capabilities.thinkingToggle,
+        ultracode: false,
+        fastMode: m.supportsFastMode === true,
+      }))
+      if (choices.length && cat.source !== 'builtin') await context.globalState.update(key, choices)
+      catalogue = {
+        choices: choices.length ? choices : builtinChoices(),
+        // `runtime` and `cache` both mean "the agent told us" — the second is
+        // the agent's OWN cache on disk, not a table of ours. Only `builtin` is
+        // a fallback, and only that one makes the picker say so.
+        source: cat.source === 'builtin' ? 'builtin' : 'cli',
+        ...(cat.note ? { problem: cat.note } : {}),
+      }
+      log.info(`Models for ${rt.label}: ${choices.map((c) => c.id).join(', ') || '(none)'}`)
+      alignModelToProvider()
+    } catch (e) {
+      catalogue = {
+        choices: rt.builtinModels().map((m) => ({
+          id: m.id, label: m.label, context: windowLabel(m.contextWindow),
+          efforts: m.supportedEffort ?? [], thinking: false, ultracode: false, fastMode: false,
+        })),
+        source: 'builtin',
+        problem: `Could not ask ${rt.label} for its models: ${e instanceof Error ? e.message : String(e)}`,
+      }
+    }
+  }
+
+  /**
    * Ask the CLI which models it can run.
    *
    * Deliberately NOT on the activation path. It spawns a CLI process, and the
@@ -194,6 +297,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    */
   async function refreshModels(force = false): Promise<void> {
     if (cfg().get<boolean>('discoverModels') === false) { recomputeCatalogue(); return }
+    // A runtime other than Claude Code answers for itself. `discoverModels`
+    // below spawns the CLAUDE CLI and asks it — pointing that at a Codex
+    // session would offer Anthropic ids to an agent that serves none of them.
+    if (runtime !== 'claude') { await refreshRuntimeModels(force); return }
     const p = currentProvider()
     // Through the same parse, so a cache this build cannot read counts as a
     // MISS and is re-asked, rather than counting as a hit and never being fixed.
@@ -484,6 +591,190 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   /** The one entry point: choose a provider, or manage the list. */
+  // --- the settings page ----------------------------------------------------
+  //
+  // A real editor tab rather than a quick pick, because a quick pick closes
+  // when focus moves and takes a half-typed gateway URL with it. See
+  // board/settings.ts for the rest of that argument.
+  //
+  // Statuses are CACHED, because collecting them spawns one process per
+  // runtime: the page asks for a refresh explicitly, and a stale readout is
+  // shown with the time it was taken rather than silently re-fetched on every
+  // repaint.
+
+  let runtimeStatuses: RuntimeStatus[] = []
+  const runtimeModels = new Map<RuntimeId, { models: { id: string; label: string }[]; source: string; note?: string }>()
+  let settingsBusy: string | undefined
+
+  const configuredPathFor = (id: RuntimeId): string | undefined =>
+    id === 'claude' ? (cfg().get<string>('claudeExecutable') || undefined)
+      : id === 'codex' ? (cfg().get<string>('codexExecutable') || undefined)
+      : undefined
+
+  async function refreshRuntimeStatus(only?: RuntimeId): Promise<void> {
+    settingsBusy = only ? `Checking ${only}…` : 'Checking which agents are installed…'
+    void SettingsPanel.refreshIfOpen()
+    try {
+      const configured: Partial<Record<RuntimeId, string | undefined>> = {}
+      for (const rt of allRuntimes()) configured[rt.id] = configuredPathFor(rt.id)
+      const fresh = await collectRuntimeStatus(configured)
+      runtimeStatuses = only
+        // A single-runtime refresh must not blank the others' readouts — the
+        // page would then show "not checked yet" for something it checked a
+        // second ago, which reads as the check having failed.
+        ? runtimeStatuses.filter((r) => r.id !== only).concat(fresh.filter((r) => r.id === only))
+        : fresh
+      for (const r of runtimeStatuses) {
+        if (r.login.kind === 'notInstalled') log.info(`${r.label} is not installed.`)
+        else if (r.login.kind === 'signedOut') log.warn(`${r.label} is installed but signed out.`)
+      }
+    } finally {
+      settingsBusy = undefined
+    }
+  }
+
+  const settingsHost: SettingsHost = {
+    async getState(): Promise<SettingsState> {
+      return {
+        defaultRuntime: runtime,
+        ...(settingsBusy ? { busy: settingsBusy } : {}),
+        runtimes: allRuntimes().map((rt) => {
+          const models = runtimeModels.get(rt.id)
+          const status = runtimeStatuses.find((r) => r.id === rt.id)
+          return {
+            id: rt.id,
+            label: rt.label,
+            vendor: rt.vendor,
+            blurb: rt.blurb,
+            installHint: rt.installHint,
+            providerProfiles: rt.capabilities.providerProfiles,
+            ...(status ? { status } : {}),
+            ...(models ? { models: models.models, modelSource: models.source } : {}),
+            ...(models?.note ? { modelNote: models.note } : {}),
+          }
+        }),
+        activeProvider: providerId,
+        providers: providers.map((p) => ({
+          id: p.id,
+          label: profileLabel(p),
+          kind: p.kind,
+          detail: describeProfile(p),
+          active: p.id === providerId,
+          hasCredential: p.hasCredential === true,
+        })),
+      }
+    },
+
+    async handle(msg: SettingsMessage): Promise<void> {
+      switch (msg.type) {
+        case 'ready':
+          // The first render must not block on spawning two CLIs, so the page
+          // paints with "not checked yet" and this fills it in.
+          if (!runtimeStatuses.length) await refreshRuntimeStatus()
+          return
+        case 'refresh':
+          await refreshRuntimeStatus(msg.runtime)
+          return
+        case 'setDefaultRuntime': {
+          runtime = msg.runtime
+          await state.update('runtime', runtime)
+          // Next session only, exactly like the provider: the runtime IS the
+          // process, so there is no honest way to move a live run onto another
+          // agent program — its transcript belongs to the one it started on.
+          ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode, runtime })
+          const rt = getRuntime(runtime)
+          void vscode.window.showInformationMessage(
+            `New sessions will run on ${rt?.label ?? runtime}. Sessions already running keep the agent they started on.`,
+          )
+          refreshAll()
+          return
+        }
+        case 'install': {
+          const rt = getRuntime(msg.runtime)
+          if (!rt) return
+          await vscode.env.clipboard.writeText(rt.installHint)
+          void vscode.window.showInformationMessage(
+            `Copied: ${rt.installHint} — run it in a terminal, then press "Check again".`,
+          )
+          return
+        }
+        case 'signIn': {
+          const rt = getRuntime(msg.runtime)
+          if (!rt) return
+          // A terminal rather than running it for them: these commands open a
+          // browser and want an interactive TTY, and a login we drove invisibly
+          // is a credential the user did not watch being created.
+          const term = vscode.window.createTerminal(`${rt.label} sign-in`)
+          term.show()
+          term.sendText(msg.runtime === 'codex' ? 'codex login' : 'claude /login', false)
+          void vscode.window.showInformationMessage(
+            `Press Enter in the terminal to sign in to ${rt.label}, then press "Check again" here.`,
+          )
+          return
+        }
+        case 'refreshModels': {
+          const rt = getRuntime(msg.runtime)
+          if (!rt) return
+          settingsBusy = `Asking ${rt.label} which models it can run…`
+          void SettingsPanel.refreshIfOpen()
+          try {
+            const loc = await rt.detect(configuredPathFor(msg.runtime))
+            if (!loc) {
+              runtimeModels.set(msg.runtime, {
+                models: rt.builtinModels().map((m) => ({ id: m.id, label: m.label })),
+                source: 'builtin',
+                note: `${rt.label} is not installed, so this is the built-in list.`,
+              })
+              return
+            }
+            const cat = await rt.models(loc)
+            runtimeModels.set(msg.runtime, {
+              models: cat.models.map((m) => ({ id: m.id, label: m.label })),
+              source: cat.source,
+              ...(cat.note ? { note: cat.note } : {}),
+            })
+          } finally {
+            settingsBusy = undefined
+          }
+          return
+        }
+        case 'selectProvider':
+          await setActiveProvider(msg.id)
+          return
+        case 'addProvider':
+          await addProvider()
+          return
+        case 'editProvider': {
+          const p = providers.find((x) => x.id === msg.id)
+          if (!p) return
+          const copy = { ...p }
+          if (await fillProfile(copy)) await saveProfiles(providers.map((x) => (x.id === copy.id ? copy : x)))
+          return
+        }
+        case 'removeProvider': {
+          const p = providers.find((x) => x.id === msg.id)
+          if (p) await removeProvider(p)
+          return
+        }
+        case 'testProvider':
+          if (msg.id !== providerId) await setActiveProvider(msg.id)
+          await testProvider()
+          return
+        case 'openSetting':
+          await vscode.commands.executeCommand('workbench.action.openSettings', msg.key)
+          return
+      }
+    },
+  }
+
+  const openSettings = (): void => {
+    SettingsPanel.show(context.extensionUri, settingsHost)
+    // Fire and forget, but never a bare void: a failure here is an empty page.
+    refreshRuntimeStatus()
+      .then(() => SettingsPanel.refreshIfOpen())
+      .catch((e: unknown) => log.error(`Could not check the installed agents: ${String(e)}`))
+  }
+
   async function selectProvider(): Promise<void> {
     type Item = vscode.QuickPickItem & { profile?: ProviderProfile; action?: string }
     const items: Item[] = providers.map((p) => ({
@@ -640,10 +931,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         store: w.store,
         worktrees: w.worktrees,
         board: w.board,
-        defaults: { model, effort, thinking, ultracode, fastMode },
+        defaults: { model, effort, thinking, ultracode, fastMode, runtime },
         permissionMode,
         maxConcurrent: cfg().get<number>('maxConcurrentAgents') ?? 3,
         claudeExecutable: cfg().get<string>('claudeExecutable') || undefined,
+        codexExecutable: cfg().get<string>('codexExecutable') || undefined,
+        // Where a runtime that spawns MCP servers gets the board's tools from.
+        // `dist/board-mcp.js` ships in the .vsix beside `dist/extension.js`;
+        // `test/package.test.mjs` asserts it is actually in there, because a
+        // package built without it installs fine and leaves every Codex agent
+        // unable to move its own card.
+        boardBridge: {
+          dir: context.globalStorageUri.fsPath,
+          script: vscode.Uri.joinPath(context.extensionUri, 'dist', 'board-mcp.js').fsPath,
+        },
         provider: currentProvider(),
         providerEnv,
         log: (m: string) => log.warn(m),
@@ -865,6 +1166,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         fastModeSupported: fastModeFor(catalogue.choices, model),
         modelSource: catalogue.source,
         ...(catalogue.problem ? { modelNote: catalogue.problem } : {}),
+        runtime,
+        runtimes: allRuntimes().map((rt) => ({
+          id: rt.id,
+          label: rt.label,
+          detail: rt.vendor,
+          providerProfiles: rt.capabilities.providerProfiles,
+        })),
         provider: active.id,
         providers: providers.map((p) => ({
           id: p.id,
@@ -1054,6 +1362,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
 
     async selectProvider() { await selectProvider() },
+    openSettings() { openSettings() },
 
     async newSessionPrompt() {
       const text = await vscode.window.showInputBox({
@@ -1107,6 +1416,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           .then(() => refreshAll())
           .catch((e: unknown) => log.error(`Could not apply the provider: ${String(e)}`))
       }
+      /*
+       * Which agent program the next session runs on.
+       *
+       * Parsed rather than trusted — the webview is another program — and
+       * applied to the NEXT session only, like the provider and for the same
+       * reason: a runtime IS the process, and its transcript, model ids and
+       * login all belong to it, so there is no honest way to move a live run
+       * onto a different one. Two cards on two agents, running at once, is the
+       * supported thing; one card changing agent mid-run is not.
+       */
+      const nextRuntime = parseRuntimeId(patch.runtime)
+      if (nextRuntime && nextRuntime !== runtime) {
+        runtime = nextRuntime
+        void state.update('runtime', runtime)
+        // The model list is per runtime, so a switch can otherwise strand the
+        // picker on an id the new agent does not serve — `claude-opus-5`
+        // selected, then a move to Codex, which would fail at the first request
+        // with somebody else's error message. Same failure the provider switch
+        // already guards against.
+        void refreshModels(true).then(() => refreshAll())
+        void SettingsPanel.refreshIfOpen()
+      }
       if (patch.ultracode) ultracode = patch.ultracode === 'on'
       if (patch.fastMode) fastMode = patch.fastMode === 'on'
 
@@ -1136,7 +1467,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       if (patch.ultracode || patch.model) void state.update('ultracode', ultracode)
       if (patch.fastMode || patch.model) void state.update('fastMode', fastMode)
-      ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode })
+      ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode, runtime })
     },
 
     async newSession(prompt, images) {
@@ -1785,6 +2116,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (text?.trim()) { BoardPanel.show(context.extensionUri, host); await host.newSession(text) }
     }),
     vscode.commands.registerCommand('agentsKanban.init', () => host.init()),
+    vscode.commands.registerCommand('agentsKanban.openSettings', () => openSettings()),
     vscode.commands.registerCommand('agentsKanban.selectProvider', () => selectProvider()),
     vscode.commands.registerCommand('agentsKanban.addProvider', () => addProvider()),
     vscode.commands.registerCommand('agentsKanban.testProvider', () => testProvider()),

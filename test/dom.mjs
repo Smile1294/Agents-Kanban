@@ -36,10 +36,29 @@ export function makeNode(tag) {
       return this._text != null ? this._text : this.children.map((c) => c.textContent).join('')
     },
     append(...ns) {
+      // Appending clears any text set directly, exactly as the real DOM does:
+      // `n.textContent = ''` empties the node, and a child added afterwards is
+      // what `textContent` then reads back. Without this the getter short
+      // circuits on the empty string forever, and every test that clears a
+      // container before filling it reads it as blank — which is a stub that
+      // makes a WORKING view look broken.
+      this._text = null
       for (const n of ns) this.children.push(typeof n === 'string' ? { textContent: n, children: [], className: '' } : n)
     },
     replaceChildren(...ns) { this.children = []; this.append(...ns) },
-    addEventListener() {}, removeEventListener() {},
+    // The older spelling of `append`, and a real DOM API. settings.js uses it
+    // throughout; board.js uses `append`. Both are in the stub because the
+    // stub's incompleteness is meant to catch APIs that do not EXIST, not to
+    // pick a house style for two files that are both correct.
+    appendChild(n) { this.append(n); return n },
+    // Click handlers are real state: a button whose handler was never attached
+    // is a button that does nothing, and that is only visible if the stub
+    // remembers them. `onclick` and `addEventListener('click')` are two
+    // spellings of one thing, so they land in the same place — board.js uses
+    // the first, settings.js the second, and a test should not have to know
+    // which.
+    addEventListener(type, fn) { if (type === 'click') this.onclick = fn },
+    removeEventListener() {},
     // Scroll offsets are real state too. render() rebuilds every scroll
     // container, so whether the new one is put back where the old one was is a
     // fact a test can check — and with these undefined, the arithmetic in
@@ -117,6 +136,30 @@ export async function boardSource() {
   return cachedSrc
 }
 
+let cachedSettings
+export async function settingsSource() {
+  cachedSettings ??= await fs.readFile(path.join(repoRoot, 'media', 'settings.js'), 'utf8')
+  return cachedSettings
+}
+
+/**
+ * The settings page, run in the same stub DOM.
+ *
+ * Shares `renderBoardWith`'s context builder deliberately: the settings page is
+ * another untyped webview script, and giving it a second harness is how a DOM
+ * API one of them starts using gets added in one place and missed in the other.
+ * The one difference is the message envelope — the settings page listens for
+ * `{type:'state', state, error}` rather than the board's `{type:'state'}`.
+ */
+export async function renderSettings(state, { error } = {}) {
+  const src = await settingsSource()
+  const view = renderBoardWith(src, undefined)
+  if (state || error) {
+    for (const fn of view.listeners) fn({ data: { type: 'state', state, error } })
+  }
+  return view
+}
+
 /**
  * Run board.js, optionally deliver one state message, and return what it drew.
  * Throws exactly where the real webview would silently blank.
@@ -191,5 +234,5 @@ export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
   // position, focus) is only testable by sending one.
   const deliver = (st) => { for (const fn of listeners) fn({ data: { type: 'state', state: st } }) }
   if (state) deliver(state)
-  return { root, posted, document, deliver, text: () => root.textContent }
+  return { root, posted, document, deliver, listeners, text: () => root.textContent }
 }

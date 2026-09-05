@@ -883,7 +883,13 @@ console.log('\n— providers: the picker, and where the credential goes')
   // The harness now has a real `globalState` for exactly this. Both of these
   // drive the BUILT bundle.
   {
-    const KEY = 'models:inherit'
+    // Keyed by RUNTIME as well as profile. The models a picker may offer are
+    // per agent program AND per backend — keying on the profile alone filed
+    // Codex's `gpt-5.5` under `inherit` and handed it back to the next Claude
+    // session. This string must match `catalogueKey()` in extension.ts; a
+    // mismatch is a cache that is written and never read, which is the failure
+    // `contextWindow` already has a postmortem about.
+    const KEY = 'models:claude:inherit'
     const cached = [
       { id: 'default', label: 'Default (recommended)', context: '1M', detail: 'Opus 5 with 1M context',
         efforts: ['low', 'medium', 'high', 'xhigh', 'max'], thinking: true, ultracode: true, fastMode: true },
