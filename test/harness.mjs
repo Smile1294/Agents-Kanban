@@ -313,12 +313,29 @@ export async function makeContext(storage) {
    *  for it to go and then look in both places. A stub that swallowed writes
    *  would make "the key went into settings.json" pass. */
   const secretStore = new Map()
+  const globalStore = new Map()
   return {
     subscriptions: [],
     extensionUri: { fsPath: repoRoot },
     globalStorageUri: { fsPath: storage ?? (await fs.mkdtemp(path.join(os.tmpdir(), 'ck-storage-'))) },
     workspaceState: { get: () => undefined, update: async () => {} },
-    globalState: { get: () => undefined, update: async () => {} },
+    /** A REAL store, like `secrets` above and for the same reason.
+     *
+     *  It was a no-op, so every `globalState.update()` went nowhere and every
+     *  `get()` came back undefined — which meant the model-cache path was
+     *  invisible to the launch gate. That is where a bug lived: a cached
+     *  catalogue is read back on the render path, and one written by a build
+     *  with a different `ModelChoice` shape reaches the composer as
+     *  `undefined.includes(...)`. A stub that swallows writes cannot fail on
+     *  that, and did not. */
+    globalState: {
+      get: (k, fallback) => (globalStore.has(k) ? globalStore.get(k) : fallback),
+      update: async (k, v) => { globalStore.set(k, v) },
+      keys: () => [...globalStore.keys()],
+      setKeysForSync: () => {},
+    },
+    /** Test handle: what survived into extension storage. */
+    _globalState: globalStore,
     secrets: {
       get: async (k) => secretStore.get(k),
       store: async (k, v) => { secretStore.set(k, v) },

@@ -6,6 +6,7 @@
  * three, which is the difference between a number worth showing and a lie.
  */
 import {
+  mainWindowOf,
   CACHE_READ, CACHE_WRITE_1H, CACHE_WRITE_5M, MODEL_RATES, MODEL_WINDOWS,
   contextOfUsage, costOfUsage, normaliseModel, summariseUsage,
   type UsageMessage,
@@ -112,6 +113,44 @@ ok(unknown.costUsd > 0, 'the known models still contribute — the total is a fl
 const synthetic = summariseUsage([frame('s', { output_tokens: 99 }, { model: '<synthetic>' })])
 ok(synthetic.priced === true && synthetic.costUsd === 0,
    'a <synthetic> message costs nothing and does not mark the total incomplete')
+
+// --- the window on the result chunk comes from the MAIN model ----------------
+//
+// `modelUsage` has one entry PER MODEL THE SESSION USED, and Claude Code runs
+// background tasks (title generation) on a haiku-class model — so a 1M session's
+// map contains a 200K entry too, and measured against a real CLI it comes
+// FIRST. Taking the first entry with a window measured every Fable and Opus
+// session against Haiku's 200K: the board read `172k/200k (86%)` on a session
+// nowhere near full. This fixture is that real answer, verbatim.
+{
+  const REAL_MODEL_USAGE = {
+    'claude-haiku-4-5-20251001': { contextWindow: 200_000 },
+    'claude-opus-5[1m]': { contextWindow: 1_000_000 },
+  }
+  ok(mainWindowOf(REAL_MODEL_USAGE, 'claude-opus-5') === 1_000_000,
+     'the window is the MAIN model’s, not the background model’s that happens to come first')
+  ok(mainWindowOf(REAL_MODEL_USAGE, 'claude-opus-5[1m]') === 1_000_000,
+     'whichever form the main model was named in — the [1m] marker does not break the match')
+  ok(mainWindowOf(REAL_MODEL_USAGE, 'claude-haiku-4-5') === 200_000,
+     'and a session genuinely ON haiku gets haiku’s window — this is a match, not a max')
+
+  // No match is UNDEFINED, never a guess. The caller keeps its previous value
+  // and downstream falls back to the sidecar and the table, both of which are
+  // at least about the right model.
+  ok(mainWindowOf(REAL_MODEL_USAGE, 'claude-sonnet-5') === undefined,
+     'a main model with no entry yields nothing rather than someone else’s window')
+  ok(mainWindowOf(REAL_MODEL_USAGE, undefined) === undefined,
+     'and with no main model known there is no safe entry to pick')
+  ok(mainWindowOf(undefined, 'claude-opus-5') === undefined, 'no map, no answer')
+  ok(mainWindowOf({ 'claude-opus-5': {} }, 'claude-opus-5') === undefined,
+     'an entry without a window does not match as zero')
+
+  // Provider-shaped keys still match: Bedrock's map is keyed by ITS ids.
+  ok(mainWindowOf(
+    { 'us.anthropic.claude-haiku-4-5-20251001-v1:0': { contextWindow: 200_000 } },
+    'claude-haiku-4-5',
+  ) === 200_000, 'a Bedrock-shaped key matches through the same normalisation as pricing')
+}
 
 // A dated snapshot is the same model at the same price as its undated alias.
 ok(normaliseModel('claude-haiku-4-5-20251001') === 'claude-haiku-4-5', 'dated model ids normalise')

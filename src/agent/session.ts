@@ -12,7 +12,7 @@
  *     parallel agents safe.
  */
 import { loadSdk, resolveClaudeExecutable, type Options, type PermissionResult, type Query, type SDKMessage, type SDKUserMessage } from './sdk.ts'
-import { contextOfUsage, costOfUsage, type TokenUsage } from '../sessions/usage.ts'
+import { contextOfUsage, costOfUsage, mainWindowOf, SYNTHETIC_MODEL, type TokenUsage } from '../sessions/usage.ts'
 import { describeImages, userContent, type AttachedImage } from './images.ts'
 import { EventEmitter } from 'node:events'
 import type { EffortLevel, ThinkingMode } from '../sessions/meta.ts'
@@ -298,6 +298,11 @@ export class AgentSession extends EventEmitter {
    *  cumulative across the whole session and would read wildly high. */
   private lastContextTokens = 0
   private contextWindow: number | undefined
+  /** The model the MAIN thread last ran on, from its assistant frames — the key
+   *  the result chunk's `modelUsage` is matched against. Never a subagent's:
+   *  their windows are their own, and one of them is exactly the 200K
+   *  background model this exists to not match. */
+  private lastMainModel: string | undefined
   /**
    * What this run has spent, by API response, for the turn in progress.
    *
@@ -533,6 +538,16 @@ export class AgentSession extends EventEmitter {
     if (parent) { this.handleSubagent(msg); return }
     // Back on the main thread, so no subagent is running any more.
     this.subagentTool = undefined
+    // And this frame's model is the MAIN thread's — the only model whose
+    // context window is this session's meter. Captured here, after the
+    // subagent early-return, precisely so a Task's frames can never set it;
+    // one of theirs is the 200K background model the window match exists to
+    // exclude. Synthetic frames (`<synthetic>`) never went to the API and name
+    // no model.
+    if (msg.type === 'assistant') {
+      const m = (msg.message as { model?: unknown }).model
+      if (typeof m === 'string' && m && m !== SYNTHETIC_MODEL) this.lastMainModel = m
+    }
     switch (msg.type) {
       case 'system': {
         if ('subtype' in msg && msg.subtype === 'init' && 'session_id' in msg) {
@@ -611,10 +626,15 @@ export class AgentSession extends EventEmitter {
           subtype?: string; result?: string; total_cost_usd?: number; is_error?: boolean
           modelUsage?: Record<string, { contextWindow?: number }>
         }
-        // The result chunk is the only place the model's context window appears.
-        for (const mu of Object.values(r.modelUsage ?? {})) {
-          if (mu?.contextWindow) { this.contextWindow = mu.contextWindow; break }
-        }
+        // The result chunk is the only place the model's context window
+        // appears — but `modelUsage` has one entry PER MODEL, and the CLI's
+        // haiku-class background model (title generation) is in there too,
+        // FIRST. Taking the first entry measured every 1M session against
+        // Haiku's 200K. The window is the MAIN model's or nothing; on nothing,
+        // the previous value stands and downstream falls back to the sidecar
+        // and the table, which are at least about the right model.
+        const window = mainWindowOf(r.modelUsage, this.lastMainModel ?? this.opts.model)
+        if (window) this.contextWindow = window
         this.emit('usage', this.lastContextTokens, this.contextWindow)
         // The turn is over: its cost can no longer change, whether it ended by
         // finishing, failing or being interrupted. All three are billed.

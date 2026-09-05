@@ -22,7 +22,7 @@ import {
 } from '../models.ts'
 import type { ProviderProfile } from '../providers.ts'
 import { ultracodeWarning } from '../session.ts'
-import { MODEL_WINDOWS, normaliseModel } from '../../sessions/usage.ts'
+import { MODEL_RATES, MODEL_WINDOWS, normaliseModel } from '../../sessions/usage.ts'
 import { MODELS, windowLabel } from '../../sessions/meta.ts'
 
 let fails = 0
@@ -228,6 +228,34 @@ const by = (id: string) => choices.find((c) => c.id === id)
   ok(junk[0]?.label === 'ok', 'a model with no display name falls back to its id rather than an empty chip')
   ok(toChoices([], normaliseModel, MODEL_WINDOWS, windowLabel).length === 0,
      'an empty answer is empty, not an error — mergeModels decides what to do about it')
+}
+
+// --- a model the picker offers must be one the meters can measure ------------
+//
+// The picker is now driven by the CLI, so it offers whatever Claude Code can
+// run — including models released after this extension was. `MODEL_RATES` and
+// `MODEL_WINDOWS` are not, and the gap is silent: an unpriced model reports
+// `≥ $0.00` and a `?` window, which is honest and useless.
+//
+// Fable shipped, the picker gained it, and neither table had it. This ties the
+// two together the way `tools.test.ts` ties the auto-allow list to the tool
+// definitions, so the NEXT model to appear fails here rather than in a session.
+{
+  for (const m of REAL) {
+    const id = normaliseModel(m.resolvedModel ?? m.value)
+    ok(!!MODEL_RATES[id], `${m.displayName} (${id}) has a published rate, so its spend is a total and not a floor`)
+    ok(!!MODEL_WINDOWS[id], `${m.displayName} (${id}) has a context window, so the meter has a denominator`)
+  }
+  ok(!!MODEL_RATES['claude-fable-5'], 'Fable specifically — it was in the picker and in neither table')
+
+  // Every rate needs a window and vice versa: one without the other is a model
+  // that shows a cost with no meter, or a meter with no cost.
+  for (const id of Object.keys(MODEL_RATES)) {
+    ok(!!MODEL_WINDOWS[id], `${id} is priced, so it needs a window too`)
+  }
+  for (const id of Object.keys(MODEL_WINDOWS)) {
+    ok(!!MODEL_RATES[id], `${id} has a window, so it needs a rate too`)
+  }
 }
 
 // --- the COMPOSITION: what the picker actually ends up showing ---------------

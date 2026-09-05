@@ -257,6 +257,27 @@ run, since each session needs a worktree.
   `system/init`. That check is deliberately ONE-SIDED: `Workflow` is present on
   ordinary sessions too, so its presence proves nothing and is never reported as
   success. A signal must be able to say bad; it need not be able to say good.
+- **Two functions that both know how to fall back is one bug.** `modelsForProfile`
+  returned the built-in list when a profile declared no models, and its caller
+  `mergeModels` leads with "a list the profile declares wins" — so the inherit
+  profile handed over the built-in three, that branch matched, and the CLI's
+  answer was discarded on every refresh. Fable never appeared. Neither function
+  was wrong alone, which is why every unit test was green and only a real
+  install found it. Fallback logic lives in exactly ONE place, the composition
+  has a single entry point (`catalogueFor`), and `models.test.ts` runs the
+  pieces TOGETHER in the order the host runs them.
+- **Anything read back out of `globalState` is parsed, not cast.** It outlives
+  the extension VERSION that wrote it, so a cached `ModelChoice[]` from an older
+  build is another program's output — and it is read on the RENDER path, where
+  `undefined.includes(…)` is a blank panel rather than an error.
+  `parseCachedChoices` rejects the whole cache on one bad entry, because a shape
+  change invalidates every entry at once and a partial result reads as "some of
+  your models silently vanished". Same rule as `parseProfiles` over settings.
+- **A value captured before an `await` must be re-checked after it.** Discovery
+  captures the active profile, spends ~400ms in the CLI, then applies the
+  result — and a provider switch inside that window would put one backend's
+  models under another's name. The cache write still uses the captured profile
+  (the answer IS that profile's); only the apply is guarded.
 - **Safety boundaries go in code, not prompts.** The tool description tells the
   agent what to do; `isHumanOnly()` makes it impossible. Both, always.
 - **A question is not a permission request.** `AskUserQuestion` arrives through

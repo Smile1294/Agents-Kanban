@@ -492,6 +492,21 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     },
   },
   {
+    id: 'openai',
+    label: 'OpenAI / Codex (via proxy)',
+    needs:
+      'A translation proxy in front of OpenAI — Claude Code speaks the Anthropic Messages API and ' +
+      'OpenAI does not serve it. Quickest: `litellm --model openai/<model>` (listens on :4000 and ' +
+      'serves /v1/messages), or claude-code-router with an openai provider. Your OpenAI key goes ' +
+      'in the PROXY\u2019s config; the credential here is whatever the proxy itself requires.',
+    profile: {
+      label: 'OpenAI', kind: 'gateway',
+      baseUrl: 'http://localhost:4000', authStyle: 'bearer',
+      disableBetas: true, disableNonessentialTraffic: true,
+      contextWindow: 200_000,
+    },
+  },
+  {
     id: 'openrouter',
     label: 'OpenRouter (via proxy)',
     needs: 'A translation proxy pointed at OpenRouter. Claude Code cannot call OpenRouter’s OpenAI-format API directly.',
@@ -647,6 +662,22 @@ export function validateProfile(profile: ProviderProfile): string[] {
   switch (profile.kind) {
     case 'gateway':
       if (!url) out.push('A custom endpoint needs a base URL — that is the whole configuration.')
+      // Refused by NAME, not left to the probe's 404, because this exact
+      // mistake has been made: "connect to OpenAI" reads as "point it at
+      // OpenAI". The CLI speaks the Anthropic Messages API and these hosts do
+      // not serve it, so the profile cannot work no matter what else is typed —
+      // and the failure it produces otherwise (a 404 mid-setup, or an agent
+      // dying three minutes in) never mentions the actual problem. The message
+      // carries the fix because "invalid URL" alone would send the user back
+      // to retyping the same URL.
+      if (url && /^https?:\/\/([^/]*\.)?(openai\.com|chatgpt\.com)([/:]|$)/i.test(url)) {
+        out.push(
+          'That is OpenAI\u2019s own API, which speaks a different protocol — Claude Code sends ' +
+          'Anthropic Messages requests, and openai.com does not serve them. To use OpenAI or Codex ' +
+          'models, run a translation proxy (LiteLLM or claude-code-router) with your OpenAI key in ' +
+          'ITS config, and point this base URL at the proxy, e.g. http://localhost:4000.',
+        )
+      }
       break
     case 'vertex':
       if (!profile.projectId?.trim() && !profile.env?.GCLOUD_PROJECT && !profile.env?.GOOGLE_CLOUD_PROJECT) {

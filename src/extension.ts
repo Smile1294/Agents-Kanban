@@ -34,7 +34,8 @@ import {
 } from './agent/providers.ts'
 import { probeProvider } from './agent/probe.ts'
 import {
-  ALL_EFFORTS, catalogueFor, discoverModels, effortsFor, fastModeFor, thinkingFor, ultracodeFor,
+  ALL_EFFORTS, catalogueFor, discoverModels, effortsFor, fastModeFor, parseCachedChoices,
+  thinkingFor, ultracodeFor,
   type ModelCatalogue, type ModelChoice,
 } from './agent/models.ts'
 
@@ -164,11 +165,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   /** Rebuild the catalogue from whatever is already known — no CLI round trip.
    *  Called whenever the profile changes, so the picker is never showing the
    *  previous provider's models while discovery runs. */
+  /** The cache for a profile, or empty when it is missing OR was written by a
+   *  build whose `ModelChoice` had a different shape. Parsed rather than cast:
+   *  `globalState` outlives the version that wrote it, and a stale entry reaches
+   *  the composer as `undefined.includes(...)` — a blank panel, not an error. */
+  const cachedChoices = (id: string): ModelChoice[] =>
+    parseCachedChoices(context.globalState.get(catalogueKey(id)))
+
   function recomputeCatalogue(discovered?: readonly ModelChoice[], problem?: string): void {
     const p = currentProvider()
-    const cached = discovered
-      ?? context.globalState.get<ModelChoice[]>(catalogueKey(p.id))
-      ?? []
+    const cached = discovered ?? cachedChoices(p.id)
     catalogue = catalogueFor(p, cached, builtinChoices(),
       { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, problem)
   }
@@ -189,7 +195,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   async function refreshModels(force = false): Promise<void> {
     if (cfg().get<boolean>('discoverModels') === false) { recomputeCatalogue(); return }
     const p = currentProvider()
-    if (!force && context.globalState.get<ModelChoice[]>(catalogueKey(p.id))?.length) {
+    // Through the same parse, so a cache this build cannot read counts as a
+    // MISS and is re-asked, rather than counting as a hit and never being fixed.
+    if (!force && cachedChoices(p.id).length) {
       recomputeCatalogue()
       return
     }
@@ -206,6 +214,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         log.info(`Models for ${profileLabel(p)}: ${choices.map((c) => c.id).join(', ')}`)
       } else if (problem) {
         log.warn(`Could not read the model list for ${profileLabel(p)}: ${problem}`)
+      }
+      // `p` was captured BEFORE the round trip, and switching provider during it
+      // is a few hundred milliseconds of exposure. The result still belongs in
+      // `p`'s cache — that is why the write above is unconditional — but applying
+      // it to the catalogue now would put one provider's models under another's
+      // name. The switch did its own `recomputeCatalogue()`, so the right move
+      // is to leave it alone.
+      if (currentProvider().id !== p.id) {
+        log.info(`Provider changed while reading models for ${profileLabel(p)}; keeping the current list.`)
+        return
       }
       recomputeCatalogue(choices, problem)
       alignModelToProvider()
@@ -455,6 +473,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     )
     if (choice !== 'Remove') return
     await context.secrets.delete(credentialKey(profile.id))
+    // And its model cache. Both are keyed by the profile ID, and ids are
+    // REUSED: delete "ollama", add "ollama" again, and the new profile would
+    // inherit the old one's model list — a picker offering models the new
+    // endpoint has never heard of, with nothing on screen to explain it.
+    await context.globalState.update(catalogueKey(profile.id), undefined)
     await saveProfiles(providers.filter((p) => p.id !== profile.id))
     if (providerId === profile.id) await setActiveProvider(INHERIT_PROFILE.id)
     refreshAll()

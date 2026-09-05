@@ -196,6 +196,52 @@ export async function discoverModels(
 }
 
 /**
+ * Read a catalogue back out of extension storage.
+ *
+ * `globalState` outlives the extension VERSION that wrote it, so a cache is
+ * another program's output — specifically, an older build of this one. When
+ * `ModelChoice` gained `ultracode` and `fastMode`, every previously cached entry
+ * became a `ModelChoice` with holes in it, and `effortsFor()` handed back
+ * `undefined` where the composer does `levels.includes(...)`. That throws inside
+ * `getState()`, which this project has a postmortem for: it is not an error
+ * message, it is a silently blank panel.
+ *
+ * So the cache is parsed, not trusted — the same treatment `parseProfiles` gives
+ * `settings.json`.
+ *
+ * A single malformed entry discards the WHOLE cache rather than being skipped.
+ * A shape change invalidates every entry at once, so a partial result would mean
+ * "some of your models silently vanished"; an empty one means "ask again", which
+ * costs one 400ms round trip and produces the right answer.
+ */
+export function parseCachedChoices(raw: unknown): ModelChoice[] {
+  if (!Array.isArray(raw) || !raw.length) return []
+  const out: ModelChoice[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') return []
+    const c = entry as Record<string, unknown>
+    if (typeof c.id !== 'string' || !c.id) return []
+    if (typeof c.label !== 'string' || typeof c.context !== 'string') return []
+    if (!Array.isArray(c.efforts)) return []
+    if (typeof c.thinking !== 'boolean') return []
+    if (typeof c.ultracode !== 'boolean' || typeof c.fastMode !== 'boolean') return []
+    out.push({
+      id: c.id,
+      label: c.label,
+      context: c.context,
+      ...(typeof c.detail === 'string' && c.detail ? { detail: c.detail } : {}),
+      // Filtered THROUGH the known levels, so a cache from a build that knew a
+      // level this one does not cannot reach a `query()` call that rejects it.
+      efforts: ALL_EFFORTS.filter((e) => (c.efforts as unknown[]).includes(e)),
+      thinking: c.thinking,
+      ultracode: c.ultracode,
+      fastMode: c.fastMode,
+    })
+  }
+  return out
+}
+
+/**
  * The models a profile DECLARES, as picker entries.
  *
  * The built-in Claude list is right on first-party and wrong everywhere else:

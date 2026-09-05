@@ -867,6 +867,126 @@ console.log('\n— providers: the picker, and where the credential goes')
   ok(latestState().composer.ultracode !== true,
      'the host refuses ultracode on a model it has not confirmed can run it')
 
+  // --- the model cache: the seam both model bugs lived in --------------------
+  //
+  // `globalState` outlives the extension VERSION that wrote it, and the cached
+  // catalogue is read back on the RENDER path. Two bugs have lived here and
+  // neither was visible from a unit test:
+  //
+  //  1. The cached list was composed with the profile's declared list in the
+  //     wrong order, so the CLI's answer was discarded and the picker showed
+  //     the built-in three. Every unit was green.
+  //  2. A cache written by a build with a different `ModelChoice` shape reached
+  //     the composer as `undefined.includes(...)` — a throw inside `getState()`,
+  //     which this project knows as a silently blank panel.
+  //
+  // The harness now has a real `globalState` for exactly this. Both of these
+  // drive the BUILT bundle.
+  {
+    const KEY = 'models:inherit'
+    const cached = [
+      { id: 'default', label: 'Default (recommended)', context: '1M', detail: 'Opus 5 with 1M context',
+        efforts: ['low', 'medium', 'high', 'xhigh', 'max'], thinking: true, ultracode: true, fastMode: true },
+      { id: 'claude-fable-5[1m]', label: 'Fable', context: '1M',
+        efforts: ['low', 'medium', 'high', 'xhigh', 'max'], thinking: true, ultracode: true, fastMode: false },
+      { id: 'haiku', label: 'Haiku', context: '200K',
+        efforts: [], thinking: false, ultracode: false, fastMode: false },
+    ]
+
+    // 1. A good cache must reach the picker. This is the bug that shipped: the
+    //    inherit profile declares no models, and that must NOT outrank it.
+    //
+    //    The catalogue is rebuilt on activation and on a provider CHANGE, not on
+    //    every repaint — so seeding the cache and asking for the same provider
+    //    again would test nothing. Switch away and back, which is the real
+    //    sequence a user goes through.
+    ctx3._globalState.set(KEY, cached)
+    await send({ type: 'composer', provider: saved[0].id })
+    await send({ type: 'composer', provider: 'inherit' })
+    await send({ type: 'ready' })
+    const c = latestState().composer
+    ok(c.models.length === 3, `the cached list reaches the picker (${c.models.length} models)`)
+    ok(c.models.some((m) => m.label === 'Fable'),
+       'including Fable — a profile that declares nothing must not outrank the CLI')
+    ok(c.modelSource === 'cli', `and it is reported as coming from the CLI (${c.modelSource})`)
+
+    // 2. Capabilities survive the round trip, or the toggles are decoration.
+    await send({ type: 'composer', model: 'haiku' })
+    await send({ type: 'ready' })
+    const haiku = latestState().composer
+    ok(haiku.efforts.length === 0, 'a cached model with no effort levels still has none after a reload')
+    ok(haiku.thinkingSupported === false, 'and no thinking toggle')
+    ok(haiku.ultracodeSupported === false, 'and no ultracode')
+
+    await send({ type: 'composer', model: 'default' })
+    await send({ type: 'ready' })
+    const opus = latestState().composer
+    ok(opus.efforts.length === 5, 'while a capable one keeps all five levels')
+    ok(opus.ultracodeSupported === true, 'and its ultracode')
+
+    // 3. A cache from a build whose ModelChoice had a different shape. This is
+    //    the crash: getState() throws and the panel goes blank with no error.
+    for (const [what, junk] of [
+      ['an older shape, before the capability fields', [{ id: 'opus[1m]', label: 'Opus', context: '1M' }]],
+      ['a non-array', 'nonsense'],
+      ['entries that are not objects', [null, 3]],
+      ['efforts that is not an array', [{ id: 'a', label: 'A', context: '1M', efforts: 'all', thinking: true, ultracode: false, fastMode: false }]],
+    ]) {
+      ctx3._globalState.set(KEY, junk)
+      // Seeding the cache is not enough: the catalogue is rebuilt on a provider
+      // CHANGE, not on every repaint, so without this switch the assertions
+      // below run against the catalogue from the PREVIOUS case and prove
+      // nothing. The switch also runs `alignModelToProvider`, which moves the
+      // selection onto the first cached entry — so the selected model becomes
+      // the malformed one, which is exactly how a real user reaches the crash.
+      await send({ type: 'composer', provider: saved[0].id })
+      await send({ type: 'composer', provider: 'inherit' })
+      // Count the states POSTED, not just the last one seen. `latestState()`
+      // reverse-finds the most recent `state` message, so when `getState()`
+      // throws nothing new is posted and it quietly returns the PREVIOUS one —
+      // which every assertion below then passes against. That is not a
+      // hypothetical: it is why the first version of this gate survived having
+      // the shape check deleted.
+      const before = stub.posted.filter((m) => m.type === 'state').length
+      let state
+      try {
+        await send({ type: 'ready' })
+        state = latestState()
+      } catch (e) {
+        ok(false, `getState() threw on ${what} — that is the blank panel: ${e.message}`)
+        continue
+      }
+      ok(stub.posted.filter((m) => m.type === 'state').length > before,
+         `${what}: a state was posted after the reload`)
+      ok(!!state?.composer, `${what}: the board still renders`)
+      // The precondition, asserted rather than assumed. Everything below is
+      // about the INHERIT profile's cache, and an earlier version of this loop
+      // silently measured the gateway profile instead because the two provider
+      // switches had not settled — passing for the wrong reason, which is worse
+      // than failing.
+      ok(state.composer.provider === 'inherit',
+         `${what}: the board is on the inherit profile (${state.composer.provider})`)
+      // The discriminating assertion: a cache this build cannot read must fall
+      // THROUGH to the built-in list. Trusted instead of parsed, the junk would
+      // satisfy `mergeModels`' "discovered" branch and be reported as `cli`.
+      ok(state.composer.modelSource === 'builtin',
+         `${what}: an unreadable cache falls back to the built-in list (${state.composer.modelSource})`)
+      ok(state.composer.models.length > 0, `${what}: and the picker is not empty`)
+      ok(Array.isArray(state.composer.efforts), `${what}: efforts is still a list, so the composer cannot throw`)
+      ok(state.composer.models.every((m) => m && typeof m.id === 'string' && m.id
+                                     && typeof m.label === 'string'),
+         `${what}: every entry that reached the picker is a real model`)
+      try {
+        await renderBoard(state, { layout: 'full' })
+      } catch (e) {
+        ok(false, `${what}: the real view threw — ${e.message}`)
+      }
+    }
+    ctx3._globalState.delete(KEY)
+    await send({ type: 'composer', model: 'claude-opus-5' })
+    await send({ type: 'ready' })
+  }
+
   // --- where the model list came from --------------------------------------
   // Only shown when it is NOT the CLI's, because that is the only case with a
   // question attached: "why is the model I use in Claude Code missing here?"

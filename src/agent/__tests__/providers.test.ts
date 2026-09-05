@@ -231,6 +231,20 @@ const SAMPLE: Record<string, ProviderProfile> = {
      'a URL with no scheme is refused: it would be sent verbatim and fail obscurely')
   ok(validateProfile(profile({ kind: 'gateway', baseUrl: 'http://localhost:3456' })).length === 0,
      'and an http URL is accepted — a local proxy has no certificate')
+
+  // The mistake that was actually made: "connect to OpenAI" typed as OpenAI's
+  // own URL. It can never work — the CLI speaks the Anthropic Messages API and
+  // openai.com does not serve it — so it is refused BY NAME, with the fix in
+  // the message, rather than left to fail as a 404 that never says why.
+  for (const url of ['https://api.openai.com', 'https://api.openai.com/v1',
+                     'http://openai.com', 'https://chatgpt.com/backend']) {
+    const problems = validateProfile(profile({ kind: 'gateway', baseUrl: url }))
+    ok(problems.length > 0, `${url} is refused — it cannot serve Anthropic Messages requests`)
+    ok(problems.some((p) => /translation proxy|LiteLLM/i.test(p)),
+       'and the message says what to run instead, not just "invalid"')
+  }
+  ok(validateProfile(profile({ kind: 'gateway', baseUrl: 'https://my-openai-proxy.example.com' })).length === 0,
+     'while a proxy that merely MENTIONS openai in its own hostname is fine — the match is the domain, not the substring')
   ok(validateProfile(profile({ kind: 'vertex', region: 'us-east5' })).length > 0, 'vertex without a project is refused')
   ok(validateProfile(profile({ kind: 'vertex', projectId: 'p' })).length > 0, 'vertex without a region is refused')
   ok(validateProfile(profile({ kind: 'vertex', region: 'us-east5', env: { GCLOUD_PROJECT: 'p' } })).length === 0,

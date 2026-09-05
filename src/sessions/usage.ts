@@ -57,9 +57,23 @@ export interface ModelRate {
  * one edit and the ratios can never drift out of step with each other.
  */
 export const MODEL_RATES: Record<string, ModelRate> = {
+  // Fable is the expensive one, and it was MISSING here while the picker
+  // offered it — so every Fable session reported `≥ $0.00` and a `?` window.
+  // A model the picker can select and this table cannot price is the gap
+  // `models.test.ts` now ties shut: every model in its real-CLI fixture must
+  // have a rate and a window here.
+  'claude-fable-5': { input: 10, output: 50 },
+  'claude-mythos-5': { input: 10, output: 50 },
   'claude-opus-5': { input: 5, output: 25 },
   'claude-opus-4-8': { input: 5, output: 25 },
-  'claude-sonnet-5': { input: 2, output: 10 },
+  'claude-opus-4-7': { input: 5, output: 25 },
+  'claude-opus-4-6': { input: 5, output: 25 },
+  // List price. This read 2/10 — Sonnet 5's introductory rate, which ran
+  // through 2026-08-31 and has since lapsed, so every Sonnet session was
+  // under-reported by a third. A dated price in an undated table goes wrong
+  // silently on a specific day; `settleTurn`'s comparison against the CLI's
+  // own `total_cost_usd` is what would eventually have said so.
+  'claude-sonnet-5': { input: 3, output: 15 },
   'claude-sonnet-4-6': { input: 3, output: 15 },
   'claude-haiku-4-5': { input: 1, output: 5 },
 }
@@ -81,8 +95,12 @@ export const CACHE_READ = 0.1
  * session last reported (persisted in the sidecar), then this table.
  */
 export const MODEL_WINDOWS: Record<string, number> = {
+  'claude-fable-5': 1_000_000,
+  'claude-mythos-5': 1_000_000,
   'claude-opus-5': 1_000_000,
   'claude-opus-4-8': 1_000_000,
+  'claude-opus-4-7': 1_000_000,
+  'claude-opus-4-6': 1_000_000,
   'claude-sonnet-5': 1_000_000,
   'claude-sonnet-4-6': 1_000_000,
   'claude-haiku-4-5': 200_000,
@@ -178,6 +196,41 @@ export function contextOfUsage(usage: TokenUsage): number {
     (usage.cache_read_input_tokens ?? 0) +
     (usage.cache_creation_input_tokens ?? 0)
   )
+}
+
+/**
+ * The context window this run actually has, out of the result chunk's
+ * `modelUsage` — which has one entry PER MODEL THE SESSION USED, not one.
+ *
+ * That plural is the bug this function exists for. Claude Code runs background
+ * tasks (session title generation) on a haiku-class model, so a Fable or Opus
+ * session's map contains that model too — and measured against a real CLI its
+ * 200K entry comes FIRST in iteration order. The old code took the first entry
+ * with a window, so every 1M session's meter was measured against Haiku's
+ * denominator: a Fable session read `172k/200k (86%)` while filling a 1M
+ * window it was nowhere near.
+ *
+ * So the entry is chosen by MATCHING THE MAIN MODEL, with both sides put
+ * through `normaliseModel` — the map is keyed by forms like
+ * `claude-opus-5[1m]` while the assistant frames say `claude-opus-5`, and the
+ * suffix must not break the match.
+ *
+ * No match returns undefined rather than a guess. The caller keeps its previous
+ * value, and downstream falls back to the sidecar's remembered window and then
+ * the table — all of which are honest, where "some other model's window" is
+ * not. This is why the signature takes the model rather than defaulting: there
+ * is no safe entry to pick without knowing whose meter this is.
+ */
+export function mainWindowOf(
+  modelUsage: Record<string, { contextWindow?: number }> | undefined,
+  mainModel: string | undefined,
+): number | undefined {
+  if (!modelUsage || !mainModel) return undefined
+  const want = normaliseModel(mainModel)
+  for (const [key, mu] of Object.entries(modelUsage)) {
+    if (mu?.contextWindow && normaliseModel(key) === want) return mu.contextWindow
+  }
+  return undefined
 }
 
 /** The shape `summariseUsage` reads. Structurally what the SDK's

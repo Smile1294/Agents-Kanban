@@ -71,6 +71,41 @@ plainly that routing Claude Code to non-Claude models through any gateway is
 not supported. The picker marks those presets `community proxy` for that reason
 — listing them beside Bedrock with no distinction would be lying by omission.
 
+#### Connecting to OpenAI or Codex, concretely
+
+Pointing the base URL at `api.openai.com` can never work, and the profile
+validator now refuses it by name: Claude Code sends Anthropic Messages requests,
+and OpenAI does not serve that protocol. The working shape is a proxy that
+translates:
+
+1. **Run a translation proxy.** Quickest is LiteLLM, whose proxy serves an
+   Anthropic-format `/v1/messages` alongside the OpenAI routes:
+
+   ```bash
+   pip install 'litellm[proxy]'
+   export OPENAI_API_KEY=sk-…        # your OpenAI key lives with the PROXY
+   litellm --model openai/<model> --port 4000
+   ```
+
+   [claude-code-router](https://github.com/musistudio/claude-code-router) does
+   the same job with per-task routing across OpenAI, Gemini, DeepSeek and
+   OpenRouter.
+
+2. **Add the "OpenAI / Codex (via proxy)" preset** from the provider picker.
+   Base URL `http://localhost:4000`; the credential field is whatever the proxy
+   itself requires (LiteLLM's `--master-key` if you set one — not your OpenAI
+   key, which the proxy already holds).
+
+3. **Press Test connection.** A pass means the proxy answered `/v1/messages`
+   and took the credential. Then use *Refresh the model list* — the proxy
+   reports what it serves, so the picker offers the OpenAI models by their own
+   ids.
+
+The board's cost figures stay honest rather than helpful here: OpenAI models
+have no entry in the Anthropic rate table, so spend shows as `≥ $…` (a floor
+covering any Claude usage) instead of a guessed OpenAI price, and the context
+meter uses the window the profile declares.
+
 Two settings exist because of this path, and the presets turn them on:
 
 - `disableBetas` → `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. The documented
@@ -259,6 +294,24 @@ because "why is the model I use in Claude Code missing here?" is otherwise
 unanswerable.
 
 Turn the whole thing off with `agentsKanban.discoverModels: false`.
+
+**The cache is parsed, not trusted.** Extension storage outlives the version
+that wrote it, so a catalogue cached by an older build is another program's
+output. When `ModelChoice` gained its capability fields, every previously cached
+entry became one with holes in it, and the composer read `undefined.includes(…)`
+inside `getState()` — a silently blank panel, not an error. A cache this build
+cannot read counts as a miss and is re-asked.
+
+### If the picker is missing a model
+
+Press **Refresh the model list** and read what it says:
+
+| It says | Meaning |
+|---|---|
+| `N models: …` naming what you expect | Working — the list is the CLI's |
+| `Using the built-in model list: …` | Discovery failed, and the reason follows |
+| The menu footer says **Built-in list** | Same, seen from the picker |
+| The menu footer says **Models listed by this provider profile** | Your profile declares its own `models`, which outranks discovery — clear that field to fall back to the CLI |
 
 ### Ultracode and fast mode
 
