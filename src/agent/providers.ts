@@ -673,9 +673,11 @@ export function validateProfile(profile: ProviderProfile): string[] {
       if (url && /^https?:\/\/([^/]*\.)?(openai\.com|chatgpt\.com)([/:]|$)/i.test(url)) {
         out.push(
           'That is OpenAI\u2019s own API, which speaks a different protocol — Claude Code sends ' +
-          'Anthropic Messages requests, and openai.com does not serve them. To use OpenAI or Codex ' +
-          'models, run a translation proxy (LiteLLM or claude-code-router) with your OpenAI key in ' +
-          'ITS config, and point this base URL at the proxy, e.g. http://localhost:4000.',
+          'Anthropic Messages requests, and openai.com does not serve them. With an OpenAI API KEY, ' +
+          'run a translation proxy (LiteLLM or claude-code-router) with the key in ITS config and ' +
+          'point this base URL at the proxy, e.g. http://localhost:4000. A ChatGPT or Codex ' +
+          'SUBSCRIPTION cannot be used this way at all: Codex is its own coding agent, a sibling of ' +
+          'Claude Code, not an API this extension can call.',
         )
       }
       break

@@ -106,6 +106,31 @@ have no entry in the Anthropic rate table, so spend shows as `≥ $…` (a floor
 covering any Claude usage) instead of a guessed OpenAI price, and the context
 meter uses the window the profile declares.
 
+#### What about Codex, or a ChatGPT subscription?
+
+**Codex is not a provider — it is a sibling of Claude Code.** The Codex CLI and
+its VS Code extension work the same way this extension does: an agent runtime
+you sign into, which drives a model behind its own protocol. There is no API
+endpoint to point a profile at, and a ChatGPT subscription's login tokens are
+usable only by Codex itself — a translation proxy cannot borrow them, because
+LiteLLM and claude-code-router need an OpenAI **API key**, which is a different
+credential on a different billing meter.
+
+So the honest matrix is:
+
+| You have | What works |
+|---|---|
+| An OpenAI **API key** | The recipe above — LiteLLM in front, today |
+| A ChatGPT / Codex **subscription** | Only the Codex runtime can spend it. Putting Codex sessions on this board would mean driving `codex exec --json` as a SECOND agent runtime beside Claude Code — a real feature, sketched below, not a profile |
+
+Running Codex as a second runtime is architecturally plausible — the CLI has a
+headless JSON mode (`codex exec --json`), session resume, and MCP support — but
+it is a subsystem, not a setting: its own spawn/stream adapter, board tools
+served over stdio MCP instead of the in-process SDK server, a transcript reader
+for `~/.codex`'s session store, and an approval-mode mapping. Nothing in the
+provider layer is reusable for it, deliberately: providers select what stands
+BEHIND Claude Code, and Codex stands beside it.
+
 Two settings exist because of this path, and the presets turn them on:
 
 - `disableBetas` → `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. The documented
