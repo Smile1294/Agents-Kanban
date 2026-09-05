@@ -373,6 +373,128 @@ ok(slug('!!!') === 'task', 'a title with nothing sluggable still names the direc
   ok(!(await svc2.list()).some((w) => w.path === a.path), 'a finished subtask is removed like any other worktree')
 }
 
+// --- the diff's left-hand side must be the FILE, byte for byte --------------
+//
+// `show()` used `git()`, which ends in `stdout.trim()`. It is the sole
+// implementation of the diff's left side, so trimming removed the trailing
+// newline and any leading blank line — and every diff opened from the review
+// panel reported a change at the head and the tail that the agent never made.
+// A convenience `.trim()` in a shared helper is a data-format decision in
+// disguise.
+{
+  const exactRepo = path.join(tmp, 'exact')
+  await fs.mkdir(exactRepo)
+  const ge = (args: string[]) => exec('git', args, { cwd: exactRepo })
+  await ge(['init', '-b', 'main'])
+  await ge(['config', 'user.email', 'test@example.com'])
+  await ge(['config', 'user.name', 'Test'])
+  // Leading blank line and a trailing newline: exactly what trimming eats.
+  const body = '\nconst a = 1\nconst b = 2\n'
+  await fs.writeFile(path.join(exactRepo, 'x.ts'), body)
+  await ge(['add', '-A']); await ge(['commit', '-m', 'init'])
+
+  const svc4 = new WorktreeService((await findRepoRoot(exactRepo))!)
+  const shown = await svc4.show(exactRepo, 'HEAD', 'x.ts')
+  ok(shown === body,
+     `the base version is served byte for byte (${JSON.stringify(shown)} vs ${JSON.stringify(body)})`)
+  ok(shown.endsWith('\n'), 'including the trailing newline the diff hinges on')
+  ok(shown.startsWith('\n'), 'and the leading blank line')
+  // A file that does not exist at the ref — the agent ADDED it — is legitimately
+  // empty, and that is the diff's "new file" left side.
+  ok(await svc4.show(exactRepo, 'HEAD', 'nope.ts') === '',
+     'a file the agent added has an empty left side rather than throwing')
+}
+
+// --- a commit the SESSION made, or none at all ------------------------------
+//
+// A fresh task branch's HEAD is the base commit, so `review()` reported the
+// BASE branch's last commit — somebody else's work — inside the session's own
+// Changes panel, with no attribution, while the Merge button was correctly
+// refusing on the grounds that the branch had no commits of its own.
+{
+  const svc5 = new WorktreeService((await findRepoRoot(repo))!)
+  const fresh = await svc5.create({ taskId: 'S8', title: 'nothing committed' })
+  const r0 = await svc5.review(fresh.path, 'main')
+  ok(r0.ahead === 0, 'a fresh task branch is not ahead of its base')
+  ok(r0.lastCommit === undefined,
+     `and claims NO commit of its own (${JSON.stringify(r0.lastCommit)})`)
+
+  await fs.writeFile(path.join(fresh.path, 'mine.txt'), 'x\n')
+  await exec('git', ['add', '-A'], { cwd: fresh.path })
+  await exec('git', ['commit', '-m', 'a commit this session made'], { cwd: fresh.path })
+  const r1 = await svc5.review(fresh.path, 'main')
+  ok(r1.ahead === 1, 'once it commits, it is ahead')
+  ok(r1.lastCommit?.message.startsWith('a commit this session made') === true,
+     `and the commit it names is its own (${r1.lastCommit?.message})`)
+
+  // `status()` promised a fallback that was never written: `git worktree add`
+  // never sets an upstream, so `HEAD...@{upstream}` always failed and
+  // ahead/behind were constants of 0 on every worktree this extension makes.
+  const st = await svc5.status(fresh.path, 'main')
+  ok(st.ahead === 1, `status() counts commits ahead of the base it was given (${st.ahead})`)
+  await svc5.remove(fresh.path)
+}
+
+// --- a filename with a space, against REAL git -----------------------------
+//
+// `status --porcelain` is space-delimited, so git C-quotes any path containing
+// a space — whatever `core.quotePath` says, because the quoting is about the
+// delimiter and not about non-ASCII. The tab-delimited `diff --name-status`
+// used beside it does NOT. So one file arrived under two spellings, `byPath`
+// could not dedupe them, and the review panel showed three rows for two files:
+// one claiming a file was committed while it had newer uncommitted edits, and
+// two carrying literal double quotes in the name. Clicking a quoted row opened
+// a path that does not exist.
+{
+  const spaced = path.join(tmp, 'spaced')
+  await fs.mkdir(spaced)
+  const gs = (args: string[]) => exec('git', args, { cwd: spaced })
+  await gs(['init', '-b', 'main'])
+  await gs(['config', 'user.email', 'test@example.com'])
+  await gs(['config', 'user.name', 'Test'])
+  await fs.writeFile(path.join(spaced, 'README.md'), '# x\n')
+  await gs(['add', '-A']); await gs(['commit', '-m', 'init'])
+
+  const svc3 = new WorktreeService((await findRepoRoot(spaced))!)
+  const wt = await svc3.create({ taskId: 'S9', title: 'spaces' })
+
+  // Committed on the branch, then edited again — the exact state the agent
+  // brief produces, since sessions are told to stop at review WITHOUT
+  // committing.
+  await fs.writeFile(path.join(wt.path, 'My Notes.md'), 'one\n')
+  await exec('git', ['add', '-A'], { cwd: wt.path })
+  await exec('git', ['commit', '-m', 'notes'], { cwd: wt.path })
+  await fs.writeFile(path.join(wt.path, 'My Notes.md'), 'one\ntwo\n')
+  await fs.writeFile(path.join(wt.path, 'Test Plan.md'), 'plan\n')
+
+  const review = await svc3.review(wt.path, 'main')
+  const paths = review.files.map((f) => f.path).sort()
+  ok(!paths.some((p) => p.includes('"')),
+     `no path carries literal quotes: ${JSON.stringify(paths)}`)
+  ok(paths.filter((p) => p === 'My Notes.md').length === 1,
+     `a file with a space appears ONCE, not once per command that reported it (${JSON.stringify(paths)})`)
+  const notes = review.files.find((f) => f.path === 'My Notes.md')
+  ok(notes?.committed === false,
+     'and its newer uncommitted edit wins the entry, as the code says it should')
+  ok(paths.includes('Test Plan.md'), 'an untracked file with a space is listed under its real name')
+  // The path has to be openable — that is the whole point of unquoting it.
+  for (const f of review.files) {
+    ok(await fs.access(path.join(wt.path, f.path)).then(() => true, () => false),
+       `the path the panel would open exists on disk: ${f.path}`)
+  }
+
+  const changed = await svc3.changedFiles(wt.path, 'main')
+  ok(changed.includes('My Notes.md') && !changed.some((c) => c.includes('"')),
+     `changedFiles reports real paths too: ${JSON.stringify(changed)}`)
+
+  // A rename must report the NEW name — the one that exists.
+  await exec('git', ['mv', 'My Notes.md', 'Their Notes.md'], { cwd: wt.path })
+  const renamed = await svc3.review(wt.path, 'main')
+  const rp = renamed.files.map((f) => f.path)
+  ok(rp.includes('Their Notes.md') && !rp.some((p) => p.includes(' -> ')),
+     `a rename reports the new name, not "old -> new": ${JSON.stringify(rp)}`)
+}
+
 await fs.rm(tmp, { recursive: true, force: true })
 console.log(fails === 0 ? 'PASS — worktrees create, isolate, and clean up under concurrency' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

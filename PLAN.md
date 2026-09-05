@@ -472,7 +472,12 @@ item. Three things are genuinely not started:
 
 - **Orchestration** — their ten meta-agent tools (`spawn_session`, `send_prompt`,
   `get_session_result`, …), with a child's completion pushed onto the parent's
-  prompt queue. A subsystem, not a button.
+  prompt queue. A subsystem, not a button. **Researched**, in
+  [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md), which declines the parent-wake
+  half of it (`manager.send()` pushes a `{kind: 'prompt'}` indistinguishable from
+  the user typing, into a session holding `split_task`) and stages the rest
+  behind `split_task` plus a dial. It also names six bugs in the code as it
+  stands today.
 - **A conflict-fixing agent** — they spawn a fresh session with a prescriptive
   prompt; we surface conflicts and offer Abort.
 - **`schedule_wakeup`** time triggers.

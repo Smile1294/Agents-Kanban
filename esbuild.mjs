@@ -37,9 +37,14 @@ const ctx = await esbuild.context({
  * and a missing `require` there is a Codex session with no board tools and a
  * message in a log nobody reads. It imports neither, so the bundle stays tiny.
  *
- * `vscode` stays external only as a guard: this file must never reach an API
- * that does not exist outside the extension host, and a build error here is how
- * we find out.
+ * `vscode` is deliberately NOT listed as an external, and that is the guard.
+ * It is not a Node builtin, so with `bundle: true` esbuild cannot resolve it
+ * and the build FAILS — which is exactly what should happen if this file ever
+ * reaches an API that does not exist outside the extension host. Listing it as
+ * an external did the opposite of what its own comment claimed: it told esbuild
+ * to leave the import alone, so the build succeeded and the failure moved to
+ * runtime, inside a process spawned by Codex, as a `require` that cannot
+ * resolve and a message in a log nobody reads.
  */
 const mcp = await esbuild.context({
   entryPoints: ['src/board-mcp.ts'],
@@ -50,7 +55,9 @@ const mcp = await esbuild.context({
   format: 'cjs',
   sourcemap: true,
   minify: !watch,
-  external: ['vscode'],
+  // Empty on purpose — see above. An accidental `vscode` import must be a BUILD
+  // error, and an external is an instruction not to raise one.
+  external: [],
   logLevel: 'info',
 })
 

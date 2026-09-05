@@ -6,7 +6,7 @@
    view-contract gate. Keeping two copies meant any DOM API board.js started
    using had to be added twice, and missing one made a gate pass that should
    have failed. */
-import { boardSource, findByTag, renderBoardWith } from '../../../test/dom.mjs'
+import { boardSource, findByTag, renderBoardWith, walk as walkAll } from '../../../test/dom.mjs'
 
 let fails = 0
 const ok = (c, m) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -32,7 +32,7 @@ const COMPOSER = {
   models: [{ id: 'claude-opus-5', label: 'Opus 5', context: '200K' }],
   efforts: [{ key: 'low', label: 'Low' }, { key: 'high', label: 'High' }],
   contextTokens: 82000, contextWindow: 1000000,
-  spentUsd: 1.234, spendPriced: true,
+  meter: { kind: 'usd', spentUsd: 1.234, priced: true },
   permissionMode: 'acceptEdits',
   permissionModes: [
     { key: 'default', label: 'Ask', detail: 'Prompt before anything that writes' },
@@ -110,7 +110,7 @@ const stored = run({
   // No `agent` on the card: nothing is running, exactly as after a restart.
   cards: [{ ...CARD, agent: undefined }],
   transcript: [{ kind: 'text', at: Date.now(), text: 'from disk' }],
-  composer: { ...COMPOSER, contextTokens: 223294, contextWindow: 1000000, spentUsd: 8.11 },
+  composer: { ...COMPOSER, contextTokens: 223294, contextWindow: 1000000, meter: { kind: 'usd', spentUsd: 8.11, priced: true } },
 })
 const stx = stored.text()
 ok(stx.includes('223k/1M (22%)'), `context survives with no live agent: ${/\d+k\/\d+\w? \(\d+%\)/.exec(stx)?.[0]}`)
@@ -119,7 +119,7 @@ ok(stx.includes('$8.11'), `and so does the spend: ${/\$[\d.]+/.exec(stx)?.[0]}`)
 // A total that is knowingly incomplete says so rather than reading as exact.
 const partial = run({
   ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
-  composer: { ...COMPOSER, spentUsd: 0.5, spendPriced: false },
+  composer: { ...COMPOSER, meter: { kind: 'usd', spentUsd: 0.5, priced: false } },
 })
 ok(partial.text().includes('≥ $0.50'), 'an incomplete total is shown as a floor, not as the answer')
 
@@ -127,7 +127,7 @@ ok(partial.text().includes('≥ $0.50'), 'an incomplete total is shown as a floo
 // readout exists to disprove.
 const cheap = run({
   ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
-  composer: { ...COMPOSER, spentUsd: 0.004 },
+  composer: { ...COMPOSER, meter: { kind: 'usd', spentUsd: 0.004, priced: true } },
 })
 ok(cheap.text().includes('$0.004'), 'a fraction of a cent is shown, not rounded to zero')
 
@@ -144,7 +144,7 @@ ok(noWindow.text().includes('45k'), 'context tokens show even when the window is
 for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
   const t = run({
     ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
-    composer: { ...COMPOSER, spentUsd: bad },
+    composer: { ...COMPOSER, meter: { kind: 'usd', spentUsd: bad, priced: true } },
   }).text()
   ok(!/NaN|Infinity/.test(t), `a spend of ${bad} does not render as itself`)
 }
@@ -152,9 +152,164 @@ for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
 // A session that has never run shows no spend claim at all, rather than $0.00.
 const fresh = run({
   ...base, mode: 'chat', selectedKey: undefined, transcript: [],
-  composer: { ...COMPOSER, contextTokens: 0, contextWindow: undefined, spentUsd: undefined },
+  composer: { ...COMPOSER, contextTokens: 0, contextWindow: undefined, meter: undefined },
 })
 ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no claim')
+
+// A phase move carries the agent's reason, because `set_phase` asks for one.
+//
+// The `note` argument's own description promises "shown on the board", and the
+// handler dropped it — so the model was invited to explain every move and spent
+// tokens writing into nothing. A field accepted and never written is the mirror
+// of one written and never read.
+{
+  const moved = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [{
+      kind: 'phase', at: Date.now(), from: 'implementing', to: 'validating',
+      note: 'Tests pass; the migration needs a look before it merges.',
+    }],
+  }).text()
+  ok(moved.includes('Tests pass; the migration needs a look'),
+     `the agent's reason for the move is on the board (${/Tests pass[^A-Z]*/.exec(moved)?.[0] ?? 'missing'})`)
+  // And a move with no note must not render an empty line.
+  const bare = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [{ kind: 'phase', at: Date.now(), from: 'implementing', to: 'validating' }],
+  })
+  ok(!walkAll(bare.root).some((n) => (n.className || '').includes('phase-note')),
+     'and a move with nothing to say renders no note at all')
+}
+
+// The provider chip shows what the CLI SAID, not what we asked for.
+//
+// `resolvedProvider` and `providerLabel` are the backend the CLI reported the
+// run is ACTUALLY on — a managed settings file, an `apiKeyHelper` or an env
+// block in `~/.claude/settings.json` all outrank our request. The host has
+// computed both onto every card since the feature was written and the view read
+// neither, so the chip could only ever repeat our own configuration back, which
+// is exactly the decorative readout the rule about this names.
+{
+  const composer = {
+    ...COMPOSER, provider: 'my-gateway',
+    providers: [{ id: 'my-gateway', label: 'My Gateway' }],
+    runtimes: [{ id: 'claude', label: 'Claude Code', providerProfiles: true }],
+    runtime: 'claude',
+  }
+  const asked = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{ ...CARD, agent: { kind: 'working', contextTokens: 0 } }],
+    composer,
+  }).text()
+  ok(asked.includes('My Gateway'), 'with no answer yet, the chip names the profile that was requested')
+
+  const answered = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{
+      ...CARD,
+      agent: { kind: 'working', contextTokens: 0, resolvedProvider: 'bedrock', providerLabel: 'Amazon Bedrock' },
+    }],
+    composer,
+  }).text()
+  ok(answered.includes('Amazon Bedrock'),
+     `once the CLI answers, the chip names what it is ACTUALLY on (${/Claude Code · [^A-Z]*[A-Za-z ]+/.exec(answered)?.[0] ?? 'nothing'})`)
+  ok(!answered.includes('My Gateway'),
+     'and not the profile that was outranked — that is the whole point of asking')
+}
+
+// An approval must name the agent that actually asked, and say what it wants.
+//
+// The header was the literal string "Claude wants to run", so a Codex approval
+// — the commonest event on Codex's shipped default policy — named the wrong
+// vendor. Worse, Codex computes its own sentence ("Codex wants to change 3
+// files in your worktree") and it was dropped at the host/webview boundary, so
+// the dialog authorising a write to the user's worktree withheld the file
+// count, the names and the reason all at once.
+{
+  const withPrompt = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{
+      ...CARD,
+      agent: {
+        kind: 'needsInput', contextTokens: 0,
+        pendingPermission: { id: 'p1', summary: 'Edit', prompt: 'Codex wants to change 3 files in your worktree' },
+      },
+    }],
+  }).text()
+  ok(withPrompt.includes('Codex wants to change 3 files'),
+     `the runtime's own sentence is shown (${/\w+ wants to [^"]{0,40}/.exec(withPrompt)?.[0] ?? 'nothing'})`)
+  ok(!withPrompt.includes('Claude wants to run'), 'and not attributed to the wrong agent')
+
+  // A runtime that gives no sentence still gets the old rendering.
+  const noPrompt = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{
+      ...CARD,
+      agent: { kind: 'needsInput', contextTokens: 0, pendingPermission: { id: 'p1', summary: 'Bash npm test' } },
+    }],
+  }).text()
+  ok(noPrompt.includes('Claude wants to run') && noPrompt.includes('npm test'),
+     'a runtime with no sentence of its own falls back to the summary')
+
+  // And a second request must be VISIBLE. One slot used to hold them all, so
+  // answering the one on screen left the agent blocked on an invisible one
+  // while the card went back to saying "working".
+  const two = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{
+      ...CARD,
+      agent: {
+        kind: 'needsInput', contextTokens: 0,
+        pendingPermission: { id: 'p1', summary: 'Bash npm test', waiting: 3 },
+      },
+    }],
+  }).text()
+  ok(/2 more waiting/.test(two), `the requests queued behind it are counted (${/\d+ more waiting[^.]*/.exec(two)?.[0] ?? 'not shown'})`)
+}
+
+// A SUBSCRIPTION session has no dollar figure it can defend, and this is the
+// case the whole union exists for. `composer.spentUsd` was a number and only
+// one runtime emits dollars, so every Codex session arrived as 0 and the bar
+// read "$0.00" over a card that had just spent 13% of a five-hour window.
+const plan = run({
+  ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+  composer: {
+    ...COMPOSER,
+    meter: { kind: 'plan', usedPercent: 13, windowMinutes: 300, plan: 'plus' },
+  },
+}).text()
+ok(plan.includes('13% of 5h'), `a plan meter shows the window it spent: ${plan.match(/\d+% of \S+/)?.[0]}`)
+ok(plan.includes('plus'), 'and names the plan')
+ok(!/\$/.test(plan), 'and makes NO dollar claim at all — not even $0.00')
+
+// "Could not read it" is not "nothing was spent", and must never render green
+// or as a zero.
+const unknown = run({
+  ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+  composer: { ...COMPOSER, meter: { kind: 'unknown' } },
+}).text()
+ok(unknown.includes('—'), 'an unknown meter renders an em dash')
+ok(!/\$|0%/.test(unknown), 'and never as zero')
+
+// A meter shape this build cannot read must not reach the bar as anything.
+// Every one of these used to be a live crash path: `spentUsd` came off an
+// untyped EventEmitter, and a `Meter` object in a number's slot made
+// `.toFixed(2)` throw inside render() — a silently blank panel.
+for (const bad of [{ kind: 'usd', spentUsd: 'lots' }, { kind: 'martian' }, { kind: 'plan' }, 42, 'x', null]) {
+  const label = JSON.stringify(bad)
+  let text = null
+  let threw = null
+  try {
+    text = run({
+      ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+      composer: { ...COMPOSER, meter: bad },
+    }).text()
+  } catch (e) {
+    threw = e instanceof Error ? e.message : String(e)
+  }
+  ok(threw === null, `a meter of ${label} does not throw in render()${threw ? `: ${threw}` : ''}`)
+  ok(text !== null && !/NaN|undefined|Infinity|\[object/.test(text), `a meter of ${label} does not render as itself`)
+}
 
 // 6. Streaming text renders as a live block.
 const st = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], streaming: 'partial out' })
@@ -557,6 +712,42 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   // run is the run the mark refers to, not a casualty of a restart.
   const live = run({ ...base, cards: [{ ...CUT, agent: CARD.agent }] })
   ok(!live.text().includes('Interrupted'), 'a card with a LIVE agent never shows the banner')
+}
+
+// --- the liveness age must actually CLIMB -----------------------------------
+//
+// The board's rule is that a spinner spins over a wedged process too, so the
+// indicator shows the AGE of the last frame the CLI sent. `tickAges()` is what
+// makes that number move between state messages — and it could not run in any
+// gate: `document.querySelectorAll` was missing from the stub and `setInterval`
+// is not a V8 intrinsic, so board.js's own `typeof setInterval === 'function'`
+// guard meant the ticker was never even registered. The one signal that has to
+// be able to say "nothing is happening" was untestable.
+{
+  const started = Date.now() - 5000
+  const v = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{ ...CARD, agent: { kind: 'working', tool: 'Bash', contextTokens: 0, lastEventAt: started } }],
+  })
+  ok(v.timers.length > 0, `the age ticker is registered (${v.timers.length} timer(s))`)
+  const age = () => {
+    const n = v.root.querySelectorAll('[data-since]')[0]
+    return n ? n.textContent : null
+  }
+  ok(age() !== null, `the age is on screen (${age()})`)
+  const first = age()
+  // Move the clock and let the ticker run, as a second of real time would.
+  const realNow = Date.now
+  try {
+    Date.now = () => realNow() + 60_000
+    v.tick()
+    const later = age()
+    ok(later !== first,
+       `and it CLIMBS when nothing is happening — the whole point of showing it (${first} -> ${later})`)
+    ok(/m|s/.test(String(later)), `still formatted as a duration (${later})`)
+  } finally {
+    Date.now = realNow
+  }
 }
 
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)

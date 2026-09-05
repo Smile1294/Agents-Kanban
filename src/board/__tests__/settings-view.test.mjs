@@ -154,5 +154,33 @@ const state = (over = {}) => ({
   ok(v.text().includes('the keychain refused'), 'a host error reaches the page rather than only the log')
 }
 
+// --- a login readout must say WHEN it was read ------------------------------
+//
+// `RuntimeStatus.at` crossed the postMessage boundary and was rendered by
+// nothing, so a "Signed in" tick from an hour ago — before the token expired,
+// before the CLI was uninstalled — looked exactly like one taken a second ago.
+// A settings page is precisely where a green tick gets painted because a config
+// file exists.
+{
+  const fresh = await renderSettings(state({
+    runtimes: [{
+      ...CLAUDE,
+      status: { id: 'claude', at: Date.now() - 3000, login: { kind: 'signedIn', via: 'subscription', account: 'a@b.c' } },
+    }],
+  }))
+  ok(/checked just now|checked \ds ago/.test(fresh.text()),
+     `a fresh reading says so (${/checked [^A-Z]*/.exec(fresh.text())?.[0]?.trim() ?? 'nothing'})`)
+
+  const old = await renderSettings(state({
+    runtimes: [{
+      ...CLAUDE,
+      status: { id: 'claude', at: Date.now() - 3 * 3600_000, login: { kind: 'signedIn', via: 'subscription' } },
+    }],
+  }))
+  ok(/checked 3h ago/.test(old.text()),
+     `and an old one says how old (${/checked [^A-Z]*/.exec(old.text())?.[0]?.trim() ?? 'nothing'})`)
+  ok(old.text().includes('Signed in'), 'while still reporting what it read')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

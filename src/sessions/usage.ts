@@ -291,6 +291,15 @@ export function summariseUsage(messages: readonly UsageMessage[]): UsageTotals {
   const responses = new Map<string, { model: string; usage: TokenUsage; main: boolean; seq: number }>()
   let seq = 0
   for (const m of messages) {
+    /* A compaction resets the context, so everything before it is no longer IN
+       the window. The live path resets explicitly for this; the disk path could
+       not even see the boundary until `readTranscript` began asking for system
+       messages. Only the FILL is reset — the spend before a compaction was
+       still spent, so the priced responses are kept. */
+    if (m.type === 'system' && (m as { subtype?: unknown }).subtype === 'compact_boundary') {
+      for (const [k, r] of responses) if (r.main) responses.set(k, { ...r, main: false })
+      continue
+    }
     if (m.type !== 'assistant') continue
     const body = m.message as { id?: unknown; model?: unknown; usage?: TokenUsage } | undefined
     const usage = body?.usage

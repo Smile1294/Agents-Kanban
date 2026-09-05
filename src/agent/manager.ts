@@ -9,7 +9,7 @@
 import { EventEmitter } from 'node:events'
 import { loadSdk, type Options } from './sdk.ts'
 import type { WorktreeService } from '../git/worktree.ts'
-import { normaliseTitle, resolveEffort, resolveThinking, type EffortLevel, type ThinkingMode } from '../sessions/meta.ts'
+import { normaliseTitle, resolveEffort, resolveThinking, type EffortLevel, type SessionMeta, type ThinkingMode } from '../sessions/meta.ts'
 import { summariseTool, type Entry, type SessionStore } from '../sessions/store.ts'
 import type { AgentState, BoardConfig } from '../board/config.ts'
 import { AgentSession, type PermissionRequest } from './session.ts'
@@ -17,7 +17,7 @@ import type { AttachedImage } from './images.ts'
 import { boardToolNames, createBoardServer, type BoardChange, type BoardNotice, type BoardToolContext } from './tools.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
 import {
-  DEFAULT_RUNTIME, getRuntime, type AgentRun, type Meter, type RuntimeId,
+  DEFAULT_RUNTIME, getRuntime, parseMeter, type AgentRun, type Meter, type RuntimeId,
 } from './runtime.ts'
 import { startBoardBridge, type BoardBridge } from './board-bridge.ts'
 
@@ -61,6 +61,24 @@ export interface ManagerOptions {
    *  file never touches a credential and `providers.ts` stays the only place
    *  that knows a variable name. */
   providerEnv?: ProviderEnv
+  /**
+   * Ask the user before fanning a card out into N billed agents.
+   *
+   * The boundary in CODE for `split_task`, which had only a boundary in a
+   * permission list — and that list is not consulted under `dontAsk` or
+   * `bypassPermissions`, and is not read by the Codex adapter at all. Awaited
+   * inside `split()` after the structural refusals and before the first
+   * `start()`; a `false` refuses the split with a message the agent can act on.
+   *
+   * Optional so the manager stays unit-testable without an editor. Absent means
+   * no host-side gate, which is the pre-existing behaviour and is why
+   * `smoke.mjs` asserts the real host supplies one.
+   */
+  confirmSplit?: (
+    parent: RunningAgent,
+    subtasks: readonly SubtaskSpec[],
+    reason: string,
+  ) => Promise<boolean>
   /** Passed to every session, for diagnostics the user cannot act on. */
   log?: (message: string) => void
 }
@@ -87,6 +105,41 @@ export function followKey(
   if (cardKeys.includes(selected)) return selected
   const moved = sessionIdFor(selected)
   return moved && cardKeys.includes(moved) ? moved : undefined
+}
+
+/**
+ * The sidecar entry written the moment a session becomes durable.
+ *
+ * Pure, and separate from `launch()`, because the fields in here are the ones
+ * that have to SURVIVE — and this project has shipped a bug at both ends of
+ * that. `contextWindow` was written by every run and missing from the reader.
+ * `runtime` was the mirror image and worse: parsed from the day it was added,
+ * written by nothing, so `store.runtimeOf()` answered `undefined` for every
+ * session and every finished Codex transcript, usage figure and meter was
+ * routed to the CLAUDE parser — a different store, a different format, an empty
+ * result. Neither was visible from inside a unit test, because nothing built
+ * this object anywhere a test could see it.
+ *
+ * `running` is `startedAt` and not a boolean for the reason in `SessionMeta`:
+ * this is the moment a run becomes resumable, so a mark still here at startup
+ * means the host went away mid-turn.
+ */
+export function durablePatch(a: {
+  startedPhase?: string
+  runtime: RuntimeId
+  worktree: { path: string; branch: string; base?: string }
+  startedAt: number
+  parent?: string
+}): Partial<SessionMeta> {
+  return {
+    phase: a.startedPhase ?? 'implementing',
+    runtime: a.runtime,
+    worktree: a.worktree.path,
+    branch: a.worktree.branch,
+    running: a.startedAt,
+    ...(a.worktree.base ? { base: a.worktree.base } : {}),
+    ...(a.parent ? { parent: a.parent } : {}),
+  }
 }
 
 /**
@@ -184,7 +237,18 @@ export interface RunningAgent {
    * `Meter` in runtime.ts.
    */
   meter?: Meter
+  /** The request on screen. The head of `pendingPermissions`. */
   pendingPermission?: PermissionRequest
+  /**
+   * Every request waiting on the user, oldest first.
+   *
+   * A single slot lost all but the last one: a turn can issue several tool
+   * calls at once, and both runtimes hold a Map of outstanding requests. When a
+   * second arrived it overwrote the first, which then had no surface able to
+   * answer it — `answerPermission` needs an id, and the webview's state no
+   * longer carried it — so the CLI stayed blocked and the card said "working".
+   */
+  pendingPermissions?: PermissionRequest[]
   startedAt: number
   /** When the CLI last emitted anything. The board renders its age, which is
    *  the difference between telling the user it is working and letting them
@@ -225,7 +289,29 @@ export class AgentManager extends EventEmitter {
   list(): RunningAgent[] { return [...this.agents.values()] }
 
   /** Picker changes apply to the next run; a running session keeps its settings. */
-  setDefaults(d: ManagerOptions['defaults']): void { this.opts.defaults = d }
+  /**
+   * Change some of the defaults new sessions start with.
+   *
+   * A PATCH, and it has to be. This was `this.opts.defaults = d` — a wholesale
+   * replacement of an object whose every member is optional, so a caller that
+   * did not mention a field silently erased it, with no type error to say so.
+   *
+   * Two of the five callers omitted `runtime`, and one of them is
+   * `ensureManager()`, which runs immediately before `mgr.start()` in
+   * `newSession`. So it erased whatever the composer chip and the settings page
+   * had just set, `launch()` fell through to `DEFAULT_RUNTIME`, and **every new
+   * session ran on Claude Code** however the board was configured — while the
+   * composer chip, the settings page and `agentsKanban.runtime` all reported a
+   * choice that could never take effect. The second runtime was unreachable
+   * for new sessions.
+   *
+   * Omission now means "leave it alone", which is what all five callers
+   * actually meant. Clearing a field is still possible and now has to be said
+   * out loud, by passing it explicitly as `undefined`.
+   */
+  setDefaults(d: Partial<ManagerOptions['defaults']>): void {
+    this.opts.defaults = { ...this.opts.defaults, ...d }
+  }
 
   /** Switch which backend the NEXT session runs against.
    *
@@ -247,13 +333,38 @@ export class AgentManager extends EventEmitter {
     return this.agents.get(key) ?? [...this.agents.values()].find((a) => a.sessionId === key)
   }
 
+  /**
+   * How many runs are occupying a concurrency slot.
+   *
+   * `launching` is counted alongside the registered agents, and that is the
+   * whole fix for a limit the code did not hold. `launch()` does not put its
+   * agent into `this.agents` until AFTER `worktrees.create()` — a real
+   * `git worktree add` behind the repo lock, tens to hundreds of milliseconds —
+   * so for that whole window the launching run was invisible here.
+   *
+   * And a completion fires TWO drains: the `state` listener drains on `done`,
+   * then `finish()` drains again, because both runtimes call `setState` before
+   * they emit `done`. The first drain suspended inside `launch()`, the second
+   * saw an unchanged count and shifted another entry off the queue. Measured
+   * with `maxConcurrent: 1`: three agents, two active, three worktrees created.
+   * The excess scales with simultaneous completions, so it could empty the
+   * queue rather than overshoot by one.
+   */
   get activeCount(): number {
-    return [...this.agents.values()].filter(
+    return this.launching.size + [...this.agents.values()].filter(
       (a) => ['working', 'starting', 'needsInput'].includes(a.state.kind),
     ).length
   }
 
   private touch(): void { this.emit('change') }
+
+  /** Runs that have been shifted off the queue and are inside `launch()`, but
+   *  have not registered an agent yet. They hold a concurrency slot — see
+   *  `activeCount`. */
+  private readonly launching = new Set<string>()
+
+  /** This manager is being torn down. Latched, never cleared. */
+  private stopped = false
 
   private keyFor(a: RunningAgent): string { return a.sessionId ?? a.runId }
 
@@ -262,6 +373,27 @@ export class AgentManager extends EventEmitter {
     const runId = `run-${++this.counter}-${Date.now().toString(36)}`
     if (this.activeCount >= this.opts.maxConcurrent) {
       this.queue.push({ runId, prompt, opts })
+      /* A queued run gets a CARD, and that is the whole fix for two separate
+         reported failures.
+         `start()` used to return the run id without registering anything, so
+         `list()` omitted it and `byKey()` missed it — `followKey()` then failed
+         both of its tests, `getState()` cleared the selection, and a user who
+         pressed send on a full board was returned to the new-session screen
+         with their prompt gone and no card anywhere to say it had been
+         accepted. It is the same absence that makes a subtask "invisible until
+         it starts", which DECISIONS.md lists as open.
+         No worktree and no branch: it has neither yet, and inventing one would
+         be a path the review panel could try to open. `launch()` fills them in. */
+      this.agents.set(runId, {
+        runId,
+        runtime: opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME,
+        title: opts.title ?? titleFrom(prompt),
+        state: { kind: 'queued', since: Date.now() },
+        worktreePath: '', branch: '',
+        live: [{ kind: 'prompt', at: Date.now(), text: prompt }],
+        history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
+        ...(opts.parent ? { parent: opts.parent } : {}),
+      })
       this.touch()
       return runId
     }
@@ -300,7 +432,7 @@ export class AgentManager extends EventEmitter {
    * can: at most MAX_SUBTASKS, one level deep, once per session, and never
    * after the parent has touched the tree.
    */
-  async split(parentKey: string, subtasks: SubtaskSpec[]): Promise<SplitResult> {
+  async split(parentKey: string, subtasks: SubtaskSpec[], reason = ''): Promise<SplitResult> {
     const parent = this.byKey(parentKey)
     if (!parent) return { ok: false, message: 'This session is not running, so it cannot start subtasks.' }
 
@@ -361,12 +493,55 @@ export class AgentManager extends EventEmitter {
       }
     }
 
+    // The real approval gate, and it has to be here.
+    //
+    // `ASKS_FIRST` is not a boundary. It is enforced two ways and BOTH have a
+    // hole: on Claude it routes through `canUseTool`, which `session.ts` skips
+    // under `dontAsk` and `bypassPermissions`; and on Codex it is filtered out
+    // of `autoAllow` — a list `codex.ts` never reads, because Codex surfaces
+    // approvals only for `execCommandApproval` and `applyPatchApproval` while an
+    // MCP call arrives as a notification. So a card could fan out four billed
+    // agents with no click at all, in three of the configurations a user who
+    // wants a self-driving board would actually choose.
+    //
+    // This runs in the HOST, after the structural refusals (a dirty parent
+    // cannot split however good the proposal) and before the first `start()`.
+    // `ASKS_FIRST` stays as the soft layer — the rule is "both, always".
+    if (this.opts.confirmSplit && !(await this.opts.confirmSplit(parent, specs, reason))) {
+      return { ok: false, message: 'The user declined the split. Do the work yourself, in this session.' }
+    }
+
+    // Re-check after the await. The confirmation is a modal and the user can
+    // sit on it: in that window the parent's own turn can end, the worktree can
+    // be committed to, or another trigger can fan the same card out. Every one
+    // of those makes the proposal we just had approved unsound — subtasks fork
+    // from the parent's base, so a parent that has since written something
+    // would have it stranded on a branch nothing merges.
+    if (!this.byKey(parentKey)) {
+      return { ok: false, message: 'This session ended while the split was waiting to be approved.' }
+    }
+    if ((await this.opts.store.childrenOf(parentKey)).length) {
+      return { ok: false, message: 'This session was already split while that was waiting to be approved.' }
+    }
+
+    // How many were APPROVED, written before the first child exists. Without
+    // it the roll-up counts only the children that got a card, and the ones
+    // still queued behind `maxConcurrentAgents` are invisible — see
+    // `SessionMeta.fanout`.
+    await this.opts.store.patch(parentKey, { fanout: specs.length }).catch(() => {})
+
     const started: { key: string; title: string; branch: string }[] = []
     for (const spec of specs) {
       const runId = await this.start(spec.prompt, {
         title: spec.title,
         parent: parentKey,
         ...(parent.base ? { base: parent.base } : {}),
+        // A child inherits the PARENT's agent program, not the workspace
+        // default. `split()` passed no runtime, so `launch()` fell through to
+        // `defaults.runtime` — and a Codex objective's children ran on Claude
+        // whenever that was the workspace default, permanently, because a
+        // session keeps the runtime it started on.
+        runtime: parent.runtime,
       })
       if (spec.tags?.length) {
         await this.opts.store.setTags(runId, spec.tags).catch(() => {})
@@ -383,6 +558,25 @@ export class AgentManager extends EventEmitter {
     this.emit('split', parent, started)
     this.touch()
     return { ok: true, started }
+  }
+
+  /**
+   * Rename a live run's card.
+   *
+   * Through the manager rather than straight to the store, because a live run's
+   * title lives in TWO places: `agent.title`, which is what the board shows for
+   * a run whose session id has not arrived, and the runtime's own session
+   * record. Writing only the second one silently did nothing for the first few
+   * seconds of every session.
+   */
+  async renameAgent(key: string, title: string): Promise<{ renamed: boolean; reason?: string }> {
+    const agent = this.byKey(key)
+    if (!agent) return { renamed: false, reason: 'this session is not running' }
+    agent.title = title
+    agent.titleChosen = true
+    this.touch()
+    if (!agent.sessionId) return { renamed: true }
+    return this.opts.store.rename(agent.sessionId, title)
   }
 
   /** Continue an existing session: same worktree, resumed Claude session. */
@@ -430,7 +624,10 @@ export class AgentManager extends EventEmitter {
       key: () => agent.sessionId ?? agent.runId,
       onChanged: (change?: BoardChange) => {
         if (change?.phase) {
-          agent.live.push({ kind: 'phase', at: Date.now(), from: change.phase.from, to: change.phase.to })
+          agent.live.push({
+            kind: 'phase', at: Date.now(), from: change.phase.from, to: change.phase.to,
+            ...(change.note ? { note: change.note } : {}),
+          })
           // The moment the board exists for: an agent announcing where it got
           // to. The host turns a move into a review column into a notification.
           this.emit('phase', agent, change.phase.from, change.phase.to)
@@ -451,10 +648,16 @@ export class AgentManager extends EventEmitter {
         // to rename. Nothing is lost: the id handler below writes `agent.title`
         // when the id arrives, so a rename inside that window is picked up
         // rather than dropped.
-        if (agent.sessionId) await this.opts.store.rename(agent.sessionId, title)
+        //
+        // The RESULT is returned, not swallowed. A runtime that owns its own
+        // session names refuses this, and the agent has to be told: it used to
+        // be answered "Card renamed" while the name reverted the moment the run
+        // ended, which is a tool reporting a write it did not make.
+        if (!agent.sessionId) return { renamed: true }
+        return this.opts.store.rename(agent.sessionId, title)
       },
-      onSplit: async (subtasks) => {
-        const result = await this.split(agent.sessionId ?? agent.runId, subtasks)
+      onSplit: async (subtasks, reason) => {
+        const result = await this.split(agent.sessionId ?? agent.runId, subtasks, reason)
         if (result.ok) {
           agent.live.push({
             kind: 'notice', at: Date.now(), urgency: 'info',
@@ -471,6 +674,45 @@ export class AgentManager extends EventEmitter {
 
   private async launch(runId: string, prompt: string, opts: LaunchOptions): Promise<void> {
     const title = opts.title ?? titleFrom(prompt)
+    // Hold the slot for the whole of this method, including the awaits before
+    // the agent is registered. Cleared in a `finally`, so a throw releases it —
+    // otherwise one failed `git worktree add` would shrink the limit for the
+    // rest of the session.
+    this.launching.add(runId)
+    try {
+      await this.launchInner(runId, title, prompt, opts)
+    } catch (e) {
+      // `launch()` NEVER throws, and that is deliberate: it has two callers
+      // reached by different routes and both were unsafe in a different way.
+      //
+      // `drain()` had `catch { /* surfaced through state */ }`, and the comment
+      // was false — `launchInner`'s own catch is after the agent is registered,
+      // so anything thrown by `store.get()` or `worktrees.create()` (a branch
+      // collision, a stale index.lock, a full disk) escaped to a place with no
+      // card to put it on, and the queue entry had already been shifted off:
+      // the run vanished with nothing in the log and no dialog.
+      //
+      // `start()` calls this directly when a slot is free, and had NO catch at
+      // all — so the same failure on a FRESH session threw out of `start()`,
+      // which in `split()` aborts the fan-out partway and leaves the agent
+      // holding a `fanout` it will never reach.
+      //
+      // One place that knows how to report it, per the two-functions rule.
+      const why = e instanceof Error ? e.message : String(e)
+      this.opts.log?.(`Session "${title}" could not start: ${why}`)
+      this.emit('warning', `"${title}" could not start: ${why}`)
+      this.touch()
+    } finally {
+      this.launching.delete(runId)
+    }
+  }
+
+  private async launchInner(
+    runId: string,
+    title: string,
+    prompt: string,
+    opts: LaunchOptions,
+  ): Promise<void> {
 
     // Reuse the worktree of the session being resumed, so a follow-up does not
     // strand the agent in a fresh checkout without its earlier work.
@@ -581,18 +823,13 @@ export class AgentManager extends EventEmitter {
       const previousKey = agent.runId
       agent.sessionId = id
       // Register the card now that Claude Code has given us an identity for it.
-      void this.opts.store.adoptKey(previousKey, id).then(() => this.opts.store.patch(id, {
-        phase: prior?.phase ?? this.opts.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing',
-        worktree: wt.path,
-        branch: wt.branch,
-        // Written here because this is the moment the card becomes durable: a
-        // run that dies before this point has no transcript and no session to
-        // resume, and discardIfUntouched() takes its worktree back. From here
-        // on, a mark left behind means the host went away mid-turn.
-        running: agent.startedAt,
-        ...(wt.base ? { base: wt.base } : {}),
+      void this.opts.store.adoptKey(previousKey, id).then(() => this.opts.store.patch(id, durablePatch({
+        startedPhase: prior?.phase ?? this.opts.board.columns.find((c) => c.category === 'started')?.id,
+        runtime,
+        worktree: wt,
+        startedAt: agent.startedAt,
         ...(opts.parent ? { parent: opts.parent } : {}),
-      }))
+      })))
         // `agent.title`, not the launch-time `title`: `set_title` may have already
         // renamed the card during the window before this id existed.
         .then(() => this.opts.store.rename(id, agent.title))
@@ -608,7 +845,7 @@ export class AgentManager extends EventEmitter {
     session.on('state', (s: AgentState) => {
       agent.lastEventAt = session.lastEvent
       agent.state = s
-      if (s.kind !== 'needsInput') delete agent.pendingPermission
+      if (s.kind !== 'needsInput') { delete agent.pendingPermission; delete agent.pendingPermissions }
       this.touch()
       // A slot frees up on ANY terminal state, not only on the `done`/`error`
       // events that finish() listens for. An aborted or interrupted run settles
@@ -713,27 +950,57 @@ export class AgentManager extends EventEmitter {
       agent.spendPriced = priced
       this.touch()
     })
-    // The runtime-neutral view of the same thing. Every runtime emits this;
-    // only the ones that price per request also emit `spend`, so a Codex card
-    // gets a rate-limit meter and no dollar figure rather than a made-up zero.
-    session.on('meter', (m: Meter) => {
-      agent.meter = m
-      this.touch()
+    // The runtime-neutral view of the same thing, and the ONE the board reads.
+    // Every runtime emits this; only the ones that price per request also emit
+    // `spend`, so a Codex card gets a rate-limit meter and no dollar figure
+    // rather than a made-up zero.
+    session.on('meter', (raw: unknown) => {
+      if (this.settleMeter(agent, raw, 'meter')) this.touch()
     })
+    /* The agent committed. Declared in both event interfaces, emitted by both
+       runtimes, and listened for by NOTHING — so the Changes panel kept showing
+       the work as uncommitted and the Merge button stayed disabled for the rest
+       of the turn, on a branch that now had something to merge. Both emit sites
+       carry a comment saying the host reads the new HEAD off this. */
+    session.on('committed', () => { this.emit('committed', agent) })
     session.on('permission', (req: PermissionRequest) => {
-      agent.pendingPermission = req
+      // Queued, not overwritten. The head is what the card shows; the rest are
+      // counted, so "1 of 3" is visible rather than two of them vanishing.
+      const waiting = (agent.pendingPermissions ??= [])
+      if (!waiting.some((r) => r.id === req.id)) waiting.push(req)
+      agent.pendingPermission = waiting[0]
       this.touch()
     })
 
     const finish = () => {
       delete agent.streaming
+      /* END the run, do not just forget it.
+         This used to `delete` the entry and stop there, on the stated grounds
+         that "the session is still alive and still able to take a follow-up".
+         That justification was unreachable: `send()` looks the session up in
+         THIS map, so once the entry is gone every follow-up takes the resume
+         branch and spawns a fresh child — which is what DECISIONS.md documents
+         as the intended behaviour. So nothing was being kept for a follow-up;
+         the child was simply abandoned.
+         And abandoned is literal. `stop()` is the only thing that ends the
+         process, and it is reached only from `halt()`, which looks the session
+         up in the map this line had already cleared — so `?.stop()` was a no-op
+         on every finished run. The prompt is an AsyncIterable, so the SDK never
+         calls `endInput()`; the CLI's stdin stays open and it never exits.
+         Ten messages to one card left nine idle `claude` processes (or nine
+         `codex app-server` plus nine `board-mcp.js`), which neither Stop nor a
+         window reload could reach, because both go through `halt()`. Only
+         quitting VS Code reclaimed them.
+         Steering a RUNNING turn is unaffected: `send()` finds the session while
+         the turn is in flight, and this runs only when it ends. */
+      const ending = this.sessions.get(runId)
       this.sessions.delete(runId)
-      // The board-tool socket is deliberately NOT closed here. `finish()` runs
-      // when a TURN ends, and the session is still alive and still able to take
-      // a follow-up — closing it would leave the agent's process running with
-      // its board tools silently gone, so the next turn could not move its own
-      // card and nothing would say why. It is closed in `halt()` and
-      // `release()`, which are the two places a session actually ends.
+      ending?.stop()
+      // The board-tool socket goes with it, for the same reason: it was kept
+      // open for a follow-up that cannot arrive on this run, so it was a
+      // leaked node process and an open descriptor per ended session.
+      this.bridges.get(runId)?.dispose()
+      this.bridges.delete(runId)
       // This run reached the end under its own power, so it was not cut off.
       // Zero, not undefined: a patch drops undefined and the mark would stay.
       if (agent.sessionId) void this.opts.store.patch(agent.sessionId, { running: 0 }).catch(() => {})
@@ -743,12 +1010,19 @@ export class AgentManager extends EventEmitter {
       this.emit('finished', agent)
       void this.drain()
     }
-    session.on('done', (summary: string, costUsd?: number) => {
-      agent.costUsd = costUsd
+    session.on('done', (summary: string, meter?: unknown, turnUsd?: unknown) => {
+      // The final settle of the session meter, then this TURN's dollars — two
+      // different scopes that used to share one argument slot. `costUsd` is the
+      // turn, which is what the transcript row and the agent row show; it is
+      // ABSENT for a runtime with no per-request price, so a Codex result row
+      // carries no dollar figure rather than a fabricated zero.
+      this.settleMeter(agent, meter, 'done')
+      const turn = typeof turnUsd === 'number' && Number.isFinite(turnUsd) ? turnUsd : undefined
+      agent.costUsd = turn
       agent.live.push({
         kind: 'result', at: Date.now(), summary,
         durationMs: Date.now() - agent.startedAt,
-        ...(costUsd !== undefined ? { costUsd } : {}),
+        ...(turn !== undefined ? { costUsd: turn } : {}),
       })
       finish()
     })
@@ -877,6 +1151,45 @@ export class AgentManager extends EventEmitter {
     return { autoAllow: bridge.autoAllow, stdio: bridge.descriptor }
   }
 
+  /**
+   * Take a `Meter` off an untyped event, and put it on the card.
+   *
+   * Two things happen here that both have to, and neither is visible to the
+   * type system.
+   *
+   * It PARSES. `EventEmitter.on()` is untyped, so a runtime that emits the
+   * wrong shape reaches `media/board.js` — which has no type checking — and a
+   * throw inside `render()` is a silently blank panel. A shape we cannot read
+   * leaves the previous reading alone and SAYS SO in the output channel, rather
+   * than being coerced into a number the board then displays as measured.
+   *
+   * And it adds `priorUsd`. The session's own arithmetic covers the turns THIS
+   * run has seen; a resumed session's earlier turns were billed to a process
+   * that no longer exists and are known only from its transcript. The `spend`
+   * event was already adjusted here and the `meter` event was not, so the two
+   * readouts for one claim disagreed by exactly the resumed history — and the
+   * board is about to read the meter rather than `spend`, which would have made
+   * a silent gap into a visible wrong number.
+   */
+  private settleMeter(agent: RunningAgent, raw: unknown, event: string): boolean {
+    const m = parseMeter(raw)
+    if (!m) {
+      // Only complain about a value that was actually sent. An absent meter on
+      // `done` is legitimate — a runtime with nothing to report.
+      if (raw !== undefined) {
+        this.opts.log?.(
+          `${agent.runtime} sent a meter on '${event}' that this build cannot read ` +
+          `(${JSON.stringify(raw)?.slice(0, 200)}). The card keeps its previous figure.`,
+        )
+      }
+      return false
+    }
+    agent.meter = m.kind === 'usd' && agent.priorUsd
+      ? { ...m, spentUsd: m.spentUsd + agent.priorUsd }
+      : m
+    return true
+  }
+
   /** Remove a worktree only if nothing was ever done in it. Anything else —
    *  a stray file, a commit, or an error while checking — is left alone: a
    *  leaked directory is a nuisance, deleting someone's work is not. */
@@ -888,13 +1201,41 @@ export class AgentManager extends EventEmitter {
     } catch {
       // Keeping a stale worktree is the safe way to fail here.
     }
+    /* And the sidecar entry, which nothing else could ever clear.
+       `parent` is written under the RUN id so a subtask joins its parent
+       immediately, and `adoptKey()` moves it when the session id arrives. When
+       the id NEVER arrives — `startRun()` threw, or the run errored before
+       adoption — the entry was left behind forever: `MetaStore.remove` is
+       reachable only through `store.delete()`, and the host's own delete
+       handler skips it for exactly these keys, so not even deleting the card
+       could get rid of it.
+       `childrenOf()` is a plain sidecar scan, so it counted that phantom
+       forever, and its phase is the default column, which is never settled — so
+       the parent's roll-up could never fire again. It survives the `fanout`
+       guard too: the phantom makes the count bigger, not smaller, so the
+       count check passes and the every-settled check then fails on a child
+       that does not exist. This is the only place that knows the run never
+       became a session. */
+    if (!agent.sessionId) {
+      await this.opts.store.forget(agent.runId).catch(() => {})
+      this.touch()
+    }
   }
 
   private async drain(): Promise<void> {
+    // Not while the host is going away. `halt()` drains because stopping one
+    // agent has to release whatever was queued behind it — but `stopAll()`
+    // shares `halt()`, and `halt()` only splices the queue by the HALTED run's
+    // own id, so on teardown every halt freed a slot and started something.
+    // Measured: `stopAll()` took the spawned-run count from 1 to 2 and left an
+    // agent behind, with a real worktree, a real branch and a real CLI, against
+    // a workspace that was being disposed — and no card anywhere to stop it.
+    if (this.stopped) return
     while (this.queue.length && this.activeCount < this.opts.maxConcurrent) {
       const next = this.queue.shift()!
-      try { await this.launch(next.runId, next.prompt, next.opts) }
-      catch { /* surfaced through state */ }
+      // `launch()` never throws; it reports. See the catch there — there is one
+      // place that knows how to describe a failed launch, not two.
+      await this.launch(next.runId, next.prompt, next.opts)
     }
   }
 
@@ -906,9 +1247,17 @@ export class AgentManager extends EventEmitter {
     selections?: Record<string, string[]>,
   ): boolean {
     const a = this.byKey(key)
-    return a
-      ? this.sessions.get(a.runId)?.answerPermission(requestId, allow, undefined, selections) ?? false
-      : false
+    if (!a) return false
+    const answered = this.sessions.get(a.runId)?.answerPermission(requestId, allow, undefined, selections) ?? false
+    if (answered && a.pendingPermissions) {
+      // Drop the one just answered and promote the next, so a turn that asked
+      // twice does not lose the second request behind the first.
+      a.pendingPermissions = a.pendingPermissions.filter((r) => r.id !== requestId)
+      if (a.pendingPermissions.length) a.pendingPermission = a.pendingPermissions[0]
+      else { delete a.pendingPermission; delete a.pendingPermissions }
+      this.touch()
+    }
+    return answered
   }
 
   /** Stop this turn, keep the session. The common case, and it was unreachable. */
@@ -966,7 +1315,9 @@ export class AgentManager extends EventEmitter {
     const i = this.queue.findIndex((q) => q.runId === a.runId)
     if (i >= 0) this.queue.splice(i, 1)
     this.touch()
-    // Stopping frees a slot too, and nothing else was going to notice.
+    // Stopping frees a slot too, and nothing else was going to notice. Guarded
+    // by `this.stopped` inside `drain()`, because `stopAll()` shares this
+    // method and must not start anything.
     void this.drain()
   }
 
@@ -994,7 +1345,18 @@ export class AgentManager extends EventEmitter {
    * next launch has to be able to say so. A crash never reaches this line at
    * all, and leaves the mark for the same reason.
    */
-  stopAll(): void { for (const a of [...this.agents.values()]) this.halt(a) }
+  stopAll(): void {
+    // Set FIRST, and never cleared: this manager is being thrown away. Without
+    // it each `halt()` freed a slot and `drain()` started the next queued run —
+    // a billed CLI, a real worktree and a real branch, created as the extension
+    // host disposed, with no card and nothing left able to stop it.
+    this.stopped = true
+    // The queue goes too. It is in memory, so a run still in it was never going
+    // to survive the host anyway; leaving entries there only gave a late drain
+    // something to find.
+    this.queue.length = 0
+    for (const a of [...this.agents.values()]) this.halt(a)
+  }
 }
 
 /** Appended to the Claude Code system prompt. Tells the agent it owns a card. */

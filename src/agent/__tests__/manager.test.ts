@@ -4,9 +4,10 @@
    runId and adopts Claude Code's session id moments later, and the board has to
    show it correctly throughout. Both halves of that have failure modes that are
    completely silent. */
-import { AgentManager, MAX_SUBTASKS, titleFrom, buildBrief, type RunningAgent } from '../manager.ts'
+import { AgentManager, durablePatch, MAX_SUBTASKS, titleFrom, buildBrief, type RunningAgent } from '../manager.ts'
 import { agentEnv, HOST_SESSION_VARS } from '../session.ts'
 import { DEFAULT_BOARD } from '../../board/config.ts'
+import { parseMeter } from '../runtime.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -90,11 +91,257 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
 // emits neither, so its slot was never released and every queued agent waited
 // forever. activeCount is what decides, so these are the states that must free
 // a slot.
-const ACTIVE = ['working', 'starting', 'needsInput']
-const TERMINAL = ['idle', 'done', 'error']
-for (const kind of ACTIVE) ok(ACTIVE.includes(kind), `"${kind}" holds a concurrency slot`)
-for (const kind of TERMINAL) {
-  ok(!ACTIVE.includes(kind), `"${kind}" releases it — so it must trigger a drain`)
+//
+// The gate that used to be here could not fail: it built two local arrays and
+// asserted that each contained its own members (`ACTIVE.includes(kind)` for
+// every `kind` of `ACTIVE`). It never touched the manager, so both halves of
+// the bug below were completely unguarded.
+{
+  // A worktree service that takes a REAL await to create a worktree, which is
+  // what the bug needs: `git worktree add` behind the repo lock is tens to
+  // hundreds of milliseconds, and for that whole window the launching run was
+  // invisible to the limit.
+  let created = 0
+  const slow = {
+    create: async (a: { taskId: string }) => {
+      created++
+      await new Promise((r) => setTimeout(r, 30))
+      return { path: '/tmp/wt/' + a.taskId, branch: 'task/' + a.taskId, base: 'main' }
+    },
+    isClean: async () => true,
+    aheadOf: async () => 0,
+    discard: async () => {},
+  }
+  const started: string[] = []
+  const mgr = new AgentManager({
+    store: {
+      get: async () => undefined,
+      card: async () => ({ phase: 'planning', tags: [] }),
+      childrenOf: async () => [],
+      patch: async () => {},
+      transcript: async () => [],
+      usage: async () => ({ costUsd: 0 }),
+      adoptKey: async () => {},
+      rename: async () => ({ renamed: true }),
+      setTags: async () => {},
+    } as never,
+    worktrees: slow as never,
+    board: DEFAULT_BOARD,
+    defaults: {},
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 1,
+  })
+  const inner = mgr as unknown as {
+    startRun: (...a: never[]) => Promise<unknown>
+    agents: Map<string, RunningAgent>
+    queue: unknown[]
+  }
+  // A run that registers and then sits in `working`, holding its slot.
+  inner.startRun = (async (_rt: unknown, runId: string) => {
+    started.push(runId as string)
+    const a = inner.agents.get(runId as string)
+    if (a) a.state = { kind: 'working' }
+    const { EventEmitter } = await import('node:events')
+    const e = new EventEmitter() as unknown as Record<string, unknown>
+    // Enough of an `AgentRun` for the manager to wire up and drive.
+    e.run = async () => {}
+    e.send = () => {}
+    e.stop = () => {}
+    e.interrupt = async () => {}
+    e.clearQueue = () => 0
+    e.answerPermission = () => false
+    e.setPermissionMode = async () => false
+    return e as never
+  }) as never
+
+  // Three sessions, a limit of ONE.
+  const firstKey = await mgr.start('first')
+  const secondKey = await mgr.start('second')
+  await mgr.start('third')
+  await new Promise((r) => setTimeout(r, 120))
+  ok(started.length === 1, `a limit of 1 starts exactly one run (${started.length})`)
+  ok(created === 1, `and creates exactly one worktree (${created})`)
+
+  // A QUEUED run must have a card. It used to have none at all: `start()`
+  // returned a run id without registering anything, so `list()` omitted it and
+  // `byKey()` missed it — `followKey()` then failed both of its tests and
+  // `getState()` cleared the selection, so a user who pressed send on a full
+  // board was returned to the new-session screen with their prompt gone and no
+  // card anywhere. It is the same absence that makes a subtask invisible until
+  // it starts.
+  ok(!!mgr.byKey(secondKey), 'a queued run is findable by its key')
+  ok(mgr.list().some((a) => a.runId === secondKey), 'and appears in the list the board renders')
+  const queued = mgr.byKey(secondKey)!
+  ok(queued.state.kind === 'queued', `and says it is queued (${queued.state.kind})`)
+  ok(queued.title === 'second', `carrying the title it was given (${queued.title})`)
+  ok(queued.live.some((e) => e.kind === 'prompt' && e.text === 'second'),
+     'and the prompt the user typed, so it is not lost')
+  ok(!queued.worktreePath && !queued.branch,
+     'with no worktree or branch, because it has neither yet')
+  ok(mgr.activeCount === 1,
+     `while still not consuming a concurrency slot (activeCount ${mgr.activeCount})`)
+  void firstKey
+
+  // Now the completion that fires TWO drains. Both runtimes call setState
+  // before they emit `done`, so the `state` listener drains and then `finish()`
+  // drains again — and the first drain is still suspended inside
+  // `worktrees.create()` when the second one reads the count.
+  const live = [...inner.agents.values()][0]!
+  live.state = { kind: 'done', summary: 'x' }
+  const drain = (mgr as unknown as { drain: () => Promise<void> }).drain.bind(mgr)
+  await Promise.all([drain(), drain(), drain()])
+  await new Promise((r) => setTimeout(r, 120))
+  ok(started.length === 2,
+     `three simultaneous drains past a finished run start ONE more, not several (${started.length})`)
+  ok(created === 2, `and create one more worktree, not several (${created})`)
+
+  // And teardown must not start anything. `halt()` drains because stopping one
+  // agent has to release what was queued behind it — but `stopAll()` shares
+  // `halt()`, and `halt()` only splices the queue by the halted run's own id.
+  const beforeTeardown = started.length
+  mgr.stopAll()
+  await new Promise((r) => setTimeout(r, 120))
+  ok(started.length === beforeTeardown,
+     `tearing the host down starts NOTHING (${started.length - beforeTeardown} extra runs)`)
+  ok(inner.agents.size === 0, 'and leaves no agent behind')
+  ok(inner.queue.length === 0, 'and no queue for a late drain to find')
+
+  // And a drain that arrives AFTER teardown must refuse. This is the case
+  // clearing the queue does not cover: an agent that was mid-turn when the host
+  // went away still emits `done` afterwards, and `finish()` drains. The latch
+  // is what makes that a no-op instead of a fresh billed process against a
+  // workspace that is being disposed.
+  const afterTeardown = started.length
+  inner.queue.push({ runId: 'run-late', prompt: 'late', opts: {} } as never)
+  await drain()
+  await new Promise((r) => setTimeout(r, 60))
+  ok(started.length === afterTeardown,
+     `a drain that arrives after teardown starts nothing (${started.length - afterTeardown} extra)`)
+}
+
+// `setDefaults` is a PATCH, and the second runtime depended on it.
+//
+// It was `this.opts.defaults = d` — a wholesale replacement of an object whose
+// every member is optional, so a caller that did not mention a field erased it
+// with no type error. Two of the five callers omitted `runtime`, and one of
+// them is `ensureManager()`, which runs immediately before `start()` in
+// `newSession` — so it erased whatever the composer chip had just set and every
+// new session ran on Claude Code, while the chip, the settings page and
+// `agentsKanban.runtime` all reported a choice that could never take effect.
+{
+  const mgr = new AgentManager({
+    store: {} as never,
+    worktrees: {} as never,
+    board: DEFAULT_BOARD,
+    defaults: { runtime: 'codex', model: 'gpt-5.5', effort: 'high' },
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 3,
+  })
+  const defaults = () => (mgr as unknown as { opts: { defaults: Record<string, unknown> } }).opts.defaults
+  // The exact call `ensureManager()` makes: everything EXCEPT runtime.
+  mgr.setDefaults({ model: 'gpt-5.5', effort: 'high', thinking: undefined, ultracode: false, fastMode: false })
+  ok(defaults().runtime === 'codex',
+     `a patch that does not mention the runtime LEAVES it (${String(defaults().runtime)})`)
+  // And clearing still works, but has to be said.
+  mgr.setDefaults({ runtime: undefined })
+  ok(defaults().runtime === undefined, 'and passing it explicitly as undefined still clears it')
+  mgr.setDefaults({ runtime: 'claude' })
+  ok(defaults().runtime === 'claude', 'and setting it works')
+  ok(defaults().model === 'gpt-5.5', 'while the fields nobody mentioned are untouched')
+}
+
+// A finished turn must END its run, not just forget it.
+//
+// `finish()` deleted the entry from `this.sessions` and stopped there, on the
+// stated grounds that the session was "still alive and still able to take a
+// follow-up". That was unreachable — `send()` looks the session up in that same
+// map, so once the entry is gone every follow-up takes the resume branch and
+// spawns a fresh child, which DECISIONS.md documents as intended. Nothing was
+// being kept; the child was abandoned. And `stop()` is the ONLY thing that ends
+// the process, reached only from `halt()`, which looks it up in the map
+// `finish()` had already cleared — so it was a no-op on every finished run.
+// Ten messages to one card left nine idle CLI processes that neither Stop nor a
+// window reload could reach.
+{
+  let stops = 0
+  let bridgeDisposals = 0
+  const mgr = new AgentManager({
+    store: {
+      get: async () => undefined,
+      card: async () => ({ phase: 'planning', tags: [] }),
+      patch: async () => {},
+      transcript: async () => [],
+      usage: async () => ({ costUsd: 0 }),
+      adoptKey: async () => {},
+      rename: async () => ({ renamed: true }),
+    } as never,
+    worktrees: {
+      create: async (a: { taskId: string }) => ({ path: '/tmp/wt/' + a.taskId, branch: 'task/x', base: 'main' }),
+      isClean: async () => true,
+      aheadOf: async () => 0,
+    } as never,
+    board: DEFAULT_BOARD,
+    defaults: {},
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 3,
+  })
+  const inner = mgr as unknown as {
+    startRun: (...a: never[]) => Promise<unknown>
+    sessions: Map<string, unknown>
+    bridges: Map<string, { dispose: () => void }>
+  }
+  let run: { emit: (e: string, ...a: unknown[]) => boolean } | undefined
+  inner.startRun = (async (_rt: unknown, runId: string) => {
+    const { EventEmitter } = await import('node:events')
+    const e = new EventEmitter() as unknown as Record<string, unknown>
+    e.run = async () => {}
+    e.send = () => {}
+    e.stop = () => { stops++ }
+    e.interrupt = async () => {}
+    e.clearQueue = () => 0
+    e.answerPermission = () => false
+    e.setPermissionMode = async () => false
+    run = e as never
+    // A bridge, as a stdio runtime would have.
+    inner.bridges.set(runId, { dispose: () => { bridgeDisposals++ } })
+    return e as never
+  }) as never
+
+  const runId = await mgr.start('do a thing')
+  await new Promise((r) => setTimeout(r, 40))
+  ok(stops === 0, 'a running turn is not stopped')
+  run!.emit('done', 'All finished.', { kind: 'usd', spentUsd: 0.01, priced: true }, 0.01)
+  await new Promise((r) => setTimeout(r, 40))
+  ok(stops === 1, `a turn that ENDS stops its run, so the child process exits (${stops})`)
+  ok(bridgeDisposals === 1, `and disposes its board-tool socket (${bridgeDisposals})`)
+  ok(!inner.sessions.has(runId), 'and drops it from the live map')
+  // Stopping the card afterwards must not double-stop or throw.
+  mgr.stop(runId)
+  ok(stops === 1, `stopping an already-finished card is a no-op, not a second stop (${stops})`)
+}
+
+// A queued run whose launch throws must SAY so. It used to be
+// `catch { /* surfaced through state */ }` — and that comment was false for the
+// only exception it can catch: `launch()`'s own try/catch is INSIDE `launch`,
+// after the agent is registered, so anything thrown by `store.get()` or
+// `worktrees.create()` escaped to a place with no card to put it on. The queue
+// entry was already shifted off, so the run vanished with no error anywhere.
+{
+  const warnings: string[] = []
+  const mgr = new AgentManager({
+    store: { get: async () => undefined, patch: async () => {} } as never,
+    worktrees: { create: async () => { throw new Error('fatal: a branch named task/x already exists') } } as never,
+    board: DEFAULT_BOARD,
+    defaults: {},
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 3,
+  })
+  mgr.on('warning', (m: string) => warnings.push(m))
+  await mgr.start('Add SSO to the admin app')
+  await new Promise((r) => setTimeout(r, 60))
+  ok(warnings.length === 1, `a run that cannot create its worktree reports it (${warnings.length})`)
+  ok(/Add SSO/.test(warnings[0] ?? ''), `naming the session (${warnings[0]})`)
+  ok(/already exists/.test(warnings[0] ?? ''), 'and the git error that caused it')
 }
 
 // --- splitting a task into subtasks ------------------------------------------
@@ -109,14 +356,24 @@ for (const kind of TERMINAL) {
   let clean = true
   let ahead = 0
   const startedWith: { prompt: string; opts: Record<string, unknown> }[] = []
+  const patches: { key: string; patch: Record<string, unknown> }[] = []
+  // The host-side approval gate. Settable, so the boundary can be tested in
+  // both directions — an approval AND a refusal.
+  let confirm: { asked: number; allow: boolean; saw?: { reason: string; n: number } } =
+    { asked: 0, allow: true }
 
   const mgr = new AgentManager({
     store: {
       card: async () => card,
       childrenOf: async () => children,
       setTags: async () => {},
-      patch: async () => {},
+      patch: async (key: string, patch: Record<string, unknown>) => { patches.push({ key, patch }) },
     } as never,
+    confirmSplit: async (_parent, subtasks, reason) => {
+      confirm.asked++
+      confirm.saw = { reason, n: subtasks.length }
+      return confirm.allow
+    },
     worktrees: {
       isClean: async () => clean,
       aheadOf: async () => ahead,
@@ -162,6 +419,78 @@ for (const kind of TERMINAL) {
      'which is what keeps a subtask an ordinary task branch')
   ok(startedWith[0]!.prompt === two[0]!.prompt,
      'the subtask prompt is passed through whole: a fresh agent has no other context')
+
+  // A child inherits the PARENT's agent program. `split()` passed no runtime at
+  // all, so `launch()` fell through to the workspace default — and a Codex
+  // objective's children ran on Claude whenever that was the default,
+  // PERMANENTLY, because a session keeps the runtime it started on.
+  ok(startedWith.every((s) => s.opts.runtime === 'claude'),
+     `each subtask runs on the agent program its parent is on (${String(startedWith[0]!.opts.runtime)})`)
+
+  // How many were APPROVED, written BEFORE the first child starts. Without it
+  // the roll-up counts only the children that already have a card, and a
+  // subtask queued behind maxConcurrentAgents has no sidecar entry at all.
+  ok(patches.some((p) => p.key === 'sess-parent' && p.patch.fanout === 2),
+     `the approved fan-out is recorded on the parent (${JSON.stringify(patches.map((p) => p.patch))})`)
+
+  // The APPROVAL GATE, which has to be here and not in the permission list.
+  // `ASKS_FIRST` excludes split_task by name, and that exclusion is not a
+  // boundary: on Claude it routes through canUseTool, which session.ts skips
+  // under `dontAsk` and `bypassPermissions`; on Codex the auto-allow list is
+  // never read at all. So a card could fan out four billed agents with no click.
+  ok(confirm.asked === 1, `the user is asked before any agent starts (${confirm.asked}x)`)
+  ok(confirm.saw?.n === 2, 'and is told how many, so the number on the dialog is the number that runs')
+
+  // The reason reaches the gate. Its own schema promises the user will see it,
+  // and the tool handler used to call onSplit(subtasks) — dropping it entirely.
+  const withReason = await mgr.split('sess-parent', two, 'These are two unrelated jobs.')
+  ok(withReason.ok === true, 'a split with a reason still runs')
+  ok(confirm.saw?.reason === 'These are two unrelated jobs.',
+     `the agent's own sentence reaches the approval, rather than being dropped (${confirm.saw?.reason})`)
+
+  // A refusal must STOP it, and say something the agent can act on.
+  confirm = { asked: 0, allow: false }
+  const before = startedWith.length
+  const declined = await mgr.split('sess-parent', two, 'because')
+  ok(declined.ok === false, 'declining the dialog refuses the split')
+  ok(startedWith.length === before, `and starts NOTHING (${startedWith.length - before} extra agents)`)
+  ok(declined.ok === false && /declined/.test(declined.message),
+     `and tells the agent why, so it does the work itself (${declined.ok === false ? declined.message : ''})`)
+  confirm = { asked: 0, allow: true }
+
+  // Re-checked AFTER the await. The dialog is modal and the user can sit on it;
+  // in that window the parent's turn can end or another trigger can fan the
+  // same card out, and either makes the approved proposal unsound.
+  {
+    const raced = new AgentManager({
+      store: {
+        card: async () => card,
+        childrenOf: async () => children,
+        setTags: async () => {},
+        patch: async () => {},
+      } as never,
+      worktrees: { isClean: async () => true, aheadOf: async () => 0 } as never,
+      board: DEFAULT_BOARD,
+      defaults: {},
+      permissionMode: 'acceptEdits',
+      maxConcurrent: 3,
+      // The children appear WHILE the dialog is open, exactly as a concurrent
+      // trigger would make them.
+      confirmSplit: async () => { children = ['run-child-9']; return true },
+    })
+    const inner = raced as unknown as {
+      agents: Map<string, RunningAgent>
+      start: (p: string, o: Record<string, unknown>) => Promise<string>
+    }
+    let startedDuringRace = 0
+    inner.agents.set('run-1', parent)
+    inner.start = async () => { startedDuringRace++; return 'run-x' }
+    const lost = await raced.split('sess-parent', two, 'r')
+    ok(lost.ok === false && /already split/.test(lost.message),
+       `a split that happened while the dialog was open is not repeated (${lost.ok === false ? lost.message : 'it ran'})`)
+    ok(startedDuringRace === 0, `and no second set of agents is started (${startedDuringRace})`)
+    children = []
+  }
 
   // Split once. A second split while the first is running is an agent that has
   // lost track of what it already did.
@@ -357,5 +686,88 @@ for (const kind of TERMINAL) {
   ok(internals.agents.size === 0, 'while still tearing every run down')
 }
 
-console.log(fails === 0 ? 'PASS — run identity, subtask boundaries and the agent brief hold' : `${fails} FAILURES`)
+// --- what a session persists when it becomes durable ------------------------
+//
+// This object was built inline inside `launch()`, where no test could see it,
+// and that is how `runtime` came to be PARSED from the day it was added and
+// written by nothing at all. The consequence was not cosmetic:
+// `store.runtimeOf()` reads it to choose which runtime's history reader to use,
+// so every finished Codex session's transcript, usage and meter went to the
+// Claude parser — a different store, in a different format, returning nothing.
+{
+  const patch = durablePatch({
+    startedPhase: 'implementing',
+    runtime: 'codex',
+    worktree: { path: '/tmp/wt/x', branch: 'task/x', base: 'main' },
+    startedAt: 1_700_000_000_000,
+    parent: 'sess-parent',
+  })
+  ok(patch.runtime === 'codex',
+     `the agent program is persisted, so a restart routes to the right transcript store (${patch.runtime})`)
+  ok(patch.worktree === '/tmp/wt/x' && patch.branch === 'task/x' && patch.base === 'main',
+     'with the worktree, its branch, and the base every diff and merge is against')
+  ok(patch.running === 1_700_000_000_000,
+     'and the running mark as a TIMESTAMP, so a mark still there at startup dates the interruption')
+  ok(patch.parent === 'sess-parent', 'a subtask records the session it was split out of')
+
+  // Every field that the reader parses must be produced here. That symmetry is
+  // the actual guard: it is what neither half of the `runtime` bug had.
+  const noParent = durablePatch({
+    runtime: 'claude',
+    worktree: { path: '/w', branch: 'b' },
+    startedAt: 1,
+  })
+  ok(noParent.parent === undefined, 'a top-level session names no parent')
+  ok(noParent.base === undefined, 'and a worktree with no recorded base does not invent one')
+  ok(noParent.phase === 'implementing', 'a board with no started column still lands somewhere real')
+}
+
+// --- the Meter, off an untyped boundary --------------------------------------
+//
+// `parseMeter` exists because `EventEmitter.on()` is untyped and two runtimes
+// disagreed about the `done` payload for the whole life of the declared
+// contract: one emitted a `Meter`, the other a bare `number`, the listener said
+// `costUsd?: number`, and `media/board.js` called `.toFixed(2)` on the result —
+// a throw inside `render()`, which is a silently blank panel.
+ok(parseMeter({ kind: 'usd', spentUsd: 1.5, priced: true })?.kind === 'usd', 'a usd meter parses')
+ok(parseMeter({ kind: 'usd', spentUsd: 0 })?.kind === 'usd', 'zero dollars is a real reading')
+// The bug's actual payload shape, in both directions.
+ok(parseMeter(4.2) === undefined, 'a BARE NUMBER is not a meter — this is the shape that shipped')
+ok(parseMeter({ kind: 'usd' }) === undefined, 'a usd meter with no figure is refused')
+ok(parseMeter({ kind: 'usd', spentUsd: '1.5' }) === undefined, 'and so is a stringified one')
+for (const bad of [Number.NaN, Number.POSITIVE_INFINITY]) {
+  ok(parseMeter({ kind: 'usd', spentUsd: bad }) === undefined, `a spend of ${bad} is refused, not rendered`)
+}
+// `priced` defaults to true on absence but an explicit false must SURVIVE: it
+// is what turns the readout into a floor rather than a total.
+const floor = parseMeter({ kind: 'usd', spentUsd: 1, priced: false })
+ok(floor?.kind === 'usd' && floor.priced === false,
+   'an explicit priced:false survives — it is what makes the readout a floor')
+const whole = parseMeter({ kind: 'usd', spentUsd: 1 })
+ok(whole?.kind === 'usd' && whole.priced === true, 'and absence means priced')
+
+const plan = parseMeter({ kind: 'plan', usedPercent: 13, windowMinutes: 300, plan: 'plus', resetsAt: 1778984752 })
+ok(plan?.kind === 'plan' && plan.usedPercent === 13 && plan.windowMinutes === 300,
+   'a plan meter parses with its window')
+ok(plan?.kind === 'plan' && plan.resetsAt === 1778984752, 'and keeps the reset time, which is the actionable half')
+ok(parseMeter({ kind: 'plan', usedPercent: 13 }) === undefined,
+   'a plan meter with no window is refused — a percentage of nothing cannot be shown')
+const secondary = parseMeter({
+  kind: 'plan', usedPercent: 13, windowMinutes: 300,
+  secondary: { usedPercent: 2, windowMinutes: 10080 },
+})
+ok(secondary?.kind === 'plan' && secondary.secondary?.windowMinutes === 10080, 'a secondary window comes through')
+ok(parseMeter({
+  kind: 'plan', usedPercent: 13, windowMinutes: 300, secondary: { usedPercent: 2 },
+})?.kind === 'plan', 'and a malformed secondary drops the secondary rather than the whole reading')
+
+ok(parseMeter({ kind: 'unknown' })?.kind === 'unknown', '"unknown" is a first-class reading')
+// The one thing it must NOT do. `unknown` is a reading that says the runtime
+// does not know; minting one from a protocol fault would turn a shape we could
+// not read into a number the board displays as measured.
+for (const bad of [undefined, null, 'x', {}, { kind: 'martian' }, []]) {
+  ok(parseMeter(bad) === undefined, `${JSON.stringify(bad) ?? 'undefined'} is no reading at all, not "unknown"`)
+}
+
+console.log(fails === 0 ? 'PASS — run identity, subtask boundaries, the meter contract and the agent brief hold' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

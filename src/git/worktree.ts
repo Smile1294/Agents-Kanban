@@ -76,6 +76,87 @@ export class GitError extends Error {
  * character of the filename — silently, and only ever for the first file, which
  * is why it survived so long.
  */
+/**
+ * One line of `git status --porcelain`, as a status and a real path.
+ *
+ * `--porcelain` is SPACE-delimited, so git C-quotes any path that contains a
+ * space — and it does that whatever `core.quotePath` says, because the quoting
+ * is about the delimiter, not about non-ASCII. `-c core.quotePath=false` (see
+ * `gitRaw`) turns off the octal escaping and nothing else.
+ *
+ * The tab-delimited `diff --name-status` used beside it does NOT quote spaces.
+ * So `My Notes.md` arrived from one command as `My Notes.md` and from the other
+ * as `"My Notes.md"`, `byPath` could not see they were the same file, and the
+ * review panel showed three rows for two files — one of them claiming a file
+ * was committed when it had newer uncommitted edits. Clicking the quoted row
+ * opened a path with literal double quotes in it, which does not exist.
+ *
+ * Same parser and same class as the postmortem for `git()` trimming its own
+ * output and eating a filename; that one was fixed only for the leading-space
+ * half.
+ */
+export function parsePorcelainLine(line: string): { status: string; path: string } | undefined {
+  if (!line.trim()) return undefined
+  const code = line.slice(0, 2).trim()
+  let rest = line.slice(3)
+  // A rename is `R  old -> new`; the NEW name is the one that exists. Split
+  // before unquoting, because either side may be quoted independently.
+  const arrow = rest.lastIndexOf(' -> ')
+  if (arrow >= 0) rest = rest.slice(arrow + 4)
+  const path = unquotePath(rest.trim())
+  return path ? { status: code === '??' ? '?' : (code[0] ?? 'M'), path } : undefined
+}
+
+/** Undo git's C-style quoting. A path that is not quoted is returned as-is. */
+export function unquotePath(raw: string): string {
+  if (!raw.startsWith('"') || !raw.endsWith('"') || raw.length < 2) return raw
+  const body = raw.slice(1, -1)
+  let out = ''
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] !== '\\') { out += body[i]; continue }
+    const n = body[++i]
+    if (n === undefined) break
+    // Octal escapes are BYTES, so a multi-byte character arrives as several and
+    // has to be decoded together rather than one at a time.
+    if (n >= '0' && n <= '7') {
+      const bytes: number[] = []
+      let j = i
+      for (;;) {
+        const oct = body.slice(j, j + 3)
+        if (!/^[0-7]{3}$/.test(oct)) break
+        bytes.push(parseInt(oct, 8))
+        j += 3
+        if (body[j] === '\\' && /[0-7]/.test(body[j + 1] ?? '')) { j++; continue }
+        break
+      }
+      if (bytes.length) { out += Buffer.from(bytes).toString('utf8'); i = j - 1; continue }
+      out += n
+      continue
+    }
+    out += n === 'n' ? '\n' : n === 't' ? '\t' : n === 'r' ? '\r' : n
+  }
+  return out
+}
+
+/**
+ * Git output as BYTES, with nothing done to it.
+ *
+ * `git()` ends in `stdout.trim()` and `gitRaw()` strips one trailing newline —
+ * both are right for parsing a list and wrong for serving a FILE. `show()` is
+ * the sole implementation of the diff's left-hand side, and trimming removed
+ * the file's trailing newline and any leading blank line, so every diff opened
+ * from the review panel reported a change at the top and bottom of the file
+ * that the agent had not made. A convenience `.trim()` in a shared helper is a
+ * data-format decision in disguise — the same lesson as the postmortem about
+ * `git()` eating a filename.
+ */
+async function gitExact(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await exec('git', ['-c', 'core.quotePath=false', ...args], {
+    cwd, maxBuffer: 64 * 1024 * 1024,
+  })
+  return stdout
+}
+
 async function gitRaw(cwd: string, args: string[]): Promise<string> {
   // -c core.quotePath=false: with git's default, a path containing anything
   // non-ASCII comes back as "src/caf\303\251.ts" — quoted, octal-escaped, and
@@ -300,7 +381,9 @@ export class WorktreeService {
     return out ? out.split('\n') : []
   }
 
-  async status(worktreePath: string): Promise<WorktreeStatus> {
+  /** @param base the branch this worktree forked from. Without it the ahead/
+   *  behind counts fall back to the repo's current branch — see the catch. */
+  async status(worktreePath: string, base?: string): Promise<WorktreeStatus> {
     const porcelain = await git(worktreePath, ['status', '--porcelain']).catch(() => '')
     const dirtyFiles = porcelain ? porcelain.split('\n').filter(Boolean).length : 0
     let ahead = 0, behind = 0
@@ -312,7 +395,22 @@ export class WorktreeService {
       ahead = Number(a) || 0
       behind = Number(b) || 0
     } catch {
-      // No upstream configured — normal for a fresh task branch.
+      // No upstream — which is not the edge case the old comment implied, it is
+      // EVERY worktree this extension makes: `git worktree add -b task/x` never
+      // sets one. So `HEAD...@{upstream}` always failed and `ahead`/`behind`
+      // were constants of 0, while the comment promised a fallback to "the
+      // repo's current branch" that was never written. Verified: a worktree two
+      // commits ahead of main reported ahead 0, while `aheadOf()` said 2.
+      try {
+        const against = base ?? (await this.currentBranch())
+        const counts = await git(worktreePath, ['rev-list', '--left-right', '--count', `HEAD...${against}`])
+        const [a, b] = counts.split(/\s+/)
+        ahead = Number(a) || 0
+        behind = Number(b) || 0
+      } catch {
+        // Neither ref resolves — a detached or freshly-initialised repo. Zero
+        // is then the honest answer rather than a fallback that failed silently.
+      }
     }
     return { dirtyFiles, ahead, behind }
   }
@@ -381,7 +479,14 @@ export class WorktreeService {
       ahead: st,
       dirty: files.filter((f) => !f.committed).length,
       files,
-      ...(lastCommit ? { lastCommit: { sha: lastCommit.sha, message: lastCommit.message } } : {}),
+      // Only a commit this SESSION made. A fresh task branch's HEAD is the base
+      // commit, so this reported the base branch's last commit — somebody
+      // else's work, rendered inside the session's own Changes panel with no
+      // attribution, on a card whose Merge button was correctly refusing on the
+      // grounds that the branch had no commits. The panel contradicted itself
+      // and named a stranger's sha. `st` is the ahead count, already computed
+      // here: zero means there is nothing of ours to show.
+      ...(lastCommit && st > 0 ? { lastCommit: { sha: lastCommit.sha, message: lastCommit.message } } : {}),
     }
   }
 
@@ -421,10 +526,8 @@ export class WorktreeService {
     // Uncommitted work wins the entry: it is the newer truth about that file.
     const porcelain = await gitRaw(worktreePath, ['status', '--porcelain']).catch(() => '')
     for (const line of porcelain.split('\n')) {
-      if (!line.trim()) continue
-      const code = line.slice(0, 2).trim()
-      const file = line.slice(3).trim().replace(/^.* -> /, '')
-      if (file) byPath.set(file, { path: file, status: code === '??' ? '?' : (code[0] ?? 'M'), committed: false })
+      const parsed = parsePorcelainLine(line)
+      if (parsed) byPath.set(parsed.path, { ...parsed, committed: false })
     }
 
     return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path))
@@ -450,8 +553,10 @@ export class WorktreeService {
    */
   private async dirtyMessage(): Promise<string> {
     const porcelain = await gitRaw(this.repoRoot, ['status', '--porcelain']).catch(() => '')
-    const files = porcelain.split('\n').filter((l) => l.trim())
-      .map((l) => l.slice(3).trim().replace(/^.* -> /, ''))
+    const files = porcelain.split('\n')
+      .map(parsePorcelainLine)
+      .filter((f): f is { status: string; path: string } => !!f)
+      .map((f) => f.path)
     if (files.length === 1 && files[0] === '.gitignore' && (await this.onlyIgnoreRuleAdded())) {
       return `The only uncommitted change is the "${this.ignoreEntry()}" rule Agents Kanban added ` +
         'to .gitignore for its worktree directory. Commit that line and merge again.'
@@ -534,7 +639,13 @@ export class WorktreeService {
 
   /** A file's contents at a ref, for the left-hand side of a diff. */
   async show(worktreePath: string, ref: string, file: string): Promise<string> {
-    return git(worktreePath, ['show', `${ref}:${file}`]).catch(() => '')
+    // `gitExact`, not `git`: this is the left-hand side of a diff, so it must be
+    // the file as the base ref has it, down to the trailing newline. `git()`
+    // trims, which made every diff show a spurious change at the head and the
+    // tail. An empty string on failure is correct and load-bearing — `git show`
+    // fails for a file the agent ADDED, and an empty left side is exactly right
+    // there.
+    return gitExact(worktreePath, ['show', `${ref}:${file}`]).catch(() => '')
   }
 
   /** Files changed in a worktree relative to `base`, for the review view. */
@@ -545,7 +656,10 @@ export class WorktreeService {
     const working = await gitRaw(worktreePath, ['status', '--porcelain']).catch(() => '')
     const set = new Set<string>()
     for (const f of committed.split('\n')) if (f.trim()) set.add(f.trim())
-    for (const l of working.split('\n')) if (l.trim()) set.add(l.slice(3).trim())
+    for (const l of working.split('\n')) {
+      const parsed = parsePorcelainLine(l)
+      if (parsed) set.add(parsed.path)
+    }
     return [...set].sort()
   }
 }

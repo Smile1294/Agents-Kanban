@@ -15,12 +15,12 @@ import {
   type BoardHost, type FocusMode, type Mode, type UiCard, type UiState,
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
-import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveThinking, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
+import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel } from './sessions/usage.ts'
 import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
-import { linkSubtasks } from './board/subtasks.ts'
+import { linkSubtasks, rollUpState } from './board/subtasks.ts'
 import { coalesce } from './board/coalesce.ts'
 import { describeImages, sanitiseImages } from './agent/images.ts'
 import {
@@ -89,9 +89,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   /** The six the SDK actually accepts; the manifest enum mirrors this list. */
   const PERMISSION_MODES = [
     { key: 'default', label: 'Ask', detail: 'Prompt before anything that writes or runs' },
-    { key: 'acceptEdits', label: 'Auto-accept edits', detail: 'File edits go through; commands still ask' },
+    // "commands still ask" was true for Claude Code and false for Codex, whose
+    // nearest policy runs commands inside the sandbox without asking. A detail
+    // that is right on one agent and wrong on the other is a control label that
+    // cannot be trusted on either.
+    { key: 'acceptEdits', label: 'Auto-accept edits', detail: 'File edits go through, inside this session\'s worktree' },
     { key: 'plan', label: 'Plan only', detail: 'Think it through, change nothing' },
-    { key: 'dontAsk', label: "Don't ask", detail: 'Stop prompting; the agent decides' },
+    // Deny-by-default, which is what the SDK defines it as: "Don't prompt for
+    // permissions, deny if not pre-approved". It used to share a row with
+    // `bypassPermissions` on the Codex side and silently removed the sandbox.
+    { key: 'dontAsk', label: "Don't ask", detail: 'Stop prompting; anything not pre-approved is refused' },
     { key: 'auto', label: 'Auto', detail: 'Let Claude Code choose per tool' },
     { key: 'bypassPermissions', label: 'Bypass all', detail: 'No checks at all — the agent is in a worktree, but still' },
   ]
@@ -296,12 +303,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * how "why is Fable missing?" becomes unanswerable.
    */
   async function refreshModels(force = false): Promise<void> {
-    if (cfg().get<boolean>('discoverModels') === false) { recomputeCatalogue(); return }
-    // A runtime other than Claude Code answers for itself. `discoverModels`
-    // below spawns the CLAUDE CLI and asks it — pointing that at a Codex
-    // session would offer Anthropic ids to an agent that serves none of them.
+    // A runtime other than Claude Code answers for itself, and this test comes
+    // FIRST. Below it, `recomputeCatalogue()` falls back to the CLAUDE built-in
+    // table — so with discovery off, or at activation, a workspace whose
+    // remembered agent is Codex opened with Anthropic ids in the picker and
+    // `model` stuck on `claude-opus-5`, which is passed unchanged into
+    // `thread/start` and fails the run. Two functions that both know how to
+    // fall back, and the wrong one was winning.
     if (runtime !== 'claude') { await refreshRuntimeModels(force); return }
+    if (cfg().get<boolean>('discoverModels') === false) { recomputeCatalogue(); return }
     const p = currentProvider()
+    // The runtime is captured for exactly the same reason as the profile: this
+    // spends ~400ms in the CLI, and a switch inside that window would file one
+    // agent's models under the other's key. `catalogueKey`'s own doc says what
+    // that costs — "a picker offering ids the running agent does not serve,
+    // which fails at the first request with somebody else's error message."
+    const rt = runtime
     // Through the same parse, so a cache this build cannot read counts as a
     // MISS and is re-asked, rather than counting as a hit and never being fixed.
     if (!force && cachedChoices(p.id).length) {
@@ -317,7 +334,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(ws?.root ? { cwd: ws.root } : {}),
       })
       if (choices.length) {
-        await context.globalState.update(catalogueKey(p.id), choices)
+        // Keyed by the runtime the answer BELONGS to, not by whichever is
+        // selected when the round trip lands.
+        await context.globalState.update(catalogueKey(p.id, rt), choices)
         log.info(`Models for ${profileLabel(p)}: ${choices.map((c) => c.id).join(', ')}`)
       } else if (problem) {
         log.warn(`Could not read the model list for ${profileLabel(p)}: ${problem}`)
@@ -328,14 +347,45 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // it to the catalogue now would put one provider's models under another's
       // name. The switch did its own `recomputeCatalogue()`, so the right move
       // is to leave it alone.
-      if (currentProvider().id !== p.id) {
-        log.info(`Provider changed while reading models for ${profileLabel(p)}; keeping the current list.`)
+      if (currentProvider().id !== p.id || runtime !== rt) {
+        log.info(
+          `${runtime !== rt ? 'Agent' : 'Provider'} changed while reading models for ` +
+          `${profileLabel(p)}; keeping the current list.`,
+        )
         return
       }
       recomputeCatalogue(choices, problem)
       alignModelToProvider()
     })().finally(() => { discovering = undefined })
     return discovering
+  }
+
+  /**
+   * Drop any session flag the SELECTED MODEL cannot take.
+   *
+   * ONE place, called after every assignment to `model` — which is the whole
+   * point, and was the thing that was wrong. The gate lived inside
+   * `setComposer` and therefore ran only on a message from the webview, while
+   * `alignModelToProvider()` reassigns the model from three other paths: a
+   * provider switch, a discovery result landing, and activation. A flag that
+   * was legitimately on for Opus survived onto a model whose capability had
+   * never been confirmed — and the control is HIDDEN when unsupported, so the
+   * board showed no way to turn off a flag it was still sending.
+   *
+   * The request path validates nothing (measured: `applyFlagSettings()`
+   * resolves for `ultracode: true` on a model with no xhigh, for
+   * `ultracode: 'banana'`, and for a key that does not exist), so this host-side
+   * check is the only gate there is.
+   */
+  function regateFlags(): void {
+    if (ultracode && !ultracodeFor(catalogue.choices, model)) {
+      ultracode = false
+      log.info(`Ultracode is not available on ${model}, which is not xhigh-capable.`)
+    }
+    if (fastMode && !fastModeFor(catalogue.choices, model)) {
+      fastMode = false
+      log.info(`Fast mode is not available on ${model}.`)
+    }
   }
 
   /**
@@ -359,6 +409,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const from = model
     model = allowed[0]!.id
     void state.update('model', model)
+    // Through the SAME gate every other model change goes through. This is a
+    // model switch, and it never reached the flag check — so `ultracode` or
+    // `fastMode` could survive onto a model whose capability was never
+    // confirmed, with the control hidden because the new model does not support
+    // it. Persisted, because the gate's decision has to outlive this window.
+    const hadUltracode = ultracode
+    const hadFastMode = fastMode
+    regateFlags()
+    if (hadUltracode !== ultracode) void state.update('ultracode', ultracode)
+    if (hadFastMode !== fastMode) void state.update('fastMode', fastMode)
     log.info(`Model ${from} is not served by ${profileLabel(currentProvider())}; using ${model}.`)
     return true
   }
@@ -434,10 +494,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       title: `${profileLabel(profile)} — ${field.label}`,
       prompt: field.detail ?? `${field.label} for ${kindDef(profile.kind).label}`,
       ...(field.placeholder ? { placeHolder: field.placeholder } : {}),
-      ...(field.secret ? { password: true } : { value: current }),
+      ...(field.secret
+        // A secret is never pre-filled — that is the point of `password: true`.
+        // So the box opens EMPTY, and the placeholder has to say what leaving
+        // it empty now means, or the user cannot know.
+        ? {
+            password: true,
+            placeHolder: hasSecret(profile)
+              ? 'Leave blank to keep the credential you already saved'
+              : (field.placeholder ?? ''),
+          }
+        : { value: current }),
       ignoreFocusOut: true,
     })
   }
+
+  /** Does this profile claim a stored credential? Read off the profile, not the
+   *  keychain: `hasCredential` exists precisely so the UI need not unlock the
+   *  keychain on every repaint. */
+  const hasSecret = (p: ProviderProfile): boolean => p.hasCredential === true
 
   /**
    * Walk a profile's fields and write the answers onto it.
@@ -448,18 +523,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * `hasCredential` is recorded.
    */
   async function fillProfile(profile: ProviderProfile): Promise<boolean> {
+    /* The credential is decided during the walk and written AFTER it, and both
+       halves of that were bugs.
+
+       An empty answer used to DELETE the secret. The box is never pre-filled —
+       it is a password field — and for the gateway kind the credential comes
+       before `models` and `contextWindow` in the field order, so there was no
+       way to edit a model list without passing through the credential prompt.
+       Pressing Enter through it, which is the obvious thing to do, silently
+       wiped a working key. Blank now means KEEP, and the placeholder says so.
+       Replacing a credential is typing a new one; getting RID of one is
+       removing the provider, which deletes it and says so in the dialog. There
+       is deliberately no blank-to-clear: a destructive default reachable by
+       pressing Enter is what this was.
+
+       And the keychain was written INSIDE the loop, so cancelling a later field
+       returned false — discarding the profile edits but not the keychain
+       mutation that had already run. That left `hasCredential: true` in
+       settings with nothing behind it, and `hasCredential` exists so the UI can
+       say "no credential set" without unlocking the keychain: a flag that lies
+       is worse than no flag. Deferred, so a cancel changes nothing at all. */
+    let secret: { set: string } | undefined
     for (const field of kindDef(profile.kind).fields) {
       const answer = await askField(profile, field)
       if (answer === undefined) return false
       const value = answer.trim()
       if (field.secret) {
-        if (value) {
-          await context.secrets.store(credentialKey(profile.id), value)
-          profile.hasCredential = true
-        } else {
-          await context.secrets.delete(credentialKey(profile.id))
-          delete profile.hasCredential
-        }
+        if (value) secret = { set: value }
         continue
       }
       const rec = profile as unknown as Record<string, unknown>
@@ -473,6 +563,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       } else {
         rec[field.key] = value
       }
+    }
+    // Only now that every field was answered. A cancel above returns false and
+    // touches neither the profile nor the keychain.
+    if (secret) {
+      await context.secrets.store(credentialKey(profile.id), secret.set)
+      profile.hasCredential = true
     }
     return true
   }
@@ -584,7 +680,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // REUSED: delete "ollama", add "ollama" again, and the new profile would
     // inherit the old one's model list — a picker offering models the new
     // endpoint has never heard of, with nothing on screen to explain it.
-    await context.globalState.update(catalogueKey(profile.id), undefined)
+    // Every runtime's entry. `catalogueKey` defaults its runtime argument to
+    // whichever is SELECTED, and provider management is reachable from the
+    // settings page whatever that is — so the stale entry this means to evict
+    // survived whenever another runtime had written it, and a re-added profile
+    // with the same id inherited a picker full of the old endpoint's models.
+    for (const r of allRuntimes()) {
+      await context.globalState.update(catalogueKey(profile.id, r.id), undefined)
+    }
     await saveProfiles(providers.filter((p) => p.id !== profile.id))
     if (providerId === profile.id) await setActiveProvider(INHERIT_PROFILE.id)
     refreshAll()
@@ -678,6 +781,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         case 'setDefaultRuntime': {
           runtime = msg.runtime
           await state.update('runtime', runtime)
+          // The model list is PER RUNTIME, so a switch here strands the picker
+          // on an id the new agent does not serve — `claude-opus-5` selected,
+          // then a move to Codex, which fails at the first request with somebody
+          // else's error message. The composer's own runtime switch has done
+          // this since it was written; this path was the documented way to
+          // change agent and did not.
+          void refreshModels(true).then(() => { void SettingsPanel.refreshIfOpen(); refreshAll() })
           // Next session only, exactly like the provider: the runtime IS the
           // process, so there is no honest way to move a live run onto another
           // agent program — its transcript belongs to the one it started on.
@@ -718,6 +828,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           settingsBusy = `Asking ${rt.label} which models it can run…`
           void SettingsPanel.refreshIfOpen()
           try {
+            /* Claude Code answers through `agent/models.ts`, not through
+               `claudeRuntime.models()`.
+               That method is a deliberate stub — it ignores its argument and
+               always returns the built-in list, and its own doc comment says
+               "the settings page asks `models.ts`". The settings page did not:
+               it took this path for EVERY runtime, so the page always reported
+               the built-in three and blamed the CLI for not answering, on the
+               one screen whose job is to explain why a model is missing. Two
+               functions that both know how to fall back, and the wrong one was
+               being asked. */
+            if (msg.runtime === 'claude') {
+              await refreshModels(true)
+              runtimeModels.set(msg.runtime, {
+                models: catalogue.choices.map((m) => ({ id: m.id, label: m.label })),
+                source: catalogue.source === 'cli' ? 'runtime' : catalogue.source,
+                ...(catalogue.problem ? { note: catalogue.problem } : {}),
+              })
+              return
+            }
             const loc = await rt.detect(configuredPathFor(msg.runtime))
             if (!loc) {
               runtimeModels.set(msg.runtime, {
@@ -947,6 +1076,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         },
         provider: currentProvider(),
         providerEnv,
+        // The boundary in CODE for fanning one card out into N billed agents.
+        //
+        // `split_task` is excluded from the auto-allow list, and that exclusion
+        // is not a boundary: on Claude it routes through `canUseTool`, which is
+        // skipped under `dontAsk` and `bypassPermissions`, and on Codex the
+        // list is never read at all. A modal here is consulted on every path,
+        // whatever permission mode the session is in and whichever runtime it
+        // is on. Rule 7 is "both, always" — the exclusion stays as the soft
+        // half.
+        //
+        // Modal rather than a notification: a notification can be missed, and
+        // this starts processes that cost money. Dismissing it is a refusal —
+        // `showWarningMessage` resolves undefined, which is not the button.
+        confirmSplit: async (parent, subtasks, reason) => {
+          const titles = subtasks.map((t, i) => `${i + 1}. ${t.title}`).join('\n')
+          const choice = await vscode.window.showWarningMessage(
+            `"${parent.title}" wants to split into ${subtasks.length} subtasks, each its own agent in its own worktree.`,
+            {
+              modal: true,
+              detail: (reason ? `${reason}\n\n` : '')
+                + titles
+                + `\n\nEach one is a real agent with a real bill. At most `
+                + `${cfg().get<number>('maxConcurrentAgents') ?? 3} run at once; the rest queue.`,
+            },
+            'Start subtasks',
+          )
+          const allowed = choice === 'Start subtasks'
+          log.info(
+            allowed
+              ? `Approved a ${subtasks.length}-way split of "${parent.title}".`
+              : `Declined a ${subtasks.length}-way split of "${parent.title}".`,
+          )
+          return allowed
+        },
         log: (m: string) => log.warn(m),
       })
       w.manager.on('change', () => refreshAll())
@@ -1007,6 +1170,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }).catch((e: unknown) => log.error(`Subtask roll-up failed: ${String(e)}`))
       })
 
+      // A commit changes what the review panel and the Merge button should say,
+      // and the event was emitted by both runtimes and heard by nobody.
+      w.manager.on('committed', (agent: RunningAgent) => {
+        const key = agent.sessionId ?? agent.runId
+        if (key !== selectedKey && agent.sessionId !== selectedKey) return
+        loadReview(selectedKey).then(() => refreshAll())
+          .catch((e) => log.error(`Review reload after a commit failed: ${String(e)}`))
+      })
       // Keep the review panel truthful without paying for it on every token.
       w.manager.on('finished', (agent: RunningAgent) => {
         const key = agent.sessionId ?? agent.runId
@@ -1100,11 +1271,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!parentKey) return false
     const siblings = await w.store.childrenOf(parentKey)
     if (!siblings.length) return false
+    const parentCard = await w.store.card(parentKey)
     const phases = await Promise.all(siblings.map((k) => w.store.card(k).then((c) => c.phase)))
-    if (!phases.every((p) => isSettledColumn(w.board, p))) return false
+    // The decision itself is pure and lives in `board/subtasks.ts`, because the
+    // wrong answer here is a NOTIFICATION and it shipped as one — see
+    // `rollUpState`. `pending` is the case that was missing: fewer children on
+    // the board than the user approved, because the rest are still queued
+    // behind `maxConcurrentAgents` with no sidecar entry to count.
+    const state = rollUpState(phases, parentCard.fanout, w.board)
+    if (state.kind !== 'ready') return false
 
     const review = w.board.columns.find((c) => c.category === 'review')?.id
-    const parentCard = await w.store.card(parentKey)
     if (review && parentCard.phase !== review) await w.store.setPhase(parentKey, review)
     refreshAll()
 
@@ -1112,7 +1289,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const title = w.manager?.byKey(parentKey)?.title
       ?? (await w.store.get(parentKey))?.title
       ?? 'The parent task'
-    notifyReady(parentKey, title, `All ${siblings.length} subtasks of "${title}" are ready for you to test.`)
+    // `state.total`, not `siblings.length`: they agree here by construction, and
+    // saying the number the DECISION was made on keeps them from drifting apart
+    // again — the whole bug was a count that came from somewhere else.
+    notifyReady(parentKey, title, `All ${state.total} subtasks of "${title}" are ready for you to test.`)
     return true
   }
 
@@ -1189,8 +1369,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         })(),
         contextTokens: 0 as number,
         contextWindow: undefined as number | undefined,
-        spentUsd: undefined as number | undefined,
-        spendPriced: true as boolean,
+        meter: undefined as Meter | undefined,
         permissionMode: permissionMode as string,
         permissionModes: PERMISSION_MODES,
       }
@@ -1284,8 +1463,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // last time. Without the fallback a resumed session shows no meter at
           // all until its first frame arrives, which can be a minute in.
           composer.contextWindow = a.contextWindow ?? metas[selectedKey]?.contextWindow
-          composer.spentUsd = a.spentUsd ?? a.priorUsd
-          composer.spendPriced = a.spendPriced ?? true
+          // The meter the run has published, already including anything the
+          // session spent before this run started (`settleMeter`). A run whose
+          // runtime has not reported yet has no reading, and that must stay
+          // undefined rather than becoming a zero.
+          composer.meter = a.meter
         } else {
           // Not running — so both numbers come from the transcript, off one
           // parse that is cached on the session file's identity. This is the
@@ -1296,8 +1478,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const totals = await ws.store.usage(selectedKey)
           composer.contextTokens = totals.contextTokens
           composer.contextWindow = metas[selectedKey]?.contextWindow ?? totals.contextWindow
-          composer.spentUsd = totals.costUsd
-          composer.spendPriced = totals.priced
+          // `store.meter()` rather than `totals.costUsd`, and this is the only
+          // caller it has ever had. It routes on the session's own recorded
+          // runtime, so a finished Codex session reports the rate-limit window
+          // it actually spent instead of the `$0.00` that `usage()` correctly
+          // returns for a runtime that bills nothing per request. For a Claude
+          // session it comes off the same cached parse as `totals`, so it costs
+          // nothing extra — and there is one place that knows how spend is
+          // derived, not two.
+          composer.meter = await ws.store.meter(selectedKey)
         }
       }
 
@@ -1457,14 +1646,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
        * simply unreachable — breaking it deliberately failed no test, which is
        * how it was found. A guard that cannot be shown to fire is not a guard.
        */
-      if (ultracode && !ultracodeFor(catalogue.choices, model)) {
-        ultracode = false
-        log.info(`Ultracode is not available on ${model}, which is not xhigh-capable.`)
-      }
-      if (fastMode && !fastModeFor(catalogue.choices, model)) {
-        fastMode = false
-        log.info(`Fast mode is not available on ${model}.`)
-      }
+      regateFlags()
       if (patch.ultracode || patch.model) void state.update('ultracode', ultracode)
       if (patch.fastMode || patch.model) void state.update('fastMode', fastMode)
       ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode, runtime })
@@ -1522,7 +1704,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const w = requireWs()
       const a = w.manager?.byKey(key)
       const id = a?.sessionId ?? key
-      if (!id.startsWith('run-')) await w.store.setPhase(id, phase)
+      // No `startsWith('run-')` guard, and removing it fixes both halves of a
+      // bug that was worse than a silent no-op.
+      //
+      // `setPhase` is `meta.update(id, { phase })` and takes ANY key — that is
+      // exactly how the agent moves its own card before Claude Code has
+      // assigned a session id, and `getState()` renders a live agent's phase
+      // from that same key, so a run-id phase is visible. `adoptKey()` then
+      // carries the entry across. The guard refused the USER the identical
+      // write the AGENT is allowed, with no message and no log line: the card
+      // simply sprang back to the column it came from.
+      //
+      // And it only ever wrapped the phase write. `offerWorktreeCleanup()` ran
+      // regardless and resolves the worktree straight off the live agent — so
+      // dragging a still-starting card to Done did nothing visible and then
+      // offered to delete the running agent's worktree. The one half of the
+      // gesture that took effect was the destructive half.
+      await w.store.setPhase(id, phase)
       refreshAll()
       // A subtask the USER moves can complete the set just as well as one the
       // agent moves. The roll-up lives behind an agent event; without this the
@@ -1707,6 +1905,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     /** Archiving is a soft flag: the card leaves the board, Claude Code keeps
      *  the transcript, and unarchiving brings it straight back. */
+    /** Pin a card to the top of its column. Works on any key — the sidecar is
+     *  keyed by whatever the board calls the run, so it needs no session id,
+     *  unlike archive, which releases the run and hides the card. */
+    async pin(key, pinned) {
+      const w = requireWs()
+      const id = w.manager?.byKey(key)?.sessionId ?? key
+      await w.store.setPinned(id, pinned)
+      refreshAll()
+    },
+
     async archive(key, archived) {
       const w = requireWs()
       const id = w.manager?.byKey(key)?.sessionId ?? key
@@ -1818,6 +2026,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (kind === 'command') {
         // Not run automatically. It is the agent's suggestion, in the user's
         // shell, and they get to read it before pressing Enter.
+        //
+        // That claim is only true for a single line, and `target` is
+        // model-written: `sendText(t, false)` does not APPEND a newline, but a
+        // newline inside `t` is still one, so everything before the last line
+        // ran on the click. `targetIsClean` is the same predicate
+        // `normaliseTestPlan` filters on, so this is defence in depth rather
+        // than the only guard — and it is worth having, because it is the last
+        // point before the user's own shell.
+        if (!targetIsClean(target)) {
+          vscode.window.showWarningMessage(
+            `Refused to run "${target.split(/[\r\n]/)[0]}…" — a test command must be a single line, ` +
+            'and this one contains control characters. Nothing was sent to the terminal.',
+          )
+          return
+        }
         const term = vscode.window.createTerminal({ name: `Test ${wt.branch}`, cwd: wt.dir })
         term.show()
         term.sendText(target, false)
@@ -1930,9 +2153,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     async rename(key, title) {
       const w = requireWs()
-      const id = w.manager?.byKey(key)?.sessionId ?? key
-      if (!title.trim() || id.startsWith('run-')) return
-      await w.store.rename(id, title.trim())
+      const live = w.manager?.byKey(key)
+      const wanted = title.trim()
+      if (!wanted) return
+      // A live run owns its own title, so rename THROUGH it. This used to bail
+      // out on `id.startsWith('run-')` — the window before the session id
+      // arrives — which made renaming a card in its first seconds silently do
+      // nothing, where archiving the same card at least says why. The manager
+      // writes `agent.title` and carries it across when the id lands, so the
+      // rename is not lost; it just had no path to get there.
+      if (live) {
+        const r = await w.manager!.renameAgent(key, wanted)
+        if (r && r.renamed === false) {
+          vscode.window.showInformationMessage(
+            `The card reads "${wanted}" for this run, but ${r.reason}, so it will go back afterwards.`,
+          )
+        }
+        refreshAll()
+        return
+      }
+      const id = key
+      if (id.startsWith('run-')) {
+        vscode.window.showWarningMessage(
+          'This session has not been given an id yet, so it cannot be renamed. Try again in a moment.',
+        )
+        return
+      }
+      const r = await w.store.rename(id, wanted)
+      if (!r.renamed) {
+        vscode.window.showInformationMessage(`This card cannot be renamed from the board — ${r.reason}.`)
+      }
       refreshAll()
     },
   }
@@ -2147,6 +2397,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // re-parses AND re-resolves rather than only re-reading the list.
       if (e.affectsConfiguration('agentsKanban.providers') || e.affectsConfiguration('agentsKanban.provider')) {
         providers = parseProfiles(cfg().get<unknown[]>('providers'))
+        /* An EXPLICIT edit of `agentsKanban.provider` wins, and it used not to.
+           The new value was read only inside `if (!providers.some(p => p.id ===
+           providerId))` — only when the currently active id had DISAPPEARED
+           from the list. `INHERIT_PROFILE` is always synthesised into the list
+           and any previously selected id is still in it, so that branch was
+           essentially never taken and the setting's new value was dropped;
+           `refreshProviderEnv()` then recompiled the environment for the old
+           profile. The comment above this block promised the opposite.
+           The other escape route was closed too: `workspaceState` shadows the
+           setting at activation, so once the picker had run the setting could
+           never be picked up, even across a reload. So this adopts the value
+           AND writes it through to the workspace state that shadows it —
+           otherwise the change would last until the next reload and then
+           silently revert. Starting an agent on the wrong backend bills someone
+           else's account, which is why this is not cosmetic. */
+        if (e.affectsConfiguration('agentsKanban.provider')) {
+          const wanted = cfg().get<string>('provider')
+          if (wanted && providers.some((p) => p.id === wanted) && wanted !== providerId) {
+            providerId = wanted
+            void context.workspaceState.update('provider', wanted)
+            log.info(`Provider changed in settings to "${wanted}".`)
+          }
+        }
         if (!providers.some((p) => p.id === providerId)) {
           providerId = cfg().get<string>('provider') ?? INHERIT_PROFILE.id
         }
@@ -2154,6 +2427,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         refreshProviderEnv()
           .then(() => { alignModelToProvider(); refreshAll() })
           .catch((err: unknown) => log.error(`Could not apply the provider: ${String(err)}`))
+      }
+      /* An explicit edit of `agentsKanban.runtime` wins over the shadow.
+         `workspaceState` is consulted first and is written by both the composer
+         chip and the settings page, so after either had been used once the
+         setting could never take effect again — including across a reload —
+         while its own manifest description told the user it decides "which
+         agent program new sessions run on". The shadow is CLEARED rather than
+         merely overwritten, so the setting stays authoritative until the user
+         picks something else in the UI. */
+      if (e.affectsConfiguration('agentsKanban.runtime')) {
+        const wanted = parseRuntimeId(cfg().get<string>('runtime'))
+        if (wanted && wanted !== runtime) {
+          runtime = wanted
+          void state.update('runtime', undefined)
+          ws?.manager?.setDefaults({ runtime })
+          log.info(`Agent changed in settings to "${wanted}".`)
+          // The model list is per runtime — the same reason the composer and
+          // the settings page both re-ask after a switch.
+          void refreshModels(true).then(() => { void SettingsPanel.refreshIfOpen(); refreshAll() })
+        }
       }
       if (e.affectsConfiguration('agentsKanban.focusMode')) {
         setBoardFocusMode(cfg().get<FocusMode>('focusMode') ?? 'wide')

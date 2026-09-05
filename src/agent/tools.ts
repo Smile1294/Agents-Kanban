@@ -44,6 +44,9 @@ export interface BoardNotice {
 export interface BoardChange {
   sessionId: string
   phase?: { from: string; to: string }
+  /** The agent's one line about WHY it moved. Bounded here rather than in the
+   *  description, because a length asked for in a schema is not a limit. */
+  note?: string
   tagsAdded?: string[]
   tagsRemoved?: string[]
 }
@@ -83,7 +86,7 @@ export interface BoardToolContext {
    * in `AgentManager.split()`. The description below is policy; that is the
    * fence.
    */
-  onSplit?: (subtasks: SubtaskProposal[]) => Promise<SplitOutcome>
+  onSplit?: (subtasks: SubtaskProposal[], reason: string) => Promise<SplitOutcome>
   /**
    * Rename this session's card.
    *
@@ -92,7 +95,7 @@ export interface BoardToolContext {
    * record, and `RunningAgent.title`, which is what the board shows for a run
    * whose session id has not arrived yet. The manager owns both.
    */
-  onRename?: (title: string) => Promise<void> | void
+  onRename?: (title: string) => Promise<{ renamed: boolean; reason?: string }> | { renamed: boolean; reason?: string }
   /**
    * The card's title while it is still the one GUESSED from the prompt, and
    * `undefined` once the agent has chosen one.
@@ -216,11 +219,31 @@ export function buildBoardTools(
       const current = await ctx.store.card(id)
       const from = current.phase
       if (plan) await ctx.store.setTestPlan(id, plan)
+      /* Leaving a review column retracts the plan that got it there.
+         A test plan describes work as it stood when the agent handed it back.
+         Once the card moves out of review — the agent picked it up again, or
+         the user pushed it back — that description is about a state that no
+         longer exists, and it had no way to be cleared: `stripUndefined()`
+         drops `undefined` from a patch, so nothing could unset it, and
+         `normaliseTestPlan` refuses to manufacture an empty plan, so an agent
+         explicitly retracting one was ignored. The panel could say "here is how
+         to test this" and never "that is out of date". */
+      else if (isReviewColumn(board, from) && !isReviewColumn(board, args.phase) && current.testPlan) {
+        await ctx.store.clearTestPlan(id)
+      }
       if (from === args.phase) {
         return ok(plan ? `Already in "${args.phase}"; test plan updated.` : `Already in "${args.phase}".`)
       }
       await ctx.store.setPhase(id, args.phase)
-      ctx.onChanged({ sessionId: id, phase: { from, to: args.phase } })
+      // The note goes WITH the move. Its own description promises the user
+      // will see it ("A short line saying why, shown on the board"), and the
+      // handler dropped it — so the model spent tokens explaining every move
+      // into nothing. A field accepted and never written is the mirror of a
+      // field written and never read.
+      ctx.onChanged({
+        sessionId: id, phase: { from, to: args.phase },
+        ...(args.note?.trim() ? { note: args.note.trim().slice(0, 200) } : {}),
+      })
       const guessed = isStartedColumn(board, args.phase) ? ctx.derivedTitle?.() : undefined
       return ok(
         `Moved: ${from} -> ${args.phase}.` +
@@ -279,7 +302,17 @@ export function buildBoardTools(
       const title = normaliseTitle(args.title)
       if (!title) return err('A title needs at least one word.')
       if (!ctx.onRename) return err('This session cannot be renamed from here.')
-      await ctx.onRename(title)
+      const renamed = await ctx.onRename(title)
+      // Answered from what actually happened. This used to say "Card renamed"
+      // unconditionally, and on a runtime that owns its own session names the
+      // card visibly took the title and then reverted when the run ended — a
+      // tool reporting a write nothing made.
+      if (renamed && renamed.renamed === false) {
+        return ok(
+          `The card now reads "${title}" for this run, but ${renamed.reason ?? 'this agent owns its own session names'}, ` +
+          'so it will go back to the name that agent gave it once the run ends. Rename it there if it matters.',
+        )
+      }
       return ok(`Card renamed to "${title}".`)
     },
   )
@@ -356,7 +389,12 @@ export function buildBoardTools(
       if (!ctx.onSplit) {
         return err('Subtasks cannot be started in this workspace — it is not a git repository.')
       }
-      const result = await ctx.onSplit(args.subtasks ?? [])
+      // `reason` is passed on, not dropped. Its own schema promises the user
+      // will see it ("Shown when they approve the split") and the handler used
+      // to call `onSplit(args.subtasks)` — so the one sentence explaining why a
+      // card became four billed agents reached nothing at all, and the approval
+      // prompt rendered the bare string `split_task`.
+      const result = await ctx.onSplit(args.subtasks ?? [], args.reason ?? '')
       if (!result.ok) return err(result.message)
       const lines = result.started.map((s) => `  - ${s.title}  [${s.branch}]`)
       return ok(

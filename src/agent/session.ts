@@ -669,7 +669,12 @@ export class AgentSession extends EventEmitter implements AgentRun {
           if (this.sawCommit) { this.sawCommit = false; this.emit('committed') }
           const summary = r.result || this.text.slice(-2000) || 'Finished.'
           this.setState({ kind: 'done', summary, ...(r.total_cost_usd !== undefined ? { costUsd: r.total_cost_usd } : {}) })
-          this.emit('done', summary, r.total_cost_usd)
+          // Three arguments, in the shape `RunEvents.done` declares: the
+          // session's meter, then this TURN's dollars. This used to pass
+          // `r.total_cost_usd` in the meter's slot — a bare number where the
+          // other runtime put a `Meter` — and the webview called `.toFixed(2)`
+          // on whichever arrived. See `parseMeter`.
+          this.emit('done', summary, this.meter, r.total_cost_usd)
         }
         break
       }
@@ -799,7 +804,24 @@ export class AgentSession extends EventEmitter implements AgentRun {
               : 'The user declined this action.'),
           },
     )
-    this.setState({ kind: 'working' })
+    /* Only back to `working` if nothing else is waiting.
+       `this.permissions` is a Map and both runtimes can hold several at once —
+       `interrupt()` loops over its values denying every one, which is code that
+       only makes sense if two can be outstanding. Setting `working`
+       unconditionally meant that answering one request told the board the agent
+       was thinking again while the CLI was still blocked inside `canUseTool`
+       for another, and the manager's state listener then dropped the pending
+       slot, so the survivor lost the only surface that could answer it. The
+       board's only remaining truth was the frame age climbing. */
+    const next = this.permissions.values().next().value
+    if (next) {
+      this.setState({ kind: 'needsInput', question: describe(next.toolName, next.input), requestId: next.id })
+      // Re-announce it, so a board that lost track of it while another request
+      // was on screen gets it back.
+      this.emit('permission', next)
+    } else {
+      this.setState({ kind: 'working' })
+    }
     return true
   }
 

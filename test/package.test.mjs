@@ -28,7 +28,22 @@ const out = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'ck-vsix-')), 'tes
 // happens to have one live session open would otherwise ship the entire repo
 // inside the .vsix — and find out from the download size, if at all. Seed one
 // so the assertion below has something to catch.
-const worktreeProbe = path.join(repoRoot, '.agentskanban', 'worktrees', 'probe')
+// `.agentskanban/` is the ONE directory this extension owns inside the user's
+// repository, and it is where LIVE AGENT WORKTREES live — whole checkouts, with
+// their own uncommitted and untracked files. So the cleanup below removes only
+// the probe this test created, and removes `.agentskanban` itself only if this
+// test is what brought it into existence.
+//
+// It used to be `fs.rm(<repo>/.agentskanban, { recursive: true, force: true })`
+// in the `finally`, which deleted every live worktree in the repository — on the
+// command CLAUDE.md tells you to run before installing. Verified on this repo
+// while the bug was live: two real worktrees, one holding modified CLAUDE.md,
+// PLAN.md and DECISIONS.md plus an UNTRACKED docs/FEATURES.md, which no git
+// object would have brought back.
+const kanbanDir = path.join(repoRoot, '.agentskanban')
+const ourDirectory = !(await fs.stat(kanbanDir).then(() => true, () => false))
+// A name nothing else can collide with, so the cleanup cannot widen.
+const worktreeProbe = path.join(kanbanDir, 'worktrees', `packaging-probe-${process.pid}`)
 await fs.mkdir(worktreeProbe, { recursive: true })
 await fs.writeFile(path.join(worktreeProbe, 'leaked.txt'), 'this must not ship\n')
 
@@ -37,7 +52,14 @@ try {
   await exec(process.execPath, [path.join(repoRoot, 'scripts', 'run-bin.mjs'), '@vscode/vsce', 'vsce', 'package', '--out', out],
     { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024 })
 } finally {
-  await fs.rm(path.join(repoRoot, '.agentskanban'), { recursive: true, force: true })
+  await fs.rm(worktreeProbe, { recursive: true, force: true })
+  // Only if there was nothing here before. `rmdir` and not `rm -r`: it refuses
+  // on a non-empty directory, which is the guard rather than a courtesy — if a
+  // worktree appeared while we were packaging, this leaves it alone.
+  if (ourDirectory) {
+    await fs.rmdir(path.join(kanbanDir, 'worktrees')).catch(() => {})
+    await fs.rmdir(kanbanDir).catch(() => {})
+  }
 }
 
 const { stdout } = await exec('unzip', ['-l', out], { maxBuffer: 64 * 1024 * 1024 })

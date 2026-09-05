@@ -85,7 +85,7 @@ const COMPOSER = {
   // now properties of the SESSION rather than of a running process — a
   // screenshot with an empty corner there documents the bug, not the feature.
   contextTokens: 223_000, contextWindow: 1_000_000,
-  spentUsd: 8.11, spendPriced: true,
+  meter: { kind: 'usd', spentUsd: 8.11, priced: true },
 }
 const now = Date.now()
 const mins = (n) => now - n * 60_000

@@ -13,6 +13,8 @@ stream reference, current state, and what to build next.
 |---|---|
 | How does this work, what's next? | [PLAN.md](PLAN.md) |
 | How does Nimbalyst do X? | [docs/NIMBALYST.md](docs/NIMBALYST.md) — don't re-clone the repo, it's already been analysed |
+| How does Paperclip do X? | [docs/PAPERCLIP.md](docs/PAPERCLIP.md) — same rule, don't re-read it |
+| Should one objective become several agents, and how? | [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) — research, not yet built |
 | What's the real Agent SDK API? | [docs/SDK-NOTES.md](docs/SDK-NOTES.md) — **the public docs are wrong in places** |
 | Why is it built this way? | [docs/DECISIONS.md](docs/DECISIONS.md) — decisions and bug postmortems |
 | Which AGENT PROGRAM runs a session — Claude Code, Codex? How do I add a third? | [docs/RUNTIMES.md](docs/RUNTIMES.md) |

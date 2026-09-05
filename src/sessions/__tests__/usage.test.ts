@@ -238,5 +238,39 @@ ok(userOnly.responses === 0, 'user messages carry no usage and are skipped')
 const noUsage = summariseUsage([{ type: 'assistant', message: { id: 'x', model: 'claude-opus-5' } }])
 ok(noUsage.responses === 0, 'an assistant frame without usage is skipped rather than counted as free')
 
+// --- a compaction resets the FILL, not the spend ----------------------------
+//
+// The compact boundary is a SYSTEM record, and `getSessionMessages` hides those
+// unless asked. So a session read back from disk reported its PRE-compaction
+// context fill — a card claiming it is nearly out of window when the compaction
+// had just given most of it back. The live path has an explicit reset for this
+// trap; the disk path could not even observe it.
+{
+  const big = { input_tokens: 190_000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  const small = { input_tokens: 5_000, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  const before = summariseUsage([
+    { type: 'assistant', message: { id: 'm1', model: 'claude-opus-5', usage: big } },
+  ] as never)
+  ok(before.contextTokens === 190_000, `a full window reads full (${before.contextTokens})`)
+
+  const after = summariseUsage([
+    { type: 'assistant', message: { id: 'm1', model: 'claude-opus-5', usage: big } },
+    { type: 'system', subtype: 'compact_boundary' },
+    { type: 'assistant', message: { id: 'm2', model: 'claude-opus-5', usage: small } },
+  ] as never)
+  ok(after.contextTokens === 5_050 || after.contextTokens === 5_000,
+     `after a compaction the fill is the NEW context, not the old one (${after.contextTokens})`)
+  ok(after.costUsd > before.costUsd,
+     `while the spend before the compaction still counts — it was still spent (${after.costUsd} vs ${before.costUsd})`)
+
+  // A compaction with nothing after it must not read as a full window either.
+  const trailing = summariseUsage([
+    { type: 'assistant', message: { id: 'm1', model: 'claude-opus-5', usage: big } },
+    { type: 'system', subtype: 'compact_boundary' },
+  ] as never)
+  ok(trailing.contextTokens === 0,
+     `a compaction with no response after it empties the meter rather than sticking (${trailing.contextTokens})`)
+}
+
 console.log(fails ? `\n${fails} FAILED` : '\nall usage tests passed')
 process.exit(fails ? 1 : 0)

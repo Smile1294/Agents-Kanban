@@ -83,8 +83,36 @@ export interface CodexUsage {
   model?: string
 }
 
-/** Every rollout file, newest first. */
+/**
+ * The last filesystem walk, on the same one-second window `list()` uses.
+ *
+ * `rolloutFiles()` readdirs `sessions/` and then every year, month and day
+ * directory under it, and the store is global to the MACHINE, not per project —
+ * "someone who has used Codex daily for a year has thousands of sessions", as
+ * `SCAN_LIMIT` already says. `list()` caps and caches; `load()` did neither, and
+ * `getState()` calls it TWICE per repaint for a selected Codex card, on a path
+ * that `refreshAll()` drives per streamed token. That is precisely the cost the
+ * coalescer exists to bound, reintroduced below it.
+ *
+ * A path list cannot go stale in a harmful way inside a second: a rollout that
+ * appears during the window is picked up on the next one, and one that
+ * disappears fails its own `stat` and is handled already.
+ */
+let walkCache: { at: number; home: string; files: Promise<string[]> } | undefined
+
 async function rolloutFiles(home: string): Promise<string[]> {
+  const now = Date.now()
+  if (walkCache && walkCache.home === home && now - walkCache.at < LIST_TTL_MS) return walkCache.files
+  // The PROMISE, not the result: two callers arriving together — which is
+  // exactly what `getState()` does — must share one walk rather than each
+  // starting their own.
+  const files = walkRollouts(home)
+  walkCache = { at: now, home, files }
+  return files
+}
+
+/** Every rollout file, newest first. */
+async function walkRollouts(home: string): Promise<string[]> {
   const root = path.join(home, 'sessions')
   const out: string[] = []
   // YYYY / MM / DD, each sorted descending, so the walk is newest-first without
@@ -108,20 +136,59 @@ async function rolloutFiles(home: string): Promise<string[]> {
   return out
 }
 
-/** The first line of a file, without reading the rest of it.
+/**
+ * The first line of a file, without reading the rest of it.
  *
- *  A rollout can be megabytes; its `session_meta` is in the first few hundred
- *  bytes. Reading the whole file to learn its cwd is what makes a session list
- *  cost a second. */
+ * The comment here used to say a rollout's `session_meta` is "in the first few
+ * hundred bytes", and it is not: `session_meta` embeds
+ * `payload.instructions` — the whole Codex system prompt. Measured against
+ * every real rollout on the machine this was found on, the first line is
+ * **22,168 to 22,385 bytes**. With a single fixed 8,192-byte read there was no
+ * newline in the buffer, `bytesRead === buf.length`, and this returned
+ * `undefined` for every rollout Codex has ever written.
+ *
+ * That is not a slow list, it is an EMPTY one. `list()` skips any file whose
+ * first line it cannot read, and `SessionStore.foreign()` is the only source of
+ * a card for a non-Claude session — so every Codex card disappeared from the
+ * board the moment `AgentManager` stopped holding it in memory: on Stop, on a
+ * window reload, on archive-and-unarchive. The worktree stayed on disk with an
+ * unmerged branch and no card pointing at it. This file's own docstring says it
+ * exists so that "the transcript, the meter and the context fill all have to
+ * survive the extension host going away".
+ *
+ * So it reads in chunks until it finds a newline, with a CAP rather than a
+ * single attempt — the point of not reading the whole file stands, since a
+ * rollout can be megabytes. The cap is generous enough for a system prompt that
+ * grows, and reaching it returns `undefined` the same way a genuinely
+ * unparseable file does.
+ *
+ * `bytesRead < CHUNK` is the end-of-file case and returns what there is: a
+ * rollout with exactly one line and no trailing newline is still a rollout.
+ */
+const FIRST_LINE_CHUNK = 64 * 1024
+/** Codex's own first records measure ~22KB. A megabyte is room for that to grow
+ *  by a factor of forty before a session goes missing again — and if one ever
+ *  does, `list()` skips it rather than reading a whole rollout per card on the
+ *  render path. */
+const FIRST_LINE_CAP = 1024 * 1024
 async function firstLine(file: string): Promise<string | undefined> {
   let handle
   try {
     handle = await fs.open(file, 'r')
-    const buf = Buffer.alloc(8192)
-    const { bytesRead } = await handle.read(buf, 0, buf.length, 0)
-    const text = buf.subarray(0, bytesRead).toString('utf8')
-    const at = text.indexOf('\n')
-    return at >= 0 ? text.slice(0, at) : (bytesRead < buf.length ? text : undefined)
+    let text = ''
+    let at = 0
+    const buf = Buffer.alloc(FIRST_LINE_CHUNK)
+    while (at < FIRST_LINE_CAP) {
+      const { bytesRead } = await handle.read(buf, 0, buf.length, at)
+      if (bytesRead <= 0) return text || undefined
+      at += bytesRead
+      text += buf.subarray(0, bytesRead).toString('utf8')
+      const nl = text.indexOf('\n')
+      if (nl >= 0) return text.slice(0, nl)
+      // Short read: that was the end of the file, and it has no newline.
+      if (bytesRead < buf.length) return text || undefined
+    }
+    return undefined
   } catch {
     return undefined
   } finally {
@@ -215,7 +282,20 @@ async function load(id: string): Promise<{ entries: Entry[]; usage: CodexUsage }
   const home = codexHome()
   const files = await rolloutFiles(home)
   const file = files.find((f) => idFromName(f) === id)
-  if (!file) return undefined
+  // A rollout the cached walk has not seen — one created since the window
+  // opened. Re-walk ONCE for it rather than never finding it, which would make
+  // a freshly-started Codex session's transcript unreadable for a second.
+  if (!file) {
+    walkCache = undefined
+    const fresh = await rolloutFiles(home)
+    const late = fresh.find((f) => idFromName(f) === id)
+    if (!late) return undefined
+    return loadFile(late)
+  }
+  return loadFile(file)
+}
+
+async function loadFile(file: string): Promise<{ entries: Entry[]; usage: CodexUsage } | undefined> {
   let stat
   try { stat = await fs.stat(file) } catch { return undefined }
   const hit = parsed.get(file)
@@ -515,4 +595,8 @@ function samePath(cwd: string, dir: string): boolean {
 export function _resetCodexCaches(): void {
   parsed.clear()
   listCache = undefined
+  // The walk cache too, or a test that seeds a fresh CODEX_HOME reads the
+  // previous one's paths for a second — which is a test asserting on somebody
+  // else's fixture.
+  walkCache = undefined
 }

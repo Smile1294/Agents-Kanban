@@ -15,6 +15,7 @@ import type { WorktreeReview } from '../git/worktree.ts'
 import type { Entry } from '../sessions/store.ts'
 import type { AttachedImage } from '../agent/images.ts'
 import type { TestPlan } from '../sessions/meta.ts'
+import type { Meter } from '../agent/runtime.ts'
 import type { SlashCommand } from '../sessions/commands.ts'
 import type { ColumnDef } from './config.ts'
 import { parseAskQuestions, type AskQuestion } from './questions.ts'
@@ -168,6 +169,9 @@ export interface UiCard {
   queued?: string[]
   agent?: {
     kind: string
+    /** When a queued run was accepted. The card shows its age, so "waiting for
+     *  a slot" is a number rather than a claim. */
+    since?: number
     tool?: string
     /** What a Task's subagent is running, so a long Task is not a dead row. */
     subagent?: string
@@ -188,7 +192,15 @@ export interface UiCard {
      *  prompt into a real picker. Without it the view has nothing to show but
      *  the tool's name, which is how a question could be "allowed" and never
      *  answered. See board/questions.ts. */
-    pendingPermission?: { id: string; summary: string; questions?: AskQuestion[] }
+    pendingPermission?: {
+      id: string; summary: string; waiting?: number; questions?: AskQuestion[]
+      /** The RUNTIME's own rendered sentence, when it gave one. Codex sends
+       *  "Codex wants to run: rm -rf build" and it was computed and then
+       *  dropped here — so a Codex patch approval rendered as "Claude wants to
+       *  run / Edit", naming the wrong vendor and withholding the file list on
+       *  a dialog that authorises a write to the user's worktree. */
+      prompt?: string
+    }
   }
 }
 
@@ -256,13 +268,24 @@ export interface UiState {
     modelNote?: string
     contextTokens: number
     contextWindow?: number
-    /** What the selected session has cost so far, in USD. Present whether or
-     *  not it is running: a finished session's figure is totalled from its
-     *  transcript, which is why it survives a restart. */
-    spentUsd?: number
-    /** False when a model with no published rate contributed, so `spentUsd` is
-     *  a floor. The view must show it as "at least". */
-    spendPriced?: boolean
+    /**
+     * What the selected session has consumed, in the unit its runtime can
+     * justify. Present whether or not it is running: a finished session's
+     * figure is totalled from its transcript, which is why it survives a
+     * restart.
+     *
+     * A `Meter`, not a dollar figure, and that is the whole point. This was
+     * `spentUsd` + `spendPriced`, and `spend` is emitted by exactly ONE runtime
+     * — so every Codex session, live or finished, arrived here as `0` and the
+     * bar read **`$0.00`** on a card that had just spent 13% of a five-hour
+     * window. That is not a rounding problem, it is the signal-that-cannot-say-
+     * bad rule broken on the readout the rule was written for.
+     *
+     * The view renders three cases and `unknown` must render as "—", never as
+     * zero. Serialised through `structuredClone` to the webview, so it stays a
+     * plain object.
+     */
+    meter?: Meter
     permissionMode: string
     permissionModes: { key: string; label: string; detail: string }[]
     /** Which agent program the NEXT session runs on. */
@@ -327,6 +350,7 @@ export interface BoardHost {
   commitWorktree(key: string): Promise<void>
   mergeWorktree(key: string): Promise<void>
   archive(key: string, archived: boolean): Promise<void>
+  pin(key: string, pinned: boolean): Promise<void>
   remove(key: string): Promise<void>
   rename(key: string, title: string): Promise<void>
   /** The user opened or closed a collapsible section. Remembered so it stays
@@ -390,6 +414,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'commit': await host.commitWorktree(id()); await refresh(); break
         case 'merge': await host.mergeWorktree(id()); await refresh(); break
         case 'archive': await host.archive(id(), msg.archived !== false); break
+      case 'pin': await host.pin(id(), msg.pinned !== false); break
         case 'remove': await host.remove(id()); break
         case 'rename': await host.rename(id(), String(msg.title ?? '')); break
         case 'disclosure':
@@ -659,6 +684,7 @@ export function toUiAgent(a: RunningAgent): NonNullable<UiCard['agent']> {
   const s = a.state
   return {
     kind: s.kind,
+    ...(s.kind === 'queued' ? { since: s.since } : {}),
     ...(s.kind === 'working' && s.tool ? { tool: s.tool } : {}),
     ...(s.kind === 'working' && s.subagent ? { subagent: s.subagent } : {}),
     ...(s.kind === 'error' ? { message: s.message } : {}),
@@ -673,6 +699,14 @@ export function toUiAgent(a: RunningAgent): NonNullable<UiCard['agent']> {
           pendingPermission: {
             id: a.pendingPermission.id,
             summary: summarise(a.pendingPermission.toolName, a.pendingPermission.input),
+            // How many are waiting in total. One slot used to hold them all, so
+            // a turn that asked twice showed one prompt and silently lost the
+            // other; the count is what makes the rest visible rather than a
+            // card that says "working" over a blocked agent.
+            ...((a.pendingPermissions?.length ?? 0) > 1
+              ? { waiting: a.pendingPermissions!.length }
+              : {}),
+            ...(a.pendingPermission.prompt ? { prompt: a.pendingPermission.prompt } : {}),
             ...(() => {
               const questions = parseAskQuestions(
                 a.pendingPermission.toolName,

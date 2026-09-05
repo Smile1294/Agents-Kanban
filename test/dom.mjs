@@ -23,6 +23,8 @@ export function makeNode(tag) {
       contains(c) { return this._o.className.split(' ').includes(c) },
     },
     _text: null, draggable: false, title: '', placeholder: '', value: '', rows: 0,
+    // The caret. Real state, so a restore that drops it is visible to a test.
+    selectionStart: undefined, selectionEnd: undefined,
     // Attributes are real state here for one reason: the live counters are
     // ticked in place by tickAges(), which finds them by `data-since`. Without
     // this the stub silently swallowed every setAttribute, so a counter could
@@ -74,7 +76,15 @@ export function makeNode(tag) {
     // whether it hands focus back is a testable fact, not a detail.
     focus() { if (node._doc) node._doc.activeElement = node },
     blur() { if (node._doc && node._doc.activeElement === node) node._doc.activeElement = null },
-    setSelectionRange() {},
+    /* A real one MOVES the caret, and the stub's no-op hid a bug.
+       `render()` restores focus to a rebuilt input; whether it also restores
+       the CARET is only observable through these two properties, so a
+       `setSelectionRange` that did nothing made "the caret jumped to the end"
+       untestable — which is why that shipped. */
+    setSelectionRange(start, end) {
+      node.selectionStart = start
+      node.selectionEnd = end === undefined ? start : end
+    },
     _doc: null,
   }
   node.classList._o = node
@@ -176,6 +186,8 @@ export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
   const root = makeNode('div')
   const posted = []
   const listeners = []
+  /** Timers board.js registered, held rather than run — see `setInterval`. */
+  const timers = []
   const document = {
     activeElement: null,
     getElementById: (id) => (id === 'root' ? root : null),
@@ -195,13 +207,31 @@ export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
     createTextNode: (t) => ({ textContent: t, children: [], className: '' }),
     documentElement: { dataset: { layout } },
     body: makeNode('body'),
+    /* `querySelectorAll` on the DOCUMENT, not only on elements.
+       `tickAges()` — the function that makes the liveness age climb, which is
+       the board's only honest "is it still moving" signal — finds its nodes
+       with `document.querySelectorAll('[data-since]')`. The stub had the method
+       on `makeNode` and not here, so the function could not run in any gate:
+       the ticker was untestable and a break in it would have been invisible. */
+    querySelectorAll: (sel) => root.querySelectorAll(sel),
+    querySelector: (sel) => root.querySelector(sel),
     addEventListener() {}, removeEventListener() {},
   }
   const ctx = {
     document,
     window: { addEventListener: (t, fn) => { if (t === 'message') listeners.push(fn) } },
     acquireVsCodeApi: () => ({ postMessage: (m) => posted.push(m) }),
-    Date, Math, Number, JSON, console, Set, Array, Object, String, prompt: () => null,
+    Date, Math, Number, JSON, console, Set, Array, Object, String, Map, Intl, Buffer, prompt: () => null,
+    /* A CONTROLLABLE timer. `setInterval` is not a V8 intrinsic, so it is
+       simply absent from a `vm` context — board.js guards on
+       `typeof setInterval === 'function'`, so the ticker was never even
+       registered. Collecting the callback instead of running it lets a test
+       drive the clock deliberately, which is the only way to assert that an age
+       climbs. */
+    setInterval: (fn, ms) => { timers.push({ fn, ms }); return timers.length },
+    clearInterval: () => {},
+    setTimeout: (fn) => { void fn; return 0 },
+    clearTimeout: () => {},
     /**
      * Just enough of the browser's image plumbing to run the attachment path.
      *
@@ -234,5 +264,7 @@ export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
   // position, focus) is only testable by sending one.
   const deliver = (st) => { for (const fn of listeners) fn({ data: { type: 'state', state: st } }) }
   if (state) deliver(state)
-  return { root, posted, document, deliver, listeners, text: () => root.textContent }
+  /** Run every registered interval callback once, as a second passing. */
+  const tick = () => { for (const t of timers) t.fn() }
+  return { root, posted, document, deliver, listeners, timers, tick, text: () => root.textContent }
 }

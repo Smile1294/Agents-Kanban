@@ -14,6 +14,7 @@
  */
 import { AgentSession } from '../session.ts'
 import { summariseUsage, type UsageMessage } from '../../sessions/usage.ts'
+import { parseMeter } from '../runtime.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -206,5 +207,46 @@ const result = (costUsd: number | undefined) => ({
   ok(near(spends[spends.length - 1]!.usd, ONE_RESPONSE), 'while the priced half still counts')
 }
 
-console.log(fails ? `\n${fails} FAILED` : '\nPASS — a live run prices itself, and agrees with its own transcript')
+// ---------------------------------------------------------------------------
+// 9. THE `done` CONTRACT — the other half of the gate in `codex.test.ts`.
+//
+// `RunEvents.done` is `(summary, meter?: Meter, turnUsd?: number)`. It was
+// declared and unenforced, and the two runtimes drifted apart inside it: this
+// one put `r.total_cost_usd` — a bare number — in the meter slot while
+// `codex.ts` put a `Meter` object there. `manager.ts` typed the listener
+// `costUsd?: number` and assigned it straight onto the card, and
+// `media/board.js` called `.toFixed(2)` on it. `EventEmitter.on()` is untyped,
+// so tsc saw none of it; the symptom was a throw inside `render()` — a silently
+// blank panel — on the first real Codex run.
+//
+// Both slots are asserted, because the failure was a SWAP and a gate that
+// checked only one of them would have passed on the broken code.
+{
+  const { session, feed } = make()
+  const payloads: { summary: unknown; meter: unknown; turnUsd: unknown }[] = []
+  session.on('done', (summary: unknown, meter: unknown, turnUsd: unknown) =>
+    payloads.push({ summary, meter, turnUsd }))
+
+  feed(assistant('msg_done', USAGE))
+  feed({ type: 'result', subtype: 'success', result: 'All done.', total_cost_usd: 0.42 })
+
+  const p = payloads[0]
+  ok(payloads.length === 1, `the turn reports done exactly once (${payloads.length})`)
+  ok(typeof p?.summary === 'string', 'the first argument is the summary')
+
+  // Slot two is the SESSION meter, in the shape every runtime reports.
+  const parsed = parseMeter(p?.meter)
+  ok(parsed?.kind === 'usd',
+     `slot two is a parseable Meter, not a bare number (got ${JSON.stringify(p?.meter)})`)
+  ok(parsed?.kind === 'usd' && near(parsed.spentUsd, ONE_RESPONSE),
+     `and it carries this session's own arithmetic, not the CLI's turn figure ` +
+     `(${parsed?.kind === 'usd' ? parsed.spentUsd : '—'} vs ${ONE_RESPONSE})`)
+
+  // Slot three is THIS TURN's dollars, which is a different scope. The board
+  // shows it on the result row and the agent row; conflating the two is what
+  // put a `Meter` where a number was expected.
+  ok(p?.turnUsd === 0.42, `slot three is the turn's billed figure (${String(p?.turnUsd)})`)
+}
+
+console.log(fails ? `\n${fails} FAILED` : '\nPASS — a live run prices itself, agrees with its own transcript, and honours the done contract')
 process.exit(fails ? 1 : 0)

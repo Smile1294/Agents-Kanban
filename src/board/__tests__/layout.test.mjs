@@ -72,7 +72,7 @@ const chatState = {
   composer: {
     ...state.composer,
     contextTokens: 998_000, contextWindow: 1_000_000,
-    spentUsd: 1234.56, spendPriced: false,
+    meter: { kind: 'usd', spentUsd: 1234.56, priced: false },
   },
   transcript: [
     { kind: 'tool', at: 1, id: 't1', name: 'mcp__claude_ai_Atlassian__getJiraIssue',
@@ -323,6 +323,53 @@ try {
   ok(narrowErrors.length === 0, `the narrow chat renders without throwing (${narrowErrors.join('; ') || 'clean'})`)
   checkReadouts(await narrow.evaluate(measureReadouts), 'in a split editor (560px)')
   await narrow.close()
+
+  /* The SUBSCRIPTION arm of the meter, at the narrow width, because it is
+     materially wider than a price and nothing had ever measured it.
+     "27% of 5h · plus" is roughly twice the width of "$1.23", and the readouts
+     sit at the right-hand end of a bar whose contents already want more than
+     560px — so this is exactly the shape that pushes a number off the edge
+     while every text assertion stays green. Two of this project's postmortems
+     are that failure; the plan meter arrived with none of them covered. */
+  const plan = await browser.newPage({ viewport: { width: 560, height: 800 } })
+  const planErrors = []
+  plan.on('pageerror', (e) => planErrors.push(String(e)))
+  await plan.setContent(page$({
+    ...chatState,
+    composer: {
+      ...chatState.composer,
+      // A worst case that is still real: three digits, the longer 7d window,
+      // and a plan name.
+      meter: {
+        kind: 'plan', usedPercent: 100, windowMinutes: 10080, plan: 'enterprise',
+        resetsAt: Math.floor(Date.now() / 1000) + 7200,
+      },
+    },
+  }))
+  await plan.waitForSelector('.composer-bar', { timeout: 5000 })
+  ok(planErrors.length === 0, `the plan meter renders without throwing (${planErrors.join('; ') || 'clean'})`)
+  const planReadouts = await plan.evaluate(measureReadouts)
+  checkReadouts(planReadouts, 'a subscription meter at 560px')
+  ok(/100% of 7d/.test(planReadouts.spend?.text ?? ''),
+     `and says the window it spent rather than a price (${JSON.stringify(planReadouts.spend?.text)})`)
+  ok(!/\$/.test(planReadouts.spend?.text ?? ''),
+     'with no dollar sign anywhere on it — a subscription session has no price to show')
+  await plan.close()
+
+  /* And the "we could not read it" arm. An em dash is one character, so the
+     risk here is the opposite one: a chip so narrow it reads as an empty gap. */
+  const unknown = await browser.newPage({ viewport: { width: 900, height: 800 } })
+  await unknown.setContent(page$({
+    ...chatState,
+    composer: { ...chatState.composer, meter: { kind: 'unknown' } },
+  }))
+  await unknown.waitForSelector('.composer-bar', { timeout: 5000 })
+  const unknownReadouts = await unknown.evaluate(measureReadouts)
+  ok((unknownReadouts.spend?.width ?? 0) > 8,
+     `an unknown meter is still wide enough to be seen (${unknownReadouts.spend?.width}px)`)
+  ok(unknownReadouts.spend?.text === '—',
+     `and is an em dash, never a zero (${JSON.stringify(unknownReadouts.spend?.text)})`)
+  await unknown.close()
 
   /* --- a repaint must not move a scrolled column -------------------------------
      render() rebuilds the tree on every state message, and an agent at work sends

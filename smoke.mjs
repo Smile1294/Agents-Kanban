@@ -255,10 +255,17 @@ if (floor && manifest.engines?.node) {
      `they agree: engines.node ${manifest.engines.node} vs preflight ${floor.slice(1, 4).join('.')}`)
 }
 
-// Every script that needs dependencies must run the preflight first, or it
-// fails with the original cryptic message instead of the useful one.
-for (const name of ['verify', 'verify:package', 'build']) {
-  ok((scripts[name] ?? '').includes('preflight'), `${name} runs the preflight before anything else`)
+// EVERY script must run the preflight first, or it fails with the original
+// cryptic message instead of the useful one. CLAUDE.md states the rule without
+// exceptions — "Never add a script that skips it" — and this gate used to name
+// three scripts explicitly, which encoded the exception rather than the rule:
+// nine of twelve skipped it and nothing could say so. A script that only
+// delegates (`npm run x`) is covered by what it delegates to.
+for (const [name, body] of Object.entries(scripts)) {
+  if (name === 'preflight') continue
+  const delegates = body.trimStart().startsWith('npm run ')
+  ok(delegates || body.includes('preflight'),
+     `${name} runs the preflight before anything else`)
 }
 
 // ------------------------------------------------------------- 3. no folder open
@@ -340,11 +347,17 @@ ok(sel?.composer?.contextTokens === STORED_CONTEXT,
    `its context fill is read back exactly: ${sel?.composer?.contextTokens} (expected ${STORED_CONTEXT})`)
 ok(sel?.composer?.contextWindow === 1_000_000,
    `measured against the model's window: ${sel?.composer?.contextWindow}`)
-ok(Math.abs((sel?.composer?.spentUsd ?? 0) - STORED_COST) < 1e-9,
-   `and its spend is priced from those tokens: $${sel?.composer?.spentUsd} (expected $${STORED_COST})`)
-ok(sel?.composer?.spendPriced === true, 'with every model in it priced')
+// Off `composer.meter`, which is the ONE source now. It was `spentUsd` — a bare
+// number — and `spend` is emitted by exactly one runtime, so every Codex session
+// reached the bar as a zero and rendered "$0.00" over a subscription card. The
+// union is the fix and this asserts the `usd` arm still carries the same figure.
+const meter = sel?.composer?.meter
+ok(meter?.kind === 'usd', `its meter is a dollar figure for a Claude session (got ${meter?.kind})`)
+ok(Math.abs((meter?.spentUsd ?? 0) - STORED_COST) < 1e-9,
+   `and its spend is priced from those tokens: $${meter?.spentUsd} (expected $${STORED_COST})`)
+ok(meter?.priced === true, 'with every model in it priced')
 // The dedupe, end to end: the two frames of one response must be billed once.
-ok((sel?.composer?.spentUsd ?? 0) < STORED_COST * 1.5,
+ok((meter?.spentUsd ?? 0) < STORED_COST * 1.5,
    'the repeated frame of a streamed response is not billed twice')
 
 // Every inbound message the view can send must be survivable. A throw here
@@ -357,6 +370,10 @@ for (const msg of [
   { type: 'select', id: '' },
   { type: 'toggleArchived' },
   { type: 'toggleArchived' },
+  // Pin: the board's primary sort key, which for a long time nothing could set.
+  { type: 'pin', id: SEEDED, pinned: true },
+  { type: 'pin', id: SEEDED, pinned: false },
+  { type: 'pin', id: 'nope', pinned: true },
   // A collapsed section is remembered host-side, so these must survive being
   // aimed at nonsense as much as any other inbound message.
   // An attachment that cannot be sent must be refused, not thrown on. Both
@@ -412,10 +429,39 @@ ok(stub.errors.length === before, `no errors from the inbound message sweep (${s
 // is how a whole extension fails to start.
 ok(stub.calls.some((c) => c.startsWith('contentProvider:')), 'the base-version content provider registers')
 ok(typeof ctl.contentProvider?.provideTextDocumentContent === 'function', 'it provides document content')
+// `query: ''` reaches only the guard clause, so this never called
+// `WorktreeService.show()` — the thing that actually runs `git show <ref>:<file>`
+// and is the only way to produce an "unresolvable base version". The assertion
+// asserted its own name. A real query is passed now, so the provider is
+// exercised end to end.
 const bogus = await ctl.contentProvider
   .provideTextDocumentContent({ path: '/nope.ts', query: '' })
   .catch((e) => `THREW: ${e.message}`)
-ok(bogus === '', `an unresolvable base version yields empty, not a throw (${JSON.stringify(bogus)})`)
+ok(bogus === '', `a malformed base-version URI yields empty, not a throw (${JSON.stringify(bogus)})`)
+
+{
+  const q = (ref, file) => ({ path: file, query: `dir=${encodeURIComponent(repo)}&ref=${ref}` })
+  const readme = await ctl.contentProvider
+    .provideTextDocumentContent(q('main', '/README.md'))
+    .catch((e) => `THREW: ${e.message}`)
+  ok(typeof readme === 'string' && readme.includes('#'),
+     `the base version of a real file is served (${JSON.stringify(String(readme).slice(0, 24))})`)
+  // Byte for byte: a trimmed left-hand side makes every diff report a change at
+  // the head and the tail that the agent never made.
+  const onDisk = await fs.readFile(path.join(repo, 'README.md'), 'utf8')
+  ok(readme === onDisk,
+     `and byte for byte, so the diff shows only what CHANGED (${readme === onDisk ? 'exact' : JSON.stringify(String(readme).slice(-12))} vs ${JSON.stringify(onDisk.slice(-12))})`)
+
+  const missingRef = await ctl.contentProvider
+    .provideTextDocumentContent(q('no-such-ref', '/README.md'))
+    .catch((e) => `THREW: ${e.message}`)
+  ok(missingRef === '', `a ref that does not resolve yields empty, not a throw (${JSON.stringify(missingRef)})`)
+  const missingFile = await ctl.contentProvider
+    .provideTextDocumentContent(q('main', '/never-existed.ts'))
+    .catch((e) => `THREW: ${e.message}`)
+  ok(missingFile === '',
+     `and so does a file the agent ADDED — an empty left side is the right diff there (${JSON.stringify(missingFile)})`)
+}
 
 // The layout. This is the gate that matters most in daily use, and the one
 // that was hardest to get right: the board must take the editor area, the

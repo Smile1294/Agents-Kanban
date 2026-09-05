@@ -91,7 +91,13 @@ interface WireTool {
  * Typed as the SDK's helper at the call site because it is structurally
  * compatible and the builder only ever reads the four fields.
  */
-function collector(into: Map<string, { def: WireTool; run: (args: Record<string, unknown>) => Promise<unknown> }>) {
+function collector(into: Map<string, {
+  def: WireTool
+  run: (args: Record<string, unknown>) => Promise<unknown>
+  /** The zod object the wire schema was generated FROM, kept so the socket path
+   *  can enforce what it advertises. */
+  parse: z.ZodTypeAny
+}>) {
   return (
     name: string,
     description: string,
@@ -110,7 +116,7 @@ function collector(into: Map<string, { def: WireTool; run: (args: Record<string,
       // Losing the tool entirely would be the card-cannot-move failure again.
       inputSchema = { type: 'object', properties: {} }
     }
-    into.set(name, { def: { name, description, inputSchema }, run: handler })
+    into.set(name, { def: { name, description, inputSchema }, run: handler, parse: z.object(schema) })
     return { name, description, inputSchema: schema, handler }
   }
 }
@@ -126,7 +132,7 @@ export async function startBoardBridge(
   ctx: BoardToolContext,
   opts: { dir: string; script: string; node?: string },
 ): Promise<BoardBridge> {
-  const tools = new Map<string, { def: WireTool; run: (args: Record<string, unknown>) => Promise<unknown> }>()
+  const tools = new Map<string, { def: WireTool; run: (args: Record<string, unknown>) => Promise<unknown>; parse: z.ZodTypeAny }>()
   // The cast is the same seam `boardToolNames` uses: the builder reads name,
   // description, schema and handler, and nothing else on the SDK's helper.
   buildBoardTools(board, ctx, collector(tools) as never)
@@ -185,7 +191,7 @@ function socketPath(dir: string): string {
 function serve(
   socket: Socket,
   token: string,
-  tools: Map<string, { def: WireTool; run: (args: Record<string, unknown>) => Promise<unknown> }>,
+  tools: Map<string, { def: WireTool; run: (args: Record<string, unknown>) => Promise<unknown>; parse: z.ZodTypeAny }>,
 ): void {
   socket.setEncoding('utf8')
   let buffer = ''
@@ -224,7 +230,26 @@ function serve(
         const name = typeof msg.name === 'string' ? msg.name : ''
         const entry = tools.get(name)
         if (!entry) { reply({ id, error: `No board tool called ${name}.` }); continue }
-        const args = (msg.args && typeof msg.args === 'object' ? msg.args : {}) as Record<string, unknown>
+        const raw = (msg.args && typeof msg.args === 'object' ? msg.args : {}) as Record<string, unknown>
+        /* VALIDATED on our side of the socket, against the very schema this
+           server advertises in `tools/list`.
+           The in-process path gets this free: the SDK parses the zod schema
+           before it calls the handler. The socket path advertised the same
+           schema and enforced nothing beyond `typeof === 'object'`, so a
+           model-written argument reached the handler unchecked — an
+           out-of-enum `urgency` slipped past the `'blocked'` test and
+           downgraded a blocked agent's alarm to a chime, and a wrong type
+           reached code that assumed the parsed one. "The guard stays on our
+           side of the socket" is the rule this transport exists to keep; it
+           kept the AUTHORISATION guard and not the shape one.
+           A failure comes back as a tool ERROR, so the agent can read the
+           schema complaint and fix its call, rather than as a dropped message. */
+        const checked = entry.parse.safeParse(raw)
+        if (!checked.success) {
+          reply({ id, error: `Invalid arguments for ${name}: ${checked.error.issues.map((i: { path: (string | number | symbol)[]; message: string }) => `${i.path.join('.') || '(root)'} ${i.message}`).join('; ')}` })
+          continue
+        }
+        const args = checked.data as Record<string, unknown>
         void Promise.resolve()
           .then(() => entry.run(args))
           .then((result) => reply({ id, result }))

@@ -28,6 +28,7 @@
  * and says so.
  */
 import { CodexSession, codexPermissions, contextFill, parseModels } from '../runtimes/codex.ts'
+import { parseMeter } from '../runtime.ts'
 import { mkdtemp, writeFile, chmod, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
@@ -63,8 +64,12 @@ process.stdin.on('data', (c) => {
     if (m.method === 'initialize') { send({ id: m.id, result: { agent: 'codex', version: '9.9.9' } }); continue }
     if (m.method === 'initialized') continue
     if (m.method === 'thread/start') { send({ id: m.id, result: { threadId: 'th-42' } }); continue }
-    if (m.method === 'turn/interrupt') { send({ id: m.id, result: {} }); process.stdout.write('INTERRUPTED\\n'); continue }
+    if (m.method === 'turn/interrupt') { send({ id: m.id, result: {} }); process.stderr.write('INTERRUPTED\\n'); continue }
     if (m.method === 'turn/start') { run(m.id); continue }
+    // Echo the client's RESPONSES to stderr so the test can assert on the wire
+    // value. A decision the server cannot deserialise is invisible to a test
+    // that only checks the board's own state — which is how \`reject\` shipped.
+    if (m.method === undefined && m.id !== undefined) { process.stderr.write('ANSWER ' + line + '\\n'); continue }
     if (m.id !== undefined) send({ id: m.id, result: {} })
   }
 })
@@ -72,13 +77,24 @@ ${'' /* the turn itself is injected per test */}
 `
 
 /** Run one turn against a scripted server and collect what the board saw. */
-async function drive(dir: string, turnBody: string, opts: { interrupt?: boolean } = {}) {
+async function drive(dir: string, turnBody: string, opts: { interrupt?: boolean; deny?: boolean } = {}) {
   const bin = await fakeCodex(dir, SERVER.replace('${\'\'}', '') + `\nfunction run(id) {\n${turnBody}\n}\n`)
+  const answers: Record<string, unknown>[] = []
+  let interruptSent = false
   const session = new CodexSession({
     taskId: 't1',
     cwd: dir,
     permissionMode: 'default',
     location: { command: bin, source: 'setting', version: '9.9.9' },
+    // The adapter forwards the child's stderr here, and the fake server echoes
+    // every response the board sent back — so the WIRE VALUE is assertable, not
+    // just the board's own state.
+    log: (m: string) => {
+      if (m.includes('INTERRUPTED')) interruptSent = true
+      const at = m.indexOf('ANSWER ')
+      if (at < 0) return
+      try { answers.push(JSON.parse(m.slice(at + 7))) } catch { /* not ours */ }
+    },
   } as never)
 
   const seen = {
@@ -91,8 +107,16 @@ async function drive(dir: string, turnBody: string, opts: { interrupt?: boolean 
     meters: [] as unknown[],
     usage: [] as { tokens: number; window?: number }[],
     warnings: [] as string[],
-    permissions: [] as { prompt?: string; resolve: (allow: boolean) => void }[],
+    permissions: [] as { prompt?: string; toolName?: string; resolve: (allow: boolean, reason?: string) => void }[],
     done: false,
+    interrupted: false,
+    /** The server received `turn/interrupt`. Without this the interrupt case
+     *  asserted something equally true of an interrupt never sent. */
+    interruptSent: false,
+    /** The `done` payload, kept rather than discarded — see the contract gate. */
+    donePayload: undefined as { meter?: unknown; turnUsd?: unknown } | undefined,
+    /** Every JSON-RPC response the board sent back, as the server saw it. */
+    answers: [] as Record<string, unknown>[],
     errors: [] as string[],
   }
   session.on('text', (t: string) => seen.text.push(t))
@@ -104,14 +128,18 @@ async function drive(dir: string, turnBody: string, opts: { interrupt?: boolean 
   session.on('meter', (m: unknown) => seen.meters.push(m))
   session.on('usage', (tokens: number, window?: number) => seen.usage.push({ tokens, window }))
   session.on('flagWarning', (m: string) => seen.warnings.push(m))
-  session.on('permission', (r: { prompt?: string; resolve: (a: boolean) => void }) => {
+  session.on('permission', (r: { prompt?: string; toolName?: string; resolve: (a: boolean, reason?: string) => void }) => {
     seen.permissions.push(r)
     // Answer on the next tick, as the user would: the server is BLOCKED until
     // we do, so a test that never answers would hang exactly like the bug this
     // asserts against.
-    setTimeout(() => r.resolve(true), 5)
+    setTimeout(() => r.resolve(!opts.deny, opts.deny ? 'not on my machine' : undefined), 5)
   })
-  session.on('done', () => { seen.done = true })
+  session.on('done', (_summary: string, meter?: unknown, turnUsd?: unknown) => {
+    seen.done = true
+    seen.donePayload = { meter, turnUsd }
+  })
+  session.on('interrupted', () => { seen.interrupted = true })
   session.on('error', (m: string) => seen.errors.push(m))
 
   const finished = new Promise<void>((resolve) => {
@@ -125,9 +153,18 @@ async function drive(dir: string, turnBody: string, opts: { interrupt?: boolean 
     await session.interrupt()
   }
   await finished
+  // The echo travels through the child's stderr, so give it a tick to land.
+  await new Promise((r) => setTimeout(r, 60))
   session.stop()
+  seen.answers = answers
+  seen.interruptSent = interruptSent
   return seen
 }
+
+/** The same driver, with the user pressing Deny. The deny arm is the one that
+ *  shipped a value the protocol does not accept, and it is invisible to any
+ *  test that only ever allows. */
+const driveDenying = (dir: string, turnBody: string) => drive(dir, turnBody, { deny: true })
 
 async function main(): Promise<void> {
   const dir = await mkdtemp(path.join(tmpdir(), 'ak-codex-'))
@@ -168,6 +205,22 @@ async function main(): Promise<void> {
     ok(fill?.window === 258400, `and the window comes from the runtime (${fill?.window})`)
     ok(seen.done, 'the turn completes')
     ok(!seen.errors.length, `and nothing errored (${seen.errors.join('; ')})`)
+
+    // THE CONTRACT GATE. `RunEvents.done` is `(summary, meter?, turnUsd?)`, and
+    // it was declared and unenforced for its whole life — so this runtime put a
+    // `Meter` in the second slot while the Claude runtime put a bare `number`
+    // there, the manager's listener declared `costUsd?: number`, and
+    // `media/board.js` called `.toFixed(2)` on whatever arrived. That is a throw
+    // inside `render()`, which is a silently blank panel, and `EventEmitter.on()`
+    // is untyped so nothing in the type system could see it.
+    //
+    // Asserting the payload PARSES is what makes the contract real. Break it by
+    // emitting `this._meter.usedPercent` instead of `this._meter` and this goes
+    // red; the old code would have passed.
+    ok(parseMeter(seen.donePayload?.meter)?.kind === 'plan',
+       `done carries a parseable Meter in the meter slot (got ${JSON.stringify(seen.donePayload?.meter)?.slice(0, 60)})`)
+    ok(seen.donePayload?.turnUsd === undefined,
+       'and NO turn dollars — a subscription session has no per-request price to report')
   }
 
   // --- the OTHER spelling, which is what schema drift looks like -----------
@@ -202,6 +255,144 @@ async function main(): Promise<void> {
     ok(seen.done, 'and answering it lets the turn finish')
   }
 
+  // --- the app-server's OWN usage notification -----------------------------
+  //
+  // `thread/tokenUsage/updated` is the name the app-server actually publishes
+  // (codex-rs/app-server/README.md). The two spellings that were here —
+  // `token_count` / `thread/tokenCount` — are the exec-era ones, so on a real
+  // app-server run `onUsage()` never ran once: the context bar showed nothing
+  // for the whole turn and a session burning a rate-limit window read as `—`.
+  // Both numbers the board shows travel on this one notification.
+  {
+    const seen = await drive(dir, `
+      send({ method: 'thread/tokenUsage/updated', params: {
+        info: { last_token_usage: { input_tokens: 14041, cached_input_tokens: 12160, output_tokens: 229, total_tokens: 14270 }, model_context_window: 258400 },
+        rate_limits: { plan_type: 'pro', primary: { used_percent: 41, window_minutes: 300 } },
+      } })
+      send({ method: 'turn/completed', params: { turn: { status: 'completed' } } })
+      send({ id, result: {} })
+    `)
+    const fill = seen.usage[seen.usage.length - 1]
+    ok(fill?.tokens === 14270, `the app-server's own usage notification is read (${fill?.tokens ?? 'nothing'})`)
+    ok(fill?.window === 258400, 'with its window')
+    const m = seen.meters[seen.meters.length - 1] as { kind?: string; usedPercent?: number } | undefined
+    ok(m?.kind === 'plan' && m.usedPercent === 41,
+       `and the rate-limit meter with it (${m?.kind} ${m?.usedPercent}%)`)
+    ok(!seen.warnings.length, `and it is not reported as an unknown message (${seen.warnings.join(' | ')})`)
+  }
+
+  // --- the most ordinary item in the protocol -------------------------------
+  //
+  // `userMessage` is a documented ThreadItem and `item/*` fires for it at the
+  // start of every turn. It was unhandled, so EVERY healthy turn ended with a
+  // warning toast claiming rows were missing from the transcript — and the
+  // claim was false, because the board renders the prompt from its own
+  // composer. A drift alarm that cries wolf on every good turn is one the user
+  // has learned to dismiss by the time it matters.
+  {
+    const seen = await drive(dir, `
+      send({ method: 'item/started', params: { item: { id: 'u1', type: 'userMessage', text: 'do the thing' } } })
+      send({ method: 'item/completed', params: { item: { id: 'u1', type: 'userMessage', text: 'do the thing' } } })
+      send({ method: 'item/completed', params: { item: { id: 'm1', type: 'agentMessage', text: 'Done.' } } })
+      send({ method: 'turn/completed', params: { turn: { status: 'completed' } } })
+      send({ id, result: {} })
+    `)
+    ok(!seen.warnings.length,
+       `a turn carrying a userMessage item warns about NOTHING (${seen.warnings.join(' | ') || 'silent'})`)
+    ok(seen.text.join('') === 'Done.',
+       `and the prompt is not echoed back into the transcript (${JSON.stringify(seen.text.join(''))})`)
+  }
+
+  // --- compaction must reset the meter --------------------------------------
+  // Same trap as the Claude path's `compact_boundary`: no usage frame follows,
+  // so a meter left alone stays pinned at the pre-compaction figure and reads
+  // as a session about to run out of context when it has just been given most
+  // of it back.
+  {
+    const seen = await drive(dir, `
+      send({ method: 'thread/tokenUsage/updated', params: { info: { last_token_usage: { input_tokens: 200000, output_tokens: 100, total_tokens: 200100 }, model_context_window: 258400 } } })
+      send({ method: 'item/completed', params: { item: { id: 'c1', type: 'contextCompaction' } } })
+      send({ method: 'turn/completed', params: { turn: { status: 'completed' } } })
+      send({ id, result: {} })
+    `)
+    const fill = seen.usage[seen.usage.length - 1]
+    ok(fill?.tokens === 0, `a compaction empties the context meter (${fill?.tokens})`)
+    ok(!seen.warnings.length, 'and is not reported as an unknown item')
+  }
+
+  // --- the app-server's approval names, which were RENAMED not respelled ----
+  //
+  // `normKind()` bridges case and separators; it cannot bridge a rename. Only
+  // the exec-era `execCommandApproval` was recognised, so on a current server
+  // every approval was answered with a JSON-RPC error before any human saw it
+  // — while `capabilities.approvals` told the board the prompts mean something.
+  {
+    const seen = await drive(dir, `
+      send({ id: 901, method: 'item/commandExecution/requestApproval', params: { command: 'rm -rf build', cwd: '/tmp', itemId: 'i1' } })
+      setTimeout(() => { send({ method: 'turn/completed', params: { turn: { status: 'completed' } } }); send({ id, result: {} }) }, 400)
+    `)
+    ok(seen.permissions.length === 1,
+       `the app-server spelling of a command approval reaches the board (${seen.permissions.length})`)
+    ok(/rm -rf build/.test(seen.permissions[0]?.prompt ?? ''),
+       `and still says what it wants to run (${seen.permissions[0]?.prompt ?? ''})`)
+  }
+  {
+    const seen = await drive(dir, `
+      send({ id: 902, method: 'item/fileChange/requestApproval', params: { changes: { 'src/a.ts': {} }, itemId: 'i2' } })
+      setTimeout(() => { send({ method: 'turn/completed', params: { turn: { status: 'completed' } } }); send({ id, result: {} }) }, 400)
+    `)
+    ok(seen.permissions.length === 1,
+       `and so does a file-change approval (${seen.permissions.length})`)
+    ok(seen.permissions[0]?.toolName === 'Edit',
+       `named as an edit rather than a command (${seen.permissions[0]?.toolName})`)
+  }
+
+  // --- Deny has to be a word the protocol knows -----------------------------
+  //
+  // The decisions are accept / acceptForSession / decline / cancel. `reject` —
+  // what this sent — is in no version of the vocabulary, so Deny posted a value
+  // the server cannot deserialise: the turn errored or blocked instead of the
+  // command being refused, and the board had already dropped the request and
+  // gone back to `working`, so there was nothing left to answer. This asserts
+  // on the WIRE VALUE, because the board's own state looked fine either way.
+  {
+    const seen = await driveDenying(dir, `
+      send({ id: 903, method: 'item/commandExecution/requestApproval', params: { command: 'rm -rf /', cwd: '/tmp' } })
+      setTimeout(() => { send({ method: 'turn/completed', params: { turn: { status: 'completed' } } }); send({ id, result: {} }) }, 400)
+    `)
+    const answer = seen.answers.find((a) => a.id === 903)
+    const decision = (answer?.result as Record<string, unknown> | undefined)?.decision
+    ok(answer !== undefined, `the denial is answered on the wire (${JSON.stringify(seen.answers)})`)
+    ok(decision !== 'reject', `and NOT with "reject", which is in no version of the vocabulary (got ${JSON.stringify(decision)})`)
+    ok(decision === 'decline', `it is the documented partner of "accept" (got ${JSON.stringify(decision)})`)
+  }
+
+  // --- a turn that did NOT succeed --------------------------------------------
+  //
+  // `turn/completed` carries the terminal status. It was ignored, so a turn the
+  // model failed on — a rate limit, a sandbox denial, a model error, which are
+  // the everyday Codex failures — was emitted as `done`. If the agent had
+  // already moved its card to a review column the user then got "ready for you
+  // to test" over work that never finished.
+  {
+    const seen = await drive(dir, `
+      send({ method: 'turn/completed', params: { turn: { status: 'failed', error: { message: 'rate limit exceeded' } } } })
+      send({ id, result: {} })
+    `)
+    ok(!seen.done, 'a FAILED turn is not reported as done')
+    ok(seen.errors.some((e) => /rate limit/.test(e)),
+       `and says what went wrong (${seen.errors.join(' | ') || 'nothing'})`)
+  }
+  {
+    const seen = await drive(dir, `
+      send({ method: 'turn/completed', params: { turn: { status: 'interrupted' } } })
+      send({ id, result: {} })
+    `)
+    ok(!seen.done, 'an INTERRUPTED turn is not reported as done either')
+    ok(seen.interrupted, 'it is reported as interrupted')
+    ok(!seen.errors.length, `and not as a crash (${seen.errors.join(' | ')})`)
+  }
+
   // --- a shape this build does not know ------------------------------------
   // Dropped silently, this is how a transcript quietly loses half its rows.
   {
@@ -215,12 +406,20 @@ async function main(): Promise<void> {
   }
 
   // --- interrupt ------------------------------------------------------------
+  //
+  // The file's header claims interrupt is proved here, and the only assertion
+  // was that nothing errored — which is also true of an interrupt that was
+  // never sent. So this asserts the REQUEST reached the server (the fake writes
+  // INTERRUPTED to stderr when `turn/interrupt` arrives) and that the board's
+  // own state ends up idle rather than stuck at `working`.
   {
     const seen = await drive(dir, `
       // A turn that never ends on its own, so only an interrupt can stop it.
       send({ method: 'turn/started', params: {} })
     `, { interrupt: true })
     ok(!seen.errors.length, `interrupting is not reported as a crash (${seen.errors.join('; ')})`)
+    ok(seen.interruptSent, 'the interrupt actually reached the server, rather than being a no-op')
+    ok(!seen.done, 'and an interrupted turn is NOT reported as a completed one')
   }
 
   await rm(dir, { recursive: true, force: true })

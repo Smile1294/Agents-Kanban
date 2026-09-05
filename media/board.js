@@ -117,6 +117,17 @@
     // than depending on which.
     const active = document.activeElement
     const hadFocus = !!active && String(active.tagName || '').toLowerCase() === 'textarea'
+    /* Where the caret was, not just that there was one.
+       `render()` never read `selectionStart`/`selectionEnd` off the outgoing
+       node, so the only positions available at restore time were 0 and the end
+       — and the author picked the end, which is better than 0 and still wrong.
+       Clicking into the middle of a long draft to fix a word, or drag-selecting
+       a phrase to replace it, was undone by the next frame from ANY card's
+       agent, because repaints are panel-wide. The text was always safe; the
+       position never was. */
+    const caret = active && typeof active.selectionStart === 'number'
+      ? { start: active.selectionStart, end: active.selectionEnd }
+      : null
     // The composer is not the only thing the user types into. An
     // AskUserQuestion picker's "something else" box is destroyed by the same
     // rebuild, and losing it mid-word is worse there, because the agent is
@@ -151,22 +162,22 @@
     // tail. That wins over "where you were", because where you were was the end.
     const sc2 = root.querySelector('.transcript-scroll')
     if (sc2 && stick) sc2.scrollTop = sc2.scrollHeight
-    if (askFocusKey && askFocusNode && askFocusNode.focus) {
-      askFocusNode.focus()
-      if (askFocusNode.setSelectionRange) {
-        const n = (askFocusNode.value || '').length
-        try { askFocusNode.setSelectionRange(n, n) } catch (e) { /* not a real input */ }
-      }
-    }
-    if (hadFocus && composerInput && composerInput.focus) {
-      composerInput.focus()
-      // Put the caret back at the end, or it lands at position 0 and the next
-      // character is typed in front of what is already there.
-      if (composerInput.setSelectionRange) {
-        const n = (composerInput.value || '').length
-        try { composerInput.setSelectionRange(n, n) } catch (e) { /* not a real input */ }
-      }
-    }
+    if (askFocusKey && askFocusNode && askFocusNode.focus) restoreFocus(askFocusNode, caret)
+    if (hadFocus && composerInput && composerInput.focus) restoreFocus(composerInput, caret)
+  }
+
+  /* Give a rebuilt input its focus AND its caret back.
+     Clamped to the current value, because the draft can legitimately be shorter
+     than it was — the host can replace it, and a selection that ran past the
+     end would throw. Falling back to the end preserves the old behaviour for
+     anything that reported no position. */
+  function restoreFocus(node, caret) {
+    node.focus()
+    if (!node.setSelectionRange) return
+    const n = (node.value || '').length
+    const start = caret && Number.isFinite(caret.start) ? Math.min(caret.start, n) : n
+    const end = caret && Number.isFinite(caret.end) ? Math.min(caret.end, n) : start
+    try { node.setSelectionRange(start, end) } catch (e) { /* not a real input */ }
   }
 
   /** Every scroll container currently on screen. They announce themselves with
@@ -197,6 +208,17 @@
    * panel, not about one card, and re-expanding it every time you switch
    * session is the same annoyance in a smaller form.
    */
+  /* A key for a transcript disclosure that is stable ACROSS READS.
+     Not `e.at`: a transcript rehydrated from disk is stamped with the time it
+     was PARSED (a documented open issue), so a timestamp key changes on every
+     reload and the open state would be forgotten anyway. The content does not
+     change, so its length plus a short prefix identifies the block for as long
+     as it exists. */
+  function thinkKey(e) {
+    const s = String(e.text || '')
+    return 'think:' + s.length + ':' + s.slice(0, 24)
+  }
+
   function disclosure(box, key, defaultOpen) {
     box.open = key in disclosed ? disclosed[key] : !!defaultOpen
     if (box.setAttribute) box.setAttribute('data-open', key)
@@ -289,6 +311,13 @@
     rail.append(head)
 
     const search = el('input', 'search')
+    // Announces itself to the focus-restore, like the ask picker's free-text
+    // box. `render()` only ever restored a <textarea>, and this is an <input> —
+    // so typing "auth" while three agents streamed produced "a" in the box and
+    // "uth" nowhere, because `replaceChildren()` moves focus to the body. The
+    // filter TEXT survived (it is module-level); only the focus did not, which
+    // is the same half-fix the composer had.
+    if (search.setAttribute) search.setAttribute('data-focus', 'rail-search')
     search.placeholder = 'Search or type # to filter by tag'
     search.value = filter
     search.oninput = (e) => { filter = e.target.value; renderRailList(list) }
@@ -318,32 +347,66 @@
     return c.title.toLowerCase().includes(q) || c.tags.some((l) => l.toLowerCase().includes(q))
   }
 
+  /* One formatter, built once, and a cache keyed by local day.
+     `toLocaleDateString` constructs a fresh `Intl.DateTimeFormat` on every call,
+     and this ran once per card PLUS once per card per group header — `n + n×g`
+     — with no cap on the list. Measured: 31ms at 30 sessions, 124ms at 60,
+     533ms at 120, 1.65s at 200, on EVERY repaint, and repaints fire per streamed
+     frame. DECISIONS.md already treats 60 sessions as a realistic board, and
+     124ms of date formatting per frame is the same order as the session scan
+     that has its own postmortem. */
+  let dayFmt = null
+  const dayCache = new Map()
   function dayLabel(ms) {
+    if (!Number.isFinite(ms)) return 'Earlier'
     const d = new Date(ms)
     if (Number.isNaN(d.getTime())) return 'Earlier'
+    // The local calendar day is the cache key: every timestamp inside one day
+    // produces the same label, so a 200-session board formats at most once per
+    // distinct day rather than 200 times.
+    const key = d.getFullYear() * 10000 + d.getMonth() * 100 + d.getDate()
+    const hit = dayCache.get(key)
+    if (hit !== undefined) return hit
     const today = new Date(); today.setHours(0, 0, 0, 0)
     const that = new Date(d); that.setHours(0, 0, 0, 0)
     const days = Math.round((today - that) / 86400000)
-    if (days <= 0) return 'Today'
-    if (days === 1) return 'Yesterday'
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    let label
+    if (days <= 0) label = 'Today'
+    else if (days === 1) label = 'Yesterday'
+    else {
+      if (!dayFmt) {
+        try { dayFmt = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }) }
+        catch (e) { dayFmt = null }
+      }
+      label = dayFmt ? dayFmt.format(d) : d.toDateString().slice(4, 10)
+    }
+    // Bounded: "Today" moves at midnight, and an unbounded map in a panel that
+    // stays open for days is a leak. Cleared when it grows past a year's worth.
+    if (dayCache.size > 400) dayCache.clear()
+    dayCache.set(key, label)
+    return label
   }
 
   function renderRailList(list) {
     list.replaceChildren()
     const shown = s.cards.filter(matches).slice().sort((a, b) => b.updated - a.updated)
     if (!shown.length) { list.append(el('div', 'empty', filter ? 'Nothing matches' : 'No sessions yet')); return }
+    // Group labels and their counts in ONE pass. The count used to re-scan the
+    // whole list for every header, which is what made this `n + n×g`.
+    const labels = shown.map((c) => dayLabel(c.updated))
+    const counts = new Map()
+    for (const g of labels) counts.set(g, (counts.get(g) ?? 0) + 1)
     let group = null
-    for (const c of shown) {
-      const g = dayLabel(c.updated)
+    for (let k = 0; k < shown.length; k++) {
+      const g = labels[k]
       if (g !== group) {
         group = g
         const h = el('div', 'rail-group')
         h.append(el('span', null, g))
-        h.append(el('span', 'n', String(shown.filter((x) => dayLabel(x.updated) === g).length)))
+        h.append(el('span', 'n', String(counts.get(g))))
         list.append(h)
       }
-      list.append(renderRailItem(c))
+      list.append(renderRailItem(shown[k]))
     }
   }
 
@@ -485,7 +548,7 @@
     const cls = kind === 'working' || kind === 'starting' ? ' running'
       : kind === 'needsInput' ? ' needs-input'
       : kind === 'error' ? ' failed' : ''
-    const n = el('article', 'card' + cls + (c.archived ? ' archived' : ''))
+    const n = el('article', 'card' + cls + (c.archived ? ' archived' : '') + (c.pinned ? ' pinned' : ''))
     n.draggable = true
     n.addEventListener('dragstart', (e) => {
       dragKey = c.key; n.classList.add('dragging')
@@ -610,7 +673,9 @@
       if (c.agent && ['working', 'starting', 'needsInput'].includes(c.agent.kind)) {
         item('Stop agent', () => post('stop', { id: c.key }))
       }
-      item(c.archived ? 'Unarchive' : 'Archive', () => post('archive', { id: c.key, archived: !c.archived }))
+      // `pinned` was the board's primary sort key with nothing able to set it.
+    item(c.pinned ? 'Unpin' : 'Pin to top', () => post('pin', { id: c.key, pinned: !c.pinned }))
+    item(c.archived ? 'Unarchive' : 'Archive', () => post('archive', { id: c.key, archived: !c.archived }))
       item('Delete permanently…', () => post('remove', { id: c.key }), 'danger')
       wrap.append(menu)
     }
@@ -645,7 +710,11 @@
     const row = el('div', 'agent-row')
     const dot = el('span', 'dot')
     let text = ''
-    if (a.kind === 'starting') { dot.classList.add('pulse'); text = 'starting…' }
+    // Accepted, waiting for a slot. It has no process yet, so it gets no
+    // pulse — a pulse over something that is not running is the signal this
+    // board has a rule about. The age is the number it is derived from.
+    if (a.kind === 'queued') { dot.classList.add('queued'); text = 'queued' }
+    else if (a.kind === 'starting') { dot.classList.add('pulse'); text = 'starting…' }
     else if (a.kind === 'working') {
       dot.classList.add('pulse')
       // A Task can run for minutes. Naming the tool its subagent is on is the
@@ -662,6 +731,11 @@
     // The honest half of the liveness claim. The dot pulses on a CSS timer and
     // would keep pulsing over a wedged process; this is the age of the last
     // thing the CLI actually said, so a stuck run shows a number that climbs.
+    if (a.kind === 'queued' && a.since) {
+      const age = el('span', 'age', ago(a.since))
+      age.title = 'Waiting for a free agent slot. Raise agentsKanban.maxConcurrentAgents to run more at once.'
+      row.append(age)
+    }
     if ((a.kind === 'working' || a.kind === 'starting') && a.lastEventAt) {
       const age = el('span', 'age', since(a.lastEventAt))
       // Read by tickAges() so the number keeps climbing between messages.
@@ -694,9 +768,21 @@
 
   function renderAskPermission(c, p) {
     const ask = el('div', 'ask')
-    ask.append(el('div', 'ask-h', 'Claude wants to run'))
-    const code = el('code'); code.textContent = p.summary
-    ask.append(code)
+    /* The RUNTIME's own sentence when it gave one, and only then our own.
+       This said "Claude wants to run" unconditionally — so a Codex approval,
+       which is the commonest event on Codex's shipped default policy, named the
+       wrong vendor. Codex computes "Codex wants to change 3 files in your
+       worktree" and it was dropped at this boundary, so the dialog that
+       authorises a write to the user's worktree withheld the file count, the
+       file names and the reason all at once. */
+    ask.append(el('div', 'ask-h', p.prompt || 'Claude wants to run'))
+    if (!p.prompt) { const code = el('code'); code.textContent = p.summary; ask.append(code) }
+    // A second request is WAITING, not gone. One slot used to hold them all, so
+    // answering the visible one left the agent blocked on an invisible one
+    // while the card went back to saying "working".
+    if (p.waiting > 1) {
+      ask.append(el('div', 'ask-more', (p.waiting - 1) + ' more waiting after this one'))
+    }
     const actions = el('div', 'row-actions')
     const allow = el('button', 'primary', 'Allow')
     allow.onclick = (e) => { stop(e); post('permission', { id: c.key, requestId: p.id, allow: true }) }
@@ -1225,25 +1311,8 @@
       readouts.append(ctx)
       readoutCount++
     }
-    // `Number.isFinite`, not `typeof`: NaN and Infinity are both numbers, and
-    // "$NaN" on the composer bar is worse than no figure at all.
-    if (Number.isFinite(s.composer.spentUsd)) {
-      const priced = s.composer.spendPriced !== false
-      const spend = el('span', 'spend' + (priced ? '' : ' partial'),
-        (priced ? '' : '≥ ') + fmtUsd(s.composer.spentUsd))
-      /* What the number is, so it can be checked rather than believed — the
-         same reason the activity indicator shows an age instead of a pulse.
-         It is arithmetic on the token counts in the transcript, not a figure
-         handed to us: input, output, cache writes and cache reads, each at its
-         model's published rate. A live run checks itself against the CLI's own
-         `total_cost_usd` at the end of every turn and warns in the output
-         channel if the two disagree. */
-      spend.title = priced
-        ? 'Total spend this session, priced from the token counts in its transcript'
-        : 'At least this much: a model in this session has no published rate here, so its tokens are uncounted'
-      readouts.append(spend)
-      readoutCount++
-    }
+    const spend = renderMeter(s.composer.meter)
+    if (spend) { readouts.append(spend); readoutCount++ }
     if (readoutCount) bar.append(readouts)
     wrap.append(bar)
 
@@ -1442,6 +1511,17 @@
   }
 
   function providerName() {
+    /* The RUNNING agent's answer wins over the profile we asked for.
+       `resolvedProvider` and `providerLabel` are what the CLI reported it is
+       ACTUALLY on — a managed settings file, an `apiKeyHelper` or an env block
+       in `~/.claude/settings.json` all outrank our request. The host has
+       computed both onto every card since the feature was written and the view
+       read neither, so the chip could only ever repeat our own configuration
+       back, which is the decorative readout the rule about this names. */
+    const live = selected() && selected().agent
+    if (live && (live.providerLabel || live.resolvedProvider)) {
+      return live.providerLabel || live.resolvedProvider
+    }
     const id = s.composer.provider
     const p = (s.composer.providers || []).find((x) => x.id === id)
     if (!p) return 'Provider'
@@ -1588,6 +1668,86 @@
     if (usd < 0.01) return '$' + usd.toFixed(3)
     if (usd < 100) return '$' + usd.toFixed(2)
     return '$' + Math.round(usd)
+  }
+
+  /* What this session has consumed, in the unit its runtime can actually
+     justify — three cases, because there are three different claims.
+
+     This used to be `if (Number.isFinite(spentUsd))` over a dollar figure, and
+     only ONE runtime emits dollars: every Codex session arrived with a zero and
+     the bar read `$0.00` over a card that had spent 13% of a five-hour window.
+     A `Meter` is a union for exactly that reason, and `unknown` renders as an
+     em dash and NEVER as zero — "we could not read it" is not "nothing was
+     spent". Returns null when there is no reading at all, so the chip is absent
+     rather than empty.
+
+     Every branch shows the number the indicator is derived from, and says in
+     its tooltip where that number came from, so it can be checked rather than
+     believed. */
+  function renderMeter(m) {
+    if (!m || typeof m !== 'object') return null
+    if (m.kind === 'usd') {
+      // `Number.isFinite`, not `typeof`: NaN and Infinity are both numbers, and
+      // "$NaN" on the composer bar is worse than no figure at all.
+      if (!Number.isFinite(m.spentUsd)) return null
+      const priced = m.priced !== false
+      const chip = el('span', 'spend' + (priced ? '' : ' partial'),
+        (priced ? '' : '≥ ') + fmtUsd(m.spentUsd))
+      /* It is arithmetic on the token counts in the transcript, not a figure
+         handed to us: input, output, cache writes and cache reads, each at its
+         model's published rate. A live run checks itself against the CLI's own
+         `total_cost_usd` at the end of every turn and warns in the output
+         channel if the two disagree. */
+      chip.title = priced
+        ? 'Total spend this session, priced from the token counts in its transcript'
+        : 'At least this much: a model in this session has no published rate here, so its tokens are uncounted'
+      return chip
+    }
+    if (m.kind === 'plan') {
+      if (!Number.isFinite(m.usedPercent)) return null
+      const bits = [Math.round(m.usedPercent) + '% of ' + fmtWindow(m.windowMinutes)]
+      if (m.plan) bits.push(String(m.plan))
+      const chip = el('span', 'spend plan', bits.join(' · '))
+      /* The reset time is the actionable half: a percentage with no reset
+         cannot be planned around. */
+      const resets = Number.isFinite(m.resetsAt) ? fmtResets(m.resetsAt) : '';
+      chip.title = 'This session is billed by subscription, so it has no per-request price. '
+        + 'This is how much of the rate-limit window it has used'
+        + (resets ? ', resetting ' + resets : '')
+        + (m.secondary && Number.isFinite(m.secondary.usedPercent)
+            ? ' — and ' + Math.round(m.secondary.usedPercent) + '% of '
+              + fmtWindow(m.secondary.windowMinutes)
+            : '')
+        + '.'
+      return chip
+    }
+    if (m.kind === 'unknown') {
+      const chip = el('span', 'spend unknown', '—')
+      chip.title = 'This session\'s runtime did not report what it has consumed. '
+        + 'Not zero — unknown.'
+      return chip
+    }
+    return null
+  }
+
+  /* A rate-limit window as the service states it: minutes in, "5h" or "7d" out. */
+  function fmtWindow(minutes) {
+    if (!Number.isFinite(minutes) || minutes <= 0) return '?'
+    if (minutes % 1440 === 0) return (minutes / 1440) + 'd'
+    if (minutes % 60 === 0) return (minutes / 60) + 'h'
+    return minutes + 'm'
+  }
+
+  /* Unix SECONDS — what the services report — never milliseconds.
+     Its own arithmetic rather than fmtDuration, which is built for a tool call
+     and would render a two-hour window as "120m 0s". */
+  function fmtResets(atSeconds) {
+    const mins = Math.round((atSeconds * 1000 - Date.now()) / 60000)
+    if (!Number.isFinite(mins)) return ''
+    if (mins <= 0) return 'now'
+    if (mins < 60) return 'in ' + mins + 'm'
+    const h = Math.floor(mins / 60)
+    return 'in ' + h + 'h' + (mins % 60 ? ' ' + (mins % 60) + 'm' : '')
   }
 
   // ------------------------------------------------------- transcript rows
@@ -1818,12 +1978,39 @@
         }
       }
       if (ch === 'h' && (str.startsWith('http://', i) || str.startsWith('https://', i)) && (i === 0 || /[\s(\["'<]/.test(str[i - 1]))) {
-        const url = BARE_URL.exec(str.slice(i))[0].replace(/[.,;:!?'"]+$/, '')
-        flush()
-        const a = el('a', null, url); a.href = url
-        out.push(a)
-        i += url.length
-        continue
+        /* The guard and the extraction were two DIFFERENT predicates, and the
+           gap between them was a blank panel.
+
+           `startsWith('https://')` is satisfied by the scheme alone; BARE_URL
+           needs `[^\s<>()[\]]+` — at least one character after it, and not one
+           of those. So `exec` returned null and `null[0]` threw a TypeError,
+           which unwound through inline() → mdBlocks() → renderMarkdown() →
+           renderChat() → render() — and render() calls replaceChildren() before
+           it builds anything, so the tree was already empty. Nothing catches it:
+           the whole chat view went blank with no transcript, no rail, no
+           composer and no error, and it re-threw on every subsequent frame
+           because the text was in Claude Code's on-disk transcript.
+
+           Five real strings did it, not just a bare scheme — verified against
+           the real board.js: "https:// followed by a host", a line ending in
+           "http://", "(http://)", `https://<your-gateway-host>/v1` (the
+           placeholder this extension's own provider documentation uses), and
+           `https://[::1]:8080`, which is a perfectly valid IPv6 URL.
+
+           So: match first, and fall through to the literal-text path when there
+           is nothing to link. `continue` is deliberately NOT taken here — the
+           tail of the loop emits the character as text and advances, which is
+           what makes an unlinkable scheme render as the characters the agent
+           actually wrote. */
+        const um = BARE_URL.exec(str.slice(i))
+        if (um) {
+          const url = um[0].replace(/[.,;:!?'"]+$/, '')
+          flush()
+          const a = el('a', null, url); a.href = url
+          out.push(a)
+          i += url.length
+          continue
+        }
       }
       let matched = false
       for (const [mark, tag] of MARKS) {
@@ -1873,7 +2060,16 @@
       }
       case 'text': return block('Claude Agent', e.at, renderMarkdown(e.text))
       case 'thinking': {
-        const d = el('details', 'thinking')
+        /* Through disclosure(), like every other <details>. These two were the
+           only ones that were not, so `forEachDisclosure()` — which selects
+           `[data-open]` — never harvested them and never restored them. Opening
+           one lasted until the next streamed frame, which is the documented
+           "it keeps reopening, I want it toggled by me only" postmortem in the
+           two places its fix was never applied. It bites harder here than it
+           did on Changes and the test plan, because the panel whose content the
+           user is trying to read is the one being streamed into.
+           Keyed by entry, so two thinking blocks are independent. */
+        const d = disclosure(el('details', 'thinking'), thinkKey(e), false)
         const sum = el('summary', null, 'Thought for a moment')
         d.append(sum, el('div', 'thinking-body', e.text))
         return d
@@ -1906,7 +2102,7 @@
         // the main thread stays readable, and "what is it actually doing in
         // there" is one click away instead of unanswerable.
         if (e.children && e.children.length) {
-          const d = el('details', 'subagent')
+          const d = disclosure(el('details', 'subagent'), 'subagent:' + (e.id || thinkKey(e)), false)
           const n = e.children.length
           const tools = e.children.filter((k) => k.kind === 'tool').length
           d.append(el('summary', null,
@@ -1929,6 +2125,9 @@
         const v = el('span', 'v')
         v.append(phaseChip(e.from), el('span', 'arrow', '→'), phaseChip(e.to))
         t.append(el('span', 'k', 'Phase'), v)
+        // The agent's own line about why. `set_phase` has always asked for one
+        // and the handler dropped it, so every move was explained into nothing.
+        if (e.note) box.append(el('div', 'phase-note', e.note))
         box.append(t)
         return box
       }

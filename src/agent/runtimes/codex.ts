@@ -125,16 +125,39 @@ export function codexPermissions(mode: PermissionMode): { approvalPolicy: string
     // Read-only and ask before anything else: the planning stance.
     case 'plan':
       return { approvalPolicy: 'on-request', sandbox: 'read-only' }
-    // Let it edit its own worktree without a click, still ask for commands.
+    /* Edits go through without a click, and so — on Codex — do commands.
+       This row used to say "still ask for commands", and `on-failure` does not:
+       it runs everything inside the sandbox WITHOUT asking and escalates only
+       when something it tried has already FAILED. The adapter says as much two
+       rows down, for `auto`. Codex has no policy that auto-accepts patches
+       while prompting for commands, so the honest options were a true label or
+       a true mapping — and the mapping is the one the sandbox makes safe: every
+       command runs inside the session's own worktree, which is the boundary the
+       one-worktree-per-session design draws. So the COMMENT is corrected rather
+       than the policy, and `extension.ts`'s user-facing detail with it. */
     case 'acceptEdits':
       return { approvalPolicy: 'on-failure', sandbox: 'workspace-write' }
-    // The user has said "stop asking". `dontAsk` is the SDK's newer spelling of
-    // the same intent and maps to the same place — mapping it to the default
-    // instead would mean a board set to "never prompt me" still prompting, but
-    // only on Codex cards.
+    // The user has explicitly escalated: bypass the checks. `danger-full-access`
+    // is the honest Codex equivalent, and the SDK gates the Claude side behind
+    // `allowDangerouslySkipPermissions` for the same reason.
     case 'bypassPermissions':
-    case 'dontAsk':
       return { approvalPolicy: 'never', sandbox: 'danger-full-access' }
+    /* `dontAsk` is NOT the same intent, and treating it as one inverted it.
+       The SDK's own `.d.ts` defines it as "Don't prompt for permissions, DENY
+       if not pre-approved" — deny-by-default, the opposite of
+       `bypassPermissions`' "Bypass all permission checks". It shared that row,
+       so a user who picked "stop prompting me, and refuse anything I have not
+       allowed" silently handed Codex `danger-full-access`: no prompts AND the
+       filesystem sandbox removed, so the agent could leave its own worktree —
+       which is the one boundary the whole one-worktree-per-session design
+       exists to draw, and which `agentsKanban.permissionMode`'s own manifest
+       description tells the user is in force.
+       There is no exact Codex analogue of "deny unless pre-approved", so this
+       takes the half that is expressible and keeps it: never prompt, and stay
+       inside the worktree. Strictly safer than the previous row, and it does
+       not claim to be the same thing. */
+    case 'dontAsk':
+      return { approvalPolicy: 'never', sandbox: 'workspace-write' }
     // `auto` lets the runtime decide. Codex's own judgement lives in
     // `on-failure`: it acts, and asks when something it tried was refused.
     case 'auto':
@@ -434,8 +457,19 @@ export class CodexSession extends EventEmitter implements AgentRun {
         return
       // Usage. Codex sends this as its own notification on some versions and
       // inside turn/completed on others; both land here.
+      //
+      // `threadtokenusageupdated` is `thread/tokenUsage/updated`, which is the
+      // name the app-server actually publishes — confirmed against
+      // codex-rs/app-server/README.md. It was missing, and the two spellings
+      // that were here are the exec-era ones, so on a real app-server run
+      // `onUsage()` never ran ONCE: no `usage` event, so the context bar showed
+      // nothing all turn, and no `meter` event, so a session burning a
+      // rate-limit window read as `—`. This adapter is built around the premise
+      // that another runtime's protocol WILL drift; it drifted on the one
+      // notification carrying both numbers the board shows.
       case 'tokencount':
       case 'threadtokencount':
+      case 'threadtokenusageupdated':
         this.onUsage(params)
         return
       case 'error': {
@@ -542,6 +576,36 @@ export class CodexSession extends EventEmitter implements AgentRun {
         if (m) this.emit('text', `\n⚠️ ${m}\n`)
         return
       }
+      /* The compaction boundary, and it has to reset the meter.
+         Same trap as the Claude path's `compact_boundary`: after a compaction
+         there is no further usage frame until the next response, so a meter
+         left alone stays pinned at the PRE-compaction figure — which reads as a
+         session about to run out of context when it has just been given most of
+         it back. The store's own parse already draws a divider for
+         `context_compacted` for this reason; the live path drew nothing and
+         reset nothing. */
+      case 'contextcompaction': {
+        if (done) {
+          this.emit('usage', 0, this.contextWindow)
+          this.emit('text', '\n— context compacted —\n')
+        }
+        return
+      }
+      /* Deliberately ignored, and each for a stated reason — NOT a blanket
+         ignore list, because the unknown-kind alarm is this adapter's only
+         defence against real schema drift and widening it would delete that.
+
+         `userMessage` is the most ordinary item in the protocol: the docs list
+         it as a `ThreadItem` and `item/*` fires for it at the start of every
+         turn. It was unhandled, so EVERY healthy Codex turn ended with a
+         warning toast saying rows were missing from the transcript — and the
+         claim was false, because the board renders the user's prompt from its
+         own composer. A drift alarm that fires on every good turn is one the
+         user has learned to dismiss by the time it matters. */
+      case 'usermessage':
+      case 'enteredreviewmode':
+      case 'exitedreviewmode':
+        return
       default:
         if (type) this.unknownMethods.add(`item:${String(pick(item, 'type', 'kind'))}`)
     }
@@ -596,11 +660,47 @@ export class CodexSession extends EventEmitter implements AgentRun {
     }
   }
 
+  /**
+   * The turn ended — and this has to read HOW.
+   *
+   * `turn/completed` carries the final turn state, and its `status` is
+   * `completed`, `interrupted` or `failed`; the app-server documents an
+   * interrupt as finishing the turn "with `status: 'interrupted'`". This
+   * handler read none of it: every terminal turn went idle and emitted `done`,
+   * so a turn the model FAILED on — a rate limit, a sandbox denial, a model
+   * error, which are the everyday Codex failures — was recorded as a success.
+   * If the agent had already moved its own card to a review column, the user
+   * then got "ready for you to test" for work that never finished.
+   *
+   * The `turn/failed` case in `onNotification` was the intended path for that
+   * and it is unreachable: there is no such notification, a failure arrives
+   * inside this one. It is kept as a second accepted spelling rather than
+   * deleted, on the same principle as reading both item spellings.
+   */
   private onTurnCompleted(params: Record<string, unknown>): void {
-    const usage = pick<Record<string, unknown>>(params, 'usage')
+    // `{ turn }` on the app-server, flat on the exec surface — read both.
+    const turn = pick<Record<string, unknown>>(params, 'turn') ?? params
+    const usage = pick<Record<string, unknown>>(params, 'usage') ?? pick<Record<string, unknown>>(turn, 'usage')
     if (usage) this.onUsage({ info: { last_token_usage: usage } })
     this.reportUnknown()
     this.clearPending()
+
+    const status = normKind(pick(turn, 'status'))
+    if (status === 'failed') {
+      const e = pick<Record<string, unknown>>(turn, 'error')
+      this.fail(new Error(String(pick(e, 'message') ?? 'Codex reported a failed turn.')))
+      this.finalText = ''
+      return
+    }
+    if (status === 'interrupted') {
+      // The board's own vocabulary for "the user stopped it", and deliberately
+      // NOT `done`: a stopped turn that reports success is the same class of
+      // lie as a killed run that does not say so.
+      this.setState({ kind: 'idle' })
+      this.emit('interrupted')
+      this.finalText = ''
+      return
+    }
     this.setState({ kind: 'idle' })
     this.emit('done', this.finalText, this._meter)
     this.finalText = ''
@@ -638,10 +738,19 @@ export class CodexSession extends EventEmitter implements AgentRun {
   private onRequest(req: IncomingRequest): void {
     this.touch()
     const kind = normKind(req.method)
-    const toolName =
-      kind === 'execcommandapproval' ? 'Bash'
-      : kind === 'applypatchapproval' ? 'Edit'
-      : undefined
+    /* BOTH generations of the name, because these were RENAMED and not merely
+       respelled — which is the one kind of drift `normKind()` cannot bridge.
+       The exec/MCP era sent `execCommandApproval` and `applyPatchApproval`; the
+       app-server sends `item/commandExecution/requestApproval` and
+       `item/fileChange/requestApproval`. Only the old pair was recognised, so
+       on a current server every approval was answered with a JSON-RPC ERROR
+       before any human saw it — while `capabilities.approvals` told the board
+       this runtime's permission prompts mean something. The prompt could not
+       fire at all, and Codex got an error where it expected a decision, so the
+       command simply did not run. */
+    const isExec = kind === 'execcommandapproval' || kind === 'itemcommandexecutionrequestapproval'
+    const isPatch = kind === 'applypatchapproval' || kind === 'itemfilechangerequestapproval'
+    const toolName = isExec ? 'Bash' : isPatch ? 'Edit' : undefined
 
     if (!toolName) {
       req.fail(`Agents Kanban does not implement ${req.method}.`)
@@ -649,7 +758,7 @@ export class CodexSession extends EventEmitter implements AgentRun {
       return
     }
 
-    const input: Record<string, unknown> = kind === 'execcommandapproval'
+    const input: Record<string, unknown> = isExec
       ? {
           command: String(pick(req.params, 'command') ?? ''),
           ...(pick(req.params, 'cwd') ? { cwd: pick(req.params, 'cwd') } : {}),
@@ -662,7 +771,7 @@ export class CodexSession extends EventEmitter implements AgentRun {
 
     const id = `codex-${++this.permissionSeq}`
     this.permissions.set(id, { req, toolName })
-    const prompt = kind === 'execcommandapproval'
+    const prompt = isExec
       ? `Codex wants to run: ${String(input.command).slice(0, 300)}`
       : `Codex wants to change ${changeCount(input.changes)} in your worktree`
     this.emit('permission', {
@@ -679,10 +788,22 @@ export class CodexSession extends EventEmitter implements AgentRun {
     const held = this.permissions.get(id)
     if (!held) return false
     this.permissions.delete(id)
-    // Codex's own vocabulary. `accept` / `reject` are what the protocol takes;
-    // the board's Allow / Deny never leaks into the wire format.
+    /* Codex's own vocabulary, and the DENY arm was not in it.
+       The published decisions are `accept` / `acceptForSession` / `decline` /
+       `cancel`. `reject` — what this sent — is in no version of the
+       vocabulary, so Deny posted a value the server cannot deserialise: the
+       turn errored or blocked rather than the command being refused, and the
+       board had already dropped the request and gone back to `working`, so
+       there was nothing left to answer. Deny was a control that could not say
+       no.
+       `decline` is the documented partner of the `accept` this already sends.
+       Stated honestly: the accept arm is unverified against a live server — the
+       older snake_case `ReviewDecision` surface spells these
+       `approved`/`denied` — but `reject` is wrong in BOTH vocabularies, so this
+       is strictly a correction rather than a guess. A real Codex run is what
+       settles which pair is in force. */
     held.req.respond({
-      decision: allow ? 'accept' : 'reject',
+      decision: allow ? 'accept' : 'decline',
       ...(reason && !allow ? { reason } : {}),
     })
     this.setState({ kind: 'working' })
@@ -990,7 +1111,7 @@ export const codexRuntime: AgentRuntime = {
     if (!location) {
       throw new Error(
         'Codex was not found on this machine. Install it with `npm install -g @openai/codex` and ' +
-        'sign in with `codex login`, or set `agentsKanban.codexPath`.',
+        'sign in with `codex login`, or set `agentsKanban.codexExecutable`.',
       )
     }
     return new CodexSession({ ...spec, location })

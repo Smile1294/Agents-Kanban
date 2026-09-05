@@ -301,3 +301,8 @@ button.primary:hover { background: var(--vscode-button-hoverBackground); }
   min-width: 0;
   padding-top: 4px;
 }
+
+/* How old a login reading is. Past a minute it is marked stale: the honest
+   claim is then "this is what it said", not "this is how it is". */
+.small { font-size: 0.88em; }
+.stale { font-style: italic; opacity: 0.8; }

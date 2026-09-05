@@ -6,7 +6,7 @@
    would have gone stale at exactly the moment a split is most visible. One
    pointer per child is a fact that MetaStore.rename() repoints; this file
    guards the other half, the derivation. */
-import { linkSubtasks, subtaskProgress, type SubtaskLinkable } from '../subtasks.ts'
+import { linkSubtasks, rollUpState, subtaskProgress, type SubtaskLinkable } from '../subtasks.ts'
 import { DEFAULT_BOARD, type BoardConfig } from '../config.ts'
 
 let fails = 0
@@ -101,5 +101,48 @@ const card = (key: string, phase: string, over: Partial<SubtaskLinkable> = {}): 
      'subtasks keep the order they appear in, not their phase order')
 }
 
-console.log(fails === 0 ? 'PASS — the subtask thread is derived and holds' : `${fails} FAILURES`)
+// --- the roll-up, which is a NOTIFICATION and shipped wrong ------------------
+//
+// The host counted a parent's children by asking the sidecar which sessions
+// name it — and a subtask held behind `maxConcurrentAgents` is not in the
+// sidecar at all, because `start()` queues it in memory and returns before
+// `launch()` writes anything. `MAX_SUBTASKS` is 4 and the concurrency default
+// is 3, so the last piece of a four-way split is ALWAYS queued. The result was
+// "All 2 subtasks are ready for you to test" over a four-way split in which two
+// agents had never run.
+{
+  const B = DEFAULT_BOARD
+  ok(rollUpState([], undefined, B).kind === 'notSplit', 'a card with no children was never split')
+
+  // THE BUG, exactly: two settled children of a four-way split.
+  const half = rollUpState(['validating', 'validating'], 4, B)
+  ok(half.kind === 'pending',
+     `two settled children of a FOUR-way split is not ready (got ${half.kind})`)
+  ok(half.kind === 'pending' && half.onBoard === 2 && half.approved === 4,
+     'and it can say which numbers it is comparing')
+
+  ok(rollUpState(['validating', 'implementing', 'validating', 'validating'], 4, B).kind === 'working',
+     'all four present but one still working is not ready either')
+  const done = rollUpState(['validating', 'complete', 'validating', 'validating'], 4, B)
+  ok(done.kind === 'ready', `all four settled IS ready (got ${done.kind})`)
+  ok(done.kind === 'ready' && done.total === 4,
+     `and the number it reports is the number that was approved (${done.kind === 'ready' ? done.total : '—'})`)
+
+  // "Settled" is review OR done, so a parent whose pieces the user already
+  // approved one by one still reaches full.
+  ok(rollUpState(['complete', 'complete'], 2, B).kind === 'ready',
+     'children the user has already approved still count as settled')
+
+  // More children than approved cannot happen, but must not deadlock if it
+  // does — a parent that can never roll up is a card nobody will ever move.
+  ok(rollUpState(['validating', 'validating', 'validating'], 2, B).kind === 'ready',
+     'more children than approved still rolls up rather than waiting forever')
+
+  // A split made before `fanout` existed has no approved count, and the old
+  // count-what-exists behaviour is the best available for it.
+  ok(rollUpState(['validating', 'validating'], undefined, B).kind === 'ready',
+     'a split with no recorded intent falls back to counting what exists')
+}
+
+console.log(fails === 0 ? 'PASS — the subtask thread is derived, and the roll-up counts what was approved' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

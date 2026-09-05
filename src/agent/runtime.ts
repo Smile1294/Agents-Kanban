@@ -258,6 +258,63 @@ export type Meter =
  *  have to spell the shape out. */
 export const NO_SPEND: Meter = { kind: 'usd', spentUsd: 0, priced: true }
 
+/**
+ * Read a `Meter` back from an untyped boundary.
+ *
+ * Parsed, never cast — the same rule as `parseRuntimeId` and
+ * `parseCachedChoices`, and for the same reason, except that here the untyped
+ * boundary is an `EventEmitter` rather than storage. `EventEmitter.on()` is
+ * untyped, so an emitter and its listener can disagree about a payload and tsc
+ * sees nothing; that is not hypothetical, it is the bug this function exists
+ * because of. `session.ts` emitted `done` with a bare `number` while
+ * `codex.ts` emitted a `Meter`, the manager's listener declared
+ * `costUsd?: number`, and `media/board.js` called `.toFixed(2)` on the
+ * result — a throw inside `render()`, which is a silently blank panel, on the
+ * first real Codex run.
+ *
+ * Returns `undefined` for anything it cannot read, which the caller must treat
+ * as "no reading" and SAY SO. It deliberately does not fall back to
+ * `{ kind: 'unknown' }`: that is a reading which reports that the runtime does
+ * not know, and minting one here would turn a protocol fault into a number the
+ * board displays as if it had been measured.
+ */
+export function parseMeter(raw: unknown): Meter | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const m = raw as Record<string, unknown>
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined
+  if (m.kind === 'usd') {
+    const spentUsd = num(m.spentUsd)
+    // `priced` defaults to TRUE on absence, matching every producer here — but
+    // an explicit `false` must survive, because it is what turns the readout
+    // into a floor (`≥ $1.23`) instead of a total.
+    return spentUsd === undefined ? undefined : { kind: 'usd', spentUsd, priced: m.priced !== false }
+  }
+  if (m.kind === 'plan') {
+    const usedPercent = num(m.usedPercent)
+    const windowMinutes = num(m.windowMinutes)
+    if (usedPercent === undefined || windowMinutes === undefined) return undefined
+    const secondary = m.secondary as Record<string, unknown> | undefined
+    const sUsed = secondary ? num(secondary.usedPercent) : undefined
+    const sWindow = secondary ? num(secondary.windowMinutes) : undefined
+    return {
+      kind: 'plan', usedPercent, windowMinutes,
+      ...(typeof m.plan === 'string' ? { plan: m.plan } : {}),
+      ...(num(m.resetsAt) !== undefined ? { resetsAt: num(m.resetsAt)! } : {}),
+      ...(sUsed !== undefined && sWindow !== undefined
+        ? {
+            secondary: {
+              usedPercent: sUsed, windowMinutes: sWindow,
+              ...(num(secondary!.resetsAt) !== undefined ? { resetsAt: num(secondary!.resetsAt)! } : {}),
+            },
+          }
+        : {}),
+    }
+  }
+  if (m.kind === 'unknown') return { kind: 'unknown' }
+  return undefined
+}
+
 // ---------------------------------------------------------------------------
 // A run
 // ---------------------------------------------------------------------------
@@ -296,11 +353,44 @@ export interface RunEvents {
   usage: (contextTokens: number, contextWindow: number | undefined) => void
   meter: (m: Meter) => void
   committed: () => void
-  permission: (req: RunPermissionRequest & { resolve: (allow: boolean, reason?: string) => void }) => void
+  /**
+   * A tool call is waiting on the user.
+   *
+   * NO `resolve` on the payload, and that is a correction. It was declared here
+   * as `resolve(allow, reason)` while `AgentSession` shipped
+   * `resolve(PermissionResult)` — two runtimes, two incompatible signatures on
+   * one declared event, and `EventEmitter` cannot see the difference. Nothing
+   * calls either one: both consumers answer through
+   * `AgentRun.answerPermission(id, …)`, which is the single typed route and
+   * the only one the webview can reach anyway, since a closure cannot cross a
+   * `postMessage`. A contract that describes two different things is worse than
+   * one that describes less.
+   */
+  permission: (req: RunPermissionRequest) => void
   sessionId: (id: string) => void
   provider: (resolved: string | undefined, label: string | undefined) => void
   flagWarning: (message: string) => void
-  done: (summary: string, meter?: Meter) => void
+  /**
+   * The turn ended.
+   *
+   * Three arguments, and the split between the last two is the whole point.
+   * `meter` is what the SESSION has consumed, in the unit its runtime can
+   * justify — the final settle of the same figure the `meter` event publishes
+   * as it goes. `turnUsd` is what THIS TURN cost in dollars, which is a
+   * different claim at a different scope, and is **absent** for a runtime that
+   * has no per-request price at all. Absent means "no such concept", as it does
+   * for `RuntimeModel.supportedEffort` and every `RuntimeCapabilities` member.
+   *
+   * They were one argument, and that is exactly how they drifted: `session.ts`
+   * put a bare `number` in the slot, `codex.ts` put a `Meter` in it, the
+   * manager's listener declared `costUsd?: number`, and the webview called
+   * `.toFixed(2)` on whatever arrived. `EventEmitter.on()` is untyped, so
+   * nothing in the type system could see it. Both consumers now go through
+   * `parseMeter()`, and `codex.test.ts` asserts the payload satisfies this
+   * signature — a contract that is declared and unenforced is a contract that
+   * will drift again.
+   */
+  done: (summary: string, meter?: Meter, turnUsd?: number) => void
   error: (message: string) => void
 }
 

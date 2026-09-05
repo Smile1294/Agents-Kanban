@@ -9,7 +9,7 @@
  * in the terminal appears here, and a session started here resumes in the CLI.
  */
 import { loadSdk, type SDKSessionInfo } from '../agent/sdk.ts'
-import { MetaStore, type SessionMeta, type TestPlan } from './meta.ts'
+import { CLEAR_TEST_PLAN, MetaStore, type SessionMeta, type TestPlan } from './meta.ts'
 import { emptyTotals, summariseUsage, type UsageMessage, type UsageTotals } from './usage.ts'
 import { allRuntimes, getRuntime, type HistoricSession, type Meter, type RuntimeHistory, type RuntimeId } from '../agent/runtime.ts'
 
@@ -96,7 +96,7 @@ export type Entry =
        *  collapsed, so the main thread stays readable but the work is there. */
       children?: Entry[]
     }
-  | { kind: 'phase'; at: number; from: string; to: string }
+  | { kind: 'phase'; at: number; from: string; to: string; note?: string }
   | { kind: 'result'; at: number; summary: string; durationMs?: number; costUsd?: number }
   | { kind: 'notice'; at: number; message: string; urgency: 'info' | 'blocked' }
   | { kind: 'error'; at: number; message: string }
@@ -318,7 +318,9 @@ export class SessionStore {
    * card at all. The sidecar is keyed by whatever the board calls the run, so
    * it always has an answer.
    */
-  async card(key: string): Promise<{ phase: string; tags: string[]; testPlan?: TestPlan; parent?: string }> {
+  async card(
+    key: string,
+  ): Promise<{ phase: string; tags: string[]; testPlan?: TestPlan; parent?: string; fanout?: number }> {
     // The sidecar first, and usually only. setPhase/setTags/setTestPlan write
     // ONLY to meta, so it is authoritative for all three fields — while get()
     // costs a listSessions() scan of every Claude Code project. This is the hot
@@ -330,6 +332,9 @@ export class SessionStore {
         phase: m.phase, tags: m.tags,
         ...(m.testPlan ? { testPlan: m.testPlan } : {}),
         ...(m.parent ? { parent: m.parent } : {}),
+        // How many subtasks this card was split into, so the roll-up can tell
+        // "every child is settled" from "every child that has a card yet".
+        ...(m.fanout ? { fanout: m.fanout } : {}),
       }
     }
     return { phase: this.defaultPhase, tags: [] }
@@ -506,7 +511,14 @@ export class SessionStore {
       // window's bound is applied below, to the TAIL. The usage total needs
       // every message anyway, and this parse is cached on the file's identity,
       // so a finished session is read once and never again.
-      all = await getSessionMessages(id)
+      // `includeSystemMessages: true` — the compact boundary is a SYSTEM
+      // record, and the SDK gates those behind this option. Without it
+      // `summariseUsage` could never see one, so a session read back from disk
+      // reported its PRE-compaction context fill: a card that says it is nearly
+      // out of window when the compaction just gave most of it back. That is
+      // the same trap the live path has an explicit reset for; the disk path
+      // could not even observe it.
+      all = await getSessionMessages(id, { includeSystemMessages: true })
     } catch {
       return { entries: [], usage: emptyTotals() }
     }
@@ -608,6 +620,27 @@ export class SessionStore {
   async setTestPlan(id: string, testPlan: TestPlan): Promise<void> {
     await this.meta.update(id, { testPlan }, this.defaultPhase)
   }
+  /** Retract a test plan. Through the `CLEAR_TEST_PLAN` sentinel, because a
+   *  patch drops `undefined` and so cannot unset anything — the same reason
+   *  `worktree` clears with `''` and `running` with `0`. */
+  async clearTestPlan(id: string): Promise<void> {
+    await this.meta.update(id, { testPlan: CLEAR_TEST_PLAN })
+    this.invalidate()
+  }
+
+
+  /**
+   * Pin a session to the top of its column.
+   *
+   * `pinned` was parsed on read, carried into `BoardSession`, forwarded to the
+   * webview and used as the PRIMARY SORT KEY below — and nothing in the
+   * extension could ever set it. A sort key nobody can change is a control that
+   * does not exist, dressed as one that does.
+   */
+  async setPinned(id: string, pinned: boolean): Promise<void> {
+    await this.meta.update(id, { pinned }, this.defaultPhase)
+    this.invalidate()
+  }
 
   async setTags(id: string, tags: string[]): Promise<void> {
     await this.meta.update(id, { tags }, this.defaultPhase)
@@ -638,6 +671,26 @@ export class SessionStore {
    * Claude Code's copy survives, because a card we cannot delete is worse than
    * a stale transcript.
    */
+  /**
+   * Drop a sidecar entry for a run that never became a session.
+   *
+   * Deliberately NOT `delete()`: there is no session to delete, only a board
+   * entry keyed by a run id that nothing will ever look up again. `delete()`
+   * would call Claude Code's `deleteSession` on a run id and report a failure
+   * that means nothing.
+   *
+   * Without this those entries were immortal — `MetaStore.remove` is reachable
+   * only through `delete()`, and the host's delete handler skips run-id keys.
+   * A subtask that died before its id arrived therefore stayed in
+   * `childrenOf()` forever, in a phase that is never settled, so its parent's
+   * roll-up could never fire again.
+   */
+  async forget(key: string): Promise<void> {
+    await this.meta.remove(key)
+    this.invalidate()
+    this.transcripts.delete(key)
+  }
+
   async delete(id: string): Promise<{ deleted: boolean; reason?: string }> {
     const { deleteSession, getSessionInfo } = await loadSdk()
     let reason: string | undefined
@@ -671,10 +724,31 @@ export class SessionStore {
    *  "Session <id> not found in any project directory" — a warning popup on
    *  every new session, for a condition that fixes itself in well under a
    *  second. */
-  async rename(id: string, title: string): Promise<void> {
+  async rename(id: string, title: string): Promise<{ renamed: boolean; reason?: string }> {
+    // `renameSession` is CLAUDE CODE's API and knows only Claude Code's JSONL
+    // store. A Codex thread id is a uuid, so it passed the SDK's uuid guard and
+    // then failed the store lookup with "not found in any project directory" —
+    // which matches `retryWhileMissing`'s pattern, so every call burned ~3.5s
+    // of backoff and then threw.
+    //
+    // That was not cosmetic. It threw on three paths at once: the adoption path
+    // fired a warning toast on EVERY Codex session start, four seconds in, on a
+    // card that was in fact registered and working; the agent's own `set_title`
+    // came back as a tool error naming a store its session was never in, while
+    // the live card had visibly taken the new name; and the user's own rename
+    // from the board failed as an error dialog. A signal that can only ever say
+    // "bad" is as useless as one that can only say "good".
+    //
+    // Refused rather than attempted, and it returns the reason instead of
+    // throwing, so a caller can say something true. `RuntimeHistory` has no
+    // `rename` member — a runtime that owns its own session names is a real
+    // thing, and inventing one here would be the abstraction leaking.
+    const runtime = await this.runtimeOf(id)
+    if (runtime) return { renamed: false, reason: 'this agent owns its own session names' }
     const { renameSession } = await loadSdk()
     await retryWhileMissing(() => renameSession(id, title))
     this.invalidate()
+    return { renamed: true }
   }
 }
 

@@ -123,8 +123,11 @@ export const claudeRuntime: AgentRuntime = {
    * Deliberately thin: `agent/models.ts` already owns discovery, its cache and
    * the three-source fallback, and duplicating that here is the "two functions
    * that both know how to fall back" bug this project has a rule about. The
-   * settings page asks `models.ts`; this exists so the contract is complete and
-   * a caller that only has a runtime can still get an answer.
+   * settings page asks `models.ts` — and for a while it did NOT, taking this
+   * path for every runtime and therefore always reporting the built-in three
+   * while blaming the CLI for not answering. It now special-cases `claude`;
+   * this exists so the contract is complete and a caller that only has a
+   * runtime can still get an answer.
    */
   async models(): Promise<ModelCatalogue> {
     return { models: builtin(), source: 'builtin' }

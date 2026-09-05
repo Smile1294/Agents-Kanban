@@ -35,9 +35,21 @@ export interface AskOption {
 }
 
 export interface AskQuestion {
-  /** The full question. Doubles as the key in the `answers` record, which is
-   *  how the tool matches an answer to its question. */
+  /** The full question, as shown. Trimmed for display. */
   question: string
+  /**
+   * The question text EXACTLY as the model wrote it, and the key the answer is
+   * filed under.
+   *
+   * The SDK's contract is "question text -> answer string", and the tool
+   * matches on the string it sent. `question` is trimmed for display, so a
+   * model that wrote `"Which library?\n"` — trailing whitespace is ordinary in
+   * generated JSON — got an answer filed under a key that did not match, the
+   * tool reported that nobody had answered, and the agent invented the decision
+   * it had deliberately stopped to ask about. That is precisely the failure
+   * this module exists to prevent, reintroduced by a `.trim()`.
+   */
+  key: string
   /** Short chip shown beside the question, e.g. "Auth method". */
   header: string
   multiSelect: boolean
@@ -66,6 +78,8 @@ export function parseAskQuestions(toolName: string, input: unknown): AskQuestion
     const r = entry as Record<string, unknown>
     const question = text(r.question)
     if (!question) continue
+    // The RAW string is the identity; the trimmed one is only for display.
+    const key = typeof r.question === 'string' ? r.question : question
 
     const options: AskOption[] = []
     for (const o of Array.isArray(r.options) ? r.options : []) {
@@ -79,6 +93,7 @@ export function parseAskQuestions(toolName: string, input: unknown): AskQuestion
 
     out.push({
       question,
+      key,
       header: text(r.header) || 'Question',
       multiSelect: r.multiSelect === true,
       options,
@@ -101,6 +116,8 @@ export function buildAskAnswers(
 ): Record<string, string> {
   const answers: Record<string, string> = {}
   for (const q of questions) {
+    // Keyed on the DISPLAYED text, because that is what the webview posts back
+    // — it never sees the raw one.
     const picked = selections[q.question]
     if (!Array.isArray(picked)) continue
     // Deduplicated, because the picker offers a free-text box *as well as* the
@@ -112,7 +129,8 @@ export function buildAskAnswers(
       if (v && !clean.includes(v)) clean.push(v)
     }
     if (!clean.length) continue
-    answers[q.question] = q.multiSelect ? clean.join(', ') : clean[0]!
+    // Filed under the RAW text, because that is what the tool matches on.
+    answers[q.key] = q.multiSelect ? clean.join(', ') : clean[0]!
   }
   return answers
 }

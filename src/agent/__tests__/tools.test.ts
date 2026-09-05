@@ -53,6 +53,30 @@ for (const n of ASKS_FIRST) {
 }
 ok(allTools.length === names.length + ASKS_FIRST.size, 'every board tool is either auto-allowed or asks first')
 
+// `reason` reaches the handler. Its schema promises "Shown when they approve the
+// split", and the handler called `ctx.onSplit(args.subtasks ?? [])` — so the one
+// sentence explaining why a card became four billed agents reached nothing at
+// all, and the approval prompt rendered the bare string `split_task`.
+{
+  const seen: { subtasks: unknown[]; reason: string }[] = []
+  const [splitTool] = buildBoardTools(DEFAULT_BOARD, ctxFor({
+    onSplit: async (subtasks, reason) => {
+      seen.push({ subtasks, reason })
+      return { ok: true, started: [{ key: 'k', title: 't', branch: 'b' }] }
+    },
+  }), tool).filter((x) => x.name === 'split_task')
+  const two = [
+    { title: 'Add SSO', prompt: 'Add SSO.' },
+    { title: 'Fix the test', prompt: 'Fix it.' },
+  ]
+  await (splitTool as unknown as { handler: (a: unknown, e: unknown) => Promise<unknown> })
+    .handler({ reason: 'Two unrelated jobs.', subtasks: two }, {})
+  ok(seen.length === 1, `split_task reaches the host once (${seen.length})`)
+  ok(seen[0]?.reason === 'Two unrelated jobs.',
+     `and carries the agent's own reason, rather than dropping it (${JSON.stringify(seen[0]?.reason)})`)
+  ok(seen[0]?.subtasks.length === 2, 'alongside the subtasks themselves')
+}
+
 for (const n of names) {
   ok(n.startsWith('mcp__board__'), `${n} is namespaced the way the model sees it`)
   // The built-in set must NOT contain them: they are passed per session, from
@@ -85,6 +109,75 @@ const ctx: BoardToolContext = {
 /** By NAME, never by position: this file adds tools, and a positional
  *  destructure silently hands the tests the wrong one when it does. */
 const byName = (list: ReturnType<typeof buildBoardTools>, name: string) => list.find((t) => t.name === name)
+
+// `set_phase`'s `note` reaches the board. Its own description promises "shown
+// on the board" and the handler dropped it, so the model was invited to explain
+// every move and wrote into nothing.
+{
+  let phase = 'implementing'
+  const changes: unknown[] = []
+  const ctxNote = ctxFor({
+    store: {
+      get: async () => ({ phase, tags: [] }),
+      card: async () => ({ phase, tags: [] }),
+      childrenOf: async () => [],
+      setPhase: async (_id: string, p: string) => { phase = p },
+      setTags: async () => {}, setTestPlan: async () => {}, clearTestPlan: async () => {},
+      list: async () => [],
+    } as never,
+    onChanged: (c) => { changes.push(c) },
+  })
+  const sp = byName(buildBoardTools(DEFAULT_BOARD, ctxNote, tool), 'set_phase')
+  await (sp as unknown as { handler: (a: unknown, e: unknown) => Promise<unknown> })
+    .handler({ phase: 'planning', note: 'Backing out: the migration needs a decision first.' }, {})
+  const c = changes[0] as { note?: string } | undefined
+  ok(c?.note === 'Backing out: the migration needs a decision first.',
+     `the note travels with the move (${JSON.stringify(c?.note)})`)
+
+  // Bounded HOST-side: a length asked for in a description is not a limit.
+  changes.length = 0
+  phase = 'implementing'
+  await (sp as unknown as { handler: (a: unknown, e: unknown) => Promise<unknown> })
+    .handler({ phase: 'planning', note: 'x'.repeat(5000) }, {})
+  const long = changes[0] as { note?: string } | undefined
+  ok((long?.note?.length ?? 0) <= 200,
+     `and is bounded where it can be enforced, not where it is described (${long?.note?.length})`)
+}
+
+// Leaving a review column retracts the plan that got it there.
+{
+  let phase = 'validating'
+  let cleared = 0
+  const plan = { summary: 'run it', steps: ['npm test'], links: [], at: 1 }
+  const ctxPlan = ctxFor({
+    store: {
+      get: async () => ({ phase, tags: [] }),
+      card: async () => ({ phase, tags: [], testPlan: plan }),
+      childrenOf: async () => [],
+      setPhase: async (_id: string, p: string) => { phase = p },
+      setTags: async () => {}, setTestPlan: async () => {},
+      clearTestPlan: async () => { cleared++ },
+      list: async () => [],
+    } as never,
+  })
+  const sp = byName(buildBoardTools(DEFAULT_BOARD, ctxPlan, tool), 'set_phase')
+  const call = (a: unknown) =>
+    (sp as unknown as { handler: (x: unknown, e: unknown) => Promise<unknown> }).handler(a, {})
+
+  await call({ phase: 'implementing' })
+  ok(cleared === 1, `moving OUT of review retracts the stale test plan (${cleared})`)
+
+  // And it must not fire on a move that keeps the card in review, or on a move
+  // that carries a fresh plan.
+  cleared = 0
+  phase = 'implementing'
+  await call({ phase: 'planning' })
+  ok(cleared === 0, 'a move between non-review columns clears nothing')
+  phase = 'validating'
+  await call({ phase: 'implementing', howToTest: { summary: 's', steps: ['x'] } })
+  ok(cleared === 0, 'and a move that supplies a NEW plan keeps it rather than clearing it')
+}
+
 const built = buildBoardTools(DEFAULT_BOARD, ctx, tool)
 const setPhase = byName(built, 'set_phase')
 const setTags = byName(built, 'set_tags')
@@ -143,7 +236,7 @@ ok(!(await run(openPhase!, { phase: 'b' })).isError, 'a board without an approva
 // so it gets to say — and it must not need permission to fix a name.
 {
   const renames: string[] = []
-  const titleCtx: BoardToolContext = { ...ctx, onRename: (t) => { renames.push(t) } }
+  const titleCtx: BoardToolContext = { ...ctx, onRename: (t) => { renames.push(t); return { renamed: true } } }
   const setTitle = byName(buildBoardTools(DEFAULT_BOARD, titleCtx, tool), 'set_title')
   ok(!!setTitle, 'set_title exists')
 
@@ -176,7 +269,7 @@ ok(!(await run(openPhase!, { phase: 'b' })).isError, 'a board without an approva
         setPhase: async (_id: string, next: string) => { p = next },
         setTags: async () => {}, setTestPlan: async () => {}, list: async () => [],
       } as never,
-      onRename: () => {},
+      onRename: () => ({ renamed: true }),
       derivedTitle: () => 'Okay.',
     }
     const phaseTool = byName(buildBoardTools(DEFAULT_BOARD, nudged, tool), 'set_phase')

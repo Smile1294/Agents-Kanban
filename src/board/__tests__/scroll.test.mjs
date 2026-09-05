@@ -157,5 +157,79 @@ raced.deliver({ ...panelState, disclosures: { testplan: false }, streaming: 'a f
 ok(details(raced.root, 'testplan').open === true,
    'and the host\'s older copy never reopens — or closes — what the user just clicked')
 
-console.log(fails ? `\n${fails} FAILURES` : '\nPASS — a repaint leaves scroll positions and closed panels alone')
+// --- the two disclosures the fix was never applied to ------------------------
+//
+// `thinking` and `subagent` were the only <details> in the file that did not go
+// through `disclosure()`. `forEachDisclosure()` selects `[data-open]`, so
+// neither was harvested and neither was restored — opening one lasted until the
+// next streamed frame. That is the documented "it keeps reopening, I want it
+// toggled by me only" postmortem, in the two places its fix never reached, and
+// it bites harder here: the panel whose content the user is trying to read is
+// the one being streamed into.
+{
+  const chatState = {
+    ...state, mode: 'chat', selectedKey: 'k0',
+    transcript: [
+      { kind: 'thinking', at: 1, text: 'weighing two designs against each other' },
+      {
+        kind: 'tool', at: 2, id: 'call_1', name: 'Task', summary: 'Task explore', status: 'ok',
+        children: [{ kind: 'text', at: 3, text: 'subagent said something' }],
+      },
+    ],
+  }
+  const v = run(chatState)
+  const find = (cls) => walk(v.root).find((n) => n.tagName === 'details' && (n.className || '').includes(cls))
+  for (const cls of ['thinking', 'subagent']) {
+    const d = find(cls)
+    ok(!!d, `the ${cls} disclosure is drawn`)
+    ok(d && d.getAttribute('data-open'), `and carries a key, so a repaint can restore it (${d && d.getAttribute('data-open')})`)
+    // Open it the way a user does, then let an agent produce a frame.
+    d.open = true
+    if (d.ontoggle) d.ontoggle()
+  }
+  v.deliver({ ...chatState, streaming: 'another token' })
+  for (const cls of ['thinking', 'subagent']) {
+    const d = find(cls)
+    ok(d && d.open === true, `the ${cls} panel the user opened is STILL open after a streamed frame`)
+  }
+}
+
+// --- the rail's search box keeps the focus ----------------------------------
+//
+// `render()` restored focus only to a <textarea>, and the search box is an
+// <input>. `replaceChildren()` moves focus to the body, so typing "auth" while
+// an agent streamed put "a" in the box and the rest nowhere. The filter TEXT
+// survived — it is module-level — which is exactly the half-fix the composer
+// had before `data-focus`.
+{
+  const v = run({ ...state, mode: 'chat', selectedKey: 'k0', transcript: [] })
+  const search = walk(v.root).find((n) => (n.className || '').includes('search'))
+  ok(!!search, 'the rail has a search box')
+  ok(search && search.getAttribute('data-focus') === 'rail-search',
+     `and announces itself to the focus restore (${search && search.getAttribute('data-focus')})`)
+}
+
+// --- the caret survives, not just the draft ---------------------------------
+//
+// The restore never read `selectionStart`, so the only positions available were
+// 0 and the end. Clicking into the middle of a draft to fix a word was undone by
+// the next frame from ANY card's agent, because repaints are panel-wide.
+{
+  const v = run({ ...state, mode: 'chat', selectedKey: 'k0', transcript: [] })
+  const ta = walk(v.root).find((n) => n.tagName === 'textarea')
+  ok(!!ta, 'the composer has a textarea')
+  ta.value = 'fix the login flow please'
+  if (ta.oninput) ta.oninput({ target: ta })
+  // The user clicks into the middle and selects a word.
+  ta.selectionStart = 8
+  ta.selectionEnd = 13
+  v.document.activeElement = ta
+  v.deliver({ ...state, mode: 'chat', selectedKey: 'k0', transcript: [], streaming: 'a frame' })
+  const after = walk(v.root).find((n) => n.tagName === 'textarea')
+  ok(after && after.value === 'fix the login flow please', 'the draft survives the repaint')
+  ok(after && after.selectionStart === 8 && after.selectionEnd === 13,
+     `and so does the caret and selection (${after && after.selectionStart}-${after && after.selectionEnd}, wanted 8-13)`)
+}
+
+console.log(fails ? `\n${fails} FAILURES` : '\nPASS — a repaint leaves scroll positions, open panels, focus and the caret alone')
 process.exit(fails ? 1 : 0)

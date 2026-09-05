@@ -1,25 +1,72 @@
-/* Exercises the store against Claude Code's REAL session data. This is the
-   assumption the whole rewrite rests on, so it is checked against disk rather
-   than a mock. */
+/* Exercises the store against Claude Code's REAL session format — and against a
+   SEEDED one, not against whatever happens to be on this laptop.
+
+   It used to read the developer's own `~/.claude` and wrap two thirds of itself
+   in `if (list.length)`. Both halves were wrong in the same direction. On a
+   machine with no Claude Code sessions for this directory — CI, a fresh clone,
+   a colleague — twenty-five assertions silently did not run and the file still
+   printed a pass; CLAUDE.md's own rule says "a gate that skips is not a gate".
+   And on a machine that HAS them it mutated them: it set a phase, added tags
+   and archived the developer's real first session.
+
+   So it seeds a transcript into a throwaway `CLAUDE_CONFIG_DIR`, exactly as
+   `smoke.mjs` does, and the guard becomes an assertion. The encoding of the
+   project directory is the fiddly part and is the reason this is worth copying
+   rather than inventing: the session's cwd with every character that is not a
+   letter or a digit replaced by `-`, applied to the REALPATH. */
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { MetaStore } from '../meta.ts'
-import { SessionStore, interruptedSessions, summariseTool, type BoardSession } from '../store.ts'
+
+const claudeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-store-claude-'))
+const prevConfig = process.env.CLAUDE_CONFIG_DIR
+process.env.CLAUDE_CONFIG_DIR = claudeHome
+
+const { MetaStore } = await import('../meta.ts')
+const { SessionStore, interruptedSessions, summariseTool } = await import('../store.ts')
+type BoardSession = import('../store.ts').BoardSession
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-sess-'))
-const repo = process.cwd()
+const repo = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ck-sess-repo-')))
+
+// One real session, in Claude Code's real on-disk format, with KNOWN contents.
+const SEEDED_ID = '99999999-8888-7777-6666-555555555555'
+{
+  const projectDir = path.join(claudeHome, 'projects', repo.replace(/[^a-zA-Z0-9]/g, '-'))
+  await fs.mkdir(projectDir, { recursive: true })
+  const common = {
+    sessionId: SEEDED_ID, cwd: repo,
+    isSidechain: false, userType: 'external', version: '2.0.0', gitBranch: 'main',
+  }
+  await fs.writeFile(path.join(projectDir, `${SEEDED_ID}.jsonl`), [
+    { ...common, type: 'user', uuid: 'u1', parentUuid: null,
+      timestamp: new Date(1e12).toISOString(),
+      message: { role: 'user', content: 'add a health check' } },
+    { ...common, type: 'assistant', uuid: 'a1', parentUuid: 'u1',
+      timestamp: new Date(1e12 + 1000).toISOString(),
+      message: {
+        id: 'msg_store', model: 'claude-opus-5', role: 'assistant', type: 'message',
+        content: [{ type: 'text', text: 'Looking at the routes.' }],
+        usage: { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      } },
+  ].map((l) => JSON.stringify(l)).join('\n') + '\n')
+}
+
 const store = new SessionStore(repo, new MetaStore(tmp, repo))
 
 const list = await store.list()
 ok(Array.isArray(list), 'list() returns sessions from Claude Code without throwing')
-console.log(`      (${list.length} real session(s) found for ${repo})`)
+// An ASSERTION, not a guard. If the SDK ever changes where it looks, this goes
+// red and names it rather than skipping the rest of the file.
+ok(list.length === 1,
+   `the seeded session is found — the SDK's project-directory encoding still holds (${list.length})`)
+ok(list.some((s) => s.id === SEEDED_ID), 'and it is the one that was seeded')
 
-if (list.length) {
-  const first = list[0]!
+{
+  const first = list.find((s) => s.id === SEEDED_ID)!
   ok(typeof first.id === 'string' && first.id.length > 8, 'session has a real id')
   ok(typeof first.title === 'string' && first.title.length > 0, `title resolved: ${JSON.stringify(first.title.slice(0, 40))}`)
   ok(first.phase === 'planning', 'a session with no metadata gets the default phase')
@@ -266,6 +313,15 @@ ok(outcome.reason === undefined, 'and no spurious warning to show the user')
   ok(interruptedSessions([card('x', { running: 0 })], []).size === 0,
      'zero is how the mark is CLEARED, so it must not read as running')
 }
+
+// Put the environment back and take the throwaway trees with us. A test that
+// leaves CLAUDE_CONFIG_DIR pointing at a deleted directory poisons whatever
+// runs next in the same process.
+if (prevConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+else process.env.CLAUDE_CONFIG_DIR = prevConfig
+await fs.rm(claudeHome, { recursive: true, force: true })
+await fs.rm(repo, { recursive: true, force: true })
+await fs.rm(tmp, { recursive: true, force: true })
 
 console.log(fails === 0 ? 'PASS — the board reads Claude Code\'s real sessions' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

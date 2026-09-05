@@ -110,5 +110,32 @@ ok(
 )
 
 
+// --- the answer KEY is the model's own string, not the trimmed one ----------
+//
+// The SDK's contract is "question text -> answer string", and the tool matches
+// on the string it sent. `question` is trimmed for display, and that trimmed
+// value was used as the key — so a model that wrote trailing whitespace (which
+// is ordinary in generated JSON) got its answer filed under a key that did not
+// match, the tool reported nobody had answered, and the agent invented the
+// decision it had deliberately stopped to ask about. That is the exact failure
+// this module exists to prevent, reintroduced by a `.trim()`.
+{
+  const raw = 'Which library should we use?\n'
+  const qs = parseAskQuestions('AskUserQuestion', {
+    questions: [{ question: raw, header: 'Library', multiSelect: false, options: [{ label: 'date-fns' }, { label: 'luxon' }] }],
+  })
+  ok(qs?.length === 1, 'the question parses')
+  ok(qs![0]!.question === 'Which library should we use?', 'the DISPLAYED text is trimmed')
+  ok(qs![0]!.key === raw, `and the KEY is the model's own string, untouched (${JSON.stringify(qs![0]!.key)})`)
+
+  // The webview posts back the displayed text — it never sees the raw one — so
+  // the lookup uses that and the answer is filed under the raw key.
+  const answers = buildAskAnswers(qs!, { 'Which library should we use?': ['luxon'] })
+  ok(answers[raw] === 'luxon',
+     `the answer is filed under the key the tool matches on (${JSON.stringify(Object.keys(answers))})`)
+  ok(answers['Which library should we use?'] === undefined,
+     'and NOT under the trimmed one, which the tool would never look up')
+}
+
 console.log(fails === 0 ? 'PASS — questions parse, answers build, and junk input degrades to Allow/Deny' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

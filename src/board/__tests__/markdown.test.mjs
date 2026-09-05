@@ -108,6 +108,43 @@ const inside = (root, tag, ancestorTag) =>
   ok(!!findByTag(r.root, 'a', (n) => n.href === 'https://bare.example/path'), 'a bare URL is linked, without the trailing full stop')
 }
 
+// --- a scheme the bare-URL matcher cannot finish ----------------------------------
+//
+// The guard was `startsWith('https://')` and the extraction was
+// `/^https?:\/\/[^\s<>()[\]]+/` — two different predicates. Every string below
+// satisfies the first and fails the second, so `exec()` returned null,
+// `null[0]` threw a TypeError, and because `render()` calls
+// `replaceChildren()` before it builds anything, the whole chat view went blank
+// — no transcript, no rail, no composer, no error — and threw again on every
+// frame, because the text was in Claude Code's on-disk transcript.
+//
+// The last two are the ones that matter: neither is malformed.
+// `https://<your-gateway-host>/v1` is the placeholder this extension's own
+// provider documentation uses, and `https://[::1]:8080` is a valid URL.
+for (const [text, why] of [
+  ['set it to https:// followed by your host', 'a bare scheme mid-sentence'],
+  ['the endpoint is http://', 'a scheme at the end of a line'],
+  ['see (http://) for the format', 'a scheme in brackets'],
+  ['use https://<your-gateway-host>/v1', 'an angle-bracket placeholder host'],
+  ['listening on https://[::1]:8080', 'a valid IPv6 literal'],
+]) {
+  let threw = null
+  let r = null
+  try { r = md(text) } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+  ok(threw === null, `${why} does not throw and blank the panel${threw ? `: ${threw}` : ''}`)
+  ok(r !== null && r.root.children.length > 0, `${why} still renders a tree`)
+  // The characters the agent wrote are shown, since there is no link to make.
+  ok(r !== null && r.text().includes(text.split(' ').find((w) => w.includes('://')) ?? '!'),
+     `${why} is shown as the text it is`)
+}
+// And the IPv6 one must not become a link to a truncated host, which would be
+// worse than not linking it: a URL that goes somewhere else.
+{
+  const r = md('listening on https://[::1]:8080')
+  ok(!findByTag(r.root, 'a', (n) => String(n.href) === 'https://'),
+     'and never becomes a link to the scheme alone')
+}
+
 // --- raw HTML is text, full stop ---------------------------------------------------
 {
   const r = md('<img src=x onerror=alert(1)> and <b>bold</b> and <script>alert(2)</script>')

@@ -91,7 +91,35 @@ function loginRow(card) {
       row.appendChild(el('span', 'muted', login.reason || ''))
       break
   }
+  /* WHEN this was read.
+     `RuntimeStatus.at` crossed the postMessage boundary and was rendered by
+     nothing, so a "Signed in" tick from an hour ago — before the token expired,
+     before `codex login` was run, before the CLI was uninstalled — looked
+     exactly like one taken a second ago. A settings page is precisely where a
+     green tick gets painted because a config file exists, and this page's own
+     contract says a state it did not read must not be asserted. The AGE is the
+     number the readout is derived from, which is the same rule the board's
+     frame-age indicator follows.
+     Past a minute it is marked stale rather than merely old: at that point the
+     honest claim is "this is what it said", not "this is how it is". */
+  if (st.at) {
+    const ageMs = Date.now() - st.at
+    const age = el('span', 'muted small' + (ageMs > 60_000 ? ' stale' : ''), 'checked ' + since(st.at))
+    age.title = 'When this was last read from the agent. Press Check to ask again.'
+    row.appendChild(age)
+  }
   return row
+}
+
+/** "just now", "3m ago" — the age of a reading, so it can be judged. */
+function since(at) {
+  const secs = Math.max(0, Math.round((Date.now() - at) / 1000))
+  if (secs < 10) return 'just now'
+  if (secs < 60) return secs + 's ago'
+  const mins = Math.round(secs / 60)
+  if (mins < 60) return mins + 'm ago'
+  const hours = Math.round(mins / 60)
+  return hours < 24 ? hours + 'h ago' : Math.round(hours / 24) + 'd ago'
 }
 
 function whereRow(card) {
