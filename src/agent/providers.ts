@@ -361,7 +361,7 @@ export const PROVIDER_KINDS: ProviderKindDef[] = [
   {
     kind: 'gateway',
     label: 'Custom endpoint or gateway',
-    blurb: 'Anything serving the Anthropic Messages API: an LLM gateway, a self-hosted proxy, or a local model behind a translation proxy.',
+    blurb: 'Anything serving the Anthropic Messages API: OpenRouter, Ollama, llama.cpp, vLLM, an enterprise gateway, or a translation proxy in front of something that only speaks OpenAI.',
     support: 'gateway',
     docs: 'https://code.claude.com/docs/en/llm-gateway-connect',
     fields: [
@@ -439,14 +439,86 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     needs: 'A Claude Platform workspace subscribed through AWS Marketplace, and its workspace id.',
     profile: { label: 'Claude on AWS', kind: 'anthropicAws' },
   },
+  // ---------------------------------------------------------------------
+  // Direct — these serve the Anthropic Messages API themselves
+  //
+  // This group used to say "(via proxy)" and point at localhost:3456. That was
+  // true when it was written and is not any more: OpenRouter, Ollama,
+  // llama.cpp and vLLM have all added a native `/v1/messages` endpoint, so
+  // Claude Code talks to them directly. Telling someone to install and run a
+  // translation proxy they no longer need is worse than saying nothing — it is
+  // an afternoon of setup for a problem that was fixed upstream.
+  //
+  // `disableBetas` stays on for all of them. They RE-IMPLEMENT the Anthropic
+  // API rather than being it, so the `anthropic-beta` header is the thing they
+  // are most likely to reject, and that failure (`Unexpected value(s) for the
+  // anthropic-beta header`) is the single most common way one of these looks
+  // broken. Off by default is recoverable; on by default is a support thread.
+  // ---------------------------------------------------------------------
   {
-    id: 'litellm',
-    label: 'LiteLLM proxy',
-    needs: 'A LiteLLM proxy you run, with its Anthropic-format endpoint enabled.',
+    id: 'openrouter',
+    label: 'OpenRouter',
+    needs:
+      'An OpenRouter API key. No proxy: OpenRouter serves an Anthropic-compatible ' +
+      '/v1/messages endpoint, so Claude Code talks to it directly. Set the model ids to the ' +
+      'OpenRouter slugs you want (`anthropic/claude-sonnet-4.5`, `openai/gpt-5.1`, …).',
     profile: {
-      label: 'LiteLLM', kind: 'gateway',
-      baseUrl: 'http://localhost:4000', authStyle: 'bearer',
-      disableNonessentialTraffic: true,
+      label: 'OpenRouter', kind: 'gateway',
+      // `/api`, not `/api/v1`. Claude Code's SDK appends `/v1/messages` itself,
+      // so the `/v1` that OpenRouter's OpenAI-compatible base URL carries would
+      // be doubled — a 404 that reads as "OpenRouter is down".
+      baseUrl: 'https://openrouter.ai/api',
+      // Bearer, and this is not a preference: OpenRouter authenticates with
+      // `Authorization: Bearer`, which is what ANTHROPIC_AUTH_TOKEN sends.
+      // ANTHROPIC_API_KEY sends `x-api-key`, so a correct key in that variable
+      // is a 401 that looks like a bad key. `envForProfile` drops the other
+      // variable entirely, which is what OpenRouter's own docs ask for when
+      // they say to blank ANTHROPIC_API_KEY out.
+      authStyle: 'bearer',
+      disableBetas: true, disableNonessentialTraffic: true,
+    },
+  },
+  {
+    id: 'ollama',
+    label: 'Ollama (local)',
+    needs:
+      'Ollama running locally. No proxy — recent Ollama serves the Anthropic Messages API ' +
+      'itself. The credential is ignored but must not be empty; `ollama` is what their docs use.',
+    profile: {
+      label: 'Ollama', kind: 'gateway',
+      baseUrl: 'http://localhost:11434',
+      authStyle: 'bearer',
+      disableBetas: true, disableNonessentialTraffic: true,
+      contextWindow: 128_000,
+    },
+  },
+  {
+    id: 'llamacpp',
+    label: 'llama.cpp (local)',
+    needs:
+      '`llama-server` running locally. No proxy — llama.cpp serves /v1/messages natively, ' +
+      'converting to its own pipeline internally. Any non-empty credential will do.',
+    profile: {
+      label: 'llama.cpp', kind: 'gateway',
+      baseUrl: 'http://127.0.0.1:8080',
+      authStyle: 'bearer',
+      disableBetas: true, disableNonessentialTraffic: true,
+      contextWindow: 128_000,
+    },
+  },
+  {
+    id: 'vllm',
+    label: 'vLLM / self-hosted',
+    needs:
+      'Your own vLLM server. No proxy — vLLM serves /v1/messages alongside its OpenAI routes. ' +
+      'One caveat worth knowing: the RUST frontend (VLLM_USE_RUST_FRONTEND=1) does not serve ' +
+      'that route, so this needs the Python one.',
+    profile: {
+      label: 'Self-hosted', kind: 'gateway',
+      baseUrl: 'http://localhost:8000',
+      authStyle: 'bearer',
+      disableBetas: true, disableNonessentialTraffic: true,
+      contextWindow: 128_000,
     },
   },
   {
@@ -459,59 +531,34 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
       authStyle: 'apiKey',
     },
   },
+
+  // ---------------------------------------------------------------------
+  // Translators — for a server that only speaks the OpenAI format
+  //
+  // Still needed, but for a much narrower case than before: an endpoint with
+  // no Anthropic route of its own. If yours is in the group above, you do not
+  // want these.
+  // ---------------------------------------------------------------------
+  {
+    id: 'litellm',
+    label: 'LiteLLM proxy (translator)',
+    needs:
+      'A LiteLLM proxy you run, with its Anthropic-format endpoint enabled. Only needed for a ' +
+      'backend that serves no /v1/messages route of its own.',
+    profile: {
+      label: 'LiteLLM', kind: 'gateway',
+      baseUrl: 'http://localhost:4000', authStyle: 'bearer',
+      disableNonessentialTraffic: true,
+    },
+  },
   {
     id: 'claude-code-router',
-    label: 'claude-code-router (any model)',
-    needs: 'claude-code-router running locally. It translates Anthropic requests to OpenAI, Gemini, DeepSeek, OpenRouter and Ollama.',
+    label: 'claude-code-router (translator)',
+    needs:
+      'claude-code-router running locally. Translates Anthropic requests to the OpenAI format, ' +
+      'with per-task routing. Only needed for a backend with no Anthropic route of its own.',
     profile: {
       label: 'Router', kind: 'gateway',
-      baseUrl: 'http://localhost:3456', authStyle: 'bearer',
-      disableBetas: true, disableNonessentialTraffic: true,
-    },
-  },
-  {
-    id: 'ollama',
-    label: 'Ollama (local, via proxy)',
-    needs: 'Ollama, plus a translation proxy in front of it — Ollama speaks the OpenAI format and Claude Code speaks Anthropic’s.',
-    profile: {
-      label: 'Ollama', kind: 'gateway',
-      baseUrl: 'http://localhost:3456', authStyle: 'bearer',
-      disableBetas: true, disableNonessentialTraffic: true,
-      contextWindow: 128_000,
-    },
-  },
-  {
-    id: 'vllm',
-    label: 'vLLM / self-hosted (via proxy)',
-    needs: 'Your own inference server, plus a translation proxy that exposes an Anthropic Messages endpoint.',
-    profile: {
-      label: 'Self-hosted', kind: 'gateway',
-      baseUrl: 'http://localhost:8000', authStyle: 'bearer',
-      disableBetas: true, disableNonessentialTraffic: true,
-      contextWindow: 128_000,
-    },
-  },
-  {
-    id: 'openai',
-    label: 'OpenAI / Codex (via proxy)',
-    needs:
-      'A translation proxy in front of OpenAI — Claude Code speaks the Anthropic Messages API and ' +
-      'OpenAI does not serve it. Quickest: `litellm --model openai/<model>` (listens on :4000 and ' +
-      'serves /v1/messages), or claude-code-router with an openai provider. Your OpenAI key goes ' +
-      'in the PROXY\u2019s config; the credential here is whatever the proxy itself requires.',
-    profile: {
-      label: 'OpenAI', kind: 'gateway',
-      baseUrl: 'http://localhost:4000', authStyle: 'bearer',
-      disableBetas: true, disableNonessentialTraffic: true,
-      contextWindow: 200_000,
-    },
-  },
-  {
-    id: 'openrouter',
-    label: 'OpenRouter (via proxy)',
-    needs: 'A translation proxy pointed at OpenRouter. Claude Code cannot call OpenRouter’s OpenAI-format API directly.',
-    profile: {
-      label: 'OpenRouter', kind: 'gateway',
       baseUrl: 'http://localhost:3456', authStyle: 'bearer',
       disableBetas: true, disableNonessentialTraffic: true,
     },
@@ -671,13 +718,20 @@ export function validateProfile(profile: ProviderProfile): string[] {
       // carries the fix because "invalid URL" alone would send the user back
       // to retyping the same URL.
       if (url && /^https?:\/\/([^/]*\.)?(openai\.com|chatgpt\.com)([/:]|$)/i.test(url)) {
+        // Three fixes, in the order they are worth trying, because "invalid
+        // URL" alone sends the user back to retyping the same URL. Two of the
+        // three did not exist when this check was written: Codex is now a
+        // runtime on this board, and OpenRouter serves an Anthropic-compatible
+        // endpoint directly.
         out.push(
           'That is OpenAI\u2019s own API, which speaks a different protocol — Claude Code sends ' +
-          'Anthropic Messages requests, and openai.com does not serve them. With an OpenAI API KEY, ' +
-          'run a translation proxy (LiteLLM or claude-code-router) with the key in ITS config and ' +
-          'point this base URL at the proxy, e.g. http://localhost:4000. A ChatGPT or Codex ' +
-          'SUBSCRIPTION cannot be used this way at all: Codex is its own coding agent, a sibling of ' +
-          'Claude Code, not an API this extension can call.',
+          'Anthropic Messages requests, and openai.com does not serve them. Three ways round it, ' +
+          'best first: (1) run the session on the CODEX agent instead — pick it from the composer ' +
+          'bar; it is OpenAI\u2019s own coding agent and takes your ChatGPT subscription or your ' +
+          'API key, with no endpoint to configure. (2) Use OpenRouter, which does serve ' +
+          '/v1/messages — base URL https://openrouter.ai/api, with GPT models by their OpenRouter ' +
+          'slug. (3) With an OpenAI API KEY only, run a translation proxy (LiteLLM or ' +
+          'claude-code-router) with the key in ITS config and point this at the proxy.',
         )
       }
       break

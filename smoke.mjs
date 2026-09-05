@@ -694,7 +694,13 @@ console.log('\n— providers: the picker, and where the credential goes')
   // Drive the real "Add a provider" flow through the real command, answering
   // the quick pick and every input box the way a person would.
   const CREDENTIAL = 'sk-smoke-secret-value'
-  ctl.quickPick = (items) => items.find((i) => i.label === 'LiteLLM proxy')
+  // Matched by PREFIX, not by the full label. The parenthetical after a preset
+  // name is prose — it went from "LiteLLM proxy" to "LiteLLM proxy
+  // (translator)" when OpenRouter and Ollama stopped needing one — and an
+  // exact match turns that copy edit into a silent no-op: the pick returns
+  // undefined, the whole add-a-provider flow does nothing, and six assertions
+  // below fail with "0 entry" pointing at nothing in particular.
+  ctl.quickPick = (items) => items.find((i) => i.label.startsWith('LiteLLM proxy'))
   ctl.inputBox = (opts) => {
     const t = String(opts?.title ?? '')
     if (t.includes('Base URL')) return 'http://localhost:4000'

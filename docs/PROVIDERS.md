@@ -63,25 +63,66 @@ different ones.
 | **Custom endpoint or gateway** | Anything serving the Anthropic Messages API at a URL | see below |
 
 The last row is one kind rather than several, because to the CLI an enterprise
-LLM gateway, a self-hosted proxy and a translation proxy in front of a local
-model are the same thing: an HTTP endpoint that speaks
-`POST /v1/messages`. Presets pre-fill it for the common cases; a preset is only
+gateway, OpenRouter, a local Ollama and a translation proxy are the same thing:
+an HTTP endpoint that speaks `POST /v1/messages`. Presets pre-fill it for the common cases; a preset is only
 a factory for a profile, so it cannot behave differently from one you typed.
 
-### About non-Claude models
+### Non-Claude models, and OpenRouter, and your own server
 
-Claude Code speaks the Anthropic Messages API. Ollama, OpenRouter, vLLM and
-OpenAI-compatible servers speak a different one, so reaching them needs a
-**translation proxy you run separately** —
-[claude-code-router](https://github.com/musistudio/claude-code-router),
-[LiteLLM](https://github.com/BerriAI/litellm), or similar. From this extension's
-side that is just a gateway profile pointing at `localhost`.
+**Most of these no longer need a proxy.** That is a change: it used to be that
+Claude Code spoke the Anthropic Messages API and nothing else did, so reaching
+Ollama or OpenRouter meant running a translator yourself. Since then all the
+obvious backends have added a native `/v1/messages` route, and pointing a
+gateway profile straight at them works.
 
-It works. It is also **not a configuration Anthropic supports**: the
-[gateway documentation](https://code.claude.com/docs/en/llm-gateway) says
-plainly that routing Claude Code to non-Claude models through any gateway is
-not supported. The picker marks those presets `community proxy` for that reason
-— listing them beside Bedrock with no distinction would be lying by omission.
+| Backend | Base URL | Proxy? |
+|---|---|---|
+| **OpenRouter** — 400+ models, one key | `https://openrouter.ai/api` | **no** |
+| **Ollama** — local | `http://localhost:11434` | **no** |
+| **llama.cpp** (`llama-server`) — local | `http://127.0.0.1:8080` | **no** |
+| **vLLM** — self-hosted | `http://localhost:8000` | **no** |
+| Cloudflare AI Gateway | your gateway URL | no |
+| Anything that only speaks OpenAI | a translator you run | yes |
+
+Three details decide whether this works first time, and all three are pre-filled
+by the presets:
+
+- **`/api`, not `/api/v1`, for OpenRouter.** Claude Code's SDK appends
+  `/v1/messages` itself, so the extra segment is a 404 that reads as "OpenRouter
+  is down".
+- **Bearer, not `x-api-key`.** OpenRouter authenticates with
+  `Authorization: Bearer`, which is what `ANTHROPIC_AUTH_TOKEN` sends;
+  `ANTHROPIC_API_KEY` sends `x-api-key`. A correct key in the wrong one is a 401
+  that looks like a bad key, and sends people off to regenerate a key that was
+  fine. `envForProfile()` drops the other variable entirely, which is what
+  OpenRouter's own docs mean when they say to blank it out.
+- **Betas off.** These *re-implement* the Anthropic API rather than being it, so
+  the `anthropic-beta` header is what they are most likely to reject —
+  `Unexpected value(s) for the anthropic-beta header` is the commonest way one
+  of them looks broken.
+
+Set the profile's **model ids** to what your endpoint actually serves —
+OpenRouter slugs like `anthropic/claude-sonnet-4.5` or `openai/gpt-5.1`, or your
+own model names. The picker then offers those instead of Anthropic's.
+
+Two honest caveats:
+
+- **Anthropic does not support this.** The
+  [gateway documentation](https://code.claude.com/docs/en/llm-gateway) says
+  plainly that routing Claude Code to non-Claude models through any gateway is
+  not supported, and that is still true when the endpoint needs no proxy. It
+  works; it is not a configuration anyone owes you a fix for.
+- **vLLM's Rust frontend has no `/v1/messages`.** `VLLM_USE_RUST_FRONTEND=1`
+  removes the route, so this needs the Python frontend.
+
+A **translator** — [LiteLLM](https://github.com/BerriAI/litellm) or
+[claude-code-router](https://github.com/musistudio/claude-code-router) — is now
+for one case only: a backend with no Anthropic route of its own. If yours is in
+the table above, you do not want one.
+
+**For OpenAI's own models, prefer the [Codex runtime](RUNTIMES.md).** It is
+OpenAI's own agent, it takes your ChatGPT subscription or API key, and there is
+no endpoint to configure at all.
 
 #### Codex, and a ChatGPT subscription
 

@@ -13,10 +13,25 @@
  *  3. The credential never lands anywhere the profile is serialised.
  */
 import {
-  AMBIENT_CREDENTIAL_VARS, INHERIT_PROFILE, PROVIDER_KINDS, PROVIDER_PRESETS, PROVIDER_VARS,
-  activeProfile, credentialKey, describeProfile, envForProfile, hostOf, kindDef,
-  parseProfiles, profileLabel, reconcileProvider, resolvedLabel, serialiseHeaders, validateProfile,
-  type ProviderKind, type ProviderProfile,
+  AMBIENT_CREDENTIAL_VARS,
+  INHERIT_PROFILE,
+  PROVIDER_KINDS,
+  PROVIDER_PRESETS,
+  PROVIDER_VARS,
+  activeProfile,
+  credentialKey,
+  describeProfile,
+  envForProfile,
+  hostOf,
+  kindDef,
+  parseProfiles,
+  profileLabel,
+  reconcileProvider,
+  resolvedLabel,
+  serialiseHeaders,
+  type ProviderKind,
+  type ProviderProfile,
+  validateProfile,
 } from '../providers.ts'
 import { agentEnv } from '../session.ts'
 import { MODEL_WINDOWS, normaliseModel } from '../../sessions/usage.ts'
@@ -412,6 +427,67 @@ const SAMPLE: Record<string, ProviderProfile> = {
      'the host session id is still stripped when nothing else is cleared')
   // `extra` wins over `clear`, so a caller need not order the two.
   ok(agentEnv({ X: 'old' }, { X: 'new' }, ['X']).X === 'new', 'setting a variable beats clearing it')
+}
+
+// --- the presets, which are claims about the outside world ------------------
+//
+// A preset is a factory for a profile, so it cannot behave differently from one
+// you typed — but it CAN be out of date, and that is the failure this guards.
+// OpenRouter, Ollama, llama.cpp and vLLM every one of them told people to
+// install and run a translation proxy, long after all four had shipped a native
+// `/v1/messages` endpoint. Nothing was broken; the advice was just stale, and
+// stale advice costs an afternoon of setup for a problem somebody else fixed.
+//
+// These assert the parts that are checkable here: that every preset produces a
+// profile the validator accepts, and that the two details which turn a working
+// key into a mysterious failure are right.
+{
+  // A preset is a STARTING POINT, not a finished profile: `vertex` has no
+  // project id and `foundry` has no resource, because those are yours to supply
+  // and `fillProfile` asks for them. So the check is not "validates cleanly" —
+  // it is "every problem left is one the user is TOLD about". A preset that is
+  // incomplete and says nothing is a dead end: the setup flow ends with a
+  // validation error naming a field the user was never asked for.
+  for (const preset of PROVIDER_PRESETS) {
+    const profile = { id: preset.id, ...preset.profile }
+    const problems = validateProfile(profile)
+    if (problems.length) {
+      ok(!!preset.needs, `incomplete preset "${preset.id}" tells the user what it needs (${problems.join(' ')})`)
+    } else {
+      ok(true, `preset "${preset.id}" is complete as written`)
+    }
+    // Whatever else is missing, the structure must be sound: a bad kind or a
+    // malformed URL is OUR mistake and no amount of filling in fixes it.
+    ok(!problems.some((m) => /is not a provider kind|is not an http/.test(m)),
+       `preset "${preset.id}" is structurally sound`)
+  }
+
+  const direct = ['openrouter', 'ollama', 'llamacpp', 'vllm']
+  for (const id of direct) {
+    const preset = PROVIDER_PRESETS.find((x) => x.id === id)
+    ok(!!preset, `there is a preset for ${id}`)
+    // The whole point of this group: these serve the Anthropic API themselves.
+    // A preset that still tells the user to run a proxy is the stale claim.
+    ok(!/via proxy/i.test(preset?.needs ?? ''), `${id} does not tell the user to run a proxy`)
+    ok(/no proxy/i.test(preset?.needs ?? ''), `${id} says so explicitly, because the old advice is all over the internet`)
+  }
+
+  // Bearer vs x-api-key is not cosmetic. ANTHROPIC_AUTH_TOKEN sends
+  // `Authorization: Bearer` and ANTHROPIC_API_KEY sends `x-api-key`, so a
+  // correct OpenRouter key in the wrong one is a 401 that reads as a bad key —
+  // and sends people off to regenerate a key that was fine.
+  const openrouter = PROVIDER_PRESETS.find((x) => x.id === 'openrouter')!
+  const env = envForProfile({ id: 'openrouter', ...openrouter.profile }, 'sk-or-test', {})
+  ok(env.set.ANTHROPIC_AUTH_TOKEN === 'sk-or-test', 'the OpenRouter key goes in the bearer variable')
+  // Their docs ask for ANTHROPIC_API_KEY to be blanked out. Dropping it is
+  // stronger, and is what this codebase does everywhere: absent, never empty.
+  ok(!('ANTHROPIC_API_KEY' in env.set), 'and x-api-key is not also set')
+  ok(env.clear.includes('ANTHROPIC_API_KEY'), 'it is dropped from the environment entirely')
+
+  // `/api`, not `/api/v1`: the SDK appends `/v1/messages` itself, so the extra
+  // segment is a 404 that reads as "OpenRouter is down".
+  ok(env.set.ANTHROPIC_BASE_URL === 'https://openrouter.ai/api',
+     `the base URL does not double the version segment (${env.set.ANTHROPIC_BASE_URL})`)
 }
 
 console.log(fails ? `\n${fails} provider test(s) failed` : '\nall provider tests passed')
