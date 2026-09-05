@@ -155,6 +155,18 @@ export interface UiCard {
    *  to "what do I test, and when": each subtask is tested on its own, and the
    *  parent is ready when all of them are. */
   subtasks?: { key: string; title: string; phase: string; ready: boolean }[]
+  /**
+   * One line about how this card's work was divided — or why it was not.
+   *
+   * DERIVED host-side from the stored record, never a string the record holds,
+   * so a wording change cannot make old cards lie. It exists because a REFUSED
+   * split used to reach the model and nothing else: a session that tried to
+   * split, was refused, and did the work alone was byte-identical on the board
+   * to the correct adaptive outcome. On a feature whose whole principle is
+   * adaptivity, that is the feature working and the feature broken rendering
+   * the same.
+   */
+  decomposition?: { line: string; stated?: string; refused: boolean }
   /** How to test this session's work, if the agent said. */
   testPlan?: TestPlan
   /**
@@ -358,7 +370,7 @@ export interface BoardHost {
   setDisclosure(key: string, open: boolean): void
   setComposer(patch: {
     model?: string; effort?: string; thinking?: string; permissionMode?: string
-    provider?: string; runtime?: string; ultracode?: string; fastMode?: string; forKey?: string
+    provider?: string; runtime?: string; orchestration?: string; ultracode?: string; fastMode?: string; forKey?: string
   }): void
   toggleArchived(): void
   /** Give the board the whole window, or hand it back. */
@@ -428,6 +440,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
             ...(msg.permissionMode ? { permissionMode: String(msg.permissionMode) } : {}),
             ...(msg.provider ? { provider: String(msg.provider) } : {}),
             ...(msg.runtime ? { runtime: String(msg.runtime) } : {}),
+            ...(msg.orchestration ? { orchestration: String(msg.orchestration) } : {}),
             ...(msg.ultracode ? { ultracode: String(msg.ultracode) } : {}),
             ...(msg.fastMode ? { fastMode: String(msg.fastMode) } : {}),
             ...(msg.id ? { forKey: id() } : {}),

@@ -374,6 +374,13 @@ for (const msg of [
   { type: 'pin', id: SEEDED, pinned: true },
   { type: 'pin', id: SEEDED, pinned: false },
   { type: 'pin', id: 'nope', pinned: true },
+  // The split dial. Per card when one is selected, and the workspace default
+  // otherwise — and a level this build cannot read must be ignored rather than
+  // reaching `buildBrief()`, which is what the agent is told.
+  { type: 'composer', orchestration: 'maximum', forKey: SEEDED },
+  { type: 'composer', orchestration: 'minimal' },
+  { type: 'composer', orchestration: 'aggressive' },
+  { type: 'composer', orchestration: 'balanced', forKey: 'nope' },
   // A collapsed section is remembered host-side, so these must survive being
   // aimed at nonsense as much as any other inbound message.
   // An attachment that cannot be sent must be refused, not thrown on. Both

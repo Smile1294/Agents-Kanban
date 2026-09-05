@@ -73,6 +73,15 @@ const chatState = {
     ...state.composer,
     contextTokens: 998_000, contextWindow: 1_000_000,
     meter: { kind: 'usd', spentUsd: 1234.56, priced: false },
+    // The split dial is a SIXTH picker on a bar that was already the row most
+    // at risk of a squeeze — and the readouts to its right are the two things
+    // on it that are pure information.
+    orchestration: 'maximum',
+    orchestrationLevels: [
+      { key: 'minimal', label: 'Minimal', detail: 'Prefer one agent.' },
+      { key: 'balanced', label: 'Balanced', detail: 'Split when independent.' },
+      { key: 'maximum', label: 'Maximum', detail: 'Split readily.' },
+    ],
   },
   transcript: [
     { kind: 'tool', at: 1, id: 't1', name: 'mcp__claude_ai_Atlassian__getJiraIssue',

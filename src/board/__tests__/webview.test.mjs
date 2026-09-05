@@ -156,6 +156,80 @@ const fresh = run({
 })
 ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no claim')
 
+// --- the split dial, on the composer bar ------------------------------------
+{
+  const LEVELS = [
+    { key: 'minimal', label: 'Minimal', detail: 'Prefer one agent.' },
+    { key: 'balanced', label: 'Balanced', detail: 'Split when independent.' },
+    { key: 'maximum', label: 'Maximum', detail: 'Split readily.' },
+  ]
+  const withDial = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: { ...COMPOSER, orchestration: 'maximum', orchestrationLevels: LEVELS },
+  }).text()
+  ok(withDial.includes('Maximum'), `the dial shows the level in force (${/Maximum|Balanced|Minimal/.exec(withDial)?.[0]})`)
+
+  // HIDDEN, never greyed, where it cannot take effect. A workspace with no git
+  // repository has no worktrees and therefore no `split_task` at all, so a dial
+  // over it would be a control that cannot say no.
+  const noDial = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: { ...COMPOSER, orchestration: 'balanced' },
+  }).text()
+  // Asserted on the dial's own marker, not on the level names: a picker
+  // rendered with no options would still pass a name check while being exactly
+  // the inert control this hides.
+  ok(withDial.includes('\u2442'), 'the dial is drawn with its own marker when it can take effect')
+  ok(!noDial.includes('\u2442'),
+     'and is absent entirely where splitting is impossible, rather than shown and inert')
+
+  // A level this build does not serve must not silently read as the default.
+  const unknown = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: { ...COMPOSER, orchestration: 'aggressive', orchestrationLevels: LEVELS },
+  }).text()
+  ok(unknown.includes('aggressive') && !/⑂ Balanced/.test(unknown),
+     'an unrecognised level shows itself rather than posing as Balanced')
+}
+
+// --- how the work was divided, or why it was not ----------------------------
+//
+// A refused split used to reach the model and nothing else, so a session that
+// wanted four agents and was refused looked exactly like one that correctly
+// decided it was a single job — the feature working and the feature broken
+// rendering the same.
+{
+  const split = run({
+    ...base,
+    cards: [{ ...CARD, decomposition: { line: 'Split into 3 subtasks · Maximum', refused: false } }],
+  }).text()
+  ok(split.includes('Split into 3 subtasks'), 'a split says so on the card')
+
+  const refused = run({
+    ...base,
+    cards: [{
+      ...CARD,
+      decomposition: {
+        line: 'Kept as one agent — asked for 5, over the limit at Minimal',
+        stated: 'These are two unrelated jobs.',
+        refused: true,
+      },
+    }],
+  })
+  const rt = refused.text()
+  ok(rt.includes('Kept as one agent'), 'and a REFUSAL is visible at all')
+  ok(rt.includes('over the limit at Minimal'), 'saying which rule and which level')
+  ok(rt.includes('These are two unrelated jobs.'), "and quoting the agent's own reason")
+  ok(/[\u201C\u201D]/.test(rt), 'as a quotation, so it reads as a claim rather than a fact')
+
+  // A card that never considered splitting says nothing at all — the ABSENCE of
+  // a record is the answer, and inventing a line for it would be noise on every
+  // card on the board.
+  const silent = run({ ...base, cards: [{ ...CARD }] }).text()
+  ok(!/Kept as one agent|Split into/.test(silent),
+     'while a card that never split renders no line at all')
+}
+
 // A phase move carries the agent's reason, because `set_phase` asks for one.
 //
 // The `note` argument's own description promises "shown on the board", and the

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { CLEAR_TEST_PLAN, MetaStore, normaliseTestPlan, parseMeta, resolveEffort, resolveThinking, targetIsClean } from '../meta.ts'
+import { CLEAR_TEST_PLAN, MetaStore, normaliseTestPlan, parseMeta, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean } from '../meta.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -303,6 +303,57 @@ for (const bad of [0, -1, 'four', null, Number.NaN]) {
   ok((await new MetaStore(dir, root).get('s-bad-fanout')).fanout === undefined,
      `a fan-out of ${JSON.stringify(bad) ?? 'null'} comes back absent rather than blocking every roll-up forever`)
 }
+
+// --- the split level, and the record of what it decided ---------------------
+//
+// Both are read on the path that builds a brief and on the render path, so both
+// are parsed rather than cast — the same rule as `runtime`.
+await meta.update('s-orch', { orchestration: 'maximum' })
+{
+  const back = await new MetaStore(dir, root).get('s-orch')
+  ok(back.orchestration === 'maximum', `the split level survives a reload (${back.orchestration})`)
+}
+await meta.update('s-orch-bad', { orchestration: 'aggressive' as never })
+ok((await new MetaStore(dir, root).get('s-orch-bad')).orchestration === undefined,
+   'a level this build does not serve comes back absent, not as itself')
+
+await meta.update('s-decomp', {
+  decomposition: { at: 1700000000000, level: 'minimal', outcome: 'refused', requested: 5, rule: 'over-cap', stated: 'two jobs' },
+})
+{
+  const back = await new MetaStore(dir, root).get('s-decomp')
+  ok(back.decomposition?.outcome === 'refused', `a refusal is remembered (${back.decomposition?.outcome})`)
+  ok(back.decomposition?.requested === 5, 'with how many were asked for')
+  ok(back.decomposition?.rule === 'over-cap', 'and which rule refused it')
+  ok(back.decomposition?.stated === 'two jobs', "and the agent's own sentence")
+}
+// A record this build cannot read is NO record, rather than a card claiming
+// something nobody can verify.
+for (const bad of [
+  { level: 'minimal' },
+  { level: 'aggressive', outcome: 'split', at: 1, requested: 2 },
+  { level: 'minimal', outcome: 'maybe', at: 1, requested: 2 },
+  { level: 'minimal', outcome: 'split', at: 'now', requested: 2 },
+  'x', 42, null,
+]) {
+  await meta.update('s-decomp-bad', { decomposition: bad as never })
+  ok((await new MetaStore(dir, root).get('s-decomp-bad')).decomposition === undefined,
+     `an unreadable record is dropped: ${JSON.stringify(bad)?.slice(0, 44)}`)
+}
+// The agent's sentence is bounded on the way IN as well, so a record written by
+// an older build cannot put an unbounded model string on the render path.
+await meta.update('s-decomp-long', {
+  decomposition: { at: 1, level: 'balanced', outcome: 'split', requested: 2, stated: 'x'.repeat(5000) },
+})
+ok(((await new MetaStore(dir, root).get('s-decomp-long')).decomposition?.stated?.length ?? 0) <= 240,
+   'a long stated reason is bounded on read, not only at the tool')
+
+// The resolution order: the session's own choice, then the workspace default.
+ok(resolveOrchestration('maximum', 'minimal') === 'maximum', 'a session choice wins')
+ok(resolveOrchestration(undefined, 'minimal') === 'minimal', 'then the workspace default')
+ok(resolveOrchestration(undefined, undefined) === 'balanced', 'then balanced')
+ok(resolveOrchestration('nonsense', 'nonsense') === 'balanced',
+   'and a value neither end can read falls through rather than reaching the brief')
 
 // --- a test plan has to be retractable --------------------------------------
 //

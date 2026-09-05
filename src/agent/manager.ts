@@ -20,6 +20,11 @@ import {
   DEFAULT_RUNTIME, getRuntime, parseMeter, type AgentRun, type Meter, type RuntimeId,
 } from './runtime.ts'
 import { startBoardBridge, type BoardBridge } from './board-bridge.ts'
+import {
+  aimSentence, checkProposal, DEFAULT_ORCHESTRATION, policyFor,
+  type DecompositionRecord, type OrchestrationLevel, type OrchestrationPolicy,
+  type PieceProposal, type ProposalNote, MAX_STATED,
+} from '../board/decomposition.ts'
 
 export interface ManagerOptions {
   store: SessionStore
@@ -30,6 +35,9 @@ export interface ManagerOptions {
     /** Session flags. Offered only when the CLI says the model supports them —
      *  see `ultracodeFor` — because the request path validates nothing. */
     ultracode?: boolean; fastMode?: boolean
+    /** How eagerly new sessions should split. Per session in the end; this is
+     *  the workspace default behind the composer bar's per-card choice. */
+    orchestration?: OrchestrationLevel
     /** Which agent program new sessions run on. Per session in the end — the
      *  whole point is that a Claude card and a Codex card sit on the same board
      *  and run at the same time — this is only the default for a session that
@@ -78,6 +86,11 @@ export interface ManagerOptions {
     parent: RunningAgent,
     subtasks: readonly SubtaskSpec[],
     reason: string,
+    /** Declared scopes two pieces share. Shown, never refused on: a prediction
+     *  is not a contract, and refusing here would teach the model to
+     *  under-declare — which destroys the only signal that can later say the
+     *  split was wrong. */
+    notes: readonly ProposalNote[],
   ) => Promise<boolean>
   /** Passed to every session, for diagnostics the user cannot act on. */
   log?: (message: string) => void
@@ -156,6 +169,9 @@ export const MAX_SUBTASKS = 4
 export interface SubtaskSpec {
   title: string
   prompt: string
+  /** The files this piece said it would touch. Carried to the child so the
+   *  board can compare it against what actually changed. */
+  scope?: string[]
   tags?: string[]
 }
 
@@ -169,6 +185,10 @@ interface LaunchOptions {
   title?: string
   /** The session this run was split out of. */
   parent?: string
+  /** Per-run override of how eagerly to split. Captured at ENQUEUE, like every
+   *  other per-run choice, so a queued run keeps the level it was started
+   *  with rather than whatever the picker says when its slot frees. */
+  orchestration?: OrchestrationLevel
   /** Fork the worktree from this branch instead of the repo's current one. */
   base?: string
   /** Images attached to the FIRST message. Held only until the run starts —
@@ -193,6 +213,9 @@ export interface RunningAgent {
   branch: string
   /** The branch the worktree forked from, for the review panel's diff and merge. */
   base?: string
+  /** The level this run LAUNCHED under. What the brief said, and therefore what
+   *  the split gate must read — not whatever the picker says a turn later. */
+  orchestration?: OrchestrationLevel
   /** The session this one was split out of, if it is a subtask. */
   parent?: string
   /** Entries produced by THIS run, appended live. Past runs come from disk. */
@@ -436,24 +459,6 @@ export class AgentManager extends EventEmitter {
     const parent = this.byKey(parentKey)
     if (!parent) return { ok: false, message: 'This session is not running, so it cannot start subtasks.' }
 
-    const specs = subtasks
-      .map((t) => ({ ...t, title: t.title.trim(), prompt: t.prompt.trim() }))
-      .filter((t) => t.title && t.prompt)
-    if (specs.length < 2) {
-      return {
-        ok: false,
-        message: 'A split needs at least two subtasks, each with a title and a prompt. ' +
-          'If the work is one thing, just do it.',
-      }
-    }
-    if (specs.length > MAX_SUBTASKS) {
-      return {
-        ok: false,
-        message: `At most ${MAX_SUBTASKS} subtasks. Each one is a real agent with a real bill — ` +
-          'group the small pieces together rather than making one session each.',
-      }
-    }
-
     // One level. A subtask that can split again is a fork bomb with a credit
     // card, and nothing on the board could render the third level anyway.
     const card = await this.opts.store.card(parentKey)
@@ -493,6 +498,38 @@ export class AgentManager extends EventEmitter {
       }
     }
 
+
+    /* Now the PROPOSAL itself, against the level this session's brief was
+       written with. The structural refusals above ran first and unconditionally
+       — a dirty parent cannot split however good the proposal is — and none of
+       them reads the level.
+       `checkProposal` does not read `level` either: it gets a ceiling. That is
+       what makes "a huge task still splits at Minimal" an invariant rather than
+       a preference, and `decomposition.test.ts` asserts it by running the same
+       proposal through two policies that differ only in their level. */
+    const level = parent.orchestration ?? this.opts.defaults.orchestration ?? DEFAULT_ORCHESTRATION
+    const policy = policyFor(level)
+    const verdict = checkProposal(subtasks, policy, MAX_SUBTASKS)
+    if (!verdict.ok) {
+      // RECORDED, not just returned. A refusal used to reach the model and
+      // nothing else, so a session that tried to split, was refused, and did
+      // the work alone was byte-identical on the board to the correct adaptive
+      // outcome — the feature working and the feature broken rendering the
+      // same, on a feature whose whole principle is adaptivity.
+      await this.recordDecomposition(parentKey, {
+        at: Date.now(), level, outcome: 'refused',
+        requested: subtasks.length, rule: verdict.rule,
+        ...(reason.trim() ? { stated: reason.trim().slice(0, MAX_STATED) } : {}),
+      })
+      return { ok: false, message: verdict.message }
+    }
+    const specs: SubtaskSpec[] = verdict.pieces.map((p) => ({
+      title: p.title,
+      prompt: p.prompt,
+      ...(p.scope?.length ? { scope: p.scope } : {}),
+      ...(p.tags?.length ? { tags: p.tags } : {}),
+    }))
+
     // The real approval gate, and it has to be here.
     //
     // `ASKS_FIRST` is not a boundary. It is enforced two ways and BOTH have a
@@ -507,7 +544,7 @@ export class AgentManager extends EventEmitter {
     // This runs in the HOST, after the structural refusals (a dirty parent
     // cannot split however good the proposal) and before the first `start()`.
     // `ASKS_FIRST` stays as the soft layer — the rule is "both, always".
-    if (this.opts.confirmSplit && !(await this.opts.confirmSplit(parent, specs, reason))) {
+    if (this.opts.confirmSplit && !(await this.opts.confirmSplit(parent, specs, reason, verdict.notes))) {
       return { ok: false, message: 'The user declined the split. Do the work yourself, in this session.' }
     }
 
@@ -529,7 +566,10 @@ export class AgentManager extends EventEmitter {
     // still queued behind `maxConcurrentAgents` are invisible — see
     // `SessionMeta.fanout`.
     await this.opts.store.patch(parentKey, { fanout: specs.length }).catch(() => {})
-
+    await this.recordDecomposition(parentKey, {
+      at: Date.now(), level, outcome: 'split', requested: subtasks.length,
+      ...(reason.trim() ? { stated: reason.trim().slice(0, MAX_STATED) } : {}),
+    })
     const started: { key: string; title: string; branch: string }[] = []
     for (const spec of specs) {
       const runId = await this.start(spec.prompt, {
@@ -545,6 +585,11 @@ export class AgentManager extends EventEmitter {
       })
       if (spec.tags?.length) {
         await this.opts.store.setTags(runId, spec.tags).catch(() => {})
+      }
+      // The declaration travels with the child, so the board can compare it
+      // against what the child actually changed.
+      if (spec.scope?.length) {
+        await this.opts.store.patch(runId, { scope: spec.scope }).catch(() => {})
       }
       const child = this.agents.get(runId)
       started.push({
@@ -577,6 +622,13 @@ export class AgentManager extends EventEmitter {
     this.touch()
     if (!agent.sessionId) return { renamed: true }
     return this.opts.store.rename(agent.sessionId, title)
+  }
+
+  /** Write the decision onto the parent's card. Never fatal: a record that
+   *  cannot be stored must not stop a split that was approved. */
+  private async recordDecomposition(key: string, record: DecompositionRecord): Promise<void> {
+    await this.opts.store.patch(key, { decomposition: record }).catch(() => {})
+    this.touch()
   }
 
   /** Continue an existing session: same worktree, resumed Claude session. */
@@ -1092,12 +1144,22 @@ export class AgentManager extends EventEmitter {
       : {}
 
     const effort = resolveEffort(undefined, this.opts.defaults.effort)
+    /* The level, captured HERE and remembered on the card.
+       `buildBrief()` bakes the matching sentence into the system prompt once,
+       and the split arrives a turn later — so the gate must read what the brief
+       SAID, not what the setting says by then. A level changed mid-session
+       applies to the next one, which is the same honest answer `setProvider()`
+       gives for a provider. */
+    const level = opts.orchestration ?? this.opts.defaults.orchestration ?? DEFAULT_ORCHESTRATION
+    agent.orchestration = level
+    // A subtask may not split again, so it is not told how eagerly to.
+    const canSplit = !opts.parent && !agent.parent
     return rt.start({
       taskId: runId,
       cwd: wt.path,
       permissionMode: this.opts.permissionMode,
       executable: location.command,
-      appendSystemPrompt: buildBrief(this.opts.board, title, wt.branch),
+      appendSystemPrompt: buildBrief(this.opts.board, title, wt.branch, policyFor(level), canSplit),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
       ...(this.opts.log ? { log: this.opts.log } : {}),
@@ -1360,7 +1422,23 @@ export class AgentManager extends EventEmitter {
 }
 
 /** Appended to the Claude Code system prompt. Tells the agent it owns a card. */
-export function buildBrief(board: BoardConfig, title: string, branch: string): string {
+/**
+ * @param policy how eagerly this session should split. Its `aim` sentence
+ *   REPLACES the disposition half of the split paragraph below — see
+ *   `aimSentence`. Two paragraphs that both set the disposition is two things
+ *   that know the policy, and the longer one would win.
+ * @param canSplit false for a session that may not split at all — a subtask, or
+ *   a resumed session whose parent already fanned out. `split()` refuses those
+ *   immediately, so telling the agent how eagerly to split would be inviting it
+ *   to call a tool that can only answer no.
+ */
+export function buildBrief(
+  board: BoardConfig,
+  title: string,
+  branch: string,
+  policy: OrchestrationPolicy = policyFor(DEFAULT_ORCHESTRATION),
+  canSplit = true,
+): string {
   const started = board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'
   const review = board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
   return [
@@ -1386,12 +1464,22 @@ export function buildBrief(board: BoardConfig, title: string, branch: string): s
     'words or fewer. It renames the CARD only — your branch and worktree keep the',
     'names they started with.',
     '',
-    'If what you have been asked for is really two or more UNRELATED pieces of work,',
-    'use `split_task` BEFORE you change anything. Each subtask gets its own agent,',
-    'its own worktree and its own card under this one, so the user can test and merge',
-    'them separately. Do not use it to parallelise one coherent change, and do not use',
-    'it once you have started editing — subtasks fork from where this session started,',
-    'so anything already written here would be stranded.',
+    // The DISPOSITION half — how eagerly to split — comes from the level, and
+    // is the only thing the level changes. The OPERATIONAL half below it is
+    // invariant, because forking from base and splitting before editing are
+    // facts about the branch model, not preferences.
+    ...(canSplit
+      ? [
+          aimSentence(policy),
+          '',
+          'Split BEFORE you change anything: subtasks fork from where this session started,',
+          'so anything already written here would be stranded on a branch nothing merges.',
+          'Each subtask gets its own agent, its own worktree and its own card under this one.',
+          'Give every subtask a `scope` — the files or directories it expects to touch — and',
+          'write each brief so it stands alone: a fresh agent reads it having seen neither',
+          'this conversation nor its siblings.',
+        ]
+      : []),
   ].join('\n')
 }
 

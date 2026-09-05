@@ -571,6 +571,22 @@
     t.append(el('span', 'ai', '✦'), document.createTextNode(c.title))
     n.append(t)
 
+    /* How the work was divided, or why it was not.
+       A refused split used to be invisible — the message went to the model and
+       nowhere else — so a session that wanted four agents and was refused
+       looked exactly like one that correctly decided it was a single job. The
+       agent's own sentence is quoted and attributed rather than merged into
+       ours, because it is a claim it made, not a fact we established. */
+    if (c.decomposition) {
+      const d = el('div', 'decomp' + (c.decomposition.refused ? ' refused' : ''))
+      d.append(el('span', 'decomp-line', c.decomposition.line))
+      if (c.decomposition.stated) {
+        const q = el('span', 'decomp-said', '\u201C' + c.decomposition.stated + '\u201D')
+        q.title = "The agent's own reason, as it gave it at the time."
+        d.append(q)
+      }
+      n.append(d)
+    }
     if (c.subtasks && c.subtasks.length) n.append(renderSubtasks(c))
 
     if (c.tags.length) {
@@ -1220,6 +1236,29 @@
       value: r.id,
       label: r.label + (r.detail ? ' — ' + r.detail : ''),
     })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }])))
+    /* HOW EAGERLY this card should break its work into subtasks.
+       Per card, beside the model, because it is a judgement about THIS piece of
+       work: someone with one huge objective and five trivial ones must not have
+       to change a workspace setting and remember to change it back.
+       It biases the agent and does not dictate a number. The only thing it
+       changes is which sentence the agent's brief carries, so a trivial task
+       stays one agent at Maximum and a genuinely unrelated pair still splits at
+       Minimal — neither of those is a rule the dial can move.
+       HIDDEN, never greyed, where it cannot take effect: a workspace with no
+       git repository has no `split_task` at all, and a control that is visible
+       and inert is the thing this board has a rule about. */
+    if (s.composer.orchestrationLevels && s.composer.orchestrationLevels.length) {
+      bar.append(picker(
+        'orchestration',
+        '⑂ ' + orchestrationLabel(),
+        (s.composer.orchestrationLevels || []).map((o) => ({
+          value: o.key,
+          label: o.label + ' — ' + o.detail,
+        })),
+        s.selectedKey,
+        s.composer.orchestrationNote,
+      ))
+    }
     /* Both of these are per MODEL, and both DISAPPEAR when the selected model
        does not have them. Haiku 4.5 accepts no effort levels and has no
        adaptive thinking, and it was being shown the full five-level picker and
@@ -1464,6 +1503,10 @@
     const chosen = selected === undefined ? s.composer[key] : selected
     const wrap = el('span', 'picker-wrap')
     const b = el('button', 'picker', label + ' ▾')
+    // The label may be ellipsised on a narrow bar, so the full one is always
+    // reachable. A control whose text is cut off and unexplained is the same
+    // failure as one that is cut off and wrapped.
+    b.title = label
     b.onclick = (e) => { stop(e); openMenu = openMenu === 'composer:' + key ? null : 'composer:' + key; render() }
     wrap.append(b)
     if (openMenu === 'composer:' + key) {
@@ -1530,6 +1573,15 @@
        naming a provider we have not been told about. */
     return p.id === 'inherit' ? 'Inherited' : p.label
   }
+  /* The level's own label. Falls back to the raw key rather than to a guess:
+     a build that stored a level this one does not serve should say so, not
+     silently show "Balanced". */
+  function orchestrationLabel() {
+    const key = s.composer.orchestration
+    const found = (s.composer.orchestrationLevels || []).find((o) => o.key === key)
+    return found ? found.label : (key || 'Split')
+  }
+
   function modelLabel(id) {
     const m = s.composer.models.find((x) => x.id === id)
     return m ? m.label : 'Model'

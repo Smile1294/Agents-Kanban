@@ -15,12 +15,16 @@ import {
   type BoardHost, type FocusMode, type Mode, type UiCard, type UiState,
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
-import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
+import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel } from './sessions/usage.ts'
 import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
 import { linkSubtasks, rollUpState } from './board/subtasks.ts'
+import {
+  DEFAULT_ORCHESTRATION, ORCHESTRATION_CHOICES, decompositionLine,
+  parseOrchestrationLevel, type OrchestrationLevel,
+} from './board/decomposition.ts'
 import { coalesce } from './board/coalesce.ts'
 import { describeImages, sanitiseImages } from './agent/images.ts'
 import {
@@ -119,6 +123,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let runtime: RuntimeId = parseRuntimeId(state.get<string>('runtime'))
     ?? parseRuntimeId(cfg().get<string>('runtime'))
     ?? DEFAULT_RUNTIME
+  /** How eagerly a NEW session should split. Parsed, never cast: it is read on
+   *  the path that builds a brief, and a value from an older build is another
+   *  program's output. */
+  let orchestration: OrchestrationLevel =
+    parseOrchestrationLevel(state.get<string>('orchestration'))
+    ?? parseOrchestrationLevel(cfg().get<string>('orchestration'))
+    ?? DEFAULT_ORCHESTRATION
   let model = state.get<string>('model') ?? cfg().get<string>('model') ?? MODELS[0]!.id
   let effort: EffortLevel = (state.get<string>('effort') as EffortLevel) ?? 'high'
   let thinking: ThinkingMode = (state.get<string>('thinking') as ThinkingMode) ?? 'enabled'
@@ -1372,6 +1383,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         meter: undefined as Meter | undefined,
         permissionMode: permissionMode as string,
         permissionModes: PERMISSION_MODES,
+        orchestration: orchestration as string,
+        /* ABSENT, not empty, where the control cannot take effect. A workspace
+           with no git repository has no worktrees and therefore no
+           `split_task` at all, so offering a dial over it would be a control
+           that cannot say no — the same rule that hides the backend picker on a
+           runtime with no provider concept. The view draws nothing when this is
+           missing. */
+        orchestrationLevels: undefined as { key: string; label: string; detail: string }[] | undefined,
+        orchestrationNote: undefined as string | undefined,
       }
       if (!ws) {
         return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
@@ -1419,6 +1439,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         cards.push({
           key: s.id, sessionId: s.id, title: s.title, phase: s.phase, tags: s.tags,
           updated: s.updated, archived: s.archived, pinned: s.pinned,
+        ...(() => {
+          const d = metas[s.id]?.decomposition
+          if (!d) return {}
+          return {
+            decomposition: {
+              line: decompositionLine(d, metas[s.id]?.fanout),
+              ...(d.stated ? { stated: d.stated } : {}),
+              refused: d.outcome === 'refused',
+            },
+          }
+        })(),
           ...(s.branch ? { branch: s.branch } : {}),
           ...(s.worktree ? { worktree: s.worktree } : {}),
           ...(s.parent ? { parent: s.parent } : {}),
@@ -1487,6 +1518,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // nothing extra — and there is one place that knows how spend is
           // derived, not two.
           composer.meter = await ws.store.meter(selectedKey)
+        }
+      }
+
+      /* The level for the card in front of you, resolved the same way effort is:
+         the session's own choice, then the workspace default. A card that has
+         already launched keeps the level its BRIEF was written with, so the
+         note says what a change would actually do rather than letting the
+         picker imply it takes effect now. */
+      if (ws.repoRoot) {
+        composer.orchestrationLevels = ORCHESTRATION_CHOICES.map((c) => ({ ...c }))
+        const meta = selectedKey ? metas[selectedKey] : undefined
+        composer.orchestration = resolveOrchestration(meta?.orchestration, orchestration)
+        const live = selectedKey ? ws.manager?.byKey(selectedKey) : undefined
+        if (live?.orchestration && live.orchestration !== composer.orchestration) {
+          composer.orchestrationNote =
+            `This session started at "${live.orchestration}". Its brief is already written, so a ` +
+            'change here applies to the next session.'
         }
       }
 
@@ -1586,6 +1634,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           effort = levels.includes('high') ? 'high' : levels[levels.length - 1]!
           void state.update('effort', effort)
         }
+      }
+      /* The split level, PER CARD.
+         Written to the selected card's own metadata when there is one, and to
+         the workspace default otherwise — the same resolution order effort has,
+         and for the same reason: a picker that shows one thing while the run
+         uses another is the bug this order exists to prevent.
+         A card that has already launched keeps the level its BRIEF was written
+         with; `RunningAgent.orchestration` is captured at launch and the split
+         gate reads that. So changing this on a running card changes what the
+         next session does, and the note below says so rather than letting the
+         user believe otherwise. */
+      const level = parseOrchestrationLevel(patch.orchestration)
+      if (level) {
+        if (patch.forKey) {
+          void ws?.store.patch(patch.forKey, { orchestration: level }).catch(() => {})
+        }
+        orchestration = level
+        void state.update('orchestration', level)
+        ws?.manager?.setDefaults({ orchestration: level })
       }
       if (patch.effort) { effort = patch.effort as EffortLevel; void state.update('effort', effort) }
       if (patch.thinking) { thinking = patch.thinking as ThinkingMode; void state.update('thinking', thinking) }

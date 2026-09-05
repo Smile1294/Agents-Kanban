@@ -7,6 +7,7 @@
 import { AgentManager, durablePatch, MAX_SUBTASKS, titleFrom, buildBrief, type RunningAgent } from '../manager.ts'
 import { agentEnv, HOST_SESSION_VARS } from '../session.ts'
 import { DEFAULT_BOARD } from '../../board/config.ts'
+import { ORCHESTRATION_LEVELS, policyFor } from '../../board/decomposition.ts'
 import { parseMeter } from '../runtime.ts'
 
 let fails = 0
@@ -64,6 +65,40 @@ ok(brief.includes('task/S1-fix'), 'it tells the agent which branch it is on')
 ok(brief.includes('Fix login'), 'and which card is its own')
 ok(!brief.includes('complete'), 'it does NOT invite the agent to complete its own work')
 ok(brief.includes('set_title'), 'and it tells the agent the card name is a guess it can fix')
+
+// --- the level reaches the agent, and only through the brief ----------------
+//
+// The dial's ENTIRE mechanism is which disposition sentence the brief carries.
+// If two paragraphs both told the agent how eagerly to split, the longer and
+// more specific one would win, the dial would move nothing, and every unit test
+// here would stay green — so the aim sentence must REPLACE the old paragraph,
+// not sit beside it.
+{
+  const briefs = ORCHESTRATION_LEVELS.map((l) => buildBrief(DEFAULT_BOARD, 'T', 'task/x', policyFor(l)))
+  ok(new Set(briefs).size === briefs.length, 'each level produces a different brief')
+  for (const [i, b] of briefs.entries()) {
+    // ONE paragraph sets the disposition. Counting the phrases that could:
+    const dispositions = [
+      /STRONGLY PREFER doing this yourself/.test(b),
+      /Splitting readily is/.test(b),
+      /If what you have been asked for is really two or more UNRELATED/.test(b),
+    ].filter(Boolean).length
+    ok(dispositions === 1,
+       `${ORCHESTRATION_LEVELS[i]}: exactly one paragraph tells the agent how eagerly to split (${dispositions})`)
+    // …while the OPERATIONAL half is invariant, because forking from base is a
+    // fact about the branch model rather than a preference.
+    ok(b.includes('Split BEFORE you change anything'), `${ORCHESTRATION_LEVELS[i]}: still says to split before editing`)
+    ok(b.includes('scope'), `${ORCHESTRATION_LEVELS[i]}: still asks for a declared scope`)
+  }
+}
+// A subtask may not split again — `split()` refuses it on `card.parent` — so
+// telling it how eagerly to split would be inviting it to call a tool that can
+// only ever answer no.
+{
+  const child = buildBrief(DEFAULT_BOARD, 'T', 'task/x', policyFor('maximum'), false)
+  ok(!child.includes('split_task'), 'a session that cannot split is not told how eagerly to')
+  ok(child.includes('set_phase'), 'while still being told everything else it owns')
+}
 
 // --- identity collision ------------------------------------------------------
 // Two live runs reporting the same session id must not become one card. Before
@@ -403,9 +438,12 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
     return runId
   }
 
+  // `scope` is required now: a subtask with no files of its own is not a
+  // separate subtask, and the declaration is what lets the board say afterwards
+  // whether the split was right.
   const two = [
-    { title: 'Add SSO', prompt: 'Add SSO to the login page.' },
-    { title: 'Fix the flaky test', prompt: 'Fix the flaky snapshot test.' },
+    { title: 'Add SSO', prompt: 'Add SSO to the login page.', scope: ['src/auth/'] },
+    { title: 'Fix the flaky test', prompt: 'Fix the flaky snapshot test.', scope: ['tests/snapshot.test.ts'] },
   ]
 
   // The happy path, and the branch decision it encodes.
@@ -524,13 +562,34 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
   const one = await mgr.split('sess-parent', [two[0]!])
   ok(one.ok === false && /at least two/.test(one.message), 'splitting into one is not a split')
   const blank = await mgr.split('sess-parent', [
-    { title: '  ', prompt: 'x' }, { title: 'ok', prompt: '   ' }, two[0]!,
+    { title: '  ', prompt: 'x', scope: ['a'] }, { title: 'ok', prompt: '   ', scope: ['b'] }, two[0]!,
   ])
   ok(blank.ok === false, 'a subtask with no title or no prompt does not count towards the two')
+  // The effective limit is `min(level's cap, MAX_SUBTASKS)`, and the refusal
+  // names the number that actually applied — not the constant. At the default
+  // level that is 3; a message saying 4 would send the agent back to propose
+  // four and be refused again.
   const many = await mgr.split('sess-parent', Array.from({ length: MAX_SUBTASKS + 1 },
-    (_, i) => ({ title: `t${i}`, prompt: `p${i}` })))
-  ok(many.ok === false && new RegExp(String(MAX_SUBTASKS)).test(many.message),
-     `more than ${MAX_SUBTASKS} subtasks is refused, and the limit is named`)
+    (_, i) => ({ title: `t${i}`, prompt: `p${i}`, scope: [`src/${i}/`] })))
+  ok(many.ok === false && /limit here is 3/.test(many.message),
+     `over the cap is refused, naming the limit that applied (${many.ok === false ? many.message : 'it ran'})`)
+  ok(many.ok === false && /5/.test(many.message),
+     'and how many were asked for, so the gap is visible')
+
+  // At Maximum the same proposal is still refused — MAX_SUBTASKS is the one
+  // real cap and the level can only ever ask for LESS than it.
+  parent.orchestration = 'maximum'
+  const manyAtMax = await mgr.split('sess-parent', Array.from({ length: MAX_SUBTASKS + 1 },
+    (_, i) => ({ title: `t${i}`, prompt: `p${i}`, scope: [`src/${i}/`] })))
+  ok(manyAtMax.ok === false && new RegExp(String(MAX_SUBTASKS)).test(manyAtMax.message),
+     `and at Maximum the cap is still ${MAX_SUBTASKS}, which no level can raise`)
+  // …while four, which Balanced refuses, is allowed at Maximum. That is the
+  // dial doing the one thing it is allowed to do: ask for more.
+  const fourAtMax = await mgr.split('sess-parent', Array.from({ length: MAX_SUBTASKS },
+    (_, i) => ({ title: `t${i}`, prompt: `p${i}`, scope: [`src/${i}/`] })))
+  ok(fourAtMax.ok === true, `four subtasks run at Maximum (${fourAtMax.ok ? 'yes' : fourAtMax.message})`)
+  children = []
+  parent.orchestration = undefined
 
   const unknown = await mgr.split('not-a-session', two)
   ok(unknown.ok === false, 'a session that is not running cannot start subtasks')

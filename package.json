@@ -341,6 +341,21 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Path to the `codex` binary. Leave empty to find it on your PATH, then in the usual install locations. Never resolved from `node_modules` \u2014 the board runs the Codex you maintain, not a bundled copy."
+        },
+        "agentsKanban.orchestration": {
+          "type": "string",
+          "enum": [
+            "minimal",
+            "balanced",
+            "maximum"
+          ],
+          "enumDescriptions": [
+            "Prefer one agent. It may still split work that is genuinely unrelated.",
+            "Split when the pieces are independent and worth testing separately.",
+            "Split readily, up to four agents. A small task still stays one."
+          ],
+          "default": "balanced",
+          "markdownDescription": "How eagerly a session should break its work into subtasks with `split_task`. This is the DEFAULT for new sessions; each card carries its own, chosen on the composer bar beside the model. It biases the agent rather than dictating a number: a small task stays one agent at **Maximum**, and a genuinely unrelated pair still splits at **Minimal**. The limit of four subtasks, one level deep, is unchanged."
         }
       }
     },

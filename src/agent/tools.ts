@@ -55,6 +55,8 @@ export interface BoardChange {
 export interface SubtaskProposal {
   title: string
   prompt: string
+  /** Files this piece expects to touch. Checked host-side; see `checkProposal`. */
+  scope?: string[]
   tags?: string[]
 }
 
@@ -380,10 +382,21 @@ export function buildBoardTools(
             prompt: z
               .string()
               .describe('The full standalone brief for a fresh agent. It has no other context.'),
+            scope: z
+              .array(z.string())
+              .describe(
+                'The files or directories this subtask expects to touch, e.g. ["src/auth/", ' +
+                '"tests/auth.test.ts"]. Required: a subtask with nothing of its own is not a ' +
+                'separate subtask. It is a PREDICTION, not a fence — the board compares it ' +
+                'against what actually changed, which is how you find out afterwards whether ' +
+                'the split was right.',
+              ),
             tags: z.array(z.string()).optional().describe('Tags for the subtask\'s card.'),
           }),
         )
-        .describe('At least 2, at most 4. Each one has to be independently testable.'),
+        .describe('At least 2, at most 4 — and fewer if this card is set to a lower ' +
+          'orchestration level, which the refusal will name. Each one has to be ' +
+          'independently testable.'),
     },
     async (args) => {
       if (!ctx.onSplit) {

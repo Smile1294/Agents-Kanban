@@ -16,6 +16,10 @@ import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { MODEL_WINDOWS } from './usage.ts'
 import { parseRuntimeId, type RuntimeId } from '../agent/runtime.ts'
+import {
+  parseOrchestrationLevel,
+  type DecompositionRecord, type OrchestrationLevel, type ProposalRule,
+} from '../board/decomposition.ts'
 
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type ThinkingMode = 'enabled' | 'disabled'
@@ -156,6 +160,36 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
 }
 
 /**
+ * A decomposition record, parsed rather than cast.
+ *
+ * Read on the render path and written by a build that may be older than this
+ * one, so the same rule as every other stored shape: a field this build cannot
+ * read is dropped, and an unreadable record is no record at all rather than a
+ * card claiming something nobody can verify.
+ */
+export function parseDecomposition(raw: unknown): DecompositionRecord | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Record<string, unknown>
+  const level = parseOrchestrationLevel(r.level)
+  const outcome = r.outcome === 'split' || r.outcome === 'refused' ? r.outcome : undefined
+  const at = typeof r.at === 'number' && Number.isFinite(r.at) ? r.at : undefined
+  const requested = typeof r.requested === 'number' && Number.isFinite(r.requested)
+    ? Math.max(0, Math.floor(r.requested))
+    : undefined
+  if (!level || !outcome || at === undefined || requested === undefined) return undefined
+  const RULES = ['one-piece', 'over-cap', 'scope-missing', 'brief-cross-reference', 'brief-too-long']
+  return {
+    at, level, outcome, requested,
+    ...(typeof r.rule === 'string' && RULES.includes(r.rule) ? { rule: r.rule as ProposalRule } : {}),
+    // Bounded on the way IN as well as at the tool, so a record written by an
+    // older build cannot put an unbounded model string on the render path.
+    ...(typeof r.stated === 'string' && r.stated.trim()
+      ? { stated: r.stated.trim().slice(0, 240) }
+      : {}),
+  }
+}
+
+/**
  * Control characters, which a test-plan target may never contain.
  *
  * `target` is MODEL-WRITTEN, and a `command` link is handed to
@@ -291,6 +325,22 @@ export interface SessionMeta {
    * be resumed, and the board can at least stop pretending nothing happened.
    */
   running?: number
+  /**
+   * How eagerly this card should break itself into subtasks.
+   *
+   * Per SESSION, not per workspace, and the level in force when the session
+   * LAUNCHED — `buildBrief()` bakes the matching sentence into the system
+   * prompt once, and the split arrives a turn later, so the two must agree.
+   * Someone with one huge objective and five trivial ones must not have to
+   * toggle a setting and remember to toggle it back.
+   */
+  orchestration?: OrchestrationLevel
+  /** The files this SUBTASK said it would touch, as declared at the split.
+   *  A prediction, kept so it can be compared with what changed. */
+  scope?: string[]
+  /** Why this card became several — or why it did not. Written once, on the
+   *  parent, at the moment of the decision. */
+  decomposition?: DecompositionRecord
   /** Per-session overrides; unset means fall through to the workspace default. */
   model?: string
   effort?: EffortLevel
@@ -342,6 +392,12 @@ export function parseMeta(v: unknown): SessionMeta | undefined {
     // program's output — and it is read on the render path.
     ...(parseRuntimeId(m.runtime) ? { runtime: parseRuntimeId(m.runtime)! } : {}),
     ...(testPlan ? { testPlan } : {}),
+    // Parsed through the closed-union helper, never cast.
+    ...(parseOrchestrationLevel(m.orchestration) ? { orchestration: parseOrchestrationLevel(m.orchestration)! } : {}),
+    ...(Array.isArray(m.scope) && m.scope.some((s) => typeof s === 'string')
+      ? { scope: m.scope.filter((s): s is string => typeof s === 'string' && !!s.trim()).map((s) => s.trim()) }
+      : {}),
+    ...(parseDecomposition(m.decomposition) ? { decomposition: parseDecomposition(m.decomposition)! } : {}),
     ...(typeof m.model === 'string' ? { model: m.model } : {}),
     // Closed unions, so a value from an older build cannot reach the picker.
     ...(EFFORT_LEVELS.some((e) => e.key === m.effort) ? { effort: m.effort as EffortLevel } : {}),
@@ -672,6 +728,18 @@ function stripUndefined<T extends object>(o: T): Partial<T> {
  * both expressible in JSON and impossible to confuse with a real plan.
  */
 export const CLEAR_TEST_PLAN = null
+
+/** The level a session runs at: its own choice, then the workspace default,
+ *  then `balanced`. The same order as `resolveEffort`, and the reason is the
+ *  same — a picker showing one thing while the session ran at another. */
+export function resolveOrchestration(
+  session: unknown,
+  workspaceDefault: unknown,
+): OrchestrationLevel {
+  return parseOrchestrationLevel(session)
+    ?? parseOrchestrationLevel(workspaceDefault)
+    ?? 'balanced'
+}
 
 /**
  * An explicit per-session value wins, then the workspace default, then nothing —
