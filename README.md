@@ -85,6 +85,32 @@ changes what exists.
 
 ---
 
+## Remote control
+
+Two ways to reach the board from somewhere else, one pairing code each.
+
+**The headless board** is the full thing: run it on a VPS, a Mac mini or a
+small Linux box that holds the repo, and drive the board from any browser —
+send prompts, start sessions, approve permissions, move cards, review and
+merge. Agents run on that box.
+
+```bash
+git clone <repo> && cd <repo>
+npm install
+npm run remote   # prints a URL and a pairing code — open, enter, done
+```
+
+The page the browser gets is the extension's own webview; the pairing code
+travels as a header on every request and in the event-stream URL, and nothing
+else is secret. See [server/README.md](server/README.md).
+
+**The relay** mirrors a board running in VS Code to a small site (Netlify,
+Cloudflare Workers, or a plain Node process), so you can watch it from a phone
+without the extension's machine being reachable at all. See
+[remote/README.md](remote/README.md).
+
+---
+
 ## Screenshots
 
 **An agent asking you something.** Real questions with real options — pick one,

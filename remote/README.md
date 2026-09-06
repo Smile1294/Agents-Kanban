@@ -1,9 +1,15 @@
 # Agents Kanban — remote board relay
 
-The other half of the extension's **Remote Control**: a small site that
-receives a board — cards, phases and the chats — pushed from an Agents Kanban
-install, and shows it in any browser. No code, no file paths and no
-credentials ever leave the machine pushing.
+The **mirror mode** of Remote Control: a small site that receives a board —
+cards, phases and the chats — pushed from an Agents Kanban install, and shows
+it in any browser. No code, no file paths and no credentials ever leave the
+machine pushing.
+
+> If what you want is a board you can **drive from a browser on a box of your
+> own** — send prompts, start sessions, approve, review, merge — see
+> [server/README.md](../server/README.md): the headless board. It runs the
+> extension itself on the box. This relay mirrors a board that runs elsewhere;
+> it cannot run agents.
 
 This folder is self-contained: copy it into its own repository (or keep it in
 place) and deploy it on any of the three hosts below. It is not part of the
