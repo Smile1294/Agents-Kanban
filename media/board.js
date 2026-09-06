@@ -2107,18 +2107,28 @@
        installed is not in the list at all — it is not something you can run on.
        The last entry still opens the settings page, which is where backends are
        added and edited. */
-    /* A STARTED session states what it is on; it does not offer to change it.
-       Its transcript belongs to that runtime's own store and its backend is
-       environment on a process that is already running, so neither can move.
-       A picker here would change what the NEXT session does while appearing to
-       change this one — a control that cannot say no, which this board has a
-       rule about. The chip keeps the full description in its tooltip. */
+    /* A STARTED session keeps its AGENT: its transcript belongs to that
+       runtime's own store and no other agent can read it, so the chip is a
+       readout. Its BACKEND it may change — the next launch re-reads the whole
+       conversation on whichever backend is picked here, at that backend's
+       input price, and the amber note by the model picker says so. Only
+       same-runtime combinations are offered: a backend change moves
+       environment, an agent change would move the transcript, and one of
+       those is not a thing. */
     if (s.composer.agentLocked) {
-      const chip = el('span', 'picker static', '🤖 ' + agentName())
-      const on = (s.composer.agents || []).find((a) => a.key === s.composer.agent)
-      chip.title = (on ? on.label + ' — ' + on.detail + '. ' : '')
-        + 'This session is running on it. An agent and its backend are fixed when the session starts.'
+      const rtEntry = (s.composer.runtimes || []).find((r) => r.id === s.composer.runtime)
+      const chip = el('span', 'picker static', '🤖 ' + (rtEntry ? rtEntry.label : (s.composer.runtime || 'Agent')))
+      chip.title = 'This session runs on this agent program. Its transcript lives in that agent’s ' +
+        'own store, so the agent itself cannot change.'
       bar.append(chip)
+      const sameRt = (s.composer.agents || []).filter((a) => a.runtime === s.composer.runtime)
+      if (sameRt.length > 1) {
+        bar.append(picker('agent', 'Backend: ' + backendName(), sameRt.map((a) => ({
+          value: a.key,
+          label: a.label,
+          meta: a.detail,
+        })), s.selectedKey, s.composer.backendNote))
+      }
     } else {
       bar.append(picker('agent', '🤖 ' + agentName(), (s.composer.agents || []).map((a) => ({
         value: a.key,
@@ -2140,7 +2150,7 @@
     if (s.composer.orchestrationLevels && s.composer.orchestrationLevels.length) {
       bar.append(picker(
         'orchestration',
-        '⑂ ' + orchestrationLabel(),
+        orchestrationLabel(),
         (s.composer.orchestrationLevels || []).map((o) => ({
           value: o.key,
           label: o.label + ' — ' + o.detail,
@@ -2215,6 +2225,16 @@
     // The one piece of the composer that changes per streamed frame, and the
     // ref the fast path patches between full renders.
     if (readouts) { bar.append(readouts); syncReadoutsNode = readouts } else syncReadoutsNode = null
+    /* The settings page, one click from every composer state. It used to be
+       reachable only from the command palette — or from an entry inside the
+       agent picker, which a STARTED session hides entirely — so the moment a
+       run started, the way to backends, schedules, the spawn-model policy and
+       the remote pairing code all disappeared at once. Reported as "how do I
+       even access the remote board". This button never disappears. */
+    const gear = el('button', 'gear-btn', '⚙')
+    gear.title = 'Settings: agents, backends, spawn policy, schedules, remote control'
+    gear.onclick = (e) => { stop(e); post('openSettings') }
+    bar.append(gear)
     wrap.append(bar)
 
     // `/name args` is executed by the Agent SDK as the matching
@@ -2659,6 +2679,15 @@
      apart. A live run's own answer still wins: `resolvedProvider` is what the
      CLI reported it is ACTUALLY on, and a managed settings file or an
      apiKeyHelper outranks anything we put in the environment. */
+  /* The backend half of the started session's chip: the label of the
+     combination the session is on, from the SAME list the menu is built from.
+     For a profile entry that is the backend's name ("OpenRouter (DeepSeek)");
+     for a runtime with no backend concept this picker is never drawn. */
+  function backendName() {
+    const on = (s.composer.agents || []).find((a) => a.key === s.composer.agent)
+    return on ? on.label : (s.composer.provider || 'Backend')
+  }
+
   function agentName() {
     const live = selected() && selected().agent
     const chosen = (s.composer.agents || []).find((a) => a.key === s.composer.agent)
@@ -2672,11 +2701,13 @@
 
   /* The level's own label. Falls back to the raw key rather than to a guess:
      a build that stored a level this one does not serve should say so, not
-     silently show "Balanced". */
+     silently show "Balanced". The ⑂ glyph this used to carry said nothing —
+     reported as "I can't select anywhere the orchestration" — so the label
+     says what the dial IS: how readily THIS card splits into subtasks. */
   function orchestrationLabel() {
     const key = s.composer.orchestration
     const found = (s.composer.orchestrationLevels || []).find((o) => o.key === key)
-    return found ? found.label : (key || 'Split')
+    return 'Split: ' + (found ? found.label : (key || 'Split'))
   }
 
   /* WHO WROTE THIS BLOCK.

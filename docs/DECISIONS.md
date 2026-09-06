@@ -147,6 +147,65 @@ session would otherwise put the entire repo inside the `.vsix`.
 
 ---
 
+### A started session's backend is a choice; its runtime is a fact
+
+The composer used to lock BOTH halves the moment a session had metadata, so the
+report went: *"once it ran I can't change from OpenRouter to Anthropic and use
+their models"*. The two halves are different constraints and were being treated
+as one:
+
+- The **runtime** is genuinely fixed: the transcript lives in that runtime's own
+  store, its model ids are that runtime's, and its login is that runtime's.
+  There is no honest move across.
+- The **backend** is environment on the CLI process, and a session launches a
+  process again on every turn. Switching it is a real thing with a real cost:
+  the next launch re-reads the whole conversation at the new backend's input
+  price.
+
+So a started session's composer shows a readout chip for the agent and a
+same-runtime-only backend picker. The load-bearing piece is on the host:
+`send()` carries `providerFor` — the profile resolved from the session's own
+`meta.provider` — and `launch()` uses it instead of the active profile. One
+global `providerEnv` for every launch would make the picker a lie the moment a
+second session starts on a different backend.
+
+`meta.switchedFrom` records the provider the conversation RAN on, so the bar can
+warn that the next turn re-reads it all at the new backend's price (with a
+caveat while the agent is live: it applies when it stops and the conversation
+resumes). The launch that performs the switch clears it — `null` in a patch, the
+same sentinel convention as `CLEAR_TEST_PLAN` — so the warning is tied to one
+switch, not permanent.
+
+### One settings door, and a page that says where things are
+
+Five complaints at once — can't find the orchestration models, can't switch a
+started session's backend, can't pick spawn models, can't reach the remote
+board, can't even open the settings page — and four of them were the same bug in
+different places: the settings surface was only reachable from the command
+palette, or from an entry inside the agent picker, which a started session
+hides. The moment a run started, backends, schedules, the spawn-model policy and
+the remote pairing code all became unreachable at once.
+
+Fixes, and the rules they encode:
+
+- **A standing gear on the composer bar.** `post('openSettings')` → the
+  existing `SettingsPanel.show()`, which is idempotent by design (one panel,
+  revealed). Never hidden by session state.
+- **Controls say what they are.** The orchestration dial was the glyph `⑂` and
+  nothing else; it now reads `Split: <level>`. The model table's spawn tick was
+  an unlabeled box at each row's end; a legend above the list says what both
+  ticks mean.
+- **The settings page grew a table of contents.** Five panels is a page nobody
+  holds in their head; a sticky nav anchors the sections that exist, never ones
+  the host did not send — an anchor to nothing is a control that cannot take
+  effect.
+- **The remote section shows where the remote IS.** The relay's viewer URL is
+  `<relay>/board`, derived host-side (`relayBase`) and rendered with Open and
+  Copy — Open goes through the host (`openExternal`), and `parseMessage`
+  restricts `openUrl` to http(s) rather than letting the webview navigate.
+
+---
+
 ## Postmortems
 
 ### The board was blank and every command was "not found"

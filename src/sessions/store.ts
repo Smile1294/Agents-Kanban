@@ -39,6 +39,15 @@ export interface BoardSession {
   model?: string
   effort?: string
   thinking?: string
+  /** The provider profile this session last launched on. Mirrors
+   *  SessionMeta.provider; the composer reads it back when a card is
+   *  selected, so a session comes back on the backend it actually ran on. */
+  provider?: string
+  /** The backend a switch moved this session AWAY from, while the switch is
+   *  still pending. Written by `switchSessionBackend`, cleared by the launch
+   *  that performs the switch; the composer's re-read warning lives exactly
+   *  as long as the re-read is still in the future. */
+  switchedFrom?: string
 }
 
 /**
@@ -277,6 +286,8 @@ export class SessionStore {
         ...(m.model ? { model: m.model } : {}),
         ...(m.effort ? { effort: m.effort } : {}),
         ...(m.thinking ? { thinking: m.thinking } : {}),
+        ...(m.provider ? { provider: m.provider } : {}),
+        ...(m.switchedFrom ? { switchedFrom: m.switchedFrom } : {}),
         ...(m.runtime ? { runtime: m.runtime } : {}),
       })
     }
@@ -308,6 +319,8 @@ export class SessionStore {
         ...(m?.contextWindow ? { contextWindow: m.contextWindow } : {}),
         ...(m?.testPlan ? { testPlan: m.testPlan } : {}),
         ...(m?.effort ? { effort: m.effort } : {}),
+        ...(m?.provider ? { provider: m.provider } : {}),
+        ...(m?.switchedFrom ? { switchedFrom: m.switchedFrom } : {}),
       })
     }
 

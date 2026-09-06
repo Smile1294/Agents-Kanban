@@ -742,5 +742,99 @@ const state = (over = {}) => ({
      'no pairing code, no toggle either — without a board id no command could ever arrive')
 }
 
+// --- the table of contents ----------------------------------------------------
+//
+// Five panels is a page nobody holds in their head; the nav at the top anchors
+// them. It is assembled from the sections that EXIST — a link to a section the
+// host never sent would be a control that cannot do anything.
+{
+  const links = (n) => [...(n ? n.children : [])]
+    .filter((c) => c.tagName === 'button').map((c) => c.textContent)
+
+  const v = await renderSettings(state())
+  const nav = v.root.querySelector('.settings-nav')
+  ok(!!nav, 'the page grows a table of contents')
+  const all = links(nav)
+  ok(all.includes('Agents') && all.includes('Backends') && all.includes('Voice'),
+     `sections that always exist are linked (${JSON.stringify(all)})`)
+  ok(!all.includes('Schedules') && !all.includes('Remote'),
+     'sections the host did not send get no link — an anchor to nothing is a button that lies')
+
+  const full = await renderSettings(state({
+    schedules: { canRun: true, rows: [] },
+    remote: { enabled: false, url: 'https://board.example.com', hasCode: true },
+  }))
+  const fullLinks = links(full.root.querySelector('.settings-nav'))
+  ok(fullLinks.includes('Schedules') && fullLinks.includes('Remote'),
+     'the conditional sections appear in the nav once they exist')
+
+  // A nav link must scroll its section — a link that does nothing is the page
+  // lying about itself. The stub DOM records `scrollIntoView`.
+  const remoteBtn = findButton(full.root, 'Remote')
+  ok(!!remoteBtn, 'the Remote link is there to click')
+  remoteBtn.onclick({})
+  const target = [...full.root.querySelectorAll('section')].find((s) => s.id === 'sec-remote')
+  ok(!!target && !!target._scrollIntoView,
+     'clicking a nav link scrolls its section into view')
+}
+
+// --- Remote Control: the viewer URL ------------------------------------------
+// "How do I even access the Remote board?" — the section that set the relay up
+// never said where the remote IS. The host derives the URL; the page shows it
+// with the two ways to use it: open it, or copy it to a phone or a chat.
+{
+  const secOf = (v) => [...v.root.querySelectorAll('section')]
+    .find((s) => s.textContent.includes('Remote Control'))
+
+  const withViewer = await renderSettings(state({
+    remote: {
+      enabled: true, url: 'https://board.example.com', hasCode: true,
+      viewerUrl: 'https://board.example.com/board',
+    },
+  }))
+  const sec = secOf(withViewer)
+  ok(sec.textContent.includes('https://board.example.com/board'),
+     'the viewer URL a phone opens is shown on the page that sets the relay up')
+  ok(sec.textContent.includes('Watch it from any browser'),
+     'labelled as the way to watch, not as another config field')
+  findButton(sec, 'Open').onclick({})
+  ok(withViewer.posted.some((m) => m.type === 'openUrl'
+       && m.url === 'https://board.example.com/board'),
+     'Open asks the host to open the viewer in the default browser')
+  findButton(sec, 'Copy').onclick({})
+  ok(withViewer.posted.some((m) => m.type === 'copyText'
+       && m.text === 'https://board.example.com/board'),
+     'Copy posts the URL to the host clipboard — the webview has none of its own')
+
+  const without = await renderSettings(state({
+    remote: { enabled: true, url: 'https://board.example.com', hasCode: true },
+  }))
+  ok(!secOf(without).querySelector('.remote-viewer'),
+     'no URL saved, no viewer row — a URL to nothing would be a button that lies')
+}
+
+// --- the model table's two ticks are explained -------------------------------
+// "I can't select which models the AIs should be able to use" — the spawn tick
+// arrived as an unlabeled box at each row's end. A legend above the list says
+// what the two ticks mean, and it lives with the ticks, not on a closed row.
+{
+  const withCatalogue = state({
+    providers: [{
+      id: 'ds', label: 'DeepSeek', kind: 'gateway', detail: 'api.deepseek.com',
+      active: true, hasCredential: true,
+      models: [{ id: 'deepseek-chat', label: 'DeepSeek Chat', context: '128K', offered: true }],
+    }],
+  })
+  const v = await renderSettings(withCatalogue)
+  ok(!v.root.querySelector('.model-legend'),
+     'the legend stays hidden while the catalogue is collapsed — it explains ticks that are not yet shown')
+  findButton(v.root, 'models available').onclick()
+  const legend = v.root.querySelector('.model-legend')
+  ok(!!legend && legend.textContent.includes('allowed for spawned agents (split_task)'),
+     'once the list is open, the legend says what the spawn tick means')
+  ok(legend.textContent.includes('offered in the composer'),
+     'and what the offer tick means — two ticks, two choices, both explained')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

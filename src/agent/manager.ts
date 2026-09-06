@@ -211,6 +211,10 @@ export function durablePatch(a: {
     ...(a.model ? { model: a.model } : {}),
     ...(a.effort ? { effort: a.effort } : {}),
     ...(a.thinking ? { thinking: a.thinking } : {}),
+    // The launch IS the moment a pending backend switch happens: the session is
+    // now on the new backend, so the "it will re-read everything" warning has
+    // nothing left to warn about. `null` is the clear sentinel — see `normalise()`.
+    switchedFrom: null,
   }
 }
 
@@ -275,6 +279,17 @@ interface LaunchOptions {
    *  default. A resumed session keeps whatever it was started on, because its
    *  transcript belongs to that runtime and nothing else can read it. */
   runtime?: RuntimeId
+  /**
+   * The backend a RESUMED session launches on, resolved by the HOST from the
+   * session's own recorded profile.
+   *
+   * A new session starts on the active profile (`this.opts.providerEnv`). A
+   * resumed one starts on ITS OWN — a session switched from OpenRouter to
+   * Anthropic must come back on Anthropic, not on whatever profile is active
+   * the day it resumes. Absent means "use the active one", which is also the
+   * right answer for a session that never recorded a provider.
+   */
+  providerFor?: { profile: ProviderProfile; env: ProviderEnv }
 }
 
 export interface RunningAgent {
@@ -770,8 +785,16 @@ export class AgentManager extends EventEmitter {
     this.touch()
   }
 
-  /** Continue an existing session: same worktree, resumed Claude session. */
-  async send(key: string, text: string, images: readonly AttachedImage[] = []): Promise<void> {
+  /** Continue an existing session: same worktree, resumed Claude session.
+   *  `providerFor` is the session's OWN backend, resolved by the host — see
+   *  `LaunchOptions.providerFor`. It only matters when the session is being
+   *  resumed; a live run's environment is already fixed on its process. */
+  async send(
+    key: string,
+    text: string,
+    images: readonly AttachedImage[] = [],
+    providerFor?: LaunchOptions['providerFor'],
+  ): Promise<void> {
     const live = this.byKey(key)
     if (live) {
       const s = this.sessions.get(live.runId)
@@ -796,7 +819,11 @@ export class AgentManager extends EventEmitter {
       if (a.sessionId === key && !this.sessions.has(a.runId)) this.agents.delete(a.runId)
     }
     const existing = await this.opts.store.get(key)
-    await this.start(text, { resume: key, ...(existing?.title ? { title: existing.title } : {}) })
+    await this.start(text, {
+      resume: key,
+      ...(existing?.title ? { title: existing.title } : {}),
+      ...(providerFor ? { providerFor } : {}),
+    })
   }
 
   /**
@@ -924,6 +951,14 @@ export class AgentManager extends EventEmitter {
     // Reuse the worktree of the session being resumed, so a follow-up does not
     // strand the agent in a fresh checkout without its earlier work.
     const prior = opts.resume ? await this.opts.store.get(opts.resume) : undefined
+    // The launch is the moment a pending backend switch actually happens, so
+    // the bar's "the next turn re-reads it all on the new backend" warning has
+    // nothing left to warn about. Cleared HERE and not only in `durablePatch`
+    // (which rides the `sessionId` event): a resume keeps the id it already
+    // has, so that event may never fire again.
+    if (opts.resume && prior?.switchedFrom) {
+      void this.opts.store.patch(opts.resume, { switchedFrom: null }).catch(() => {})
+    }
     const wt = prior?.worktree && prior.branch
       ? { path: prior.worktree, branch: prior.branch, base: prior.base }
       // A subtask forks from what its PARENT forked from, not from the parent's
@@ -1050,8 +1085,11 @@ export class AgentManager extends EventEmitter {
         startedAt: agent.startedAt,
         ...(opts.parent ? { parent: opts.parent } : {}),
         // What this run is on, so opening the card later says so rather than
-        // repeating the workspace default back.
-        ...(this.opts.provider ? { provider: this.opts.provider.id } : {}),
+        // repeating the workspace default back. A resumed session records ITS
+        // backend (`opts.providerFor`), not the workspace's active one.
+        ...(opts.providerFor?.profile ?? this.opts.provider
+          ? { provider: (opts.providerFor?.profile ?? this.opts.provider)!.id }
+          : {}),
         ...(chosen.model ? { model: chosen.model } : {}),
         ...(chosen.effort ? { effort: chosen.effort } : {}),
         ...(chosen.thinking ? { thinking: chosen.thinking } : {}),
@@ -1313,12 +1351,18 @@ export class AgentManager extends EventEmitter {
     // environment on the child process. Handing them to one that authenticates
     // as itself would be configuring something that cannot take effect, and the
     // board would then name a provider that is not billing anything.
+    // A RESUMED session brings its OWN backend (`opts.providerFor`, resolved by
+    // the host from the session's recorded profile); a new one starts on the
+    // active profile. Resolving this twice — once at enqueue, once here — is
+    // how a queued run could start on a profile nobody picked.
+    const launchProfile = opts.providerFor?.profile ?? this.opts.provider
+    const launchEnv = opts.providerFor?.env ?? this.opts.providerEnv
     const provider = rt.capabilities.providerProfiles
       ? {
-          ...(this.opts.provider ? { provider: this.opts.provider } : {}),
-          ...(this.opts.providerEnv?.set && Object.keys(this.opts.providerEnv.set).length
-            ? { env: this.opts.providerEnv.set } : {}),
-          ...(this.opts.providerEnv?.clear?.length ? { envClear: this.opts.providerEnv.clear } : {}),
+          ...(launchProfile ? { provider: launchProfile } : {}),
+          ...(launchEnv?.set && Object.keys(launchEnv.set).length
+            ? { env: launchEnv.set } : {}),
+          ...(launchEnv?.clear?.length ? { envClear: launchEnv.clear } : {}),
         }
       : {}
 

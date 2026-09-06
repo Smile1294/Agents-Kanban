@@ -398,18 +398,22 @@ export interface UiState {
       key: string; label: string; detail: string; runtime: string; provider: string
     }[]
     /**
-     * True when the selected session has already been launched, so its agent
-     * and backend are decided.
+     * True when the selected session has already been launched.
      *
-     * A session's transcript lives in its runtime's own store and its backend
-     * is environment on a process that is already running — neither can move.
-     * The chip still names them, because that is a statement about the run in
-     * front of you; it just stops being a control, rather than being a control
-     * that quietly changes what the NEXT session does while appearing to change
-     * this one.
+     * The RUNTIME half is decided: a session's transcript lives in its
+     * runtime's own store, and no other runtime can read it — so the agent
+     * chip stops being a control and becomes a readout. The BACKEND half is
+     * not: the transcript is re-read on the next launch either way, so the
+     * view offers a backend picker filtered to the session's own runtime, and
+     * the host warns about the re-read cost (`modelSwitchNote` / `switchedFrom`
+     * on `SessionMeta`).
      */
     agentLocked?: boolean
     runtime: string
+    /** Shown inside the started session's backend picker — a live run cannot
+     *  change backend until it stops, and the note says so at the moment of
+     *  choosing rather than after the choice. Absent when nothing is running. */
+    backendNote?: string
     /** Every agent program this build can drive. `providerProfiles` is carried
      *  so the chip can name a backend only where one is a real choice — a Codex
      *  session has nothing behind it to name, and inventing one would be the

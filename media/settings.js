@@ -272,8 +272,9 @@ function providerSection() {
   box.appendChild(head)
   box.appendChild(el('p', 'blurb',
     'Which service Claude Code talks to: Anthropic directly, a cloud that resells it, or a gateway ' +
-    'you run. This applies to Claude Code sessions only — it is environment on the CLI process, ' +
-    'and it takes effect on the NEXT session rather than one already running.'))
+    'you run. The active backend is what the NEXT session starts on. A session already running ' +
+    'keeps its own — the composer can switch it, and the next turn re-reads the whole ' +
+    'conversation at the new backend prices.'))
 
   if (!state.providers.length) {
     box.appendChild(el('div', 'muted', 'No profiles yet. The default inherits whatever your shell already sets.'))
@@ -360,6 +361,20 @@ function providerModels(p) {
     render()
   })
   box.appendChild(filter)
+
+  /* Two ticks per row deserve a legend: the spawn tick arrived as an unlabeled
+     box at the row's end, and "which models may split_task use?" had no answer
+     that could be found by looking at the page. */
+  const legend = el('div', 'model-legend')
+  const offerLeg = el('span', 'model-legend-part')
+  offerLeg.appendChild(el('span', 'model-legend-mark', '☑'))
+  offerLeg.appendChild(el('span', '', 'offered in the composer'))
+  legend.appendChild(offerLeg)
+  const spawnLeg = el('span', 'model-legend-part')
+  spawnLeg.appendChild(el('span', 'model-legend-mark', '☑'))
+  spawnLeg.appendChild(el('span', '', 'allowed for spawned agents (split_task)'))
+  legend.appendChild(spawnLeg)
+  box.appendChild(legend)
 
   const SHOW = 60
   const table = el('div', 'model-rows')
@@ -830,6 +845,28 @@ function remoteSection() {
     sec.appendChild(wrow)
   }
 
+  /* Where the remote actually IS — the one fact this section never showed,
+     which made "how do I access the Remote board" unanswerable from the page
+     that sets it up. Copy prefers the webview's own clipboard and falls back
+     to the host's when it is unavailable (as it is here). */
+  if (r.viewerUrl) {
+    const vrow = el('div', 'remote-viewer')
+    vrow.appendChild(el('span', 'muted small', 'Watch it from any browser:'))
+    vrow.appendChild(el('code', 'fix', r.viewerUrl))
+    vrow.appendChild(button('Open', 'link', () => post({ type: 'openUrl', url: r.viewerUrl })))
+    vrow.appendChild(button('Copy', 'link', () => {
+      // The webview's own clipboard is absent more often than present; the
+      // host's is the reliable one, so the page prefers the first and falls
+      // back to the second.
+      if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(r.viewerUrl).catch(() => post({ type: 'copyText', text: r.viewerUrl }))
+      } else {
+        post({ type: 'copyText', text: r.viewerUrl })
+      }
+    }))
+    sec.appendChild(vrow)
+  }
+
   const form = el('div', 'remote-form')
 
   const url = el('input', 'remote-input')
@@ -922,7 +959,17 @@ function render() {
 
   if (state.busy) page.appendChild(el('div', 'busy', state.busy))
 
+  /* The page outgrew one screen — five panels now — so it grows a table of
+     contents. Each section takes an id as it is built, and this nav is filled
+     from the ones that exist (backends, schedules and remote are conditional)
+     once they are all on the page. Anchors scroll the page's own body. */
+  const navItems = []
+  const nav = el('nav', 'settings-nav')
+  page.appendChild(nav)
+
   const agents = el('section', 'panel')
+  agents.id = 'sec-agents'
+  navItems.push({ id: 'sec-agents', label: 'Agents' })
   const ahead = el('div', 'panel-head')
   ahead.appendChild(el('h2', '', 'Agents'))
   ahead.appendChild(button('Check all again', 'link', () => post({ type: 'refresh' })))
@@ -946,17 +993,43 @@ function render() {
   // Only shown when at least one runtime actually takes provider profiles.
   // Offering a backend picker for a board whose agents all sign in as
   // themselves would be a setting that cannot take effect.
-  if (state.runtimes.some((r) => r.providerProfiles)) page.appendChild(providerSection())
+  if (state.runtimes.some((r) => r.providerProfiles)) {
+    const prov = providerSection()
+    prov.id = 'sec-backends'
+    navItems.push({ id: 'sec-backends', label: 'Backends' })
+    page.appendChild(prov)
+  }
 
   // Always rendered when the host provides the section — an empty rows list
   // is a real state ("nothing scheduled yet"), not an absent feature. Old
   // hosts that never send `schedules` simply show no section.
-  if (state.schedules) page.appendChild(scheduledSection())
+  if (state.schedules) {
+    const sched = scheduledSection()
+    sched.id = 'sec-schedules'
+    navItems.push({ id: 'sec-schedules', label: 'Schedules' })
+    page.appendChild(sched)
+  }
 
   const remote = remoteSection()
-  if (remote) page.appendChild(remote)
+  if (remote) {
+    remote.id = 'sec-remote'
+    navItems.push({ id: 'sec-remote', label: 'Remote' })
+    page.appendChild(remote)
+  }
 
-  page.appendChild(dictationSection())
+  const voice = dictationSection()
+  voice.id = 'sec-voice'
+  navItems.push({ id: 'sec-voice', label: 'Voice' })
+  page.appendChild(voice)
+
+  /* Filled now, after every conditional section has claimed its id — the nav
+     element is already on the page in its place, so filling it keeps it there. */
+  for (const item of navItems) {
+    nav.appendChild(button(item.label, 'link', () => {
+      const target = document.getElementById(item.id)
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }))
+  }
 
   const foot = el('footer', 'settings-footer')
   foot.appendChild(el('span', 'muted small',

@@ -15,7 +15,7 @@ import { repoRoot } from './harness.mjs'
 
 export function makeNode(tag) {
   const node = {
-    tagName: tag, className: '', children: [], style: {}, dataset: {},
+    tagName: tag, className: '', id: null, children: [], style: {}, dataset: {},
     classList: {
       _o: null,
       add(...c) { this._o.className = [this._o.className, ...c].filter(Boolean).join(' ') },
@@ -107,6 +107,10 @@ export function makeNode(tag) {
     querySelector(sel) { return this.querySelectorAll(sel)[0] ?? null },
     querySelectorAll(sel) { return walk(this).slice(1).filter((n) => n.tagName && matchesSelector(n, sel)) },
     getBoundingClientRect() { return { top: 0, height: 10 } },
+    // The settings page's table of contents scrolls sections into view. Recorded
+    // rather than omitted: a nav link whose handler is never attached is a link
+    // that does nothing, which is only visible if the call lands somewhere.
+    scrollIntoView(opts) { this._scrollIntoView = opts || {} },
     // Focus is real state here: render() destroys and rebuilds the composer, so
     // whether it hands focus back is a testable fact, not a detail.
     focus() { if (node._doc) node._doc.activeElement = node },
@@ -225,7 +229,13 @@ export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
   const timers = []
   const document = {
     activeElement: null,
-    getElementById: (id) => (id === 'root' ? root : null),
+    // Real lookup by id: the settings page's table of contents anchors sections
+    // with `document.getElementById`, and a stub that answered only for 'root'
+    // made every nav link a no-op that no test could see.
+    getElementById: (id) => {
+      if (id === 'root') return root
+      return walk(root).find((n) => n.id === id) ?? null
+    },
     createElement: (tag) => {
       const n = makeNode(tag)
       n._doc = document
