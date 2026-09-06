@@ -389,6 +389,65 @@ function providerModels(p) {
   return box
 }
 
+/* --- the composer's mic ------------------------------------------------
+ *
+ * Dictation is two LOCAL tools — ffmpeg records, whisper-cli transcribes —
+ * and the audio never leaves the machine, which is the entire point of it.
+ * Each piece is checked by actually asking the binary, and each missing one
+ * is its own row with its own fix, because "install the thing" is wallpaper
+ * the moment a user has one of the two installed.
+ */
+const VOICE_SETTING_KEYS = { whisper: 'agentsKanban.whisperPath', model: 'agentsKanban.whisperModel', ffmpeg: 'agentsKanban.ffmpegPath' }
+
+function dictationSection() {
+  const sec = el('section', 'panel')
+  const head = el('div', 'panel-head')
+  head.appendChild(el('h2', '', 'Dictation'))
+  head.appendChild(el('span', 'muted small', 'the composer mic — recorded and transcribed on this machine'))
+  sec.appendChild(head)
+
+  const intro = el('div', 'muted small')
+  intro.appendChild(el('span', '', 'The composer’s 🎤 needs whisper-cli and ffmpeg, found on your PATH or pointed to by four settings. Nothing is uploaded: the recording and the transcription both happen here.'))
+  sec.appendChild(intro)
+
+  const v = state.voice
+  if (!v) {
+    const row = el('div', 'status-row')
+    // NEVER "not installed" when we simply have not looked.
+    row.appendChild(el('span', 'dot unknown'))
+    row.appendChild(el('span', 'status-text', 'Not checked yet.'))
+    row.appendChild(button('Check', 'link', () => post({ type: 'checkVoice' })))
+    sec.appendChild(row)
+  } else {
+    for (const r of v.rows) {
+      const row = el('div', 'status-row')
+      row.appendChild(el('span', 'dot ' + (r.ok ? 'ok' : 'bad')))
+      const label = el('span', 'status-text', r.label)
+      row.appendChild(label)
+      if (r.ok) {
+        row.appendChild(el('span', 'muted small', r.detail))
+      } else {
+        // A missing piece opens the very setting that fixes it — a fix is a
+        // place, not just a sentence.
+        const fix = el('code', 'fix')
+        fix.textContent = r.detail
+        fix.style.cursor = 'pointer'
+        fix.title = 'Open the setting for this'
+        fix.addEventListener('click', () => {
+          post({ type: 'openSetting', key: VOICE_SETTING_KEYS[r.key] || 'agentsKanban' })
+        })
+        row.appendChild(fix)
+      }
+      const age = el('span', 'muted small', 'checked ' + since(v.at))
+      age.title = 'When the binaries were last asked. Press Check to ask again.'
+      row.appendChild(age)
+      sec.appendChild(row)
+    }
+    sec.appendChild(button('Check again', 'link', () => post({ type: 'checkVoice' })))
+  }
+  return sec
+}
+
 function render() {
   const root = document.getElementById('root')
   /* THE SAME RULE THE BOARD HAS: anything the user is typing into is destroyed
@@ -448,6 +507,8 @@ function render() {
   // Offering a backend picker for a board whose agents all sign in as
   // themselves would be a setting that cannot take effect.
   if (state.runtimes.some((r) => r.providerProfiles)) page.appendChild(providerSection())
+
+  page.appendChild(dictationSection())
 
   const foot = el('footer', 'settings-footer')
   foot.appendChild(el('span', 'muted small',

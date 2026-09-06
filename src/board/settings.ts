@@ -49,6 +49,23 @@ export interface SettingsState {
   /** Set while a check is in flight, so the page can say so rather than
    *  appearing to have answered instantly. */
   busy?: string
+  /**
+   * The composer's voice pipeline, checked.
+   *
+   * Absent until "Check" is pressed: checking spawns whisper-cli and ffmpeg,
+   * which is never something a page paint does. `at` rides along so the page
+   * can say how stale a green row is.
+   */
+  voice?: { at: number; rows: VoiceRowState[] }
+}
+
+/** One piece of the dictation pipeline, as the settings page shows it. */
+export interface VoiceRowState {
+  key: string
+  label: string
+  ok: boolean
+  /** Where it was found, or the fix for THIS piece when it was not. */
+  detail: string
 }
 
 export interface RuntimeAgentCard {
@@ -144,6 +161,9 @@ export type SettingsMessage =
    *  message rather than an edit to the profile: `[]` and `undefined` have to
    *  survive the round trip as the same answer. */
   | { type: 'setProfileModels'; id: string; models: string[] }
+  /** Run the voice-pipeline probe now, cache or no cache — a Check button is a
+   *  check. Fills `state.voice`. */
+  | { type: 'checkVoice' }
 
 export interface SettingsHost {
   getState: () => Promise<SettingsState>
@@ -300,6 +320,7 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
   switch (type) {
     case 'ready':
     case 'addProvider':
+    case 'checkVoice':
       return { type } as SettingsMessage
     case 'refresh':
       return known.has(runtime) ? { type, runtime: runtime as RuntimeId } : { type }

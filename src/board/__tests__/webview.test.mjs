@@ -917,5 +917,129 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   ok(!/Showing/.test(v.text()), 'and nothing is hidden, so nothing is announced')
 }
 
+// 18. The composer's mic, gated on a real check of whisper and ffmpeg. ---------
+// The mic is drawn ONLY when the host's probe of the two binaries answered —
+// a control that cannot take effect is not drawn (this project's rule), and
+// before the probe there is nothing honest to draw.
+{
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  ok(!findButton(v.root, '🎤'), 'no mic before the voice probe answered')
+}
+
+{
+  const voice = { available: true, recording: false }
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice } })
+  const mic = findButton(v.root, '🎤')
+  ok(!!mic, 'a checked-in voice pipeline draws the mic')
+  mic.onclick()
+  ok(v.posted.some((m) => m.type === 'voiceStart'), 'pressing the mic asks the host to start recording')
+
+  // The host says recording is live (it rides the next state), and the mic
+  // turns into the stop control.
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: true } })
+  for (const fn of v.listeners) fn({ data: { type: 'state', state: { ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: true, recording: true } } } } })
+  const stop = findButton(v.root, '⏺')
+  ok(!!stop, 'while recording the mic is a stop control')
+  ok(stop.className.includes('live'), 'and is marked live')
+
+  // Stop, and the transcript arrives as a message — not as part of any state —
+  // and lands in the draft where the caret was.
+  stop.onclick()
+  ok(v.posted.some((m) => m.type === 'voiceStop'), 'pressing again asks the host to stop and transcribe')
+  const ta = findByTag(v.root, 'textarea')
+  ok(!!ta, 'the composer textarea is there')
+  ta.value = 'look at the log:'
+  ta.oninput({ target: ta })
+  ta.onclick() // caret tracked at end of the draft
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, text: 'the build broke' } })
+  const after = findByTag(v.root, 'textarea')
+  ok(after.value === 'look at the log: the build broke ', `the transcript lands in the draft: "${after.value}"`)
+}
+
+{
+  // A second dictation right after the first appends where the first left off.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: true, recording: false } } })
+  const ta = findByTag(v.root, 'textarea')
+  ta.value = 'fix'
+  ta.oninput({ target: ta })
+  ta.onclick()
+  findButton(v.root, '🎤').onclick()
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, text: 'the parser' } })
+  const ta2 = findByTag(v.root, 'textarea')
+  ok(ta2.value === 'fix the parser ', 'transcript is spaced off the existing word')
+  findButton(v.root, '🎤').onclick()
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, text: 'and rerun it' } })
+  const ta3 = findByTag(v.root, 'textarea')
+  ok(ta3.value === 'fix the parser and rerun it ', 'two dictations do not weld together')
+}
+
+{
+  // Whisper or ffmpeg missing: no dead mic. The mic shows, dimmed, and goes to
+  // the settings page — the place that says how to install each piece.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: false, why: 'whisper-cli not found' } } })
+  const mic = findButton(v.root, '🎤')
+  ok(!!mic && mic.className.includes('missing'), 'an unavailable pipeline draws the mic dimmed, not hidden and not dead')
+  mic.onclick()
+  ok(v.posted.some((m) => m.type === 'openSettings'), 'the dimmed mic opens the settings page, which says how to fix each piece')
+}
+
+{
+  // A pipeline that refused to start says so, and does not pretend to record.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: true, recording: false } } })
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, error: 'Recording stopped itself — no default device' } })
+  ok(v.text().includes('Recording stopped itself'), 'a failed capture is shown under the composer')
+  ok(!findButton(v.root, '⏺'), 'and the mic is not left pretending to record')
+}
+
+// 19. The @-mention picker: naming a file so the agent reads it itself. --------
+{
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  const ta = findByTag(v.root, 'textarea')
+  ok(!ta.value.includes('@'), 'draft starts empty')
+  ta.value = '@con'
+  ta.oninput({ target: ta })
+  // The FIRST @ asks the host for the file list — once, lazily, never on a
+  // repaint — and shows nothing until the list is really there.
+  ok(v.posted.some((m) => m.type === 'mentionFiles'), 'the first @ asks the host for the file list')
+  ok(!v.text().includes('constants.ts'), 'nothing is offered before the host answered')
+  for (const fn of v.listeners) fn({ data: { type: 'mentions', files: ['src/constants.ts', 'src/main.ts', 'readme.md'] } })
+  const menu = v.text()
+  ok(menu.includes('@src/constants.ts'), 'typing @con offers the files that match')
+  ok(!menu.includes('readme.md'), 'and not the ones that do not')
+  const item = findButton(v.root, 'src/constants.ts')
+  ok(!!item, 'the match is a button')
+  item.onclick({ stopPropagation() {} })
+  const after = findByTag(v.root, 'textarea')
+  ok(after.value === '@src/constants.ts ', `choosing a file replaces the half-typed @: "${after.value}"`)
+}
+
+{
+  // Tab completes the highlighted row; Enter would send the message, so it
+  // completes instead while the menu is open — same bargain the slash menu
+  // makes.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  for (const fn of v.listeners) fn({ data: { type: 'mentions', files: ['src/a.ts', 'src/b.ts', 'lib/c.ts'] } })
+  const ta = findByTag(v.root, 'textarea')
+  ta.value = '@lib'
+  ta.oninput({ target: ta })
+  ok(v.text().includes('lib/c.ts'), 'matches come from the middle of the path too')
+  ta.onkeydown({ key: 'Tab', preventDefault() {}, shiftKey: false })
+  const after = findByTag(v.root, 'textarea')
+  ok(after.value === '@lib/c.ts ', 'Tab inserts the highlighted file')
+}
+
+{
+  // No file list — a workspace with nothing mentionable — and the @ stays a
+  // plain character: no empty menu, no dead picker.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  for (const fn of v.listeners) fn({ data: { type: 'mentions', files: [] } })
+  const ta = findByTag(v.root, 'textarea')
+  ta.value = '@'
+  ta.oninput({ target: ta })
+  const bare = findByTag(v.root, 'textarea')
+  ok(bare.value === '@', 'a bare @ with no files to offer stays a plain character')
+  ok(!v.root.querySelector('.mention-menu'), 'and no empty menu is drawn')
+}
+
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

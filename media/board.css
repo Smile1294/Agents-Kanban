@@ -871,6 +871,50 @@ details.thinking summary::-webkit-details-marker { display: none; }
 .slash-scope { font-size: 0.86em; color: var(--faint); }
 .slash-hint { padding: 5px 10px; font-size: 0.74em; color: var(--faint); border-top: 1px solid var(--line); }
 
+/* --- the composer's dictation mic and its note ------------------------------ */
+
+/* `button` resets the cursor to default, which is wrong for a control. */
+.mic { flex: none; font-size: 1.05em; line-height: 1; padding: 5px 8px; cursor: pointer; }
+/* Recording: a solid stop glyph on a red mic, pulsing — a live capture that
+   silently ended is shown as such by state, not by this pulse alone. */
+.mic.live {
+  color: #fff; background: var(--vscode-errorForeground, #f14c4c);
+  border-color: transparent; border-radius: 50%;
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+/* Whisper or ffmpeg is missing: still clickable, because it opens the settings
+   page that says how to install them — a button that goes to the fix is not a
+   dead control. */
+.mic.missing { opacity: 0.45; cursor: pointer; }
+.voice-note {
+  margin: 0 14px 8px; font-size: 0.78em; color: var(--warn, #f0ad4e);
+  padding: 4px 10px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel);
+}
+
+/* --- the composer's @-mention picker ---------------------------------------- */
+
+.mention-menu {
+  display: flex; flex-direction: column;
+  margin: 0 14px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); overflow: hidden; max-height: 260px; overflow-y: auto;
+}
+.mention-item {
+  display: flex; align-items: baseline; gap: 10px; width: 100%;
+  padding: 6px 10px; border: none; border-bottom: 1px solid var(--line);
+  background: none; color: var(--vscode-foreground); text-align: left;
+  font-family: var(--vscode-editor-font-family); font-size: 0.84em; cursor: pointer;
+}
+.mention-item:last-of-type { border-bottom: none; }
+.mention-item:hover, .mention-item.on { background: var(--vscode-list-hoverBackground); }
+.mention-item.on { box-shadow: inset 2px 0 0 var(--vscode-focusBorder); }
+.mention-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-dir { font-size: 0.86em; color: var(--faint); }
+
 /* --- taking the window ----------------------------------------------------- */
 
 .focus-btn {

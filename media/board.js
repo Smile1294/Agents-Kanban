@@ -32,8 +32,31 @@
   let menuFilter = {}
   /** Index into the slash-command suggestions, or -1 when the list is closed. */
   let slashPick = -1
-  /** The live composer textarea, so a repaint can hand focus back to it. */
-  let composerInput = null
+  /**
+   * Files the @-mention picker can suggest, workspace-relative.
+   *
+   * `null` means "not fetched yet". Fetching is the one thing on this panel
+   * that crosses to the DISK (the host answers with `findFiles`), so it happens
+   * once, lazily, the first time the user types an @ — never on a repaint.
+   */
+  let mentionFiles = null
+  let mentionFetching = false
+  /** Index into the mention suggestions, or -1 when the list is closed. */
+  let mentionPick = -1
+  /** Where the transcript of the dictation in progress will be inserted, or -1
+   *  when none is in flight. Captured when the mic is pressed, because between
+   *  then and the transcript arriving the textarea can be rebuilt by a repaint
+   *  and lose its caret — the position must survive in here, not in the DOM. */
+  let dictateAt = -1
+  /** The last place the user's caret sat in the composer, captured from the
+   *  live textarea on every input/click/keyup. The mic button steals focus when
+   *  pressed, so the caret has to be remembered, not read. */
+  let caretAt = -1
+  /** A one-line message under the composer — a dictation error, or "nothing
+   *  recognised". Stamped, because repaints happen several times a second and
+   *  without a timestamp a note posted from the host would vanish on the next
+   *  frame; with one it fades after a few seconds of its own accord. */
+  let voiceNote = null // { text: string, at: number }
   /**
    * Images attached to the message being composed.
    *
@@ -84,13 +107,36 @@
   let disclosuresSeeded = false
 
   window.addEventListener('message', (e) => {
-    if (e.data.type === 'state') {
-      s = e.data.state
+    const d = e.data
+    if (d.type === 'state') {
+      s = d.state
       if (!disclosuresSeeded) {
         disclosuresSeeded = true
         for (const k in s.disclosures || {}) disclosed[k] = !!s.disclosures[k]
       }
       render()
+    } else if (d.type === 'mentions') {
+      // The @-mention file list, fetched once on first use. Repaints do not
+      // clear it — it is module-level — and arriving late merely fills the
+      // picker the next time the user types @.
+      if (Array.isArray(d.files)) {
+        mentionFiles = d.files
+        mentionFetching = false
+        if (mentionAt(draft)) render()
+      }
+    } else if (d.type === 'voice') {
+      // Replies to voiceStart/voiceStop. The recording STATE rides the normal
+      // repaint (composer.voice.recording); these carry what a repaint cannot:
+      // the transcript, and the error when the pipeline refused to start.
+      if (d.started) {
+        if (voiceNote) { voiceNote = null; render() }
+      } else if (typeof d.text === 'string') {
+        insertDictation(d.text)
+      } else {
+        voiceNote = { text: d.error || 'Dictation is unavailable', at: Date.now() }
+        dictateAt = -1
+        render()
+      }
     }
   })
   document.addEventListener('click', () => { if (openMenu) { openMenu = null; render() } })
@@ -1384,6 +1430,11 @@
     // nobody knew they were there.
     const matches = slashMatches(draft)
     if (matches.length) wrap.append(renderSlashMenu(matches))
+    // `@path` names a file IN THE REPO — the agent reads it itself, so the
+    // prompt never has to quote it. One menu at a time: a draft starts with
+    // either, and the two lists never both match.
+    const mentions = mentionMatches(draft)
+    if (!matches.length && mentions.length) wrap.append(renderMentionMenu(mentions))
 
     const row = el('div', 'composer')
     const ta = el('textarea')
@@ -1391,16 +1442,41 @@
     ta.placeholder = c ? 'Reply… (Enter to send, Shift+Enter for a new line)' : 'What should the agent do? (Enter to start)'
     ta.value = draft
     ta.rows = 1
+    const rememberCaret = () => {
+      if (typeof ta.selectionStart === 'number') caretAt = ta.selectionStart
+    }
+    // A repaint destroys this textarea; clicks and keystrokes land on a new
+    // one each time. Caret position is per-node, so it is copied out on every
+    // interaction — the mic steals focus when pressed, and the transcript has
+    // to come back where the caret was, not at the end.
+    ta.onfocus = rememberCaret
+    ta.onclick = rememberCaret
+    ta.onkeyup = rememberCaret
     ta.oninput = (e) => {
       const had = slashKey(draft)
+      const hadMent = mentionQuery(draft)
       draft = e.target.value
       e.target.style.height = 'auto'
       e.target.style.height = Math.min(160, e.target.scrollHeight) + 'px'
+      rememberCaret()
       const now = slashKey(draft)
+      const nowMent = mentionQuery(draft)
       // Compare the actual match SET, not its size. Comparing counts left the
       // menu showing the old commands whenever a different query happened to
       // match the same number — and clicking a row inserted the stale one.
-      if (had !== now) { slashPick = now ? 0 : -1; render() }
+      const menuChanged = had !== now || hadMent !== nowMent
+      if (had !== now) slashPick = now ? 0 : -1
+      if (hadMent !== nowMent) mentionPick = nowMent !== null ? 0 : -1
+      // The first @ of the panel's life: go get the file list. One fetch per
+      // panel — it is the list of files in the workspace, and it does not
+      // change faster than that. Deliberately not inside the repaint branch:
+      // the very first @ changes the menu state AND must fire the fetch, and
+      // an early return for the one would starve the other.
+      if (mentionAt(draft) && !mentionFiles && !mentionFetching) {
+        mentionFetching = true
+        post('mentionFiles')
+      }
+      if (menuChanged) render()
     }
     ta.onkeydown = (e) => {
       const list = slashMatches(draft)
@@ -1417,6 +1493,21 @@
           return
         }
         if (e.key === 'Escape') { e.preventDefault(); slashPick = -1; draft = draft + ' '; render(); return }
+      }
+      const ments = mentionMatches(draft)
+      if (ments.length) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault()
+          mentionPick = (mentionPick + (e.key === 'ArrowDown' ? 1 : ments.length - 1)) % ments.length
+          render()
+          return
+        }
+        if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+          e.preventDefault()
+          chooseMention(ments[Math.max(0, mentionPick)].value)
+          return
+        }
+        if (e.key === 'Escape') { e.preventDefault(); mentionPick = -1; draft = draft + ' '; render(); return }
       }
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
     }
@@ -1458,6 +1549,38 @@
       picker.click()
     }
 
+    /* The mic: dictation into the draft, recorded and transcribed on THIS
+       machine by ffmpeg + whisper — the audio never leaves it. Shown only
+       when the host's probe of both binaries answered, because a mic that
+       cannot record is a control that cannot take effect; when the probe says
+       what is missing, the mic still shows, dimmed, and opens the settings
+       page that says how to install it — a button that takes you to the fix
+       is not a dead control. Absent (probe not finished) it is not drawn. */
+    const voice = s.composer.voice
+    let mic = null
+    if (voice && voice.available) {
+      mic = el('button', 'mic' + (voice.recording ? ' live' : ''), voice.recording ? '⏺' : '🎤')
+      mic.title = voice.recording
+        ? 'Stop dictating — the recording is transcribed locally'
+        : 'Dictate… (recorded on this machine, transcribed by whisper-cli)'
+      mic.onclick = () => {
+        if (voice.recording) {
+          dictateAt = -1
+          post('voiceStop')
+        } else {
+          // Where the transcript lands: the last place the caret sat. Read now,
+          // because a repaint between stop and transcript will rebuild the
+          // textarea, and a rebuilt textarea does not remember where you were.
+          dictateAt = caretAt >= 0 ? Math.min(caretAt, draft.length) : draft.length
+          post('voiceStart')
+        }
+      }
+    } else if (voice && voice.why) {
+      mic = el('button', 'mic missing', '🎤')
+      mic.title = voice.why + '\n\nClick to open the settings page, which says how to install each piece.'
+      mic.onclick = () => { dictateAt = -1; post('openSettings') }
+    }
+
     const send = el('button', 'primary send', '➤')
     send.title = c ? 'Send' : 'Start session'
     send.onclick = submit
@@ -1473,10 +1596,101 @@
       else post('newSession', { text, images })
       render()
     }
-    row.append(ta, clip, send)
+    row.append(ta, clip)
+    if (mic) row.append(mic)
+    row.append(send)
     if (attachments.length) wrap.append(renderAttachments())
     wrap.append(row)
+    // A dictation error or an empty transcript, shown where the mic is, and
+    // only for a few seconds — repaints do not repaint it away instantly
+    // because it carries a timestamp, and nothing here pretends it is news
+    // after eight seconds.
+    if (voiceNote && Date.now() - voiceNote.at < 8000) {
+      const note = el('div', 'voice-note', voiceNote.text)
+      wrap.append(note)
+    } else if (voiceNote) {
+      voiceNote = null
+    }
     return wrap
+  }
+
+  /* —— @-mentions: naming a file in the repo, so the agent reads it itself. — */
+
+  /** The @-mention being typed, if the caret is in one.
+   *
+   *  An @ that starts a token — after whitespace or the start of the draft —
+   *  and that has only filename-ish characters after it. An email address in
+   *  prose must not open the picker on every keystroke. */
+  function mentionAt(text) {
+    const m = /(^|\s)@([\w./~-]*)$/.exec(text)
+    if (!m) return null
+    return { at: m.index + m[1].length, query: m[2].toLowerCase() }
+  }
+
+  /** The query of the mention being typed, or null when none — the identity of
+   *  the current suggestion set, for deciding whether to repaint. Deliberately
+   *  independent of whether the file list has arrived: the FIRST @ must change
+   *  the menu state even though there is nothing to match yet, or the lazy
+   *  fetch below would never fire. */
+  function mentionQuery(text) {
+    const m = mentionAt(text)
+    return m ? m.query : null
+  }
+
+  /** Suggestions for the @ the user is part-way through typing. No matches
+   *  until the file list has been fetched — there is nothing honest to offer
+   *  before the host answered. */
+  function mentionMatches(text) {
+    const m = mentionAt(text)
+    if (!m || !mentionFiles || !mentionFiles.length) return []
+    const hits = []
+    for (const f of mentionFiles) {
+      if (m.query && f.toLowerCase().indexOf(m.query) === -1) continue
+      hits.push(f)
+      if (hits.length >= 8) break
+    }
+    return hits.map((f) => ({ value: f, label: f, meta: f.slice(0, f.lastIndexOf('/')) }))
+  }
+
+  function renderMentionMenu(list) {
+    const box = el('div', 'mention-menu')
+    list.forEach((f, i) => {
+      const row = el('button', 'mention-item' + (i === Math.max(0, mentionPick) ? ' on' : ''))
+      row.append(el('span', 'mention-name', '@' + f.label))
+      row.append(el('span', 'mention-dir', f.meta || ''))
+      row.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); chooseMention(f.value) }
+      box.append(row)
+    })
+    return box
+  }
+
+  /** Replace the half-typed @query with the chosen path (and a trailing space,
+   *  so the next word does not stick to it). */
+  function chooseMention(file) {
+    const m = /(^|\s)@([\w./~-]*)$/.exec(draft)
+    if (!m) return
+    draft = draft.slice(0, m.index + m[1].length) + '@' + file + ' '
+    mentionPick = -1
+    render()
+  }
+
+  /** Drop the transcript of a finished dictation into the draft. */
+  function insertDictation(text) {
+    const t = String(text || '').trim()
+    if (!t) {
+      voiceNote = { text: 'Nothing recognised — is the microphone live?', at: Date.now() }
+      dictateAt = -1
+      render()
+      return
+    }
+    const at = dictateAt >= 0 ? dictateAt : caretAt >= 0 ? Math.min(caretAt, draft.length) : draft.length
+    // A space unless the text before the caret already ends in one, so two
+    // dictations in a row do not weld themselves together.
+    const piece = (at > 0 && !/\s$/.test(draft.slice(0, at)) ? ' ' : '') + t + ' '
+    draft = draft.slice(0, at) + piece + draft.slice(at)
+    dictateAt = -1
+    caretAt = at + piece.length
+    render()
   }
 
   /** Suggestions for the `/` the user is part-way through typing. */

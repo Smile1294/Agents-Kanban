@@ -342,6 +342,27 @@ export interface UiState {
     runtimes: { id: string; label: string; detail?: string; providerProfiles: boolean }[]
     /** The provider profile the NEXT session will run on. */
     provider: string
+    /**
+     * Whether the composer's mic can dictate.
+     *
+     * Not a capability guess: the host has ASKED each binary. Absent until the
+     * first check completes (the board is usable long before a lazy probe
+     * finishes), and `why` — present only when unavailable — names the missing
+     * piece and the setting that fixes it, which is what the mic's tooltip and
+     * the settings page render. `recording` is live state on the same object
+     * because the mic is a single control: it flips back on the next repaint
+     * when the capture dies on its own, so a recording that stopped must not
+     * keep pulsing.
+     */
+    voice?: {
+      /** Whether the two binaries answered. */
+      available: boolean
+      /** Present only when unavailable — names the missing piece and the
+       *  setting that fixes it. */
+      why?: string
+      /** A capture is live right now. */
+      recording?: boolean
+    }
     /** Everything selectable. `support` is carried so the view can mark a
      *  community setup as one, rather than listing it beside Bedrock as though
      *  Anthropic supported it. */
@@ -424,6 +445,17 @@ export interface BoardHost {
    *  that could only choose between profiles that already exist would leave the
    *  feature reachable only from the command palette. */
   selectProvider(): Promise<void>
+  /** Workspace-relative, forward-slash file paths for the composer's
+   *  @-mention picker. Asked lazily — the file list is the one payload that is
+   *  too big to ride the state channel on every repaint. */
+  mentionFiles(): Promise<string[]>
+  /** Begin a dictation: the host records the microphone with ffmpeg. Fails
+   *  with a named reason when a piece of the local whisper pipeline is missing
+   *  or the device refuses. */
+  voiceStart(): Promise<{ ok: true } | { ok: false; error: string }>
+  /** Stop the recording and transcribe it locally. `text` may be empty — the
+   *  composer says "nothing recognised" rather than appending silence. */
+  voiceStop(): Promise<{ ok: true; text: string } | { ok: false; error: string }>
   /** Open the settings tab: agents, backends and logins. Synchronous because
    *  showing a panel is not something to await — the page fills itself in. */
   openSettings(): void
@@ -495,6 +527,32 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'permission':
           host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))
           break
+        case 'mentionFiles': {
+          // One round trip, answered with a post rather than through `refresh`:
+          // the file list is not board state and must not ride the repaint
+          // channel, which would ship it ten times a second.
+          const files = await host.mentionFiles()
+          void webview.postMessage({ type: 'mentions', files })
+          break
+        }
+        case 'voiceStart': {
+          const r = await host.voiceStart()
+          void webview.postMessage(
+            r.ok
+              ? { type: 'voice', started: true }
+              : { type: 'voice', started: false, error: r.error },
+          )
+          break
+        }
+        case 'voiceStop': {
+          const r = await host.voiceStop()
+          void webview.postMessage(
+            r.ok
+              ? { type: 'voice', started: false, text: r.text }
+              : { type: 'voice', started: false, error: r.error },
+          )
+          break
+        }
       }
     } catch (e) {
       vscode.window.showErrorMessage(`Agents Kanban: ${e instanceof Error ? e.message : String(e)}`)

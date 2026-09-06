@@ -1266,6 +1266,58 @@ console.log('\n— providers: the picker, and where the credential goes')
   } catch (e) {
     ok(false, `the view threw on a provider note — ${e.message}`)
   }
+
+  // --- @-mentions: the file search answers the composer --------------------
+  //
+  // A control the view can click is only real if the host path behind it works
+  // through the built bundle. The harness walks what a test seeded into
+  // `ctl.files` minus the same directories and binary extensions the real
+  // exclude glob names — so what comes back proves the workspace-relative
+  // answer and the filter, not a glob engine.
+  try {
+    ctl.files = ['README.md', 'src/main.ts', 'src/board/panel.ts', 'docs/DECISIONS.md',
+      'node_modules/pkg/x.js', '.vscode/settings.json', 'assets/icon.png']
+    await send({ type: 'mentionFiles' })
+    const mention = [...stub.posted].reverse().find((m) => m.type === 'mentions')
+    ok(!!mention, 'mentionFiles is answered with a `mentions` post')
+    const mf = mention?.files ?? []
+    ok(mf.includes('README.md') && mf.includes('src/main.ts') && mf.includes('src/board/panel.ts'),
+       `the search returns workspace files by relative path (${mf.join(', ')})`)
+    ok(!mf.some((p) => /^(node_modules|\.vscode)\//.test(p) || /\.png$/.test(p)),
+       'and not the vendored, the configured or the binary')
+    ok(mf.every((p) => typeof p === 'string' && !p.startsWith('/')),
+       'every name is relative — a file path an @-mention can actually carry')
+  } catch (e) {
+    ok(false, `the file search failed through the real bundle — ${e.message}`)
+  }
+
+  // --- the voice pipeline reports itself on the settings page ---------------
+  //
+  // The probe spawns the user's own binaries, so this gate promises a shape,
+  // never a verdict: three rows, each able to say ok or not, with the page
+  // saying when they were checked. A check that could not run at all is what
+  // would fail here, and that is the failure to catch.
+  try {
+    stub.cmds.get('agentsKanban.openSettings')()
+    await new Promise((r) => setTimeout(r, 0))
+    ok(!!ctl.settings, 'the settings tab opens for the voice check too')
+    await ctl.settings.send({ type: 'checkVoice' })
+    let rows
+    for (let i = 0; i < 100 && !rows; i++) {
+      rows = ctl.settings.state()?.voice?.rows
+      if (!rows) await new Promise((r) => setTimeout(r, 20))
+    }
+    ok(!!rows && rows.length === 3,
+       `the voice check reports the three pieces (${rows?.map((r) => r.key).join(', ') || 'nothing'})`)
+    ok(rows?.every((r) => typeof r.ok === 'boolean'),
+       'each piece says ok or not — a check that cannot say bad is not a check')
+    for (const key of ['whisper', 'model', 'ffmpeg'])
+      ok(rows?.some((r) => r.key === key), `the ${key} piece is among them`)
+    ok(typeof ctl.settings.state()?.voice?.at === 'number',
+       'and the page says when it was checked')
+  } catch (e) {
+    ok(false, `the voice check failed through the real bundle — ${e.message}`)
+  }
 }
 
 // ---------------------------------------------------------------------- teardown

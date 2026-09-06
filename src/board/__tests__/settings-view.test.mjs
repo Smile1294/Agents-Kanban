@@ -326,5 +326,61 @@ const state = (over = {}) => ({
   ok(!!findButton(v.root, 'Check again'), 'while still offering the way to re-check it')
 }
 
+// --- dictation: the composer mic's two local binaries -----------------------
+{
+  // Not checked yet is a real state, and is not painted as "not installed".
+  const notAsked = await renderSettings(state())
+  ok(notAsked.text().includes('Dictation'), 'the page has a dictation section')
+  ok(notAsked.text().includes('Not checked yet.'), 'an unasked pipeline says it was not asked')
+  const section = [...notAsked.root.querySelectorAll('section')].find((s) => s.textContent.includes('Dictation'))
+  const check = section && findButton(section, 'Check')
+  ok(!!check, 'and offers the way to ask')
+  check.onclick()
+  ok(notAsked.posted.some((m) => m.type === 'checkVoice'), 'pressing Check asks the host to probe the binaries')
+}
+
+{
+  // Every piece green: the rows say where each binary was found, and when.
+  const v = await renderSettings(state({
+    voice: {
+      at: Date.now() - 70_000,
+      rows: [
+        { key: 'whisper', label: 'whisper-cli', ok: true, detail: '/opt/whisper/whisper-cli' },
+        { key: 'model', label: 'whisper model', ok: true, detail: '/models/ggml-base.en.bin' },
+        { key: 'ffmpeg', label: 'ffmpeg', ok: true, detail: 'on PATH (ffmpeg)' },
+      ],
+    },
+  }))
+  const t = v.text()
+  ok(t.includes('whisper-cli') && t.includes('whisper model') && t.includes('ffmpeg'),
+     'each piece of the pipeline is its own row')
+  ok(t.includes('/opt/whisper/whisper-cli'), 'a green row says where the binary was found')
+  ok(t.includes('checked 1m ago'), 'a stale check is dated, so a green tick from an hour ago does not look fresh')
+}
+
+{
+  // One piece missing: the row names THAT piece's fix, and the fix opens the
+  // very setting that repairs it — a fix is a place, not just a sentence.
+  const v = await renderSettings(state({
+    voice: {
+      at: Date.now(),
+      rows: [
+        { key: 'whisper', label: 'whisper-cli', ok: true, detail: '/opt/whisper/whisper-cli' },
+        { key: 'model', label: 'whisper model', ok: false, detail: 'no whisper model — set agentsKanban.whisperModel to a ggml-*.bin file' },
+        { key: 'ffmpeg', label: 'ffmpeg', ok: true, detail: 'on PATH (ffmpeg)' },
+      ],
+    },
+  }))
+  ok(v.text().includes('whisperModel'), 'a missing piece names the setting that fixes it')
+  const fix = [...v.root.querySelectorAll('.fix')].find((n) => n.textContent.includes('whisperModel'))
+  ok(!!fix, 'the fix is rendered as a chip')
+  fix.onclick()
+  ok(v.posted.some((m) => m.type === 'openSetting' && m.key === 'agentsKanban.whisperModel'),
+     'clicking the fix opens that exact setting')
+  const modelRow = [...v.root.querySelectorAll('.status-row')].find((r) => r.textContent.includes('whisper model'))
+  ok(!!modelRow && modelRow.textContent.includes('whisperModel'),
+     'the fix sits on the row of the piece it fixes — a working whisper row is not blamed for the missing model')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

@@ -44,6 +44,10 @@ import {
   collectRuntimeStatus, SettingsPanel,
   type SettingsHost, type SettingsMessage, type SettingsState,
 } from './board/settings.ts'
+import {
+  checkVoice, rowsFromChecks, startCapture, verdict,
+  type Capture, type VoiceChecks, type VoiceConfig,
+} from './agent/dictation.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
 // See agent/runtimes/index.ts for why registration is explicit rather than
 // happening wherever an implementation happens to be imported first.
@@ -965,6 +969,76 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const runtimeModels = new Map<RuntimeId, { models: { id: string; label: string }[]; source: string; note?: string }>()
   let settingsBusy: string | undefined
 
+  // ——— Voice dictation (the composer's mic) ———
+  //
+  // The mic is gated on an actual check of two user-installed binaries, and a
+  // check SPAWNS THEM, so it is never on the render path and never at
+  // activation: the board's first paint does not wait for two `--version`
+  // probes. `voiceResult` is written once per real check and invalidated when
+  // the config it describes changes; `liveCapture` is live state, cleared when
+  // the capture ends however it ends.
+
+  /** The four settings that describe the pipeline, read together so the cached
+   *  result always knows which config it was an answer to. Spelled `cfg().get`
+   *  (not a saved `const c`) because the smoke gate counts declared settings by
+   *  that exact spelling — a read through a local variable is a setting that
+   *  looks unread. */
+  const voiceConfig = (): VoiceConfig => {
+    return {
+      whisperPath: cfg().get<string>('whisperPath') ?? '',
+      whisperModel: cfg().get<string>('whisperModel') ?? '',
+      ffmpegPath: cfg().get<string>('ffmpegPath') ?? '',
+      recordDevice: cfg().get<string>('recordDevice') ?? '',
+    }
+  }
+
+  /** The config keys the voice cache depends on — one invalidation list for the
+   *  config listener, so a new key cannot be forgotten there. */
+  const VOICE_KEYS = ['whisperPath', 'whisperModel', 'ffmpegPath', 'recordDevice']
+
+  interface VoiceResult { checks: VoiceChecks; cfg: VoiceConfig; at: number }
+  let voiceResult: VoiceResult | undefined
+  let voiceChecking: Promise<VoiceResult> | undefined
+  /** A recording in progress, if there is one. */
+  let liveCapture: Capture | undefined
+
+  /** Ask the two binaries where they are — once, never twice at once. */
+  function voiceCheckNow(): Promise<VoiceResult> {
+    if (voiceResult) return Promise.resolve(voiceResult)
+    voiceChecking ??= Promise.resolve().then(() => {
+      const cfg = voiceConfig()
+      const checks = checkVoice(cfg)
+      voiceResult = { checks, cfg, at: Date.now() }
+      return voiceResult
+    }).finally(() => { voiceChecking = undefined })
+    return voiceChecking
+  }
+
+  /** The composer's mic facts from the last check. Runs on every repaint, so
+   *  it is pure — the check it summarises never does. */
+  const voiceState = (r: VoiceResult) => {
+    const v = verdict(r.checks)
+    return {
+      voice: {
+        available: v.ok,
+        ...(v.why ? { why: v.why } : {}),
+        recording: !!liveCapture,
+      },
+    }
+  }
+
+  /** The first check, after the window has had a second to paint. */
+  let voiceKicked = false
+  const kickVoiceCheck = (): void => {
+    if (voiceKicked) return
+    voiceKicked = true
+    setTimeout(() => {
+      voiceCheckNow()
+        .then(() => { refreshAll(); void SettingsPanel.refreshIfOpen() })
+        .catch((e: unknown) => log.error(`Voice check failed: ${String(e)}`))
+    }, 2000)
+  }
+
   const configuredPathFor = (id: RuntimeId): string | undefined =>
     id === 'claude' ? (cfg().get<string>('claudeExecutable') || undefined)
       : id === 'codex' ? (cfg().get<string>('codexExecutable') || undefined)
@@ -1076,6 +1150,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               : {}),
           }
         }),
+        // One row per piece of the dictation pipeline. Absent until the user
+        // presses "Check" (or the config changed and the host re-checked) —
+        // checking spawns the binaries, which is never something a page paint
+        // does, so the section says "not checked yet" when this is missing.
+        ...(voiceResult
+          ? {
+              voice: {
+                at: voiceResult.at,
+                rows: rowsFromChecks(voiceResult.cfg, voiceResult.checks),
+              },
+            }
+          : {}),
       }
     },
 
@@ -1234,6 +1320,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         case 'openSetting':
           await vscode.commands.executeCommand('workbench.action.openSettings', msg.key)
+          return
+        case 'checkVoice':
+          // The settings page's own probe: always ask again, cache or no cache
+          // — that is what a Check button is for.
+          settingsBusy = 'Checking whisper-cli and ffmpeg…'
+          void SettingsPanel.refreshIfOpen()
+          try {
+            voiceResult = undefined
+            await voiceCheckNow()
+          } finally {
+            settingsBusy = undefined
+          }
           return
       }
     },
@@ -1739,6 +1837,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
            missing. */
         orchestrationLevels: undefined as { key: string; label: string; detail: string }[] | undefined,
         orchestrationNote: undefined as string | undefined,
+        // The mic's gate: absent until the lazy probe answered, so the first
+        // paint of the board never waits on two `--version` spawns.
+        ...(voiceResult ? voiceState(voiceResult) : {}),
       }
       if (!ws) {
         return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
@@ -1947,6 +2048,78 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     async selectProvider() { await selectProvider() },
     openSettings() { openSettings() },
+
+    /** Workspace-relative paths for the @-mention picker.
+     *
+     * This is the one payload too big to ride the state channel on every
+     * repaint, so the view asks for it once, lazily, and keeps it. The first
+     * workspace folder is the board's folder — `ws.root` is built from it — so
+     * a multi-root workspace does not mix two projects' paths into one list.
+     */
+    async mentionFiles(): Promise<string[]> {
+      const folder = vscode.workspace.workspaceFolders?.[0]
+      if (!folder) return []
+      try {
+        // What a mention could plausibly name: source and documents, not the
+        // vendored, the generated or the binary. 2000 is a picker, not a disk
+        // sweep — the view only ever shows the first handful of matches.
+        const uris = await vscode.workspace.findFiles(
+          new vscode.RelativePattern(folder, '**/*'),
+          '{**/.git/**,**/node_modules/**,**/.agentskanban/**,**/.vscode/**,**/out/**,**/dist/**,**/build/**,**/coverage/**,**/.next/**,**/vendor/**,**/bin/**,**/obj/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.webp,**/*.svg,**/*.ico,**/*.woff,**/*.woff2,**/*.wasm,**/*.zip,**/*.tar,**/*.gz,**/*.mp3,**/*.mp4,**/*.mov,**/*.wav}',
+          2000,
+        )
+        return uris
+          .map((u) => vscode.workspace.asRelativePath(u, false))
+          .filter((p): p is string => !!p)
+          .sort()
+      } catch (e) {
+        // A closed folder races any async ask. An empty list is honest — the
+        // picker says "nothing to mention" instead of pretending.
+        log.warn(`Mention file search failed: ${String(e)}`)
+        return []
+      }
+    },
+
+    /** Start dictating: check the pipeline, then record the microphone.
+     *  Idempotent — a second press while recording is a no-op that returns ok.
+     */
+    async voiceStart(): Promise<{ ok: true } | { ok: false; error: string }> {
+      if (liveCapture) return { ok: true }
+      const r = await voiceCheckNow()
+      const v = verdict(r.checks)
+      if (!v.ok) return { ok: false, error: v.why ?? 'Dictation is unavailable' }
+      const cap = startCapture(voiceConfig())
+      liveCapture = cap
+      // However the capture ends — user stop, device busy, ffmpeg dying — the
+      // mic must stop reading as recording. Live state, picked up by the next
+      // repaint through composer.voice.recording.
+      void cap.stopped.then((o) => {
+        if (liveCapture === cap) liveCapture = undefined
+        if (!o.ok) log.warn(`Dictation stopped itself: ${o.error}`)
+      })
+      // ffmpeg fails fast when the device is busy or there is no default, so
+      // give it a moment before telling the mic "recording": a capture that is
+      // already dead must come back as the error it is, not as one frame of
+      // pulsing that ends on its own.
+      const early = await Promise.race([
+        cap.stopped,
+        new Promise<null>((res) => setTimeout(() => res(null), 500)),
+      ])
+      if (early && !early.ok) return { ok: false, error: early.error }
+      return { ok: true }
+    },
+
+    /** Stop dictating and transcribe what was captured, locally. */
+    async voiceStop(): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+      const cap = liveCapture
+      if (!cap) return { ok: false, error: 'Not recording' }
+      liveCapture = undefined
+      cap.stop()
+      const outcome = await cap.stopped
+      return outcome.ok
+        ? { ok: true, text: outcome.text }
+        : { ok: false, error: outcome.error }
+    },
 
     async newSessionPrompt() {
       const text = await vscode.window.showInputBox({
@@ -2911,6 +3084,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (e.affectsConfiguration('agentsKanban.focusMode')) {
         setBoardFocusMode(cfg().get<FocusMode>('focusMode') ?? 'wide')
       }
+      // A whisper/ffmpeg path changed, so the mic's gate must be re-asked: the
+      // cache describes the OLD config, and without this, installing whisper
+      // while the window is open leaves the mic missing until a reload — the
+      // fix reading as not having worked, exactly like a corrected executable
+      // path above.
+      if (VOICE_KEYS.some((k) => e.affectsConfiguration(`agentsKanban.${k}`))) {
+        voiceResult = undefined
+        voiceCheckNow()
+          .then(() => { refreshAll(); void SettingsPanel.refreshIfOpen() })
+          .catch((err: unknown) => log.error(`Could not re-check the dictation pipeline: ${String(err)}`))
+      }
     }),
     { dispose: () => ws?.manager?.stopAll() },
     { dispose: () => paint.dispose() },
@@ -2945,6 +3129,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   detectRuntimes()
     .then(() => refreshAll())
     .catch((e: unknown) => log.error(`Could not look for the installed agents: ${String(e)}`))
+
+  /* The composer's mic, probed once in the background. Two spawnSync probes are
+     too slow to sit on first paint; 2s later nobody is watching the frame rate. */
+  kickVoiceCheck()
 
   const startupEndpoint = currentProvider()
   if (cfg().get<boolean>('discoverModels') !== false
