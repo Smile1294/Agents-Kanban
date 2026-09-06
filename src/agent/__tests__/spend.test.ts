@@ -49,7 +49,7 @@ const USAGE = {
 // Opus 5 at $5/$25 per MTok: 100·5 + 1000·25 + 200000·0.5 + 4000·10 millionths.
 const ONE_RESPONSE = 0.1655
 
-const assistant = (id: string, usage: unknown, parent: string | null = null) => ({
+const assistant = (id: string | undefined, usage: unknown, parent: string | null = null) => ({
   type: 'assistant',
   parent_tool_use_id: parent,
   message: {
@@ -152,6 +152,11 @@ const result = (costUsd: number | undefined) => ({
   feed(result(ONE_RESPONSE * 4))
   ok(logged.length === 1, 'a figure well off the bill is reported')
   ok(/usage\.ts/.test(logged[0] ?? ''), `and names where to fix it: ${logged[0]}`)
+  // The two rate sources are named, because a session on a custom endpoint is
+  // priced by the endpoint's own catalogue, not by MODEL_RATES — blaming only
+  // the table would send someone to edit a file that is not involved.
+  ok(/providers|endpoint/.test(logged[0] ?? ''),
+     `and points at the endpoint-published prices too: ${logged[0]}`)
 }
 {
   // A turn the CLI never priced — an interrupt, an older CLI — must not be
@@ -160,6 +165,38 @@ const result = (costUsd: number | undefined) => ({
   feed(assistant('msg_x', USAGE))
   feed(result(undefined))
   ok(logged.length === 0, 'an unpriced turn is not reported as drift')
+}
+
+// ---------------------------------------------------------------------------
+// 5b. The no-id merge, live. The disk path (`summariseUsage`) merges
+// consecutive id-less frames with identical usage; the live path must do the
+// same, or the number on the board changes when the run ends — the very
+// divergence section 3 exists to prevent.
+{
+  const { spends, feed } = make()
+  feed(assistant(undefined, USAGE))
+  feed(assistant(undefined, USAGE))
+  feed(assistant(undefined, USAGE))
+  ok(near(spends[spends.length - 1]!.usd, ONE_RESPONSE),
+     `id-less frames with identical usage are billed once: $${spends[spends.length - 1]?.usd.toFixed(4)} ` +
+     `(not $${(ONE_RESPONSE * 3).toFixed(4)})`)
+}
+{
+  const { spends, feed } = make()
+  feed(assistant(undefined, USAGE))
+  // Different usage is a different response: +1000 output tokens at $25/Mtok.
+  feed(assistant(undefined, { ...USAGE, output_tokens: 2000 }))
+  ok(near(spends[spends.length - 1]!.usd, ONE_RESPONSE * 2 + 0.025),
+     'id-less frames whose usage differs are separate responses')
+}
+{
+  // An id in between ends the merge — those are two different responses.
+  const { spends, feed } = make()
+  feed(assistant(undefined, USAGE))
+  feed(assistant('msg_named', USAGE))
+  feed(assistant(undefined, USAGE))
+  ok(near(spends[spends.length - 1]!.usd, ONE_RESPONSE * 3),
+     'a frame with an id between two id-less frames ends the merge')
 }
 
 // ---------------------------------------------------------------------------

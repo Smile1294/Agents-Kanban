@@ -161,6 +161,13 @@ export interface PieceProposal {
    */
   scope?: string[]
   tags?: string[]
+  /**
+   * The model the agent asks this piece to run on — one half of the routing
+   * reserved in `PieceRouting`. Carried through to `SubtaskSpec` and gated by
+   * the spawn allowlist in `AgentManager.split()`, which is the boundary; this
+   * file only passes the id along.
+   */
+  model?: string
 }
 
 export type ProposalRule =
@@ -169,6 +176,10 @@ export type ProposalRule =
   | 'scope-missing'
   | 'brief-cross-reference'
   | 'brief-too-long'
+  /** The proposal named a model the spawn allowlist does not permit. Produced
+   *  by `AgentManager.split()`, never by `checkProposal` — the allowed set is
+   *  host state, and this function is deliberately pure of it. */
+  | 'spawn-model'
 
 /** Recorded and SHOWN at the approval, never refused.
  *
@@ -232,6 +243,13 @@ export function checkProposal(
       ...p,
       title: String(p.title ?? '').trim(),
       prompt: String(p.prompt ?? '').trim(),
+      // A model id is a short string; the bound exists so a refusal message
+      // never carries an unbounded model-written value. Any truncation still
+      // fails the spawn gate — it cannot turn a disallowed id into an allowed
+      // one, only into a different disallowed one. Absent stays absent.
+      ...(typeof p.model === 'string' && p.model.trim()
+        ? { model: p.model.trim().slice(0, 200) }
+        : {}),
       ...(p.scope ? { scope: p.scope.filter((s) => typeof s === 'string' && s.trim()).map((s) => s.trim()) } : {}),
     }))
     .filter((p) => p.title && p.prompt)
@@ -371,6 +389,7 @@ export function decompositionLine(r: DecompositionRecord, started: number | unde
     : r.rule === 'scope-missing' ? 'a subtask declared no files of its own'
     : r.rule === 'brief-cross-reference' ? 'a brief depended on another subtask'
     : r.rule === 'brief-too-long' ? 'a brief was too long to hand over'
+    : r.rule === 'spawn-model' ? 'a subtask asked for a model spawned agents may not run on'
     : 'the split was declined'
   return `Kept as one agent — ${why}`
 }

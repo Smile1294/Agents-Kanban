@@ -364,7 +364,13 @@ function providerModels(p) {
   const SHOW = 60
   const table = el('div', 'model-rows')
   for (const m of matches.slice(0, SHOW)) {
-    const r = el('label', 'model-row' + (m.offered ? ' on' : ''))
+    const r = el('div', 'model-row' + (m.offered ? ' on' : ''))
+    // Two ticks, two choices, kept apart on purpose: what the composer OFFERS
+    // (the small human list saved on the profile) and what a SPAWNED agent
+    // may run on (the allowlist). A row that was one label made the second
+    // tick a nested label, so each gets its own.
+    const offer = el('label', 'model-tickwrap')
+    offer.title = 'Offer this model in the composer'
     const tick = el('input', 'model-tick')
     tick.type = 'checkbox'
     tick.checked = !!m.offered
@@ -372,7 +378,8 @@ function providerModels(p) {
       const next = p.models.filter((x) => (x.id === m.id ? !m.offered : x.offered)).map((x) => x.id)
       post({ type: 'setProfileModels', id: p.id, models: next })
     })
-    r.appendChild(tick)
+    offer.appendChild(tick)
+    r.appendChild(offer)
     const main = el('div', 'model-main')
     main.appendChild(el('div', 'model-name', m.label))
     /* The id, the window and the price on one line — the three facts that make
@@ -383,6 +390,20 @@ function providerModels(p) {
       .filter(Boolean).join(' · ')
     if (meta) main.appendChild(el('div', 'muted small', meta))
     r.appendChild(main)
+    // "Allowed for spawned agents". Unticking it removes the id from what
+    // split_task may ask for — absent on the host means allowed, so this tick
+    // is the DEFAULT state and the unticked set is what is stored.
+    const spawn = el('label', 'model-tickwrap spawn')
+    spawn.title = 'Allowed for spawned agents (split_task)'
+    const spawnTick = el('input', 'model-spawn')
+    spawnTick.type = 'checkbox'
+    spawnTick.checked = m.spawnAllowed !== false
+    spawnTick.addEventListener('change', () => {
+      post({ type: 'setSpawnAllowed', id: p.id, modelId: m.id, allowed: spawnTick.checked })
+    })
+    spawn.appendChild(spawnTick)
+    spawn.appendChild(el('span', 'muted small', 'spawn'))
+    r.appendChild(spawn)
     table.appendChild(r)
   }
   box.appendChild(table)
@@ -570,6 +591,13 @@ function schedRow(s, canRun) {
   const title = el('div', 'row-title')
   title.appendChild(el('span', '', s.title))
   if (!s.enabled) title.appendChild(el('span', 'badge quiet', 'Paused'))
+  // An agent created this, not the form below — say which one, so a run nobody
+  // typed in is traceable to the session that asked for it.
+  if (s.createdBy) {
+    const by = el('span', 'badge quiet sched-by', 'agent · ' + s.createdBy)
+    by.title = 'Created by the agent session "' + s.createdBy + '" — not typed into this form'
+    title.appendChild(by)
+  }
   left.appendChild(title)
 
   /* When + instruction on one ellipsising line: several schedules can share

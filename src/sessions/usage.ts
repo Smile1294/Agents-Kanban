@@ -197,9 +197,36 @@ export function normaliseModel(model: string): string {
  * so normalising it can only produce a string that means nothing; but a
  * gateway serving Claude under a normalisable id should still match. Exact,
  * then normalised, then the table — most specific first.
+ *
+ * Whatever the source, the rate comes back through one sanity check: a
+ * published cache-read price ABOVE the fresh-input price is not a price. No
+ * vendor charges more for a cache hit than a cache miss — caching exists to be
+ * cheaper — so the only way such a number exists is a unit misread at the
+ * parse boundary (a per-1M figure where the others are per-token, or the wrong
+ * cache field). Trusting it is how a DeepSeek session priced 65x high on the
+ * board: its endpoint published a cache-read rate four times its input rate,
+ * the session was 98% cache reads, and the board showed ~$102 against a
+ * platform usage page of $1.56. The guard drops the impossible number and lets
+ * `costOfUsage` derive the read rate instead — the 10%-of-input convention
+ * every known vendor (Anthropic, DeepSeek, the routers) actually follows. A
+ * wrong derivation is still caught downstream: `settleTurn` compares each turn
+ * against the CLI's own `total_cost_usd` and says so when the gap exceeds 20%.
+ *
+ * `rateFor` is deliberately the ONE entry point this guard lives at. Its only
+ * arithmetic caller is `costOfUsage`, and everything that prices a token goes
+ * through that — disk, live and store paths alike. The picker's `priceLabel`
+ * reads the raw catalogue rate and shows input/output only, so the impossible
+ * cache figure never reaches a display either.
  */
 export function rateFor(model: string, book?: ModelBook): ModelRate | undefined {
-  return book?.[model]?.rate ?? book?.[normaliseModel(model)]?.rate ?? MODEL_RATES[normaliseModel(model)]
+  const rate = book?.[model]?.rate ?? book?.[normaliseModel(model)]?.rate ?? MODEL_RATES[normaliseModel(model)]
+  if (!rate) return undefined
+  // `>=` would be wrong: some routers price a cache read AT the full input
+  // rate (see `costOfUsage`), and equal is a real price, not a misread.
+  if (rate.cacheRead !== undefined && rate.cacheRead > rate.input) {
+    return { ...rate, cacheRead: undefined }
+  }
+  return rate
 }
 
 /** The context window for a model, from the same three sources in the same
@@ -332,6 +359,38 @@ export function emptyTotals(): UsageTotals {
 }
 
 /**
+ * Do two usage objects charge the same? Compares only the fields that decide
+ * the bill — the token counts, with the cache-write TTL split flattened to
+ * what `costOfUsage` actually charges. Extra fields (`service_tier`,
+ * `output_tokens_details`, …) are irrelevant to the charge and are ignored.
+ *
+ * This is the predicate behind the no-id deduplication in `summariseUsage`
+ * and `AgentSession.recordSpend`. When a gateway's streaming frames carry no
+ * message id, consecutive frames that charge the same are one response's
+ * blocks (each repeats the same cumulative usage), so merging them is
+ * charge-neutral by construction — it can only fix an overcount, never change
+ * a right number.
+ */
+export function sameUsage(a: TokenUsage, b: TokenUsage): boolean {
+  const flat = (u: TokenUsage) => ({
+    input: u.input_tokens ?? 0,
+    output: u.output_tokens ?? 0,
+    read: u.cache_read_input_tokens ?? 0,
+    // An unsplit flat total is charged at the 5m rate, so a frame carrying
+    // the flat field and a frame carrying a split with everything in the 5m
+    // bucket cost the same and may merge.
+    write5m: u.cache_creation
+      ? (u.cache_creation.ephemeral_5m_input_tokens ?? 0)
+      : (u.cache_creation_input_tokens ?? 0),
+    write1h: u.cache_creation ? (u.cache_creation.ephemeral_1h_input_tokens ?? 0) : 0,
+  })
+  const x = flat(a)
+  const y = flat(b)
+  return x.input === y.input && x.output === y.output && x.read === y.read
+    && x.write5m === y.write5m && x.write1h === y.write1h
+}
+
+/**
  * Total a session's usage from its transcript.
  *
  * The one thing that makes this correct rather than roughly 2.7x too big:
@@ -348,6 +407,8 @@ export function emptyTotals(): UsageTotals {
 export function summariseUsage(messages: readonly UsageMessage[], book?: ModelBook): UsageTotals {
   /** The last frame seen for each response id, main thread or subagent. */
   const responses = new Map<string, { model: string; usage: TokenUsage; main: boolean; seq: number }>()
+  /** The last id-less frame, so consecutive ones can be merged (below). */
+  let lastNoId: { key: string; model: string; usage: TokenUsage } | undefined
   let seq = 0
   for (const m of messages) {
     /* A compaction resets the context, so everything before it is no longer IN
@@ -357,22 +418,41 @@ export function summariseUsage(messages: readonly UsageMessage[], book?: ModelBo
        still spent, so the priced responses are kept. */
     if (m.type === 'system' && (m as { subtype?: unknown }).subtype === 'compact_boundary') {
       for (const [k, r] of responses) if (r.main) responses.set(k, { ...r, main: false })
+      lastNoId = undefined
       continue
     }
-    if (m.type !== 'assistant') continue
+    // Only frames of ONE streamed response are consecutive, so anything in
+    // between ends an id-less merge.
+    if (m.type !== 'assistant') { lastNoId = undefined; continue }
     const body = m.message as { id?: unknown; model?: unknown; usage?: TokenUsage } | undefined
     const usage = body?.usage
     if (!usage) continue
     const model = typeof body?.model === 'string' ? body.model : ''
-    // A response with no id cannot be deduplicated against anything, so it is
-    // keyed by its position and counted once — which is what it is.
-    const id = typeof body?.id === 'string' && body.id ? body.id : `@${seq}`
+    // Frames of one streamed response are deduplicated by `message.id`. A
+    // gateway whose frames carry no id cannot be deduplicated by identity —
+    // but consecutive id-less frames whose usage is IDENTICAL are the same
+    // response's blocks, each repeating the whole response's cumulative
+    // usage. Merging them is charge-neutral (see `sameUsage`): identical
+    // usage costs the same whether one entry or several, so a merge can only
+    // undo an overcount. Different usage is a different response and counts
+    // separately.
+    const id = typeof body?.id === 'string' && body.id ? body.id : undefined
+    let key: string
+    if (id !== undefined) {
+      lastNoId = undefined
+      key = id
+    } else if (lastNoId && lastNoId.model === model && sameUsage(lastNoId.usage, usage)) {
+      key = lastNoId.key
+    } else {
+      key = `@${seq}`
+      lastNoId = { key, model, usage }
+    }
     // A repeat frame supersedes the usage but keeps the response's ORIGINAL
     // position. Re-dating it would let a trailing frame of an earlier response
     // pose as the newest one, and the context meter would then be drawn from a
     // response that is not the last thing the model said.
-    const seen = responses.get(id)
-    responses.set(id, { model, usage, main: !m.parent_tool_use_id, seq: seen ? seen.seq : seq })
+    const seen = responses.get(key)
+    responses.set(key, { model, usage, main: !m.parent_tool_use_id, seq: seen ? seen.seq : seq })
     seq++
   }
 

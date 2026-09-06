@@ -114,6 +114,9 @@ export interface ScheduleRowState {
   /** When it will next fire, host-computed. Absent when no days are picked. */
   nextAt?: number
   lastRun?: { at: number; ok: boolean; note?: string }
+  /** The card title of the agent session that created this schedule, when an
+   *  agent did. Absent on user-created ones; the page marks only the former. */
+  createdBy?: string
 }
 
 /** What the page sends to add or change a schedule. */
@@ -205,6 +208,11 @@ export interface ProviderModelChoice {
   /** True when this id is in the profile's own list — the small human list of
    *  what to OFFER, as opposed to the big machine list of what EXISTS. */
   offered: boolean
+  /** Whether a session SPLIT by an agent may run on this model — the spawn
+   *  allowlist's per-model tick, separate from `offered` on purpose: what the
+   *  composer shows is one choice, what a spawned agent may bill is another.
+   *  False only when the user unticked it; absent means allowed. */
+  spawnAllowed?: boolean
 }
 
 /** Messages the page sends the host. Parsed on arrival, never trusted: a
@@ -230,6 +238,10 @@ export type SettingsMessage =
    *  message rather than an edit to the profile: `[]` and `undefined` have to
    *  survive the round trip as the same answer. */
   | { type: 'setProfileModels'; id: string; models: string[] }
+  /** Tick or untick one model for SPAWNED agents — the spawn allowlist. An
+   *  untick is a write, a tick is a removal, because absence is the allowed
+   *  state (see `agent/spawn-policy.ts`). */
+  | { type: 'setSpawnAllowed'; id: string; modelId: string; allowed: boolean }
   /** Run the voice-pipeline probe now, cache or no cache — a Check button is a
    *  check. Fills `state.voice`. */
   | { type: 'checkVoice' }
@@ -378,6 +390,13 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
         .filter((v): v is string => typeof v === 'string' && !!v.trim())
         .map((v) => v.trim())
       return { type, id, models }
+    }
+    case 'setSpawnAllowed': {
+      // A model id from a webview becomes part of what a spawned agent is
+      // allowed to bill, so it is checked like the ids in `setProfileModels`.
+      const modelId = typeof m.modelId === 'string' ? m.modelId.trim() : ''
+      if (!id || !modelId || typeof m.allowed !== 'boolean') return undefined
+      return { type, id, modelId, allowed: m.allowed }
     }
     case 'openSetting':
       return typeof m.key === 'string' && m.key ? { type, key: m.key } : undefined

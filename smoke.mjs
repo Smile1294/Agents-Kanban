@@ -1297,6 +1297,52 @@ console.log('\n— providers: the picker, and where the credential goes')
       ok(card?.models?.every((m) => m.offered === false),
          'none of them ticked yet — the profile still declares the ids the endpoint does not serve')
 
+      /* --- the spawn allowlist round-trips through the real host ---------- */
+      // Untick one model for SPAWNED agents: the message goes through the real
+      // parseMessage, the real handle, and real workspace storage — the three
+      // seams a write can die in — and comes back through getState. A stub that
+      // swallowed the write (the harness's old workspaceState) could not fail
+      // on any of them, which is the exact hole this project's read-back rule
+      // exists for.
+      ok(card?.models?.every((m) => m.spawnAllowed !== false),
+         'every served model starts allowed for spawned agents — the tick is opt-OUT')
+      await ctl.settings.send({ type: 'setSpawnAllowed', id: gw, modelId: 'deepseek-reasoner', allowed: false })
+      ok(JSON.stringify(ctx3._workspaceState.get('spawnPolicy')) ===
+         JSON.stringify({ [gw]: ['deepseek-reasoner'] }),
+         `unticking a spawn model is PERSISTED to workspace storage (${JSON.stringify(ctx3._workspaceState.get('spawnPolicy'))})`)
+      await ctl.settings.send({ type: 'ready' })
+      const unticked = (ctl.settings.state()?.providers ?? [])
+        .find((p) => p.id === gw)?.models?.find((m) => m.id === 'deepseek-reasoner')
+      ok(unticked?.spawnAllowed === false,
+         'and READS BACK through the settings page state — a write with no round trip is not persistence')
+      // Ticking it back on removes it: absence is the allowed state, and an
+      // emptied profile must read back exactly like one that was never touched.
+      await ctl.settings.send({ type: 'setSpawnAllowed', id: gw, modelId: 'deepseek-reasoner', allowed: true })
+      ok(!ctx3._workspaceState.get('spawnPolicy')?.[gw],
+         `re-ticking removes the entry rather than recording "allowed: true" (${JSON.stringify(ctx3._workspaceState.get('spawnPolicy'))})`)
+
+      /* --- a schedule round-trips through the same three seams ------------- */
+      // The schedule the board TOOLS create lands in the exact store and view
+      // this message flow writes to (saveSchedules / scheduleView), so this is
+      // the persistence round trip for agent-created schedules minus only the
+      // createdBy stamp, whose own round trip the engine test pins.
+      await ctl.settings.send({
+        type: 'saveSchedule',
+        draft: { title: 'Bug patrol', prompt: 'Fix them.', hour: 9, minute: 0, days: [1], enabled: true },
+      })
+      const stored = ctx3._workspaceState.get('schedules')
+      ok(Array.isArray(stored) && stored.length === 1 && stored[0].title === 'Bug patrol' && stored[0].id,
+         `a schedule saved through the page is PERSISTED with an id the tools key on (${JSON.stringify(stored?.[0]?.title)})`)
+      await ctl.settings.send({ type: 'ready' })
+      const sched = ctl.settings.state()?.schedules
+      ok(sched?.rows?.length === 1 && sched.rows[0].when === 'Mon at 09:00',
+         `and READS BACK through the settings page state with its one-line when (${sched?.rows?.[0]?.when})`)
+      ok(sched?.rows?.[0]?.createdBy === undefined,
+         'a schedule saved from the form carries no creator stamp — only the agent path writes one')
+      await ctl.settings.send({ type: 'removeSchedule', id: stored[0].id })
+      ok((ctx3._workspaceState.get('schedules') ?? []).length === 0,
+         'and removing it empties the store rather than leaving a tombstone')
+
       await ctl.settings.send({ type: 'setProfileModels', id: gw, models: ['deepseek-reasoner'] })
       const declared = (ctl.config.providers ?? []).find((p) => p.id === gw)?.models
       ok(JSON.stringify(declared) === JSON.stringify(['deepseek-reasoner']),

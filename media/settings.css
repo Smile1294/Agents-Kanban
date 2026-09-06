@@ -345,13 +345,19 @@ button.primary:hover { background: var(--vscode-button-hoverBackground); }
 }
 .model-row {
   display: flex; gap: 8px; align-items: flex-start;
-  padding: 6px 9px; border-bottom: 1px solid var(--line); cursor: pointer;
+  padding: 6px 9px; border-bottom: 1px solid var(--line);
   min-width: 0;
 }
 .model-row:last-child { border-bottom: none; }
 .model-row:hover { background: var(--vscode-list-hoverBackground); }
 .model-row.on { background: var(--vscode-list-inactiveSelectionBackground); }
+/* Each tick in its own label, so a row can carry TWO choices — offered in the
+   composer, and allowed for spawned agents — without a nested-label markup
+   that one click would aim at both. */
+.model-tickwrap { display: flex; align-items: center; gap: 4px; flex: none; cursor: pointer; }
+.model-tickwrap.spawn { margin-left: auto; }
 .model-tick { margin-top: 2px; flex: none; }
+.model-spawn { margin-top: 2px; flex: none; }
 /* `min-width: 0` for the reason it is always needed here: a flex item defaults
    to `min-width: auto`, and a long model id would push the row wider than the
    panel rather than ellipsising inside it. */

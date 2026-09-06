@@ -8,6 +8,7 @@ import {
   DAY_NAMES,
   describeWhen,
   nextFireAt,
+  parseScheduleDraft,
   parseSchedules,
   type Schedule,
 } from '../schedules.ts'
@@ -124,6 +125,74 @@ ok(describeWhen({ hour: 9, minute: 0, days: [] }) === 'No days — never fires',
   ok(DAY_NAMES[new Date(2026, 8, 6).getDay()] === 'Sun' &&
     DAY_NAMES[new Date(2026, 8, 7).getDay()] === 'Mon',
     'day numbering matches JS getDay (0 = Sunday)')
+}
+
+// --- parseScheduleDraft (the board-tools fence) ------------------------------
+
+{
+  const good = parseScheduleDraft({
+    title: ' Morning patrol ', prompt: 'Check the bug board\nand start fixing.',
+    hour: 9, minute: 30, days: [1, 2, 2, 3], enabled: false,
+  })
+  ok(good.ok && good.draft.title === 'Morning patrol',
+    'a well-formed draft parses, with the title trimmed')
+  ok(good.ok && good.draft.hour === 9 && good.draft.minute === 30,
+    'hour and minute come through as named')
+  ok(good.ok && good.draft.days.join(',') === '1,2,3',
+    'duplicate days collapse to a set, in order')
+  ok(good.ok && good.draft.enabled === false,
+    'an explicit enabled:false is respected, not defaulted away')
+  ok(good.ok && good.draft.enabled !== undefined, 'enabled is never undefined — a real boolean')
+}
+{
+  const junk = [
+    undefined, null, 'nope', 42,
+    { title: '', prompt: 'p', hour: 9, minute: 0, days: [1] },
+    { title: 'x', prompt: '  ', hour: 9, minute: 0, days: [1] },
+    { title: 'x', prompt: 'p', hour: 24, minute: 0, days: [1] },
+    { title: 'x', prompt: 'p', hour: -1, minute: 0, days: [1] },
+    { title: 'x', prompt: 'p', hour: 9.5, minute: 0, days: [1] },
+    { title: 'x', prompt: 'p', hour: 9, minute: 60, days: [1] },
+    { title: 'x', prompt: 'p', hour: 9, minute: 0, days: [] },
+    { title: 'x', prompt: 'p', hour: 9, minute: 0, days: [-1, 7, 2.5] },
+    { title: 'x', prompt: 'p', hour: 9, minute: 0, days: 'weekdays' },
+  ]
+  for (const bad of junk) {
+    const r = parseScheduleDraft(bad)
+    ok(!r.ok && r.message.length > 0, `refuses ${JSON.stringify(bad)?.slice(0, 60)} with a reason: ${r.ok ? '' : r.message}`)
+  }
+  // A draft that would not survive parseSchedules must be refused, not written
+  // and then silently dropped on the next read-back.
+  const tooLongTitle = parseScheduleDraft({ title: 'x'.repeat(201), prompt: 'p', hour: 9, minute: 0, days: [1] })
+  ok(!tooLongTitle.ok, 'a title longer than the reader accepts is refused up front')
+}
+
+// --- createdBy: the agent stamp survives the read-back ------------------------
+{
+  // The exact object the host's tool path writes: a parsed draft, an id, a
+  // stamp, and the creator's card title. The READ BACK is parseSchedules — this
+  // is the write/read round trip the persistence rule asks for.
+  const created = parseScheduleDraft({ title: 'Bug patrol', prompt: 'Fix them.', hour: 9, minute: 0, days: [1] })
+  ok(created.ok, 'sanity: the draft parses')
+  if (created.ok) {
+    const s: Schedule = {
+      id: 'a1', ...created.draft,
+      createdAt: 1000,
+      createdBy: 'Pricing, spawn policy and schedules',
+    }
+    const round = parseSchedules(JSON.parse(JSON.stringify([s])))
+    ok(round[0]?.createdBy === 'Pricing, spawn policy and schedules',
+      'a schedule written with createdBy reads back with its creator')
+    ok(round[0]?.createdBy !== undefined, 'and it is a real field on the schedule, not derived on the page')
+  }
+}
+{
+  // A schedule the user typed into the settings form has no creator stamp, and
+  // must stay unmarked — an old record must not grow a badge the host never wrote.
+  const userMade = parseSchedules([{ id: 'u1', title: 'x', prompt: 'p', hour: 9, minute: 0, createdAt: 5 }])
+  ok(userMade[0]?.createdBy === undefined, 'a user-created schedule has no creator — absence, not a default')
+  const junkBy = parseSchedules([{ id: 'j1', title: 'x', prompt: 'p', hour: 9, minute: 0, createdAt: 5, createdBy: 42 }])
+  ok(junkBy[0]?.createdBy === undefined, 'a non-string creator stamp is dropped, never cast')
 }
 
 if (fails) {

@@ -12,19 +12,23 @@ import type { WorktreeService } from '../git/worktree.ts'
 import { normaliseTitle, resolveEffort, resolveThinking, type EffortLevel, type SessionMeta, type ThinkingMode } from '../sessions/meta.ts'
 import { summariseTool, type Entry, type SessionStore } from '../sessions/store.ts'
 import type { AgentState, BoardConfig } from '../board/config.ts'
-import { AgentSession, type PermissionRequest } from './session.ts'
+import { type PermissionRequest } from './session.ts'
 import type { AttachedImage } from './images.ts'
-import { boardToolNames, createBoardServer, type BoardChange, type BoardNotice, type BoardToolContext } from './tools.ts'
+import {
+  boardToolNames, createBoardServer, type BoardChange, type BoardNotice, type BoardToolContext,
+  type ScheduleActOutcome, type ScheduleCreateOutcome,
+} from './tools.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
 import type { ModelBook } from '../sessions/usage.ts'
 import {
   DEFAULT_RUNTIME, getRuntime, parseMeter, type AgentRun, type Meter, type RuntimeId,
 } from './runtime.ts'
 import { startBoardBridge, type BoardBridge } from './board-bridge.ts'
+import type { Schedule, ScheduleDraft } from '../board/schedules.ts'
 import {
   aimSentence, checkProposal, DEFAULT_ORCHESTRATION, policyFor,
   type DecompositionRecord, type OrchestrationLevel, type OrchestrationPolicy,
-  type PieceProposal, type ProposalNote, MAX_STATED,
+  type ProposalNote, MAX_STATED,
 } from '../board/decomposition.ts'
 
 export interface ManagerOptions {
@@ -98,6 +102,35 @@ export interface ManagerOptions {
      *  split was wrong. */
     notes: readonly ProposalNote[],
   ) => Promise<boolean>
+  /**
+   * The models a spawned agent may run on — the host's spawn allowlist: what
+   * the active backend offers, minus what the user unticked on the settings
+   * page. Read FRESH at split time, because the policy can change between
+   * sessions while a tool description baked at launch is only ever policy.
+   *
+   * `split()` is the ONE place it is enforced: a spec may name a `model`, and
+   * a spec that names none inherits `defaults.model` — so the EFFECTIVE model
+   * is what is gated. Absent (unit tests, a host too old to supply it) means
+   * no gate, which is the pre-existing behaviour.
+   */
+  spawnModels?: () => string[]
+  /**
+   * The board's scheduled runs, behind callbacks into the host.
+   *
+   * The schedule store is host state, and firing one is starting the CLI —
+   * both only the host can do. The manager is the crossing point because the
+   * tools are built per session and the host's callbacks are bound once:
+   * `boardContext()` supplies the four callbacks, and stamps `createdBy` with
+   * the card title of the session that asked, so the settings page can mark a
+   * schedule as an agent's. Absent (unit tests, a host too old) means the
+   * schedule tools answer "not available", never invent a store.
+   */
+  schedules?: {
+    list: () => Promise<Schedule[]> | Schedule[]
+    create: (draft: ScheduleDraft, createdBy: string) => Promise<ScheduleCreateOutcome>
+    remove: (id: string) => Promise<ScheduleActOutcome>
+    run: (id: string) => Promise<ScheduleActOutcome>
+  }
   /** Passed to every session, for diagnostics the user cannot act on. */
   log?: (message: string) => void
 }
@@ -199,6 +232,13 @@ export interface SubtaskSpec {
    *  board can compare it against what actually changed. */
   scope?: string[]
   tags?: string[]
+  /**
+   * The model this subtask asks to run on — the per-piece half of the routing
+   * reserved in `PieceRouting`. Gated by the spawn allowlist in `split()`
+   * before anyone is asked to approve anything; absent means the child runs
+   * on the default for new sessions.
+   */
+  model?: string
 }
 
 export type SplitResult =
@@ -446,8 +486,6 @@ export class AgentManager extends EventEmitter {
   /** This manager is being torn down. Latched, never cleared. */
   private stopped = false
 
-  private keyFor(a: RunningAgent): string { return a.sessionId ?? a.runId }
-
   /** Start a new session from a prompt. Returns the local run id immediately. */
   async start(prompt: string, opts: LaunchOptions = {}): Promise<string> {
     const runId = `run-${++this.counter}-${Date.now().toString(36)}`
@@ -585,7 +623,45 @@ export class AgentManager extends EventEmitter {
       prompt: p.prompt,
       ...(p.scope?.length ? { scope: p.scope } : {}),
       ...(p.tags?.length ? { tags: p.tags } : {}),
+      ...(p.model ? { model: p.model } : {}),
     }))
+
+    // The spawn-model allowlist, and it has to be HERE: after the proposal is
+    // known to be structurally sound, before the user is asked to approve it —
+    // a modal should never ask about a plan the host already knows it will
+    // refuse. The tool description names the allowed models, but a description
+    // is policy; this is the fence, and the only one. A spec that names no
+    // model inherits the default for new sessions, so the EFFECTIVE model is
+    // what is gated — unticking the default on the settings page means "not
+    // even on my default", and an empty allowed set refuses every split.
+    const spawnAllowed = this.opts.spawnModels?.()
+    if (spawnAllowed) {
+      const offender = spawnAllowed.length === 0
+        ? specs[0]
+        : specs.find((s) => {
+            const effective = s.model ?? this.opts.defaults.model
+            return effective !== undefined && !spawnAllowed.includes(effective)
+          })
+      if (offender) {
+        const effective = offender.model ?? this.opts.defaults.model
+        const message = spawnAllowed.length === 0
+          ? 'No model is allowed for spawned agents right now — the user unticked every one ' +
+            'on the settings page. Do the work yourself, or ask the user to re-tick a model.'
+          : `Spawned agents may only run on: ${spawnAllowed.join(', ')}. ` +
+            `"${offender.title}" would run on ${effective ?? 'the runtime default'}` +
+            `${offender.model ? '' : ' (the default for new sessions)'}, which is not allowed. ` +
+            'Name one of the allowed models instead, or do the work yourself.'
+        // RECORDED like the proposal refusals above: a session that tried to
+        // split, was refused, and did the work alone must not be byte-identical
+        // on the board to the correct adaptive outcome.
+        await this.recordDecomposition(parentKey, {
+          at: Date.now(), level, outcome: 'refused',
+          requested: subtasks.length, rule: 'spawn-model',
+          ...(reason.trim() ? { stated: reason.trim().slice(0, MAX_STATED) } : {}),
+        })
+        return { ok: false, message }
+      }
+    }
 
     // The real approval gate, and it has to be here.
     //
@@ -632,6 +708,12 @@ export class AgentManager extends EventEmitter {
       const runId = await this.start(spec.prompt, {
         title: spec.title,
         parent: parentKey,
+        // The model the spec named — already vetted by the allowlist gate
+        // above, which is the ONE place a model from an agent is checked.
+        // `chosen` rather than `defaults`, exactly like a resumed session:
+        // what the card shows and what the runtime is handed must be the
+        // same value, resolved once.
+        ...(spec.model ? { chosen: { model: spec.model } } : {}),
         ...(parent.base ? { base: parent.base } : {}),
         // A child inherits the PARENT's agent program, not the workspace
         // default. `split()` passed no runtime, so `launch()` fell through to
@@ -731,6 +813,11 @@ export class AgentManager extends EventEmitter {
     return {
       store: this.opts.store,
       key: () => agent.sessionId ?? agent.runId,
+      // Baked into the tool descriptions at launch. A policy change mid-turn
+      // cannot update text the model has already read — which is fine, because
+      // a description is policy and `split()` re-reads the allowlist at gate
+      // time. This is the same division the orchestration level already has.
+      spawnModels: this.opts.spawnModels?.(),
       onChanged: (change?: BoardChange) => {
         if (change?.phase) {
           agent.live.push({
@@ -749,6 +836,7 @@ export class AgentManager extends EventEmitter {
         this.touch()
       },
       derivedTitle: () => (agent.titleChosen ? undefined : agent.title),
+      sessionTitle: () => agent.title,
       onRename: async (title: string) => {
         agent.title = title
         agent.titleChosen = true
@@ -778,6 +866,16 @@ export class AgentManager extends EventEmitter {
         }
         return result
       },
+      // Mechanical 1:1 wires — the tool handlers own every decision, including
+      // the creator stamp (`onScheduleCreate` gets `createdBy` from
+      // `sessionTitle`, which the tools test pins). This file supplies only the
+      // host callbacks.
+      onScheduleList: this.opts.schedules ? async () => this.opts.schedules!.list() : undefined,
+      onScheduleCreate: this.opts.schedules
+        ? async (draft, createdBy) => this.opts.schedules!.create(draft, createdBy)
+        : undefined,
+      onScheduleDelete: this.opts.schedules ? async (id) => this.opts.schedules!.remove(id) : undefined,
+      onScheduleRun: this.opts.schedules ? async (id) => this.opts.schedules!.run(id) : undefined,
     }
   }
 
@@ -1241,7 +1339,9 @@ export class AgentManager extends EventEmitter {
       cwd: wt.path,
       permissionMode: this.opts.permissionMode,
       executable: location.command,
-      appendSystemPrompt: buildBrief(this.opts.board, title, wt.branch, policyFor(level), canSplit),
+      appendSystemPrompt: buildBrief(
+        this.opts.board, title, wt.branch, policyFor(level), canSplit, this.opts.spawnModels?.(),
+      ),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
       ...(this.opts.log ? { log: this.opts.log } : {}),
@@ -1526,6 +1626,10 @@ export function buildBrief(
   branch: string,
   policy: OrchestrationPolicy = policyFor(DEFAULT_ORCHESTRATION),
   canSplit = true,
+  /** The spawn allowlist, for the split paragraph: the models a subtask may
+   *  name. Omitted (the usual test case, or a host without the policy) leaves
+   *  the paragraph as it always was. */
+  spawnModels?: string[],
 ): string {
   const started = board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'
   const review = board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
@@ -1566,6 +1670,17 @@ export function buildBrief(
           'Give every subtask a `scope` — the files or directories it expects to touch — and',
           'write each brief so it stands alone: a fresh agent reads it having seen neither',
           'this conversation nor its siblings.',
+          // The spawn allowlist. A sentence, not the fence — `split()` re-reads
+          // the policy at gate time, so this can only ever be a stale but honest
+          // answer, never a wrong one that passes.
+          ...(spawnModels
+            ? ['',
+               spawnModels.length
+                 ? `Spawned agents may only run on: ${spawnModels.join(', ')}. ` +
+                   'If you split, name each subtask\'s `model` from that list.'
+                 : 'No model is currently allowed for spawned agents, so `split_task` will be refused.',
+              ]
+            : []),
         ]
       : []),
   ].join('\n')

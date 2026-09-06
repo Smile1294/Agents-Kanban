@@ -334,12 +334,16 @@ export function priceLabel(rate: EndpointRate | undefined): string | undefined {
 /**
  * A custom endpoint's own catalogue, as picker entries.
  *
- * The capabilities are the SAFE defaults, and for a stronger reason than in
- * `modelsForProfile`: nobody has asked this endpoint what it supports, and half
- * of what the composer offers is Claude Code's vocabulary rather than a
- * model's. Effort and thinking stay available because losing them only costs a
- * control; ultracode and fast mode stay off because offering them spends money
- * on a mode the model may not have.
+ * Capabilities are ABSENT, every one of them, and that is the honest answer.
+ * The endpoint's model list carries no capability fields, so nothing here is
+ * known-true — and the composer gates every capability on `=== true` and
+ * DISAPPEARS the control when it is not. The effort dial is Anthropic's
+ * reasoning effort, and "low…max" next to `deepseek-v4-pro` is a control that
+ * cannot say no: DeepSeek has no such dial, and a picker that looks adjustable
+ * while doing nothing is the same class of bug as a spinner over a wedged
+ * process. The controls vanish; a profile that knows better can declare its
+ * models (`modelsForProfile`), where a match against the known table carries
+ * the real capabilities back.
  */
 export function endpointChoices(
   models: readonly EndpointModel[],
@@ -355,8 +359,8 @@ export function endpointChoices(
       ...(tokens ? { contextTokens: tokens } : {}),
       ...(m.description ? { detail: m.description } : {}),
       ...(m.rate ? { rate: m.rate } : {}),
-      efforts: [...ALL_EFFORTS],
-      thinking: true,
+      efforts: [],
+      thinking: false,
       ultracode: false,
       fastMode: false,
     }
@@ -388,10 +392,13 @@ export function endpointChoices(
  * against. `known` is consulted for that and nothing else; it is never returned
  * wholesale.
  *
- * Capabilities get the SAFE defaults, not the permissive ones: nobody asked this
- * endpoint what it supports, so effort and thinking stay available (losing them
- * only costs a control) while ultracode and fast mode stay off (offering them
- * would spend money on a mode the model may not have).
+ * Capabilities come from the known match — or not at all. `us.anthropic.*` IS
+ * the Anthropic model, so a Bedrock profile's id carries the real capability
+ * through `normalise`. An id that matches nothing known (`deepseek-v4-pro`)
+ * gets NONE: nobody has told us that endpoint understands Anthropic's effort
+ * vocabulary, and the composer gates on `=== true`, so the controls disappear
+ * rather than sit there inert — "what does low…max mean on DeepSeek" is a
+ * question no answer to it is worth reading.
  */
 export function modelsForProfile(
   profile: Pick<ProviderProfile, 'models' | 'contextWindow'>,
@@ -418,10 +425,10 @@ export function modelsForProfile(
       ...(tokens ? { contextTokens: tokens } : {}),
       ...(served?.description ? { detail: served.description } : {}),
       ...(served?.rate ? { rate: served.rate } : {}),
-      efforts: [...ALL_EFFORTS],
-      thinking: true,
-      ultracode: false,
-      fastMode: false,
+      efforts: match ? [...match.efforts] : [],
+      thinking: match?.thinking === true,
+      ultracode: match?.ultracode === true,
+      fastMode: match?.fastMode === true,
     }
   })
 }
