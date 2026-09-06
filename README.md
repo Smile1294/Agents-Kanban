@@ -69,14 +69,66 @@ prompts back to it.
    and choose a pairing code.
 3. Open the relay site on any device and enter the same code.
 
-Only cards and chat rows leave your machine — no file paths, no commands, no
-credentials — and the relay stores nothing secret: the board's address is a
-hash of your pairing code, which never leaves your machine. By default the
-relay is a read-only mirror. Turning on **Allow prompts from the remote page**
-adds a composer on the watching device, and the extension runs those prompts
-exactly like one typed locally, through the same permissions. Treat the pairing
-code like a password — anyone with it can watch the board, and send prompts
-while the write channel is on. Full details: [remote/README.md](remote/README.md).
+---
+
+## Remote control
+
+Two ways to reach the board from somewhere else, one pairing code each.
+
+**The headless board** is the full thing: run it on a VPS, a Mac mini or a
+small Linux box that holds the repo, and drive the board from any browser —
+send prompts, start sessions, approve permissions, move cards, review and
+merge. Agents run on that box.
+
+```bash
+git clone <repo> && cd <repo>
+npm install
+npm run remote   # prints a URL and a pairing code — open, enter, done
+```
+
+The page the browser gets is the extension's own webview; the pairing code
+travels as a header on every request and in the event-stream URL, and nothing
+else is secret. See [server/README.md](server/README.md).
+
+**The relay** mirrors a board running in VS Code to a small site (Netlify,
+Cloudflare Workers, or a plain Node process), so you can watch it from a phone
+without the extension's machine being reachable at all. See
+[remote/README.md](remote/README.md).
+
+---
+
+## Screenshots
+
+**An agent asking you something.** Real questions with real options — pick one,
+tick several, or type your own answer.
+
+![Asking a question](https://raw.githubusercontent.com/Smile1294/Agents-Kanban/main/docs/screenshots/10-asking-a-question.png)
+
+**A finished session, with its test plan.** Every link is a button: files open
+from the agent's worktree, commands open a terminal already `cd`'d into it.
+
+![How to test this](https://raw.githubusercontent.com/Smile1294/Agents-Kanban/main/docs/screenshots/02-chat-with-test-plan.png)
+
+**Asking permission.** Tool calls that write anything stop and wait.
+
+![Permission prompt](https://raw.githubusercontent.com/Smile1294/Agents-Kanban/main/docs/screenshots/03-permission-prompt.png)
+
+**Notices and queued follow-ups.** Type while it works — messages are held
+until the turn ends rather than vanishing. The agent can interrupt *you* when
+it is stuck.
+
+![Notices and queued follow-ups](https://raw.githubusercontent.com/Smile1294/Agents-Kanban/main/docs/screenshots/07-notice-and-queue.png)
+
+**The board with the window to itself.** The terminal and right-hand chat step
+aside; your left side bar never moves, because it is how you get back.
+
+![Full window](https://raw.githubusercontent.com/Smile1294/Agents-Kanban/main/docs/screenshots/08-full-window.png)
+
+**It works narrow, too.**
+
+![Narrow board](https://raw.githubusercontent.com/Smile1294/Agents-Kanban/main/docs/screenshots/04-narrow-board.png)
+
+---
 
 ## Requirements
 

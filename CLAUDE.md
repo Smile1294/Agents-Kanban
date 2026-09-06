@@ -34,6 +34,7 @@ npm run verify:package # package a .vsix and check what is inside it. Run before
 npm run watch          # rebuild on change
 npm run install-local  # package and install into VS Code (reload the window after)
 npm run screenshots    # render the real view in headless Chromium -> docs/screenshots
+npm run remote         # build, then serve the headless board from server/server.mjs (see server/README.md)
 ```
 
 Press <kbd>F5</kbd> for an Extension Development Host. It runs `verify` first —

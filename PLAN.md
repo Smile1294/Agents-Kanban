@@ -337,6 +337,20 @@ Working:
   The context window and per-token price it publishes reach the picker AND both
   spend meters, so a session on a router shows a real figure instead of
   `≥ $0.00`. See [`src/agent/endpoint.ts`](src/agent/endpoint.ts)
+- **The headless board — Remote Control that runs the board itself.**
+  `npm run remote` serves the built extension on a box, activated against a
+  `vscode` stub (the `test/harness.mjs` technique) with the browser as its
+  webview: the real `media/board.js` page, `acquireVsCodeApi` supplied by
+  `server/bridge.js` — `postMessage` becomes a POST, host frames arrive over
+  SSE, dialogs become overlays — and a pairing code (`x-rc-code` header /
+  `?code=` on the stream, sha-256 compared `timingSafeEqual`) gates everything.
+  Every webview message the extension understands works from a browser, so a
+  VPS or a mini PC holding the repo is a complete board reachable from
+  anywhere. The gate test (`src/remote/__tests__/headless.test.mjs`) spawns
+  the server against a throwaway repo and drives the whole flow through a real
+  Chromium: 401s without the code, state over the stream, the gate, the
+  composer, the settings tab, zero console errors. The relay in `remote/`
+  remains as the smaller mirror mode. See [server/README.md](server/README.md)
 - Archive (soft, reversible) and permanent delete
 - Permission prompts inline on the card
 - Multiple tags per session
