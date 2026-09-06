@@ -2643,7 +2643,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           title: s?.title ?? a.title,
           phase: phase ?? ws.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing',
           tags: s?.tags ?? m?.tags ?? [],
-          updated: Date.now(),
+          /* The session's own last-modified time, or when the run started —
+             never the wall clock. Stamping `Date.now()` here made every live
+             card claim it had just changed on EVERY repaint, which is ten
+             times a second while an agent streams, and that was wrong twice.
+
+             It is a signal that cannot say bad: a wedged run reads "just now"
+             for as long as it stays wedged, which is the rule this board has
+             a postmortem about.
+
+             And the view puts `updated` in `chromeSig()`, so the signature
+             changed on every frame and the streaming fast path could never
+             match — the whole DOM was rebuilt ten times a second, which
+             cancels any click, drag or wheel gesture in flight. Reported as
+             "I can't switch to other chats or scroll up or even change to the
+             kanban board while it is running". See docs/DECISIONS.md. */
+          updated: s?.updated ?? a.startedAt,
           branch: a.branch,
           worktree: a.worktreePath,
           ...(a.parent ?? m?.parent ? { parent: (a.parent ?? m?.parent)! } : {}),

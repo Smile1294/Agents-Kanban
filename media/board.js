@@ -203,8 +203,19 @@
   let syncHintNode = null // the new-session hint, when no card is selected
   let syncReadoutsNode = null // the composer bar's context/spend readouts
   let syncBarNode = null // the composer bar itself, to append a first readouts
-  /** chromeSig() of the state the last full render drew. A frame with the
-   *  same signature goes down the fast path; anything else rebuilds. */
+  /**
+   * chromeSig() of the tree that is ON SCREEN. A frame with the same signature
+   * goes down the fast path; anything else rebuilds.
+   *
+   * Written by `render()` itself, not by the message handler, because render()
+   * has other callers: every click that changes something the view owns —
+   * opening the search screen, opening a menu — repaints without a state
+   * message. Recorded in the handler alone, the signature then described a
+   * tree that had been replaced since, and the next matching frame took the
+   * fast path over a screen it did not describe: opening search and clicking a
+   * hit left the search screen up, because the frame that should have redrawn
+   * the chat matched a signature from before search was ever opened.
+   */
   let lastChrome = null
   /** A "load earlier" round trip is in flight. Debounces the pill: its click
    *  posts once, the widened state arrives as a normal frame (and prepends via
@@ -216,6 +227,24 @@
    *  every full render and every fast-path apply — it is how the handler tells
    *  a widened transcript (same key, more rows) from a session change. */
   let syncKey = null
+  /**
+   * The `.agent-row` of every card the last full render drew, as
+   * `{ key, node }`. This is the kanban half of the fast path.
+   *
+   * `syncApply()` only ever handled CHAT, so kanban rebuilt the entire board on
+   * every frame an agent produced — the columns, the cards, and the scroll
+   * container inside each column. That is the same freeze the chat view had:
+   * a destroyed node cannot be scrolled, and a card replaced between mousedown
+   * and mouseup never fires its click, which is why a running board could not
+   * be scrolled and its cards could not be opened.
+   *
+   * Only this row is volatile — the tool name, the age, the context percentage
+   * — because everything else on a card is in `chromeSig()` and a change there
+   * rebuilds properly. The permission prompt below it is deliberately NOT
+   * patched: it is in the signature, and it holds a text box the user may be
+   * typing an answer into.
+   */
+  let syncStrips = []
 
   window.addEventListener('message', (e) => {
     const d = e.data
@@ -246,10 +275,9 @@
       // place instead of rebuilding the tree. Rebuilding destroyed the scroll
       // container several times a second, which cancelled every scrollbar drag
       // and mouse-wheel gesture mid-flight: that is the freeze this fixes.
-      const sig = chromeSig()
-      if (sig === lastChrome && syncApply()) return
+      if (chromeSig() === lastChrome && syncFrame()) return
+      // render() records its own signature — see the note on `lastChrome`.
       render()
-      lastChrome = sig
     } else if (d.type === 'mentions') {
       // The @-mention file list, fetched once on first use. Repaints do not
       // clear it — it is module-level — and arriving late merely fills the
@@ -365,6 +393,15 @@
     Object.keys(askChoices).forEach((k) => { if (!livePermissions[k]) delete askChoices[k] })
 
     root.replaceChildren()
+    // Every card node the old tree held is gone; the refs into it must go with
+    // it, or the next matched frame patches rows that are no longer on screen.
+    syncStrips = []
+    // What this tree is about to draw. Recorded here rather than by the caller
+    // so that EVERY path out of render() — including the early returns below —
+    // leaves the signature describing what is actually on screen. It depends
+    // only on `s` and the view's own flags, neither of which moves while a
+    // render runs.
+    lastChrome = chromeSig()
     if (s.noWorkspace) return renderNoWorkspace()
     if (!s.ready) return renderSetup()
 
@@ -422,13 +459,23 @@
    *  catalogue is never in here: the view keeps it once, out of `s`. */
   function chromeSig() {
     const cards = (s.cards || []).map((c) => {
-      if (!c.agent) return c
+      /* `updated` enters the signature as the MINUTE it falls in, not the
+         millisecond. It is drawn by `ago()`, whose finest step is a minute,
+         and as a day group header — so a timestamp that moves within one
+         minute changes no text on screen, and rebuilding the tree for it
+         destroys the container the reader is scrolling for nothing.
+         A live session's transcript file is being written continuously, so
+         its mtime moves constantly; the host used to stamp the clock here
+         outright. Sort order can flip inside a minute without a rebuild.
+         That is the trade, and it is invisible. */
+      const base = { ...c, updated: Math.floor((c.updated || 0) / 60000) }
+      if (!c.agent) return base
       const a = { ...c.agent }
       delete a.tool
       delete a.subagent
       delete a.lastEventAt
       delete a.contextTokens
-      return { ...c, agent: a }
+      return { ...base, agent: a }
     })
     const composer = { ...(s.composer || {}) }
     delete composer.models
@@ -464,6 +511,54 @@
       case 'error': return 'x:' + (e.message || '')
       default: return '?' + JSON.stringify(e)
     }
+  }
+
+  /**
+   * Handle a state frame whose chrome signature matched the last full render.
+   *
+   * A matched signature means nothing STRUCTURAL changed — so a full rebuild
+   * can only destroy what the user is holding: the scroll container under a
+   * wheel gesture, the card under a half-finished click, the drag in flight.
+   * Returning true means "the frame is dealt with, do not rebuild"; false
+   * means something did not line up and the (always correct, merely slower)
+   * full render should run.
+   *
+   * There is one branch per screen, because each has a different volatile part:
+   *
+   *   chat    — the transcript grows and the streaming block changes.
+   *   kanban  — only the agent rows on the cards.
+   *   search  — nothing: the results screen is drawn from module state
+   *             (`searchRows`), which arrives on its own channel and renders
+   *             itself.
+   *   control — nothing: the side bar draws counts and titles, all of which
+   *             are in the signature.
+   *
+   * The last two used to fall through to `render()`, which is how a side bar
+   * and a search screen ended up rebuilding ten times a second to draw exactly
+   * the same characters.
+   */
+  function syncFrame() {
+    if (!s.ready || s.noWorkspace) return false
+    if (control) return syncCards()
+    if (searching) return syncCards()
+    if (s.mode === 'chat') return syncApply()
+    return syncCards()
+  }
+
+  /** Refresh the volatile agent row on every card the last full render drew.
+   *  The card node, the column it sits in and that column's scroll container
+   *  are never touched — which is the whole point. */
+  function syncCards() {
+    for (const ref of syncStrips) {
+      const c = card(ref.key)
+      // The card is gone, or has no agent any more. Neither is possible with a
+      // matched signature (the key set and `agent.kind` are both in it), so it
+      // means the two have drifted — rebuild rather than patch around it.
+      if (!c || !c.agent) return false
+      const fresh = agentRow(c.agent)
+      ref.node.replaceChildren(...fresh.children)
+    }
+    return true
   }
 
   /** Handle a state frame whose chromeSig matched the last full render, by
@@ -1246,6 +1341,20 @@
 
   function renderAgentStrip(c, a) {
     const wrap = el('div', 'agent')
+    const row = agentRow(a)
+    /* Registered for the fast path: a frame whose chrome is unchanged patches
+       this row's contents instead of rebuilding the board around it. */
+    syncStrips.push({ key: c.key, node: row })
+    wrap.append(row)
+    if (a.pendingPermission) wrap.append(renderAsk(c, a))
+    return wrap
+  }
+
+  /* The volatile half of a card: what the agent is doing, how long since the
+     CLI last said anything, and how full the window is. Built on its own
+     because it is the only part of a card that changes between repaints, and
+     the fast path re-renders exactly this into the existing node. */
+  function agentRow(a) {
     const row = el('div', 'agent-row')
     const dot = el('span', 'dot')
     let text = ''
@@ -1287,9 +1396,7 @@
       row.append(el('span', 'spacer'))
       row.append(el('span', 'ctx', pct(a.contextTokens, a.contextWindow)))
     }
-    wrap.append(row)
-    if (a.pendingPermission) wrap.append(renderAsk(c, a))
-    return wrap
+    return row
   }
 
   /* An agent stops for two different reasons, and they used to look identical.

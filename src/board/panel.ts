@@ -727,6 +727,30 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri, layout: 'board'
  * bar itself; a view we hid could never report being switched away from, which
  * is the trap every earlier version fell into.
  */
+/**
+ * The side bar's share of a state — which is everything EXCEPT the big parts,
+ * because the control draws none of them.
+ *
+ * `post()` is called on every frame an agent produces, and posting to a webview
+ * serialises what it is given. The side bar was being handed the selected
+ * session's whole transcript ten times a second to render a title, two counts
+ * and a button: on a reasoning-model session that is hundreds of kilobytes per
+ * frame, copied on the same event loop that drains the CLI's stdout. Nothing
+ * here changes what the control can draw — `renderControl()` reads `cards`,
+ * `columns`, `running`, `waiting`, `focused` and `boardOpen`, and nothing else.
+ *
+ * Only the three that are O(session) and redrawn per frame are dropped.
+ * `commands` and `disclosures` are small and static, and `composer.models` is
+ * already omitted by the host when it has not changed — trimming those buys
+ * nothing and costs the side bar the only coverage it has. Fields are DROPPED,
+ * never emptied: an empty array is a real state elsewhere in this protocol.
+ */
+function forControl(state: UiState): UiState {
+  const { transcript, streaming, review, ...rest } = state
+  void transcript; void streaming; void review
+  return rest
+}
+
 export class BoardViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'agentsKanban.board'
 
@@ -772,7 +796,7 @@ export class BoardViewProvider implements vscode.WebviewViewProvider {
    *  index. One state, two views. */
   async post(state: UiState): Promise<void> {
     if (!this.view) return
-    await this.view.webview.postMessage({ type: 'state', state })
+    await this.view.webview.postMessage({ type: 'state', state: forControl(state) })
   }
 }
 

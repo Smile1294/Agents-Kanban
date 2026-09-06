@@ -1104,6 +1104,94 @@ is. "Repaint when something changes" is a correct-sounding rule that quietly
 becomes "repaint 2,000 times a minute", and the cost lands on the same event
 loop as the work being watched.
 
+### One `Date.now()` killed the streaming fast path, and the board froze
+
+Reported as: "when the commands and bashes and the LLM are running I can't
+switch to other chats or scroll up or even change to the kanban board."
+
+Three symptoms, one cause, and every unit test was green.
+
+The webview repaints by replacing the whole tree. That is fine when it is rare
+and fatal when it is continuous: **a node that is destroyed mid-gesture takes
+the gesture with it.** A card replaced between mousedown and mouseup never fires
+its click — that is "I can't switch to other chats" and "I can't change to the
+kanban board". A scroll container replaced mid-wheel drops the scroll — that is
+"I can't scroll up". Harvest-and-restore cannot help: restoring the OFFSET after
+the node is gone does not bring the gesture back.
+
+So the view already had a fast path. `chromeSig()` is a signature of everything
+structural, and a frame whose signature matches the last full render patches the
+transcript in place instead of rebuilding. It was written for exactly this
+report and it **had never once run in real use.**
+
+`getState()` builds a card for every live agent, and one line of it said:
+
+```ts
+updated: Date.now(),
+```
+
+`getState()` runs on every repaint. `updated` is in the signature. So the
+signature was different on every single frame, `sig === lastChrome` was never
+true, and the tree was rebuilt ten times a second — the exact behaviour the fast
+path exists to prevent, for as long as any agent was running anywhere on the
+board.
+
+**Why no test caught it.** `webview.test.mjs` has a `CARD` fixture with
+`updated: Date.now()` evaluated ONCE, at module load, and every frame it
+delivers reuses it. Held still, the fast path works perfectly and nine
+assertions say so. The host did not hold it still. The fixture was not wrong —
+it was a state the host never produces, which is the same failure mode as
+`agent/executable.test.ts` asserting against source instead of the bundle.
+
+Three fixes, and they are three different bugs that happened to line up:
+
+1. **The host does not stamp the clock.** `updated: s?.updated ?? a.startedAt` —
+   the session file's own mtime, or when the run started. `Date.now()` was also
+   a signal that cannot say bad, the rule this board already has a postmortem
+   about: a wedged run read "just now" for as long as it stayed wedged.
+2. **The signature carries `updated` at the resolution it is DRAWN at.**
+   `Math.floor(updated / 60000)` — `ago()` steps in minutes. A live session's
+   transcript file is being written continuously, so its mtime moves regardless;
+   rebuilding the tree to change no text on screen is the same bug with a
+   slower clock. Sort order can flip inside one minute without a rebuild. That
+   is the trade, and it is invisible.
+3. **The fast path covered CHAT only.** `syncApply()` began
+   `if (s.mode !== 'chat') return false`, so kanban — the default screen —
+   rebuilt everything on every frame even when the signature matched, and so did
+   the side bar and the search screen. Now `syncFrame()` has a branch per
+   screen: chat patches the transcript, kanban patches the one volatile thing a
+   card draws (`agentRow`: the tool, the age, the context fill), and the side
+   bar and search screen are no-ops because everything they draw is in the
+   signature. The permission prompt under a card is deliberately NOT patched —
+   it is in the signature, and it holds a text box the user may be typing an
+   answer into.
+
+A fourth thing fell out of fixing the third. `lastChrome` was recorded by the
+message handler, but `render()` has other callers: every click that changes
+something the view owns repaints without a state message. Once matched
+signatures actually started being acted on, the recorded signature could
+describe a tree that had been replaced since — opening the search screen and
+clicking a hit left the search screen up, because the frame that should have
+drawn the chat matched a signature from before search was ever opened. `render()`
+now records its own signature, on every path out, including the early returns.
+
+And one more per-frame cost, found on the way: the side bar was posted the
+selected session's **entire transcript** on every frame, to draw a title, two
+counts and a list of names. Posting to a webview serialises what it is given, on
+the same event loop that drains the CLI's stdout. `forControl()` drops
+`transcript`, `streaming` and `review` — the three fields that are O(session)
+and redrawn per frame — and nothing else, because `commands` and `disclosures`
+are small and static and `composer.models` is already omitted by the host when
+unchanged. The harness gives the side bar its own mailbox so a test can tell the
+two surfaces apart; they are handed different payloads now.
+
+**Lesson:** a fast path gated on a signature is only as good as the worst field
+in it, and the field that kills it will be the one nobody thinks of as data — a
+timestamp, a counter, a formatted string. Any fixture that holds such a field
+still is testing a state the host cannot produce. Test the fast path against
+frames shaped like what the host actually sends, moving the things the host
+actually moves.
+
 ### Four and a half minutes, and no row said which call spent them
 
 The other half of the same report, and the one the board genuinely could not

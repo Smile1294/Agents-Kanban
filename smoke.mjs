@@ -694,6 +694,58 @@ try {
   ok(!onDisk[STORED_SESSION]?.running, 'and clears the mark on disk, so it stays dismissed')
 }
 
+// --- what the SIDE BAR is sent, as opposed to what the panel is sent --------
+//
+// Both surfaces are painted from ONE state, on every frame an agent produces.
+// The side bar draws a title, two counts, a button and a list of session names
+// — and it was handed the selected session's entire transcript ten times a
+// second to do it. Posting to a webview serialises what it is given, on the
+// same event loop that drains the CLI's stdout, so that is the "nothing
+// expensive may be SENT per streamed token" rule broken by however large the
+// conversation has grown, every frame, for a view that never reads it.
+//
+// Only the O(session) fields are dropped, and only for the side bar. The two
+// surfaces are told apart by identity: the harness keeps the side bar's own
+// mailbox as well as the shared log, so "what the panel got" is what is in the
+// log and not in that mailbox.
+console.log('\n— the side bar is not sent what it does not draw')
+{
+  const restoreMode = latestState().mode
+  await send({ type: 'openBoard' })
+  const chatty = (latestState().cards ?? [])[0]
+  if (!chatty) ok(false, 'the smoke store seeded no cards to select')
+  else {
+    await send({ type: 'select', id: chatty.key })
+    await send({ type: 'setMode', mode: 'chat' })
+    await send({ type: 'ready' })
+    const barPosts = new Set(ctl.sideBar?.posted ?? [])
+    const panel = [...stub.posted].reverse()
+      .find((m) => m.type === 'state' && !barPosts.has(m))?.state
+    const bar = ctl.sideBar?.state()
+    ok(!!bar, 'the side bar was painted')
+    ok(!!panel, 'and so was the panel, from the same state')
+    ok(Array.isArray(panel?.transcript), 'the PANEL is sent the transcript — it draws it')
+    ok(bar.transcript === undefined, 'the SIDE BAR is not — it has none to draw')
+    ok(bar.streaming === undefined && bar.review === undefined,
+       'nor the streaming block or the worktree review')
+    // Trimmed, never starved: everything the control DOES draw must survive.
+    ok(Array.isArray(bar.cards) && bar.cards.length === (panel?.cards ?? []).length,
+       'every card is still there — the list it draws')
+    ok(bar.mode === panel?.mode && bar.ready === panel?.ready && bar.selectedKey === panel?.selectedKey,
+       'and it agrees with the panel about mode, readiness and selection')
+    try {
+      const view = await renderBoard(bar, { layout: 'control' })
+      ok(view.text().includes(chatty.title), 'and the real control renders it, session named')
+    } catch (e) {
+      ok(false, `the control threw on the trimmed state — ${e.message}`)
+    }
+  }
+  // Put the board back where the rest of this file expects to find it.
+  await send({ type: 'select', id: '' })
+  await send({ type: 'setMode', mode: restoreMode })
+  await send({ type: 'ready' })
+}
+
 // The side bar renders a control, not a board.
 const boardSrc = await fs.readFile(path.join(repoRoot, 'media', 'board.js'), 'utf8')
 ok(!boardSrc.includes('compact'), 'the squeezed "compact" board layout is gone')
@@ -1471,6 +1523,44 @@ console.log('\n— providers: the picker, and where the credential goes')
        'and the page says when it was checked')
   } catch (e) {
     ok(false, `the voice check failed through the real bundle — ${e.message}`)
+  }
+}
+
+// --- a repaint must not INVENT a timestamp ----------------------------------
+//
+// Reported as: "when the commands and bashes and the LLM are running I can't
+// switch to other chats or scroll up or even change to the kanban board."
+//
+// A live card was stamped `updated: Date.now()` inside `getState()`, which runs
+// on every repaint — ten times a second while an agent streams. Two things were
+// wrong with that. It is a signal that cannot say bad: a wedged run reads "just
+// now" for as long as it stays wedged. And `updated` is in the view's chrome
+// signature, so the signature differed on every frame, the streaming fast path
+// could never match, and the whole DOM was rebuilt continuously — a node
+// replaced between mousedown and mouseup never fires its click, and a scroll
+// container replaced mid-wheel takes the gesture with it.
+//
+// `maxConcurrentAgents: 0` is how a hermetic test reaches `getState()`'s LIVE
+// card branch at all: `start()` queues instead of launching, and a queued run
+// is registered as a real agent with no CLI anywhere near it.
+console.log('\n— a live card does not restamp itself on every repaint')
+{
+  ctl.config.maxConcurrentAgents = 0
+  await send({ type: 'newSession', text: 'a task that will sit in the queue' })
+  await send({ type: 'ready' })
+  const first = (latestState().cards ?? []).find((c) => c.agent?.kind === 'queued')
+  ok(!!first, 'a queued run gets a live card')
+  if (first) {
+    // Long enough that a wall clock would visibly move.
+    await new Promise((r) => setTimeout(r, 50))
+    await send({ type: 'ready' })
+    const second = (latestState().cards ?? []).find((c) => c.key === first.key)
+    ok(!!second, 'and it is still there on the next repaint')
+    ok(second?.updated === first.updated,
+       `whose "updated" is the same on both repaints (${first.updated} -> ${second?.updated})`)
+    ok(second?.updated <= Date.now(),
+       'and is a real moment in the past, not a clock read while painting')
+    await send({ type: 'stop', id: first.key })
   }
 }
 

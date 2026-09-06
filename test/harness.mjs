@@ -215,9 +215,19 @@ export function makeVscodeStub(ctl) {
         // bar icon is what opens and closes the board, so the test has to be
         // able to click it.
         const listeners = []
+        /* Its own mailbox, for the reason the settings panel has one: the side
+           bar and the editor panel are two surfaces, they are posted DIFFERENT
+           payloads (the control draws no transcript, so it is not sent one),
+           and a shared outbox would let one answer a question asked about the
+           other — `latestState()` reads the newest post, and which surface
+           that came from is a race. */
+        const sideBarOut = []
         const view = {
           visible: layout.sideBar && layout.sideBarView === KANBAN_CONTAINER,
-          webview: makeWebview(),
+          webview: {
+            ...makeWebview(),
+            postMessage: async (m) => { posted.push(m); sideBarOut.push(m); return true },
+          },
           onDidChangeVisibility: (fn) => { listeners.push(fn); return disposable },
           onDidDispose: () => disposable,
           show: () => {},
@@ -247,6 +257,11 @@ export function makeVscodeStub(ctl) {
           syncBoardView()
         }
         ctl.boardView = view
+        /** What the SIDE BAR was handed, as opposed to the editor panel. */
+        ctl.sideBar = {
+          posted: sideBarOut,
+          state: () => [...sideBarOut].reverse().find((m) => m?.type === 'state')?.state,
+        }
         return disposable
       },
       createStatusBarItem: (alignment, priority) => {

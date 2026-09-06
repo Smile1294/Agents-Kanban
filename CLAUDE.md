@@ -457,6 +457,25 @@ run, since each session needs a worktree.
   The scripts under `docs/DECISIONS.md` "the first real agent run" are the
   shape to copy: drive `AgentManager` against a temp git repo and read what
   actually happened.
+- **A repaint that rebuilds the tree cancels whatever the user is doing, so a
+  frame that changes nothing must not rebuild.** A node destroyed mid-gesture
+  takes the gesture with it: a card replaced between mousedown and mouseup never
+  fires its click, a scroll container replaced mid-wheel drops the scroll.
+  Restoring the OFFSET afterwards does not bring the gesture back. So the view
+  compares `chromeSig()` against the tree on screen and patches instead of
+  rebuilding — `syncFrame()`, one branch per screen, and kanban and the side bar
+  are branches too: the fast path covered chat alone, so the DEFAULT screen
+  rebuilt on every frame. Three things are load-bearing. Nothing volatile may
+  enter the signature at a finer resolution than it is DRAWN at — `getState()`
+  stamped `updated: Date.now()` on every live card on every repaint, so the
+  signature differed on every frame, the fast path never ran once in real use,
+  and all three of "I can't scroll / can't switch chats / can't reach the
+  kanban board" were that one line. `render()` records its own signature, on
+  every path out, because clicks repaint without a state message and a recorded
+  signature that describes a replaced tree is worse than none. And a fixture
+  that holds a volatile field STILL is testing a state the host cannot produce
+  — nine assertions passed over a dead fast path for exactly that reason. See
+  [docs/DECISIONS.md](docs/DECISIONS.md).
 - **Anything the USER put into a state, and `render()` rebuilds, carries a key.**
   The webview replaces the whole tree several times a second while an agent
   works, so any state living only in the DOM is destroyed on the next frame.

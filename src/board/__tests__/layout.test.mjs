@@ -381,35 +381,86 @@ try {
   await unknown.close()
 
   /* --- a repaint must not move a scrolled column -------------------------------
-     render() rebuilds the tree on every state message, and an agent at work sends
-     one every few hundred milliseconds. The column body is the scroll container,
-     so it was destroyed and recreated at scrollTop 0 each time: scroll down a
-     busy column and the next frame threw you back to the top. Measured in a real
-     browser because scrollTop only means anything once the box has a height. */
+     An agent at work produces a state message every few hundred milliseconds,
+     and the column body is the scroll container. Two rules, and they are
+     different rules:
+
+     1. A frame that changes NOTHING structural must not rebuild the column at
+        all. Restoring the offset onto a fresh node is not good enough: a node
+        that is destroyed mid-gesture takes the wheel scroll or the scrollbar
+        drag with it, and no restored number brings that back. This is the
+        "I cannot scroll the board while it is running" report.
+     2. A frame that genuinely changes the chrome DOES rebuild, and then the
+        offset has to be carried across — the `data-scroll` harvest.
+
+     Measured in a real browser because scrollTop only means anything once the
+     box has a height. */
   const tall = {
     ...state,
     cards: Array.from({ length: 40 }, (_, i) => ({
       key: 't' + i, sessionId: 't' + i, title: 'Session number ' + i, phase: 'implementing', tags: [], updated: 1000 + i,
     })),
   }
+  /* What the HOST actually sends while an agent streams: the same board, with
+     the running card's volatile readouts moving. `updated` moves too — a live
+     session's transcript file is being written — and the whole freeze was that
+     any movement in it rebuilt the tree. */
+  /* Anchored to the START of the current minute, so the three frames below
+     cannot straddle one. `ago()` renders at minute resolution and the board
+     legitimately redraws when that text changes — a test that sometimes
+     crossed the boundary would fail once an hour for the right reason, which
+     is indistinguishable from failing for the wrong one. */
+  const T0 = Math.floor(Date.now() / 60000) * 60000
+  const busyCards = (tool, at) => [
+    { ...tall.cards[0], updated: at, agent: { kind: 'working', tool, lastEventAt: at, contextTokens: 40000, contextWindow: 200000 } },
+    ...tall.cards.slice(1),
+  ]
+  const busy = { ...tall, cards: busyCards('Bash', T0), running: 1 }
   const scrolled = await browser.newPage({ viewport: { width: 1400, height: 600 } })
-  await scrolled.setContent(page$(tall))
+  await scrolled.setContent(page$(busy))
   await scrolled.waitForSelector('.card', { timeout: 5000 })
-  const kept = await scrolled.evaluate((st) => {
-    const body = [...document.querySelectorAll('.column')]
+  const kept = await scrolled.evaluate((frames) => {
+    const find = () => [...document.querySelectorAll('.column')]
       .find((c) => c.querySelector('.column-head').textContent.includes('Implementing'))
       .querySelector('.cards')
+    const body = find()
     body.scrollTop = 150
     const set = body.scrollTop
-    window.dispatchEvent(new MessageEvent('message', { data: { type: 'state', state: st } }))
-    const again = [...document.querySelectorAll('.column')]
-      .find((c) => c.querySelector('.column-head').textContent.includes('Implementing'))
-      .querySelector('.cards')
-    return { set, rebuilt: again !== body, after: again.scrollTop }
-  }, tall)
+    for (const f of frames.volatile) {
+      window.dispatchEvent(new MessageEvent('message', { data: { type: 'state', state: f } }))
+    }
+    const live = find()
+    const out = {
+      set,
+      rebuiltOnVolatile: live !== body,
+      afterVolatile: live.scrollTop,
+      tool: document.querySelector('.agent-row').textContent,
+    }
+    // Now something real changes: a card is renamed. That must rebuild, and the
+    // offset must survive the rebuild.
+    window.dispatchEvent(new MessageEvent('message', { data: { type: 'state', state: frames.renamed } }))
+    const after = find()
+    out.rebuiltOnChrome = after !== body
+    out.afterChrome = after.scrollTop
+    out.renamed = document.body.textContent.includes('Session renamed')
+    return out
+  }, {
+    volatile: [
+      { ...busy, cards: busyCards('Bash', T0 + 300) },
+      { ...busy, cards: busyCards('Edit', T0 + 600) },
+    ],
+    renamed: {
+      ...busy,
+      cards: [{ ...busy.cards[0], title: 'Session renamed' }, ...busy.cards.slice(1)],
+    },
+  })
   ok(kept.set === 150, `the column body is tall enough to scroll (asked for 150, got ${kept.set})`)
-  ok(kept.rebuilt, 'the state message rebuilt the column')
-  ok(Math.abs(kept.after - 150) <= 1, `and the new column body is scrolled to where the old one was (${kept.after}px)`)
+  ok(!kept.rebuiltOnVolatile, 'a streaming frame does NOT rebuild the column — the node the reader is scrolling survives')
+  ok(Math.abs(kept.afterVolatile - 150) <= 1, `and it stays where it was scrolled to (${kept.afterVolatile}px)`)
+  ok(kept.tool.includes('Edit'), `while the card's tool readout still updated in place (${JSON.stringify(kept.tool)})`)
+  ok(kept.rebuiltOnChrome, 'a real change (a renamed card) still rebuilds the column')
+  ok(kept.renamed, 'and the new title is on screen')
+  ok(Math.abs(kept.afterChrome - 150) <= 1, `with the scroll offset carried across the rebuild (${kept.afterChrome}px)`)
   await scrolled.close()
 
   /* --- rendered markdown must stay inside the transcript ------------------------

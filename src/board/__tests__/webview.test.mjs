@@ -1604,5 +1604,99 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   ok(post2[post2.length - 1].textContent.includes('a new tail row'), 'and lands last')
 }
 
+// 19c. The fast path against the state the HOST ACTUALLY SENDS. ---------------
+//
+// Reported as: "when the commands and bashes and the LLM are running I can't
+// switch to other chats or scroll up or even change to the kanban board."
+//
+// Every assertion in 19 and 19b passed while that was true, because the fixture
+// above holds `updated` at one value for the life of the file. The host did
+// not: a live card was stamped `updated: Date.now()` on every `getState()`,
+// which is every repaint — so `chromeSig()` differed on every single frame, the
+// fast path never ran, and the whole tree was rebuilt ten times a second. A
+// node replaced between mousedown and mouseup never fires its click, and a
+// scroll container replaced mid-wheel takes the gesture with it. That is all
+// three symptoms from one line.
+//
+// So these frames move exactly what a live run moves: `updated` (the session
+// file is being written), `lastEventAt`, the tool, and the context fill.
+{
+  const liveCard = (at, tool, tokens) => ({
+    key: 'abc-123', sessionId: 'abc-123', title: 'Fix login', phase: 'implementing',
+    tags: ['auth'], updated: at,
+    agent: { kind: 'working', tool, lastEventAt: at, contextTokens: tokens, contextWindow: 200000 },
+  })
+  /* Anchored to the start of a minute: `ago()` renders at minute resolution
+     and a frame that crosses the boundary rebuilds for a real reason, so a
+     drifting base would make this fail once an hour and prove nothing. */
+  const T0 = Math.floor(Date.now() / 60000) * 60000
+  const frame = (n, extra = {}) => ({
+    ...base,
+    cards: [liveCard(T0 + n * 120, n % 2 ? 'Edit' : 'Bash', 40000 + n * 500)],
+    ...extra,
+  })
+
+  // --- chat: the transcript the user is reading -----------------------------
+  const chat = (n, extra = {}) => frame(n, {
+    mode: 'chat', selectedKey: 'abc-123',
+    transcript: [{ kind: 'prompt', at: 1, text: 'go' }, { kind: 'text', at: 2, text: 'working' }],
+    streaming: 'partial'.slice(0, 3 + n),
+    ...extra,
+  })
+  const v = run(chat(0))
+  const sc = v.root.querySelector('.transcript-scroll')
+  v.deliver(chat(1))
+  v.deliver(chat(2))
+  ok(v.root.querySelector('.transcript-scroll') === sc,
+     'a live frame — moving `updated`, age, tool and context — keeps the transcript scroll node')
+  ok(v.text().includes('parti'), 'and the streamed text still landed')
+
+  // --- kanban: the board itself --------------------------------------------
+  // `syncApply()` only ever handled chat, so kanban rebuilt EVERYTHING per
+  // frame even when the chrome was identical — the columns, the cards and the
+  // scroll container inside each column.
+  const kv = run(frame(0))
+  const col = kv.root.querySelector('[data-scroll="col:implementing"]')
+  const cardNode = kv.root.querySelector('.card')
+  ok(!!col && !!cardNode, 'the kanban board drew a column and a card')
+  ok(kv.text().includes('Bash'), 'and names the running tool')
+  kv.deliver(frame(1))
+  ok(kv.root.querySelector('[data-scroll="col:implementing"]') === col,
+     'a live frame keeps the COLUMN scroll node — this is the board that could not be scrolled')
+  ok(kv.root.querySelector('.card') === cardNode,
+     'and the card node itself, which is what a click has to survive')
+  ok(kv.text().includes('Edit') && !kv.text().includes('Bash'),
+     'while the tool readout still moved — a frozen board is not a fix')
+
+  // A real change still rebuilds. The fast path must never eat one.
+  kv.deliver(frame(2, { cards: [{ ...liveCard(Date.now(), 'Edit', 41000), title: 'Fix login properly' }] }))
+  ok(kv.root.querySelector('.card') !== cardNode, 'a renamed card still rebuilds')
+  ok(kv.text().includes('Fix login properly'), 'and the new title is on screen')
+
+  // A permission prompt is IN the signature, so it arrives as a rebuild — the
+  // fast path must never patch around an ask, because it holds a text box the
+  // user may be typing an answer into.
+  const asking = kv.root.querySelector('.ask')
+  ok(!asking, 'no ask on an ordinary working card')
+  kv.deliver(frame(3, {
+    cards: [{
+      ...liveCard(T0, 'Bash', 42000),
+      agent: {
+        kind: 'needsInput', lastEventAt: T0, contextTokens: 42000, contextWindow: 200000,
+        pendingPermission: { id: 'p1', summary: 'rm -rf /' },
+      },
+    }],
+  }))
+  ok(!!kv.root.querySelector('.ask'), 'a permission request rebuilds and is drawn')
+
+  // --- the side bar control, which draws nothing volatile at all ------------
+  const cv = renderBoardWith(src, frame(0), { layout: 'control' })
+  const list = cv.root.querySelector('.control-list')
+  cv.deliver(frame(1))
+  cv.deliver(frame(2))
+  ok(cv.root.querySelector('.control-list') === list,
+     'the side bar control is not rebuilt by a frame that changes nothing it draws')
+}
+
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)
