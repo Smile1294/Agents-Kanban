@@ -32,6 +32,7 @@ export default async (req) => {
     boardId: key || url.searchParams.get('id') || '',
     key,
     tailKey: url.searchParams.get('tail') || undefined,
+    cmds: url.searchParams.get('cmds') !== null,
     body,
   }, store)
   return json(out.status, out.json)

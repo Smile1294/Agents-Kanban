@@ -11,7 +11,7 @@
  * its own package.json). Importing across the boundary from src/ keeps the
  * lifted code under this repo's test runner without duplicating it.
  */
-import { handle, ID_OK, KEY_OK } from '../../../remote/functions/board-core.mjs'
+import { handle, ID_OK, KEY_OK, NONCE_OK, CMD_MAX, CMD_TEXT_MAX } from '../../../remote/functions/board-core.mjs'
 
 let fails = 0
 const ok = (c, m) => { if (!c) { console.error('FAIL:', m); fails++ } else console.log('ok:', m) }
@@ -152,6 +152,116 @@ const post = (store, over = {}) => handle({
     'and refuses anything else')
   ok(KEY_OK.test('abc-1._x') && !KEY_OK.test('a/b') && !KEY_OK.test('') && !KEY_OK.test('a'.repeat(81)),
     'session keys: the same rule the extension enforces before anything is sent')
+}
+
+// --- the command queue: the write channel, relay side -------------------------
+
+const command = (store, nonce, text, extra = {}) => post(store, {
+  body: { kind: 'command', nonce, text, ...extra },
+})
+
+{
+  const store = fakeStore()
+  const r = await command(store, 'n1', 'fix the build', { session: 'abc' })
+  ok(r.status === 400 && r.json.error.includes('no board here yet'),
+    'a command naming a session is refused while no board has been pushed — the session cannot be validated')
+  await post(store, { body: { kind: 'update', index: index(), tails: [] } })
+  const r2 = await command(store, 'n1', 'fix the build', { session: 'abc' })
+  ok(r2.status === 200 && r2.json.ok === true, 'once the board exists, a command naming a real session is queued')
+  const queued = JSON.parse(store.map.get(`c:${ID}`))
+  ok(queued.length === 1 && queued[0].nonce === 'n1' && queued[0].text === 'fix the build' && queued[0].session === 'abc',
+    'the queue holds exactly the command, under the derived cmd blob name')
+  const noSession = await command(store, 'n2', 'please do a thing')
+  ok(noSession.status === 200, 'a command without a session (start a new session) is queued too')
+  const queued2 = JSON.parse(store.map.get(`c:${ID}`))
+  ok(queued2.length === 2 && queued2[1].session === undefined, '…and it carries no session field at all')
+}
+
+{
+  const store = fakeStore()
+  const badNonce = await command(store, 'nope nope', 'x')
+  ok(badNonce.status === 400, 'a nonce that is not ack-handle-shaped is refused')
+  const noText = await command(store, 'n1', '   ')
+  ok(noText.status === 400, 'a command with no text is refused')
+  const huge = await command(store, 'n1', 'x'.repeat(CMD_TEXT_MAX + 1))
+  ok(huge.status === 400 && huge.json.error.includes('20000'), 'text over the cap is refused, and the cap is named')
+  const badSession = await command(store, 'n1', 'x', { session: 'a/b' })
+  ok(badSession.status === 400 && badSession.json.error.includes('not a session'),
+    'a session that is not key-shaped is refused')
+  ok(store.map.size === 0, '…and none of the shape rejects stored anything')
+  await post(store, { body: { kind: 'update', index: index(), tails: [] } })
+  const unknown = await command(store, 'n1', 'x', { session: 'zzz' })
+  ok(unknown.status === 400 && unknown.json.error.includes('no such session'),
+    'a command naming a session the index does not carry is refused — the page could never show it')
+}
+
+{
+  const store = fakeStore()
+  await post(store, { body: { kind: 'update', index: index(), tails: [] } })
+  await command(store, 'n1', 'go')
+  const again = await command(store, 'n1', 'go')
+  ok(again.status === 200 && again.json.ok === true, 'the same nonce twice is an idempotent retry, not an error')
+  const queued = JSON.parse(store.map.get(`c:${ID}`))
+  ok(queued.length === 1, '…and it did not queue a second copy')
+
+  for (let i = 0; i < CMD_MAX - 1; i++) await command(store, `fill${i}`, 'x')
+  ok(JSON.parse(store.map.get(`c:${ID}`)).length === CMD_MAX, 'the queue is full at CMD_MAX')
+  const over = await command(store, 'over', 'x')
+  ok(over.status === 429 && over.json.error.includes('queue is full'),
+    'one more is refused 429 — a holder of the id cannot bloat the store')
+}
+
+{
+  const store = fakeStore()
+  await post(store, { body: { kind: 'update', index: index(), tails: [] } })
+  await command(store, 'n1', 'go')
+  await command(store, 'n2', 'again')
+  const ack = await post(store, { body: { kind: 'ack', nonces: ['n1', 'n9'] } })
+  ok(ack.status === 200, 'an ack is accepted — unknown nonces in it are simply nothing to remove')
+  const queued = JSON.parse(store.map.get(`c:${ID}`))
+  ok(queued.length === 1 && queued[0].nonce === 'n2', 'acked commands leave the queue; the rest stay')
+  const badAck = await post(store, { body: { kind: 'ack', nonces: ['bad nonce'] } })
+  ok(badAck.status === 400, 'a malformed ack is refused')
+  await post(store, { body: { kind: 'ack', nonces: ['n2'] } })
+  ok(store.map.get(`c:${ID}`) === undefined, 'an empty queue is deleted, not stored as []')
+}
+
+{
+  // Commands ride the update answer back: a busy board picks them up on its
+  // own pushes, without an extra poll.
+  const store = fakeStore()
+  await post(store, { body: { kind: 'update', index: index(), tails: [] } })
+  await command(store, 'n1', 'go')
+  const r = await post(store, { body: { kind: 'update', index: index({ at: 2000 }), tails: [] } })
+  ok(Array.isArray(r.json.cmds) && r.json.cmds.length === 1 && r.json.cmds[0].nonce === 'n1',
+    'a push answer carries the pending commands')
+  // Delivery does not remove a command — only an ack does (at-least-once).
+  await post(store, { body: { kind: 'ack', nonces: ['n1'] } })
+  const empty = await post(store, { body: { kind: 'update', index: index(), tails: [] } })
+  ok(empty.json.cmds === undefined, '…and an empty queue is omitted, not sent as []')
+
+  await command(store, 'n9', 'another one')
+  const got = await handle({ method: 'GET', boardId: ID, cmds: true }, store)
+  ok(got.status === 200 && Array.isArray(got.json.cmds) && got.json.cmds.length === 1
+      && got.json.cmds[0].nonce === 'n9',
+    '?cmds=1 reads the queue directly — the host’s dedicated poll')
+  const plain = await handle({ method: 'GET', boardId: ID }, store)
+  ok(plain.json.cmds === undefined && plain.json.index !== undefined,
+    'a GET without cmds reads the index, not the queue')
+  const wrongKey = await handle({
+    method: 'POST', boardId: ID, key: 'b'.repeat(24),
+    body: { kind: 'ack', nonces: ['n1'] },
+  }, store)
+  ok(wrongKey.status === 401, 'acking needs the board’s own key too — the write gate covers every POST')
+}
+
+// --- the write-channel rules agree with the extension's, stated literally ----
+// The extension's copy lives in src/remote/commands.ts; this file cannot
+// import it (it runs as plain .mjs), so both ends are pinned to the SAME
+// literals — the agreement is through the literal.
+{
+  ok(NONCE_OK.source === '^[A-Za-z0-9._-]{1,64}$', 'NONCE_OK is the literal both ends carry')
+  ok(CMD_MAX === 20 && CMD_TEXT_MAX === 20_000, 'the queue bounds are the literal numbers both ends carry')
 }
 
 console.log(fails ? `\n${fails} failure(s)` : '\nrelay handler: all ok')

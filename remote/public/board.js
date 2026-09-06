@@ -11,12 +11,23 @@
  * page never holds anything the relay could be robbed for, and forgetting the
  * board is one button.
  *
- * Polling is adaptive so the free Netlify tier lasts: fast (12s) while the
- * board is moving, slow (60s) once it has been quiet — a quiet board does not
- * need watching every few seconds, and every poll is a function invocation.
+ * The WRITE half: when the board's owner has remote prompts enabled, the
+ * index's `writes` flag is true and this page shows a composer. A posted
+ * command is a PROMPT, never a board edit: with a session it goes to that
+ * session's chat, without one it starts a new session — and the board's
+ * machine decides whether it runs (its own `remote.writes` toggle is the gate;
+ * the composer appears exactly while that toggle is on). The relay only
+ * queues the command until the extension picks it up.
+ *
+ * Polling is adaptive so the free tiers last: fast (12s) while the board is
+ * moving, slow (60s) once it has been quiet — a quiet board does not need
+ * watching every few seconds, and every poll is a relay invocation.
  */
 const root = document.getElementById('root')
-const API = '/.netlify/functions/board'
+// Every host serves the relay at <site>/board: Netlify rewrites it to its
+// function, the Cloudflare worker and the Node server route it directly
+// (remote/README.md).
+const API = '/board'
 const STORAGE = 'agents-kanban.remote'
 const ACTIVE_MS = 30_000 // "moving" while the last push is fresher than this
 const POLL_FAST = 12_000
@@ -36,6 +47,12 @@ let openKey = '' // the session whose chat is open
 let error = ''
 let waiting = false // the relay answered, but has no board yet
 let polling = false // the poll chain runs once, however it started
+
+/* Composer state lives OUTSIDE the DOM: the page rebuilds the whole tree on
+ * every poll, and a draft held in a textarea would be destroyed mid-word. The
+ * same discipline as the extension's own settings page. */
+const drafts = { board: '', chat: {} } // 'board' or a session key -> text
+let sendNote = { text: '', ok: false } // the last send's outcome, shown inline
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag)
@@ -196,6 +213,17 @@ function boardScreen() {
   if (unplaced.length) board.appendChild(columnFor(null, 'Elsewhere', unplaced))
   wrap.appendChild(board)
   if (openKey) wrap.appendChild(chatPanel(openKey))
+  // The write channel is drawn exactly while the HOST's toggle is on — a
+  // composer that posts into a void would be a dead control.
+  if (index.writes === true) {
+    wrap.appendChild(composerNode({
+      get: () => drafts.board,
+      set: (v) => { drafts.board = v },
+      focusKey: 'composer::board',
+      placeholder: "Start a new session with this prompt — it runs on the board's machine",
+      sendText: 'Start a session',
+    }))
+  }
   root.replaceChildren(head, wrap)
 }
 
@@ -214,10 +242,96 @@ function chatPanel(key) {
   const tail = tails[key]
   if (!tail || !tail.entries || !tail.entries.length) {
     panel.appendChild(el('p', 'muted', 'No chat has arrived for this session yet.'))
-    return panel
+  } else {
+    for (const e of tail.entries) panel.appendChild(entryNode(e))
   }
-  for (const e of tail.entries) panel.appendChild(entryNode(e))
+  if (index.writes === true) {
+    panel.appendChild(composerNode({
+      get: () => drafts.chat[key] || '',
+      set: (v) => { drafts.chat[key] = v || '' },
+      focusKey: 'composer::chat::' + key,
+      placeholder: "Send a prompt to this session — it runs on the board's machine",
+      sendText: 'Send',
+      session: key,
+    }))
+  }
   return panel
+}
+
+/* --- the write channel ------------------------------------------------------ */
+
+/* Post one command to the relay. The command is a prompt for the board's
+ * machine: with `session` it goes to that session's chat, without it starts a
+ * new session. The relay only queues it — whether it runs is the board
+ * machine's decision, and this page offers the composer only while the index
+ * says that machine has the channel on. Returns true when the relay accepted
+ * the post; the caller clears the draft only then, so a failed send loses
+ * nothing. */
+async function sendCommand(text, session) {
+  let nonce = ''
+  try {
+    nonce = crypto.randomUUID && crypto.randomUUID()
+  } catch { /* very old browser */ }
+  if (!nonce) nonce = String(Date.now()) + Math.random().toString(36).slice(2)
+  const body = session
+    ? { kind: 'command', nonce, text, session }
+    : { kind: 'command', nonce, text }
+  try {
+    const res = await fetch(API, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-rc-key': id },
+      body: JSON.stringify(body),
+    })
+    const answer = await res.json().catch(() => ({}))
+    if (!res.ok || answer.ok === false) {
+      throw new Error((answer && answer.error) || 'the relay answered ' + res.status)
+    }
+    sendNote = { text: 'Sent — the board picks it up on its next check.', ok: true }
+    return true
+  } catch (e) {
+    sendNote = { text: 'Not sent: ' + (e && e.message ? e.message : e), ok: false }
+    return false
+  }
+}
+
+/* One composer. The draft lives at module level (see `drafts`) and the
+ * textarea re-renders from it on every poll, so a half-typed prompt survives
+ * the rebuilds; `focusKey` is how render() hands the caret back. */
+function composerNode({ get, set, focusKey, placeholder, sendText, session }) {
+  const box = el('div', 'composer')
+  const ta = el('textarea', 'composer-input')
+  ta.placeholder = placeholder
+  ta.maxLength = 20000 // the relay's own cap (CMD_TEXT_MAX)
+  ta.rows = 3
+  ta.value = get()
+  ta.setAttribute('data-focus', focusKey)
+  ta.addEventListener('input', (e) => {
+    set((e && e.target ? e.target.value : ta.value) || '')
+  })
+  const acts = el('div', 'composer-acts')
+  const send = el('button', 'primary', sendText)
+  send.type = 'button'
+  send.addEventListener('click', () => {
+    const text = get().trim()
+    if (!text) return
+    void (async () => {
+      if (await sendCommand(text, session)) set('')
+      render()
+    })()
+  })
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      send.click()
+    }
+  })
+  acts.appendChild(send)
+  if (sendNote.text) {
+    acts.appendChild(el('span', 'muted small composer-note' + (sendNote.ok ? '' : ' error'),
+      sendNote.text))
+  }
+  box.append(ta, acts)
+  return box
 }
 
 function entryNode(e) {
@@ -352,7 +466,24 @@ async function fetchTail(key) {
 /* --- render + the age tick -------------------------------------------------- */
 
 function render() {
+  // The whole tree is replaced on every poll, so a focused input would be
+  // destroyed mid-word. `data-focus` marks the inputs that survive — the
+  // composer textareas — and the caret is handed back here.
+  const active = document.activeElement
+  const focusKey = active && active.getAttribute ? active.getAttribute('data-focus') : null
+  const caret = active && typeof active.selectionStart === 'number'
+    ? { start: active.selectionStart, end: active.selectionEnd }
+    : null
   root.replaceChildren(id ? boardScreen() : pairScreen())
+  if (focusKey) {
+    const next = root.querySelector('[data-focus="' + focusKey + '"]')
+    if (next) {
+      next.focus()
+      if (caret && typeof next.selectionStart === 'number') {
+        try { next.selectionStart = caret.start; next.selectionEnd = caret.end } catch { /* not focusable */ }
+      }
+    }
+  }
 }
 
 // Between polls the ages would lie still. "Never show a signal that cannot say

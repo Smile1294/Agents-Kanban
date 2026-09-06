@@ -696,5 +696,51 @@ const state = (over = {}) => ({
      'and the code never appears in the page text')
 }
 
+// --- Remote Control: the write-channel toggle ---------------------------------
+// A second capability, separately enabled: prompts sent from the remote page
+// run on THIS machine. The toggle is drawn only when it could take effect (a
+// URL and a pairing code exist), and its description names the risk.
+{
+  const secOf = (v) => [...v.root.querySelectorAll('section')]
+    .find((s) => s.textContent.includes('Remote Control'))
+  const remote = (over = {}) => state({
+    remote: { enabled: true, url: 'https://board.example.com', hasCode: true, ...over },
+  })
+
+  const off = await renderSettings(remote())
+  const wrow = secOf(off).querySelector('.remote-writes')
+  const tick = wrow && wrow.querySelector('.model-tick')
+  ok(!!tick && tick.checked === false,
+     'with a relay configured, the writes toggle renders — OFF, because it is opt-in')
+  ok(off.text().includes('Allow prompts from the remote page')
+       && off.text().includes('can start sessions'),
+     'and the description names what ON means: prompts run HERE, and can start sessions')
+  tick.checked = true // a real click flips the box, then fires change
+  tick.onchange()
+  ok(off.posted.some((m) => m.type === 'setRemoteWrites' && m.enabled === true),
+     'checking it posts setRemoteWrites(true)')
+
+  const on = await renderSettings(remote({ writesEnabled: true }))
+  const onTick = secOf(on).querySelector('.remote-writes').querySelector('.model-tick')
+  ok(onTick.checked === true,
+     'the host’s ON state renders checked')
+  ok(on.text().includes('Remote prompts are ON'), 'and the row says so outright')
+  onTick.checked = false
+  onTick.onchange()
+  ok(on.posted.some((m) => m.type === 'setRemoteWrites' && m.enabled === false),
+     'unchecking it posts setRemoteWrites(false)')
+
+  const noUrl = await renderSettings(state({
+    remote: { enabled: true, url: '', hasCode: true, writesEnabled: true },
+  }))
+  ok(!secOf(noUrl).querySelector('.remote-writes'),
+     'no relay URL, no toggle — a control that cannot take effect is not drawn')
+  const noCode = await renderSettings(state({
+    remote: { enabled: true, url: 'https://board.example.com', hasCode: false, writesEnabled: true },
+  }))
+  ok(!secOf(noCode).querySelector('.remote-writes'),
+     'no pairing code, no toggle either — without a board id no command could ever arrive')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

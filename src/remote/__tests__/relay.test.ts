@@ -67,7 +67,7 @@ const CARDS = [
 
 {
   const tvs: Record<string, number> = { abc: 7, def: 2 }
-  const idx = projectIndex(9999, [{ id: 'impl', name: 'Implementing' }], CARDS, (k) => tvs[k] ?? 0)
+  const idx = projectIndex(9999, [{ id: 'impl', name: 'Implementing' }], CARDS, (k) => tvs[k] ?? 0, false)
   ok(idx.v === 1 && idx.at === 9999, 'the index carries its version and write time')
   ok(idx.columns.length === 1 && idx.columns[0]!.name === 'Implementing',
     'columns are copied as id and name only')
@@ -81,9 +81,13 @@ const CARDS = [
   ok(c!.tv === 7 && idx.sessions['def']!.tv === 2, 'each card carries its tail version')
   ok(idx.sessions['def']!.archived === true && idx.sessions['def']!.agent === undefined,
     'an archived idle card has no agent row at all')
+  ok(idx.writes === false, 'the host’s write-channel toggle rides the index — false when it is off')
   const keys = Object.keys(idx.sessions).sort()
   ok(keys.join(',') === 'abc,def', 'only the cards given, nothing else')
   const serialised = JSON.stringify(idx)
+  const idxKeys = Object.keys(JSON.parse(serialised)).sort().join(',')
+  ok(idxKeys === 'at,columns,sessions,v,writes',
+    `the index carries exactly its five fields (got: ${idxKeys})`)
   const cardKeys = Object.keys(JSON.parse(serialised).sessions['abc']).sort().join(',')
   ok(cardKeys === 'agent,archived,key,phase,runtime,tags,title,tv,updated',
     `the live card carries exactly its nine declared fields, not one more (got: ${cardKeys})`)
@@ -98,8 +102,16 @@ const CARDS = [
 
 // projectIndex must never invent a card for a key the caller never named.
 {
-  const idx = projectIndex(1, [], CARDS, () => 0)
+  const idx = projectIndex(1, [], CARDS, () => 0, false)
   ok(Object.keys(idx.sessions).length === 2, 'no phantom sessions in an index')
+}
+
+// The writes flag is the host's own value, carried verbatim — the page draws
+// its composer from it, so a flag the relay could rewrite would be a dead or
+// lying control.
+{
+  const idx = projectIndex(1, [], [], () => 0, true)
+  ok(idx.writes === true, 'writes: true is carried true')
 }
 
 // --- projectTail -------------------------------------------------------------
@@ -186,6 +198,12 @@ ok(relayBase('https://board.example.com/.netlify/functions/board') === 'https://
   'a pasted function path normalises to the site root')
 ok(relayBase('https://board.example.com/foo/.netlify/functions/board') === 'https://board.example.com/foo',
   'a subpath before the function path is kept')
+ok(relayBase('https://board.example.com/board') === 'https://board.example.com',
+  'the common /board API path (every host) normalises to the site root')
+ok(relayBase('https://board.example.com/foo/board') === 'https://board.example.com/foo',
+  'a subpath before /board is kept')
+ok(relayBase('https://board.example.com/board/') === 'https://board.example.com',
+  '…trailing slash and all')
 ok(relayBase('') === undefined && relayBase('   ') === undefined, 'blank is undefined')
 ok(relayBase('not a url') === undefined && relayBase('ftp://x.com') === undefined,
   'unparseable and non-http schemes are refused')

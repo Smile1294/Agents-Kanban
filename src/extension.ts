@@ -64,6 +64,7 @@ import { RemoteFeed, type TailSource } from './remote/feed.ts'
 import { RemotePusher, type PushSnapshot } from './remote/pusher.ts'
 import { boardIdOf, projectTail, relayBase, type RemoteTail } from './remote/relay.ts'
 import { toRemoteCard } from './remote/cards.ts'
+import { acceptCommands, parseCommands, RemoteCommandClient } from './remote/commands.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
 // See agent/runtimes/index.ts for why registration is explicit rather than
 // happening wherever an implementation happens to be imported first.
@@ -1279,10 +1280,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * decisions live in src/remote/: relay.ts is the SHAPE of what may leave
    * (its tests pin the redaction field by field), pusher.ts is WHEN (cadence,
    * heartbeat, backoff), feed.ts is WHAT changed (a transcript tail travels
-   * only when it grew). Left for the host is the act itself: where the pieces
-   * are stored, what a snapshot is built from, and the settings-page buttons.
+   * only when it grew), commands.ts is the WRITE channel back in (the toggle,
+   * the nonce, the session re-check). Left for the host is the act itself:
+   * where the pieces are stored, what a snapshot is built from, and the
+   * settings-page buttons.
    *
-   * Storage follows the house rules: the URL and the on/off flag are plain
+   * Storage follows the house rules: the URL and the on/off flags are plain
    * workspace state, parsed on the way back; the pairing code is a credential,
    * so it lives in SecretStorage and never crosses the postMessage boundary in
    * either direction — the page sees only `hasCode`, a boolean from the one
@@ -1297,6 +1300,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let remoteStatus: { at: number; ok: boolean; note?: string; error?: string } | undefined
   let remotePusher: RemotePusher | undefined
   const remoteFeed = new RemoteFeed()
+  // The WRITE channel. The pairing code is a capability for the mirror; the
+  // code alone must never run anything on this machine, so `remote.writes` is
+  // a separate toggle, default OFF, and the gate lives here — commands.ts
+  // pins the policy and its tests pin the gate. The nonce memory is
+  // in-process, so a host restart forgets it: the one re-delivery window is
+  // the host dying between running a command and acking it.
+  let remoteWrites = state.get<unknown>('remote.writes') === true
+  let remoteClient: RemoteCommandClient | undefined
+  const remoteNonces = new Set<string>()
 
   /** How fresh a stored session's last update must be to ride the one-time
    *  backfill, and how big one backfill POST may be (a tail is at most
@@ -1332,6 +1344,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *  changes, and the reset for that lives in the saveRemote case. */
   function syncRemoteEngine(): void {
     const baseUrl = remoteUrl ? relayBase(remoteUrl) : undefined
+    remoteFeed.setWrites(remoteWrites)
+    remoteClient = baseUrl
+      ? new RemoteCommandClient({ baseUrl, boardId: remoteBoardId, fetch })
+      : undefined
     remotePusher = new RemotePusher({
       now: Date.now,
       baseUrl,
@@ -1345,6 +1361,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // tick that no attempt ever produced is the page's own forbidden
         // signal, and so is a red one that a later success never clears.
         void SettingsPanel.refreshIfOpen()
+      },
+      // Commands ride push answers back. The callback does not run them
+      // itself: acceptCommands in commands.ts is the gate, and its tests
+      // pin that a disabled toggle drops everything.
+      onCommands: (raw) => {
+        void handleRemoteCommands(raw).catch((e) => log.error(`Remote command failed: ${String(e)}`))
       },
     })
   }
@@ -1396,6 +1418,74 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await flush()
   }
 
+  /* --- Remote Control: the WRITE half ---------------------------------------
+   *
+   * Prompts from the remote page, picked up here. `acceptCommands` (commands.ts)
+   * is the gate — the toggle, the nonce, the live session re-check — and what
+   * it accepts runs through the SAME host paths the local webview uses:
+   * `sendMessage` into a session, `newSession` for a prompt without one. Those
+   * paths carry the provider checks, the permission mode, the worktree
+   * creation and the money; nothing here reaches around them. A command naming
+   * a session this board no longer has is dropped, never re-targeted.
+   */
+  async function handleRemoteCommands(raw: unknown): Promise<void> {
+    if (!remoteClient) return
+    const { accepted, ack } = await acceptCommands(raw, {
+      writesEnabled: remoteWrites,
+      seenNonce: (n) => remoteNonces.has(n),
+      rememberNonce: (n) => remoteNonces.add(n),
+      sessionExists: async (key) => {
+        if (!ws) return false
+        if (ws.manager?.byKey(key)) return true
+        return !!(await ws.store.get(key))
+      },
+    })
+    // Ack AFTER acting: a host that dies mid-command may run it once more on
+    // the next delivery, a host that acked first would lose it silently.
+    // Re-delivery while this host is alive is a nonce no-op either way.
+    if (!accepted.length) {
+      if (ack.length) {
+        await remoteClient.ack(ack).catch((e) => log.error(`Remote ack failed: ${String(e)}`))
+      }
+      return
+    }
+    for (const c of accepted) {
+      if (c.session !== undefined) {
+        log.info(`Remote prompt → ${c.session}: ${c.text.slice(0, 80)}`)
+        await host.sendMessage(c.session, c.text)
+      } else {
+        log.info(`Remote prompt starts a new session: ${c.text.slice(0, 80)}`)
+        await host.newSession(c.text)
+      }
+    }
+    await remoteClient.ack(ack).catch((e) => log.error(`Remote ack failed: ${String(e)}`))
+    // The board changed (a prompt row, or a whole new card): let the relay
+    // show it without waiting out a heartbeat.
+    void remotePusher?.nudge()
+  }
+
+  /** Poll the relay for commands. Runs on the remote timer only while writes
+   *  are enabled — with the toggle off, the queue is not even read. */
+  async function pollRemoteCommands(): Promise<void> {
+    if (!remoteClient?.ready || !remoteWrites) return
+    const raw = await remoteClient.poll()
+    if (raw !== undefined) await handleRemoteCommands(raw)
+  }
+
+  /** Enabling writes flushes whatever piled up while the channel was closed:
+   *  commands sent while writes were OFF are discarded, never run — "only
+   *  commands sent while the channel is on ever run" is the honest contract,
+   *  and a queue that runs at some later moment is a time bomb, not a feature. */
+  async function flushRemoteCommands(): Promise<void> {
+    if (!remoteClient?.ready) return
+    const raw = await remoteClient.poll()
+    const cmds = parseCommands(raw ?? [])
+    if (cmds.length) {
+      await remoteClient.ack(cmds.map((c) => c.nonce))
+        .catch((e) => log.error(`Remote flush ack failed: ${String(e)}`))
+    }
+  }
+
   // The pairing code is read ONCE, here: `hasCode` for the settings page is
   // this boolean, and the code itself is never kept anywhere but the keychain.
   // One SecretStorage IPC before the rest of activation is cheaper than a page
@@ -1414,9 +1504,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // The engine's own ticker. Repaints nudge it too (see `paint`), but a board
   // with no agent running produces no repaints, so this is what keeps the
   // idle heartbeat honest. Cheap when there is nothing to do: tick() checks
-  // its gates before building anything.
+  // its gates before building anything. The command poll rides the same timer
+  // and the same gate — an idle board is exactly when a remote prompt arrives,
+  // and the poll only runs while the write channel is enabled.
   const remoteTimer = setInterval(() => {
     void remotePusher?.tick().catch((e) => log.error(`Remote tick failed: ${String(e)}`))
+    void pollRemoteCommands().catch((e) => log.error(`Remote command poll failed: ${String(e)}`))
   }, 30_000)
   context.subscriptions.push({ dispose: () => clearInterval(remoteTimer) })
 
@@ -1550,6 +1643,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           enabled: remoteEnabled,
           url: remoteUrl,
           hasCode: remoteHasCode,
+          writesEnabled: remoteWrites,
           ...(remoteStatus ? { status: remoteStatus } : {}),
         },
       }
@@ -1826,6 +1920,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               void SettingsPanel.refreshIfOpen()
             }
           }
+          return
+        }
+        case 'setRemoteWrites': {
+          // The write channel: prompts from the remote page may run on THIS
+          // machine. Off by default, persisted, and the gate that matters is
+          // in commands.ts — this case only flips the switch.
+          remoteWrites = msg.enabled
+          await state.update('remote.writes', remoteWrites)
+          syncRemoteEngine()
+          log.info(remoteWrites
+            ? 'Remote writes ENABLED — prompts from the remote page will run on this machine'
+            : 'Remote writes disabled')
+          if (remoteWrites) {
+            // Anything queued while the channel was closed is discarded, not
+            // run: only commands sent while writes are ON are ever acted on.
+            void flushRemoteCommands().catch((e) => log.error(`Remote flush failed: ${String(e)}`))
+            // The index's `writes` flag changed — push it now so the remote
+            // page shows its composer without waiting out the cadence.
+            void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+          }
+          void SettingsPanel.refreshIfOpen()
           return
         }
         case 'clearRemoteCode': {

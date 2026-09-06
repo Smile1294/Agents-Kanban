@@ -25,7 +25,7 @@ function ok(cond: unknown, what: string): void {
 }
 
 const index = (at: number, title = 'same'): RemoteIndex => ({
-  v: 1, at,
+  v: 1, at, writes: false,
   columns: [{ id: 'c', name: 'Backlog' }],
   sessions: { abc: { key: 'abc', title, phase: 'backlog', tags: [], archived: false, updated: at, tv: 0 } },
 })
@@ -42,8 +42,12 @@ interface Rig {
   now: number
   statuses: PushStatus[]
   posts: Posted[]
+  /** Every onCommands payload the pusher handed over. */
+  commands: unknown[]
   /** What build() answers. Callers replace this before a tick. */
   next: PushSnapshot
+  /** What the relay answers (defaults to { ok: true }). */
+  answer: { ok?: boolean; cmds?: unknown }
   failFetchWith: Error | null
   build(): Promise<PushSnapshot>
 }
@@ -53,7 +57,9 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     now: 1_000_000,
     statuses: [] as PushStatus[],
     posts: [] as Posted[],
+    commands: [] as unknown[],
     next: { index: index(1_000_000), tails: [] } as PushSnapshot,
+    answer: { ok: true } as { ok?: boolean; cmds?: unknown },
     failFetchWith: null as Error | null,
   }
   const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -64,13 +70,14 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
       key: String((init?.headers as Record<string, string> | undefined)?.['x-rc-key'] ?? ''),
       body,
     })
-    return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response
+    return { ok: true, status: 200, json: async () => state.answer } as Response
   }
-  // `now`, `next` and `failFetchWith` are accessors into `state`, NOT spread
-  // copies: the tests write `r.now += n`, `r.next = …` and `r.failFetchWith`
-  // while the pusher reads `state.*`. A copied field would diverge the instant
-  // either side wrote it, and every cadence test would quietly test nothing
-  // (it did; the heartbeat never fired until `now` became an accessor).
+  // `now`, `next`, `answer` and `failFetchWith` are accessors into `state`,
+  // NOT spread copies: the tests write `r.now += n`, `r.next = …` and
+  // `r.failFetchWith` while the pusher reads `state.*`. A copied field would
+  // diverge the instant either side wrote it, and every cadence test would
+  // quietly test nothing (it did; the heartbeat never fired until `now`
+  // became an accessor).
   const rig: Rig = {
     ...state,
     build: async (): Promise<PushSnapshot> => state.next,
@@ -79,6 +86,8 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     set now(v: number) { state.now = v },
     get next(): PushSnapshot { return state.next },
     set next(v: PushSnapshot) { state.next = v },
+    get answer(): { ok?: boolean; cmds?: unknown } { return state.answer },
+    set answer(v: { ok?: boolean; cmds?: unknown }) { state.answer = v },
     get failFetchWith(): Error | null { return state.failFetchWith },
     set failFetchWith(v: Error | null) { state.failFetchWith = v },
   }
@@ -91,6 +100,7 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     fetch: fetch as unknown as typeof fetch,
     build: async () => rig.build(),
     onStatus: (s) => state.statuses.push(s),
+    onCommands: (raw) => state.commands.push(raw),
   })
   return rig
 }
@@ -101,10 +111,28 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
   const r = rig()
   r.pusher.reset()
   await r.pusher.tick()
-  ok(r.posts.length === 1 && r.posts[0]!.url === 'https://board.example.com/.netlify/functions/board',
-    'the first tick posts the snapshot to the relay function')
+  ok(r.posts.length === 1 && r.posts[0]!.url === 'https://board.example.com/board',
+    'the first tick posts the snapshot to the relay API path (/board, the path every host serves)')
   ok(r.posts[0]!.key === '0123456789abcdef01234567', 'the board id rides in x-rc-key')
   ok(r.posts[0]!.body.index.sessions['abc']!.tv === 0, 'the index travels as posted')
+}
+
+// --- commands ride the answer back -------------------------------------------
+
+{
+  const r = rig()
+  const cmds = [{ nonce: 'n1', text: 'please fix the build' }]
+  r.answer = { ok: true, cmds }
+  await r.pusher.tick()
+  ok(r.commands.length === 1 && r.commands[0] === cmds,
+    'commands the relay is holding are handed to the host on a push answer')
+  ok(r.statuses.at(-1)?.ok === true, 'and the push itself still reports success')
+}
+
+{
+  const r = rig()
+  await r.pusher.tick()
+  ok(r.commands.length === 0, 'no cmds in the answer, no callback — an empty queue is not a call')
 }
 
 {

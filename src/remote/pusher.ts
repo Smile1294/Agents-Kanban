@@ -32,8 +32,10 @@
 import { relayBase } from './relay.ts'
 import type { RemoteIndex, RemoteTail } from './relay.ts'
 
-/** The function path under the relay site root. */
-export const FN_PATH = '/.netlify/functions/board'
+/** The relay path under the site root. Every host target serves the relay
+ *  here — Netlify rewrites it to its function, the Cloudflare worker and the
+ *  plain-Node server route it directly (see remote/README.md). */
+export const FN_PATH = '/board'
 
 /** Fastest allowed push cadence, ms. */
 export const MIN_INTERVAL = 2_000
@@ -73,6 +75,10 @@ export interface PusherDeps {
   fetch: typeof fetch
   build(): PushSnapshot | Promise<PushSnapshot>
   onStatus(s: PushStatus): void
+  /** Commands the relay is holding, delivered on a push's answer so a busy
+   *  board picks them up without an extra poll. Optional: the host may prefer
+   *  to poll only. */
+  onCommands?(raw: unknown): void
 }
 
 interface PostBody {
@@ -84,6 +90,7 @@ interface PostBody {
 interface RelayAnswer {
   ok?: boolean
   error?: string
+  cmds?: unknown
 }
 
 export class RemotePusher {
@@ -193,6 +200,12 @@ export class RemotePusher {
       const answer = (await res.json().catch(() => ({}))) as RelayAnswer
       if (!res.ok || answer.ok === false) {
         throw new Error(answer.error || `relay answered ${res.status}`)
+      }
+      // Commands ride the answer back. The pusher stays a transport: it does
+      // not look at them, the host's callback does — which keeps the decision
+      // about running anything in the one place that owns the gate.
+      if (answer.cmds !== undefined && this.deps.onCommands) {
+        this.deps.onCommands(answer.cmds)
       }
       this.lastSent = now
       this.lastErrorAt = 0

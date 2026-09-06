@@ -704,10 +704,13 @@ function dictationSection() {
 
 /* --- Remote Control ----------------------------------------------------------
  *
- * This machine PUSHES the board to a small site the user deploys — Netlify's
- * free tier is enough, and the remote/ folder in this repo lifts into its own
- * repo. The remote page is read-only, and the redaction happens ONCE, here, in
- * cards.ts: the page never sees more than the board shows.
+ * This machine PUSHES the board to a small site the user deploys — the
+ * remote/ folder in this repo lifts into its own repo and runs on Netlify,
+ * Cloudflare or any Node server. The redaction happens ONCE, here, in
+ * cards.ts: the page never sees more than the board shows. The page is
+ * read-only until the user switches ON the write channel below — then
+ * prompts typed on it run on THIS machine, so the toggle is an explicit,
+ * separately-enabled, honestly described capability.
  *
  * Two rules this section must keep:
  *
@@ -719,6 +722,9 @@ function dictationSection() {
  *    says "not asked yet" before the first one — the same rule as every other
  *    status row on this page. A tick that no attempt ever produced is the
  *    page's one forbidden signal.
+ *  - The writes toggle is drawn ONLY when a relay URL and a pairing code are
+ *    configured: with neither, no command could ever arrive, and a control
+ *    that cannot take effect is not drawn (the settings page's own rule).
  */
 const remoteDraft = { url: '', code: '' }
 let remoteDraftInited = false
@@ -739,11 +745,11 @@ function remoteSection() {
   head.appendChild(el('span', 'muted small', 'watch this board from any browser'))
   sec.appendChild(head)
   sec.appendChild(el('p', 'blurb',
-    'Streams the board — cards, phases and the chats — to a small page you deploy ' +
-    '(the remote/ folder in this repo lifts into its own Netlify site). Only what the ' +
-    'board itself shows ever leaves: no code, no file paths, no credentials. The page ' +
-    'is read-only, and only changes travel — a quiet board pushes at most every 90 ' +
-    'seconds, so the free tier covers it.'))
+    'Streams the board — cards, phases and the chats — to a small page you deploy from ' +
+    'the remote/ folder (Netlify, Cloudflare or any Node server). Only what the board ' +
+    'itself shows ever leaves: no code, no file paths, no credentials. The page is ' +
+    'read-only unless you enable the write channel below; only changes travel, and a ' +
+    'quiet board pushes at most every 90 seconds, so the free tiers cover it.'))
 
   /* The status line. Four states, four texts: paused, connected-but-never-asked,
      last attempt went out, last attempt failed. */
@@ -772,6 +778,29 @@ function remoteSection() {
     row.appendChild(button('Retry', 'link', () => post({ type: 'setRemote', enabled: true })))
   }
   sec.appendChild(row)
+
+  /* The write channel: prompts sent from the remote page run on THIS machine.
+     The description names the risk outright — the user must knowingly let
+     another device drive the board, start sessions and spend tokens. */
+  if (r.url && r.hasCode) {
+    const wrow = el('label', 'remote-writes')
+    const wtick = el('input', 'model-tick')
+    wtick.type = 'checkbox'
+    wtick.checked = !!r.writesEnabled
+    wtick.addEventListener('change', () => {
+      post({ type: 'setRemoteWrites', enabled: !!wtick.checked })
+    })
+    wrow.appendChild(wtick)
+    const wmain = el('div', 'model-main')
+    wmain.appendChild(el('div', 'model-name',
+      r.writesEnabled ? 'Remote prompts are ON' : 'Allow prompts from the remote page'))
+    wmain.appendChild(el('div', 'muted small',
+      'A prompt typed on the remote page runs HERE — it can start sessions, create ' +
+      'worktrees and spend tokens. Anyone with the pairing code and the site address ' +
+      'can send one. Off by default; switch it off and the channel closes.'))
+    wrow.appendChild(wmain)
+    sec.appendChild(wrow)
+  }
 
   const form = el('div', 'remote-form')
 

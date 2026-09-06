@@ -76,6 +76,11 @@ export interface RemoteIndex {
   at: number
   columns: RemoteColumn[]
   sessions: Record<string, RemoteCard>
+  /** Whether the host will act on commands sent from the remote page. The page
+   *  shows its composer exactly when this is true — a composer that posts into
+   *  a void would be a dead control, and the value is the HOST's own toggle
+   *  (`remote.writes`), never something the relay asserts. */
+  writes: boolean
 }
 
 /**
@@ -132,13 +137,16 @@ export const tailBlob = (id: string, key: string): string => `t:${id}:${key}`
 
 /**
  * Build the index payload. `tvOf` supplies each session's tail version — the
- * host owns the counter, because it owns the pushes that bump it.
+ * host owns the counter, because it owns the pushes that bump it. `writes` is
+ * the host's own write-channel toggle, carried so the page knows whether a
+ * command would be acted on.
  */
 export function projectIndex(
   at: number,
   columns: readonly RemoteColumn[],
   cards: readonly RemoteCardSource[],
   tvOf: (key: string) => number,
+  writes: boolean,
 ): RemoteIndex {
   const sessions: Record<string, RemoteCard> = {}
   for (const c of cards) {
@@ -147,6 +155,7 @@ export function projectIndex(
   return {
     v: 1,
     at,
+    writes,
     columns: columns.map((c) => ({ id: c.id, name: c.name })),
     sessions,
   }
@@ -215,8 +224,8 @@ export const KEY_OK = /^[A-Za-z0-9._-]{1,80}$/
  *  the nonsense URL `https://ftp://x.com` (which PARSES, as host `ftp:`). */
 const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i
 
-/** The relay URL a code addresses. Accepts the bare site and the function
- *  path, so a user pasting either works. */
+/** The relay URL a code addresses. Accepts the bare site, the function path and
+ *  the common API path — a user pasting any of them works. */
 export function relayBase(raw: string): string | undefined {
   let url = (raw || '').trim().replace(/\/+$/, '')
   if (!url) return undefined
@@ -224,9 +233,11 @@ export function relayBase(raw: string): string | undefined {
   let u: URL
   try { u = new URL(url) } catch { return undefined }
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return undefined
-  // Normalise away a function path the user may have pasted from the address
-  // bar, and a site subpath: the function lives at /.netlify/functions/board.
-  const idx = u.pathname.indexOf('/.netlify/functions/')
-  if (idx >= 0) u.pathname = u.pathname.slice(0, idx)
+  // Normalise away an API path the user may have pasted from the address bar,
+  // and a site subpath: every host serves the relay at <site>/board (Netlify
+  // rewrites it to /.netlify/functions/board, which is also accepted).
+  const atFn = u.pathname.indexOf('/.netlify/functions/')
+  if (atFn >= 0) u.pathname = u.pathname.slice(0, atFn)
+  else if (u.pathname.endsWith('/board')) u.pathname = u.pathname.slice(0, -'/board'.length)
   return u.toString().replace(/\/$/, '')
 }
