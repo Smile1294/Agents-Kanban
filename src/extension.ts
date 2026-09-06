@@ -17,12 +17,14 @@ import {
 import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
   setBoardFocusMode, showSideBarView, toUiAgent,
-  type BoardHost, type FocusMode, type Mode, type UiCard, type UiState,
+  type BoardHost, type FocusMode, type Mode, type SearchAnswer, type SearchRow,
+  type UiCard, type UiState,
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, type ModelBook, type ModelFacts } from './sessions/usage.ts'
 import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
+import { searchEntries } from './sessions/search.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
 import { linkSubtasks, rollUpState } from './board/subtasks.ts'
@@ -2290,6 +2292,54 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         log.warn(`Mention file search failed: ${String(e)}`)
         return []
       }
+    },
+
+    /** Search what the conversations actually were.
+     *
+     * Answered on its own channel, never through `refresh`: it reads every
+     * session's transcript, which is never something a repaint does. The
+     * filter is deliberate and tested elsewhere — prompts and agent answers
+     * only; no tool rows, no thinking, no subagent frames. And each session
+     * is searched through the SAME array its chat view renders — a live
+     * run's own history plus its streaming tail, a finished one's store
+     * parse — so a hit's `entryIndex` is the row the chat will show when
+     * the hit is opened, not an index into a differently-cut file.
+     */
+    async searchTranscript(qRaw: string): Promise<SearchAnswer> {
+      const q = qRaw.trim().slice(0, 200)
+      if (!ws || !q) return { q, matches: [], more: 0 }
+      const stored = await ws.store.list({ includeArchived: true })
+      const live = ws.manager?.list() ?? []
+      const rows: SearchRow[] = []
+      const push = (key: string, title: string | undefined, entries: readonly Entry[]): void => {
+        for (const h of searchEntries(entries, q)) {
+          rows.push({ key, ...(title ? { title } : {}), ...h })
+        }
+      }
+      for (const a of live) {
+        const key = a.sessionId ?? a.runId
+        // The chat renders the run's own history + live tail, NOT the session
+        // file: the file is a message behind, and reading both would double
+        // every row that has already flushed.
+        push(key, a.title, [...a.history, ...a.live])
+      }
+      const liveKeys = new Set(live.map((a) => a.sessionId ?? a.runId))
+      for (const s of stored) {
+        if (liveKeys.has(s.id)) continue
+        try {
+          // The store's parse cache (keyed on the file's identity) makes this
+          // cheap once each session has been read; the entry indices line up
+          // with the chat because both are the store's own tail parse.
+          push(s.id, s.title, await ws.store.transcript(s.id))
+        } catch {
+          // A session whose file vanished mid-search contributes nothing.
+          // `transcript()` already returns [] for a read failure; this guard
+          // is for anything its own catch does not cover.
+        }
+      }
+      rows.sort((a, b) => b.at - a.at)
+      const cap = 200
+      return { q, matches: rows.slice(0, cap), more: Math.max(0, rows.length - cap) }
     },
 
     /** Start dictating: check the pipeline, then record the microphone.

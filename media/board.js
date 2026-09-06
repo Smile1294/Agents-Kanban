@@ -21,6 +21,37 @@
   let stick = true
   let openMenu = null
   /**
+   * Transcript search — a third screen, over every session's actual
+   * conversation, shown from either mode.
+   *
+   * It must survive repaints for the same reason `draft` does: render()
+   * replaces the whole tree several times a second while an agent streams, so
+   * the open query, the busy flag and the last answer all live here, never in
+   * the DOM. The answer travels on its own message channel (`searchResults`),
+   * like `mentions` and `voice`, because the host reads every session's
+   * transcript to produce it — never something a repaint does. `searchRows`
+   * is `null` until an answer lands, which is also "the box is empty": no
+   * answer yet is not the same thing as "no matches".
+   */
+  let searching = false
+  let searchQ = ''
+  let searchBusy = false
+  let searchRows = null // { key, entryIndex, at, kind, snippet, lead }[] | null
+  let searchMore = 0
+  let searchTimer = null
+  /** The query the outstanding search was posted with — answers must echo it
+   *  back or they are for a query the box no longer holds. */
+  let searchAsked = null
+  /** A hit the user clicked, waiting for the chat to show its session:
+   *  `{ key, idx, at }`. Kept here because the select lands a refresh or two
+   *  later, and the entry it names must flash when it finally renders — not
+   *  on whichever session happens to be on screen when the click was made. */
+  let jump = null
+  /** How long a jump may wait for its session to appear before it is dropped.
+   *  A vanished or archived-hidden session would otherwise flash the row on
+   *  some LATER visit to the same session — wrong, and only visible then. */
+  const JUMP_TTL = 15000
+  /**
    * What has been typed into an open menu's filter box, keyed by menu id.
    *
    * Module-level for the reason everything else here is: render() replaces the
@@ -124,6 +155,20 @@
         mentionFetching = false
         if (mentionAt(draft)) render()
       }
+    } else if (d.type === 'searchResults') {
+      // The answer to a transcript search. The host echoes the query it
+      // actually answered, and the view compares it against both what it
+      // asked and what is in the box NOW: a result for a query the user has
+      // already edited away is dropped, and a screen the user closed gets no
+      // results either. Typing can outrun the search — that is what the
+      // debounce is for — so a stale answer must never paint over a newer
+      // one.
+      if (searching && typeof d.q === 'string' && d.q === searchQ.trim() && d.q === searchAsked) {
+        searchRows = Array.isArray(d.matches) ? d.matches : []
+        searchMore = Number.isFinite(d.more) ? d.more : 0
+        searchBusy = false
+        render()
+      }
     } else if (d.type === 'voice') {
       // Replies to voiceStart/voiceStop. The recording STATE rides the normal
       // repaint (composer.voice.recording); these carry what a repaint cannot:
@@ -210,7 +255,7 @@
 
     const shell = el('div', 'shell')
     shell.append(renderRail())
-    shell.append(s.mode === 'chat' ? renderChat() : renderKanban())
+    shell.append(searching ? renderSearch() : (s.mode === 'chat' ? renderChat() : renderKanban()))
     root.append(shell)
 
     forEachScroll((n) => { const k = n.getAttribute('data-scroll'); if (scrolled[k]) n.scrollTop = scrolled[k] })
@@ -220,6 +265,21 @@
     if (sc2 && stick) sc2.scrollTop = sc2.scrollHeight
     if (askFocusKey && askFocusNode && askFocusNode.focus) restoreFocus(askFocusNode, caret)
     if (hadFocus && composerInput && composerInput.focus) restoreFocus(composerInput, caret)
+    // A search hit the user clicked finally rendered: its row carries
+    // `hit-jump`, and this scrolls it into the middle of the transcript and
+    // forgets the request. A jump waits only JUMP_TTL for its session — the
+    // select lands a refresh or two later, and a session that never appears
+    // (deleted, or the run id never resolved) must not flash a row on some
+    // future visit to a different session that happens to share the key.
+    if (jump) {
+      const hit = root.querySelector('.hit-jump')
+      if (hit) {
+        if (hit.scrollIntoView) { try { hit.scrollIntoView({ block: 'center' }) } catch (e) { /* stub DOM */ } }
+        jump = null
+      } else if (Date.now() - jump.at > JUMP_TTL) {
+        jump = null
+      }
+    }
   }
 
   /* Give a rebuilt input its focus AND its caret back.
@@ -362,8 +422,23 @@
     const head = el('div', 'rail-head')
     head.append(el('div', 'rail-title', 'Agent Sessions'))
     const t = el('button', 'pill' + (s.mode === 'kanban' ? ' on' : ''), '▤ Kanban')
-    t.onclick = () => post('setMode', { mode: s.mode === 'kanban' ? 'chat' : 'kanban' })
+    t.onclick = () => { closeSearch(); post('setMode', { mode: s.mode === 'kanban' ? 'chat' : 'kanban' }) }
     head.append(t)
+    // Transcript search — its screen replaces the main area, whichever mode it
+    // was opened from, so the toggle has to live in the rail, the one thing
+    // both modes keep.
+    const ts = el('button', 'pill' + (searching ? ' on' : ''), '⌕ Search')
+    ts.title = 'Search what was actually said — prompts and answers, no tool calls'
+    ts.onclick = () => {
+      if (searching) { closeSearch(); render() }
+      else {
+        searching = true
+        render()
+        const inp = root.querySelector('[data-focus="ts-search"]')
+        if (inp && inp.focus) inp.focus()
+      }
+    }
+    head.append(ts)
     rail.append(head)
 
     const search = el('input', 'search')
@@ -380,7 +455,7 @@
     rail.append(search)
 
     const nw = el('button', 'primary new-session', '+ New session')
-    nw.onclick = () => { post('select', { id: '' }); post('setMode', { mode: 'chat' }) }
+    nw.onclick = () => { closeSearch(); post('select', { id: '' }); post('setMode', { mode: 'chat' }) }
     rail.append(nw)
 
     const list = el('div', 'rail-list')
@@ -468,7 +543,7 @@
 
   function renderRailItem(c) {
     const row = el('div', 'rail-item' + (c.key === s.selectedKey ? ' active' : '') + (c.archived ? ' archived' : ''))
-    row.onclick = () => { post('select', { id: c.key }); post('setMode', { mode: 'chat' }) }
+    row.onclick = () => { closeSearch(); post('select', { id: c.key }); post('setMode', { mode: 'chat' }) }
     const top = el('div', 'rail-item-top')
     top.append(el('span', 'ai', '✦'))
     top.append(el('span', 'nm', c.title))
@@ -1088,7 +1163,18 @@
     scroll.setAttribute('data-scroll', 'transcript')
     if (!c) scroll.append(renderNewSessionHint())
     else if (!s.transcript || !s.transcript.length) scroll.append(el('div', 'empty', 'No transcript yet.'))
-    else for (const e of s.transcript) scroll.append(renderEntry(e, c))
+    else {
+      // The row a search hit pointed at, when this session finally rendered —
+      // marked here (the entry index IS the row the search read, by contract
+      // between the host's two transcript paths and this loop) and scrolled to
+      // at the end of render(), which is where the scroll restore has finished.
+      const want = jump && jump.key === c.key ? jump.idx : -1
+      for (let i = 0; i < s.transcript.length; i++) {
+        const node = renderEntry(s.transcript[i], c)
+        if (i === want) node.classList.add('hit-jump')
+        scroll.append(node)
+      }
+    }
     if (s.streaming) scroll.append(renderStreaming(s.streaming))
     // The running indicator belongs HERE, at the foot of the transcript, where
     // new output appears and where the eye already is. It used to exist only on
@@ -1101,6 +1187,169 @@
 
     main.append(renderComposer(c))
     return main
+  }
+
+  // ----------------------------------------------------------- transcript search
+
+  /** Closing the search screen. Navigation (a rail click, a mode flip) closes
+   *  it too, and the state frame those posts produce repaints — so this only
+   *  ever touches module state, never the DOM. */
+  function closeSearch() {
+    if (!searching) return
+    searching = false
+    searchQ = ''
+    searchBusy = false
+    searchRows = null
+    searchMore = 0
+    searchAsked = null
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+    jump = null
+  }
+
+  /** Post the search that is in the box. The host answers on its own channel,
+   *  never through the repaint — see the `searchResults` branch — so the busy
+   *  flag set here needs its own repaint, which the caller provides. */
+  function doSearch() {
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+    const q = searchQ.trim().slice(0, 200)
+    if (!q) { searchRows = null; searchMore = 0; searchBusy = false; searchAsked = null; return }
+    searchBusy = true
+    searchAsked = q
+    post('search', { q })
+  }
+
+  function renderSearch() {
+    const main = el('main', 'main search-main')
+    const head = el('div', 'chat-head')
+    head.append(el('div', 'chat-title', 'Search transcripts'))
+    head.append(el('div', 'spacer'))
+    const close = el('button', 'pill', '✕ Close')
+    close.onclick = () => { closeSearch(); render() }
+    head.append(close)
+    main.append(head)
+
+    const pane = el('div', 'search-pane')
+    const row = el('div', 'search-line')
+    const inp = el('input', 'ts-input')
+    inp.setAttribute('data-focus', 'ts-search')
+    inp.placeholder = 'e.g. jira, a file name, “the build broke”…'
+    inp.value = searchQ
+    inp.oninput = (e) => {
+      searchQ = e.target.value
+      if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+      if (!searchQ.trim()) {
+        // The box was emptied: the old answer no longer answers anything, and
+        // whatever was in flight answers it even less. Back to the idle state.
+        searchRows = null
+        searchMore = 0
+        searchBusy = false
+        searchAsked = null
+        render()
+        return
+      }
+      // Debounce: a keystroke sets a timer, and a later keystroke replaces it.
+      // Enter skips the wait. (The timer is real only in the browser; the test
+      // DOM holds setTimeout and never fires it, so tests drive Enter.)
+      searchTimer = setTimeout(() => { searchTimer = null; doSearch(); render() }, 250)
+    }
+    inp.onkeydown = (e) => {
+      if (e.key === 'Enter') { doSearch(); render() }
+      else if (e.key === 'Escape') { closeSearch(); render() }
+    }
+    row.append(inp)
+    pane.append(row)
+
+    pane.append(el('div', 'search-note',
+      'Prompts and agent answers only — tool calls, thinking and subagent chatter are not searched.'))
+
+    const list = el('div', 'search-list')
+    list.setAttribute('data-scroll', 'search')
+    if (searchBusy && searchQ.trim()) {
+      // An answer is on its way. What is on screen is the LAST answer — the
+      // busy line is above it, and the box the user typed into keeps its text.
+      if (searchRows && searchRows.length) list.append(searchFooter(searchRows.length, true))
+      else list.append(el('div', 'search-idle', 'Searching…'))
+    } else if (searchRows && searchRows.length) {
+      list.append(searchFooter(searchRows.length, false))
+      for (const r of searchRows) list.append(searchRow(r))
+    } else if (searchRows && searchRows.length === 0) {
+      list.append(el('div', 'search-empty', 'No matches for “' + searchQ.trim() + '”.'))
+      list.append(el('div', 'search-empty-sub', 'Remember the filter — a word that only appears in a tool call is not in here.'))
+    } else {
+      list.append(el('div', 'search-idle',
+        'Every prompt you sent and every answer the agent gave, across every session — archived ones too.'))
+    }
+    pane.append(list)
+    main.append(pane)
+    return main
+  }
+
+  function searchFooter(n, busy) {
+    const f = el('div', 'search-meta')
+    f.append(el('span', null, n + (n === 1 ? ' match' : ' matches')))
+    if (busy) f.append(el('span', 'search-more', 'searching…'))
+    else if (searchMore) f.append(el('span', 'search-more', 'and ' + searchMore + ' more — narrow the query'))
+    return f
+  }
+
+  /** One hit: where it lives, what it was, and the text that matched. Clicking
+   *  jumps to the session with the row set to flash — the entry index was
+   *  measured against exactly the array the chat renders, so the flash lands
+   *  on the row the snippet came from, not on "somewhere in this session". */
+  function searchRow(r) {
+    const c = card(r.key)
+    const row = el('div', 'srow')
+    row.onclick = () => {
+      // Close first — closeSearch() clears any leftover jump — then announce
+      // the jump THIS click means, so the flash cannot be stolen by an older
+      // pending one.
+      closeSearch()
+      jump = { key: r.key, idx: r.entryIndex, at: Date.now() }
+      // An archived session that the rail is hiding has no card to open. The
+      // search covers archived sessions by design (that is where the old work
+      // is), so jumping to one first reveals it — same tap count as any other
+      // hit, and honest: the chat opens on the session, not on a blank.
+      if (!c && !s.showArchived) post('toggleArchived')
+      post('select', { id: r.key })
+      post('setMode', { mode: 'chat' })
+    }
+    const top = el('div', 'srow-top')
+    top.append(el('span', 'srow-title', (c && c.title) || r.title || r.key))
+    if (c) top.append(phaseChip(c.phase))
+    top.append(el('span', 'srow-when', whenLabel(r.at)))
+    row.append(top)
+    const who = el('span', 'srow-kind', r.kind === 'prompt' ? 'you asked' : 'agent answered')
+    const text = el('div', 'srow-snip')
+    if (r.lead) text.append(el('span', 'srow-lead', '…'))
+    text.append(snipWithMark(r.snippet, searchQ))
+    row.append(who, text)
+    return row
+  }
+
+  /** A snippet with the occurrence marked. Text nodes only — the snippet is
+   *  another program's output and this file never builds HTML from it, so the
+   *  mark is a `<mark>` whose textContent is set, never an innerHTML
+   *  substitution. Whitespace is flattened first: the snippet can span
+   *  paragraphs, and a preview is one line, not the row's layout. */
+  function snipWithMark(text, q) {
+    const out = el('span')
+    const flat = text.replace(/\s+/g, ' ')
+    const ql = (q || '').trim().toLowerCase()
+    const i = ql ? flat.toLowerCase().indexOf(ql) : -1
+    if (i < 0) { out.append(flat); return out }
+    const mark = el('mark', 'hl')
+    mark.textContent = flat.slice(i, i + ql.length)
+    out.append(flat.slice(0, i), mark, flat.slice(i + ql.length))
+    return out
+  }
+
+  /** When a hit happened: the day when it was not today, the time always —
+   *  the transcript's own rows show the time alone, and a hit from Tuesday
+   *  would read as one from this afternoon without the day. */
+  function whenLabel(at) {
+    const time = new Date(at).toLocaleTimeString()
+    const day = dayLabel(at)
+    return day === 'Today' ? time : day + ' · ' + time
   }
 
   /** How to test what the agent built.

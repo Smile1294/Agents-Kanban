@@ -1070,5 +1070,156 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   ok(!v.root.querySelector('.mention-menu'), 'and no empty menu is drawn')
 }
 
+// ---------------------------------------------------------------- transcript search
+
+// The search screen is a third main area over both modes, opened from the
+// rail head (the one thing both modes keep), and answered on its own channel
+// like mentions and voice.
+{
+  const v = run(base)
+  const pill = findButton(v.root, 'Search')
+  ok(!!pill, 'the rail offers a Search pill beside the mode pill')
+  pill.onclick({})
+  ok(v.text().includes('Search transcripts'), 'clicking it opens the search screen')
+  ok(!v.root.querySelector('.board'), 'the kanban board stands down while searching')
+  ok(v.text().includes('Every prompt you sent'), 'the idle hint says what the search covers')
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  ok(!!box && box.placeholder.includes('jira'), 'the screen leads with a search box')
+
+  box.value = ''
+  box.onkeydown({ key: 'Escape' })
+  ok(!!v.root.querySelector('.board'), 'Escape closes the screen back to the board')
+
+  pill.onclick({})
+  ok(v.text().includes('Search transcripts'), 'and it opens again on the next click')
+  const close = findButton(v.root, '✕ Close')
+  ok(!!close, 'the screen carries an explicit close control')
+  close.onclick({})
+  ok(!!v.root.querySelector('.board') && !v.text().includes('Search transcripts'), 'Close returns to the board')
+
+  // The same pill exists from chat mode, and the composer is stood down with
+  // the chat — one screen at a time.
+  const cv = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  ok(!!findButton(cv.root, 'Search'), 'the pill is there in chat mode too')
+  findButton(cv.root, 'Search').onclick({})
+  ok(cv.text().includes('Search transcripts'), 'and opens from chat mode')
+  ok(!findByTag(cv.root, 'textarea'), 'the composer is gone while searching')
+}
+
+// Typing defers to the debounce; Enter searches immediately; the answer
+// renders hits joined to their sessions, marked, with busy states between.
+{
+  const v = run(base)
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = '  jira  '
+  box.oninput({ target: box })
+  ok(!v.posted.some((m) => m.type === 'search'), 'a keystroke alone does not search — the debounce owns it')
+  box.onkeydown({ key: 'Enter' })
+  const posted = v.posted.filter((m) => m.type === 'search')
+  ok(posted.length === 1 && posted[0].q === 'jira', 'Enter searches once, with the query trimmed')
+  ok(v.text().includes('Searching…'), 'busy is painted while every transcript is read')
+
+  // The answer arrives on its own channel, echoing the query it answers.
+  const at = Date.now()
+  const matches = [
+    { key: 'abc-123', title: 'Fix login', entryIndex: 0, at, kind: 'prompt', snippet: 'please look at jira now', lead: false },
+    { key: 'abc-123', title: 'Fix login', entryIndex: 2, at: at - 60_000, kind: 'text', snippet: 'earlier I said a thing then JIRA is fixed', lead: true },
+  ]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches, more: 3 } })
+  ok(v.text().includes('2 matches') && v.text().includes('and 3 more — narrow the query'), 'the count is stated, with the overflow')
+  ok(v.text().includes('Fix login'), 'a hit is shown under its session title')
+  ok(v.text().includes('you asked') && v.text().includes('agent answered'), 'each hit says which side of the conversation it is from')
+  ok(!v.text().includes('Searching…'), 'the busy state clears when the answer lands')
+  const mark = findByTag(v.root, 'mark')
+  ok(!!mark && mark.textContent === 'jira', 'the occurrence is a <mark> whose text was set, never HTML')
+  ok(v.text().includes('…'), 'a snippet that starts mid-text says so with a lead ellipsis')
+}
+
+// An answer for a query the box no longer holds is dropped, not painted.
+{
+  const v = run(base)
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = 'jira'
+  box.oninput({ target: box })
+  box.onkeydown({ key: 'Enter' })
+  const stale = [{ key: 'abc-123', entryIndex: 0, at: Date.now(), kind: 'prompt', snippet: 'older query text', lead: false }]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'older', matches: stale, more: 0 } })
+  ok(!v.text().includes('older query text'), 'an answer to a query that was not asked is dropped')
+  ok(v.text().includes('Searching…'), 'and the search still reads as in flight')
+
+  // The right query's answer, zero matches: an honest no, not a blank.
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches: [], more: 0 } })
+  ok(v.text().includes('No matches for “jira”'), 'a real miss says so, naming the query')
+  ok(v.text().includes('tool call'), 'and reminds why — the filter is the point')
+}
+
+// Clicking a hit jumps to the session and flashes the exact row the snippet
+// came from. The jump survives the couple of refreshes the select takes.
+{
+  const v = run(base)
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = 'jira'
+  box.oninput({ target: box })
+  box.onkeydown({ key: 'Enter' })
+  const matches = [
+    { key: 'abc-123', entryIndex: 1, at: Date.now(), kind: 'text', snippet: 'the answer that mentions jira', lead: false },
+  ]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches, more: 0 } })
+  const row = walkAll(v.root).find((n) => n.className === 'srow')
+  ok(!!row, 'the hit is drawn as a row')
+  row.onclick({})
+  ok(v.posted.some((m) => m.type === 'select' && m.id === 'abc-123'), 'clicking a hit selects its session')
+  ok(v.posted.some((m) => m.type === 'setMode' && m.mode === 'chat'), 'and asks for the chat view')
+  ok(!v.posted.some((m) => m.type === 'toggleArchived'), 'a session already on the board jumps without revealing anything')
+
+  // The chat renders the session — an intermediate frame may show another
+  // session first, so the jump must wait for ITS session, then flash.
+  v.deliver({ ...base, mode: 'kanban' })
+  ok(!walkAll(v.root).some((n) => (n.className || '').includes('hit-jump')), 'an intermediate frame flashes nothing')
+  ok(!v.text().includes('Search transcripts'), 'the state frame after the click has closed the search screen')
+  v.deliver({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+      { kind: 'text', at: Date.now(), text: 'the answer that mentions jira' },
+    ],
+  })
+  const flash = walkAll(v.root).find((n) => (n.className || '').includes('hit-jump'))
+  ok(!!flash && flash.textContent.includes('the answer that mentions jira'),
+    'the row the entryIndex named is the one flashed')
+  v.deliver({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+      { kind: 'text', at: Date.now(), text: 'the answer that mentions jira' },
+    ],
+  })
+  ok(!walkAll(v.root).some((n) => (n.className || '').includes('hit-jump')),
+    'the flash is one-shot — a later frame does not repeat it')
+}
+
+// Archived sessions are searched too (that is where the old work is); a hit
+// whose card the rail is hiding reveals it first, and the row names it with
+// the title the search read rather than a raw id.
+{
+  const v = run({ ...base, cards: [] })
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = 'jira'
+  box.oninput({ target: box })
+  box.onkeydown({ key: 'Enter' })
+  const matches = [{ key: 'old-9', title: 'The archived saga', entryIndex: 0, at: Date.now(), kind: 'prompt', snippet: 'about jira again', lead: false }]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches, more: 0 } })
+  ok(v.text().includes('The archived saga'), 'a hit from a hidden archived session is still named, by the title the search read')
+  const row = walkAll(v.root).find((n) => n.className === 'srow')
+  row.onclick({})
+  const ti = v.posted.findIndex((m) => m.type === 'toggleArchived')
+  const si = v.posted.findIndex((m) => m.type === 'select' && m.id === 'old-9')
+  ok(ti !== -1 && si !== -1 && ti < si, 'jumping reveals the archived session before selecting it')
+}
+
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

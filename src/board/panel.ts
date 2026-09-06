@@ -13,12 +13,38 @@ import * as vscode from 'vscode'
 import type { RunningAgent } from '../agent/manager.ts'
 import type { WorktreeReview } from '../git/worktree.ts'
 import type { Entry } from '../sessions/store.ts'
+import type { TranscriptHit } from '../sessions/search.ts'
 import type { AttachedImage } from '../agent/images.ts'
 import type { TestPlan } from '../sessions/meta.ts'
 import type { Meter } from '../agent/runtime.ts'
 import type { SlashCommand } from '../sessions/commands.ts'
 import type { ColumnDef } from './config.ts'
 import { parseAskQuestions, type AskQuestion } from './questions.ts'
+
+/** One transcript search hit, joined to the session it lives in. */
+export interface SearchRow extends TranscriptHit {
+  /** The session's key — the same key the board's cards carry, so the view
+   *  can name the hit with the card's current title and phase. */
+  key: string
+  /** The session's title as the SEARCH saw it. The view prefers the card's
+   *  current title and falls back to this — the card is not on the board when
+   *  the rail is hiding archived sessions, and a hit that names itself with a
+   *  raw session id reads as broken. */
+  title?: string
+}
+
+/** The answer to a search. Not board state: it arrives on its own channel and
+ *  `q` echoes the request, so a slow answer to an old query is dropped rather
+ *  than painted over a newer one. */
+export interface SearchAnswer {
+  /** The query this answer is for. */
+  q: string
+  /** Matches across every session, most recent first. */
+  matches: SearchRow[]
+  /** How many further matches were cut by the cap. Zero when the list is
+   *  complete; the view says "narrow the search" rather than pretending. */
+  more: number
+}
 
 export type Mode = 'kanban' | 'chat'
 
@@ -459,6 +485,15 @@ export interface BoardHost {
    *  @-mention picker. Asked lazily — the file list is the one payload that is
    *  too big to ride the state channel on every repaint. */
   mentionFiles(): Promise<string[]>
+  /**
+   * Search every session's transcript for what the conversation actually was.
+   *
+   * Answered with a post rather than through `refresh`, like `mentionFiles`:
+   * the matches are not board state and must not ride the repaint channel,
+   * which would recompute them ten times a second. The request echoes its own
+   * query back (`q`) so the view can drop an answer to a superseded search.
+   */
+  searchTranscript(q: string): Promise<SearchAnswer>
   /** Begin a dictation: the host records the microphone with ffmpeg. Fails
    *  with a named reason when a piece of the local whisper pipeline is missing
    *  or the device refuses. */
@@ -547,6 +582,13 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
           // channel, which would ship it ten times a second.
           const files = await host.mentionFiles()
           void webview.postMessage({ type: 'mentions', files })
+          break
+        }
+        case 'search': {
+          // Same one-round-trip rule as mentionFiles: transcript search parses
+          // every session, which is never something a repaint does.
+          const answer = await host.searchTranscript(String(msg.q ?? ''))
+          void webview.postMessage({ type: 'searchResults', ...answer })
           break
         }
         case 'voiceStart': {

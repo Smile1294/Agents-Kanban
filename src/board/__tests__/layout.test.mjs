@@ -571,6 +571,77 @@ try {
   ok(menu.filterInside <= 1, `the filter box stays inside the menu (${menu.filterInside}px past the edge)`)
   await menuPage.close()
 
+  /* --- the transcript-search screen, measured --------------------------------
+   *
+   * A hit row is a flex column of title / kind / clipped snippet, and the
+   * snippet may be a 340-character token with no spaces — the exact shape
+   * (a flex item's default min-width: auto) that has escaped this stylesheet
+   * twice before. The rail head also holds a second pill now, and the pair
+   * must not shove the title off the rail. Driven through the real pill and
+   * the real message channel, because the screen opens on a click and fills
+   * on an answer, and neither is reachable by text.
+   */
+  const searchPage = await browser.newPage({ viewport: { width: 1400, height: 900 } })
+  await searchPage.setContent(page$(state))
+  await searchPage.waitForSelector('.card', { timeout: 5000 })
+  await searchPage.evaluate(() => {
+    const pill = [...document.querySelectorAll('button')].find((b) => /Search/.test(b.textContent))
+    pill.click()
+  })
+  await searchPage.waitForSelector('.ts-input', { timeout: 5000 })
+  await searchPage.evaluate(() => {
+    // Ask first — the answer channel only accepts an answer to the query in
+    // the box, so drive the box like a user (Enter searches; the debounce
+    // never gets to fire).
+    const inp = document.querySelector('.ts-input')
+    inp.value = 'jira'
+    inp.dispatchEvent(new Event('input', { bubbles: true }))
+    inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    window.dispatchEvent(new MessageEvent('message', { data: {
+      type: 'searchResults', q: 'jira', more: 0,
+      matches: [
+        { key: 'a', entryIndex: 0, at: Date.now(), kind: 'prompt',
+          snippet: '/jira-task https://example.atlassian.net/browse/ACME-184 jira ' + 'x'.repeat(300),
+          lead: false },
+        { key: 'b', entryIndex: 0, at: Date.now(), kind: 'text',
+          snippet: 'jira ' + 'y'.repeat(330), lead: true },
+      ],
+    } }))
+  })
+  await searchPage.waitForSelector('.srow', { timeout: 5000 })
+  const search = await searchPage.evaluate(() => {
+    const list = document.querySelector('.search-list')
+    const rows = [...document.querySelectorAll('.srow')]
+    const first = rows[0]
+    const title = first.querySelector('.srow-title')
+    const snip = first.querySelector('.srow-snip')
+    const mark = first.querySelector('mark.hl')
+    const head = document.querySelector('.rail-head')
+    const nb = list.getBoundingClientRect()
+    const rb = first.getBoundingClientRect()
+    const tb = title.getBoundingClientRect()
+    return {
+      listOverflow: Math.round(list.scrollWidth - list.clientWidth),
+      rowEscapes: Math.round(tb.right - nb.right),
+      rowOverflow: Math.round(rb.width - nb.width + (rb.right - nb.right)),
+      snipHeight: Math.round(snip.getBoundingClientRect().height),
+      rows: rows.length,
+      markInside: !!mark && mark.getBoundingClientRect().right <= tb.right + 1,
+      headOverflow: Math.round(head.scrollWidth - head.clientWidth),
+      pillVisible: [...document.querySelectorAll('.rail-head button')]
+        .every((p) => p.getBoundingClientRect().right <= head.getBoundingClientRect().right + 1),
+    }
+  })
+  ok(search.listOverflow <= 1, `the result list does not scroll horizontally (${search.listOverflow}px)`)
+  ok(search.rowEscapes <= 1, `a hit title stays inside the list (${search.rowEscapes}px past the edge)`)
+  ok(search.rows === 2, `both hits drew (${search.rows})`)
+  ok(search.snipHeight > 16 && search.snipHeight < 46,
+     `a snippet is at most two lines, never a paragraph (${search.snipHeight}px)`)
+  ok(search.markInside, 'the highlight mark sits inside the row')
+  ok(search.headOverflow <= 1, `the rail head with two pills does not overflow (${search.headOverflow}px)`)
+  ok(search.pillVisible, 'both pills are on screen')
+  await searchPage.close()
+
 } finally {
   await browser.close()
 }
