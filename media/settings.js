@@ -29,6 +29,15 @@ const expanded = new Set()
 const catalogueOpen = new Set()
 const catalogueFilter = {}
 
+/* The new-schedule form. Module-level for the standing reason: this page
+   re-renders on every host reply, and a half-typed schedule held in the DOM
+   is gone with the next frame — the exact state a quick-pick used to lose,
+   which is the reason this page exists. `enabled` rides along so editing a
+   paused schedule does not silently resume it. */
+const schedDraft = { title: '', prompt: '', time: '09:00', days: [1, 2, 3, 4, 5], enabled: true }
+/** Set while the form is editing an existing schedule; its row id. */
+let schedEditingId = undefined
+
 let state = { runtimes: [], providers: [], defaultRuntime: 'claude' }
 let error = ''
 
@@ -389,6 +398,439 @@ function providerModels(p) {
   return box
 }
 
+/* --- scheduled runs: the board's time triggers -------------------------
+ *
+ * "Every morning, check the bug board and start fixing." A schedule is a
+ * prompt plus a wall-clock time on chosen weekdays; at the moment, the host
+ * starts a NEW session with that prompt — a new card, an ordinary run, the
+ * same lifecycle as one started by hand.
+ *
+ * Two honesties the page must keep, and both are the board's own rules:
+ *
+ *  - Runs happen only while the extension is running, so this is NOT cron.
+ *    A moment that passed while VS Code was closed starts at the next check
+ *    — once, not once per missed day — and the blurb below says so.
+ *  - A schedule that cannot fire is shown as DUE, never marked failed and
+ *    never shown as silent. When no git repo is open the page says why.
+ */
+const DAY_TAGS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa']
+const DAY_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+const pad2 = (n) => String(n).padStart(2, '0')
+
+/** "09:00" (an `<input type="time">` value) -> {hour, minute}, or undefined
+ *  when it is not a time the host could fire on. */
+function schedTimeParts(t) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '').trim())
+  if (!m) return undefined
+  const h = Number(m[1]); const min = Number(m[2])
+  if (h < 0 || h > 23 || min < 0 || min > 59) return undefined
+  return { hour: h, minute: min }
+}
+
+function schedResetDraft() {
+  schedEditingId = undefined
+  schedDraft.title = ''
+  schedDraft.prompt = ''
+  schedDraft.time = '09:00'
+  schedDraft.days = [1, 2, 3, 4, 5]
+  schedDraft.enabled = true
+}
+
+function schedDayChips() {
+  const chips = el('div', 'sched-days')
+  for (let d = 0; d < 7; d++) {
+    const on = schedDraft.days.includes(d)
+    const c = el('button', 'sched-day' + (on ? ' on' : ''), DAY_TAGS[d])
+    c.type = 'button'
+    c.title = (on ? 'Remove ' : 'Fire on ') + DAY_FULL[d]
+    c.addEventListener('click', () => {
+      schedDraft.days = on
+        ? schedDraft.days.filter((x) => x !== d)
+        : [...schedDraft.days, d].sort((a, b) => a - b)
+      render()
+    })
+    chips.appendChild(c)
+  }
+  return chips
+}
+
+function schedForm() {
+  const form = el('div', 'sched-form')
+
+  const line1 = el('div', 'sched-line')
+  const title = el('input', 'sched-title')
+  title.type = 'text'
+  title.placeholder = 'Name — becomes the card title, e.g. Morning bug patrol'
+  title.value = schedDraft.title
+  title.setAttribute('data-focus', 'sched::title')
+  const onInput = (field) => (e) => {
+    schedDraft[field] = (e && e.target && e.target.value != null ? e.target.value : title.value) || ''
+    render()
+  }
+  title.addEventListener('input', onInput('title'))
+  line1.appendChild(title)
+
+  const time = el('input', 'sched-time')
+  time.type = 'time'
+  time.value = schedDraft.time
+  time.title = 'When the run starts — your local time'
+  time.setAttribute('data-focus', 'sched::time')
+  time.addEventListener('input', (e) => {
+    const v = (e && e.target && e.target.value != null ? e.target.value : time.value) || ''
+    schedDraft.time = v
+    render()
+  })
+  line1.appendChild(time)
+  form.appendChild(line1)
+
+  const prompt = el('textarea', 'sched-prompt')
+  prompt.rows = 2
+  prompt.placeholder = 'What the session should do — e.g. check the bug board and start fixing what is broken'
+  prompt.value = schedDraft.prompt
+  prompt.setAttribute('data-focus', 'sched::prompt')
+  prompt.addEventListener('input', onInput('prompt'))
+  form.appendChild(prompt)
+
+  form.appendChild(schedDayChips())
+
+  const acts = el('div', 'sched-form-acts')
+  const canSave = !!(schedDraft.title.trim() && schedDraft.prompt.trim()
+    && schedTimeParts(schedDraft.time) && schedDraft.days.length)
+  const save = button(schedEditingId ? 'Save changes' : 'Add schedule', 'primary', () => {
+    const t = schedTimeParts(schedDraft.time)
+    if (!t) return
+    const draft = {
+      title: schedDraft.title.trim(),
+      prompt: schedDraft.prompt,
+      hour: t.hour,
+      minute: t.minute,
+      days: schedDraft.days.slice(),
+      enabled: schedDraft.enabled,
+    }
+    if (schedEditingId) draft.id = schedEditingId
+    post({ type: 'saveSchedule', draft })
+    schedResetDraft()
+    render()
+  }, {
+    disabled: !canSave,
+    title: 'A schedule needs a name, an instruction, a time and at least one day',
+  })
+  acts.appendChild(save)
+  if (schedEditingId) {
+    acts.appendChild(button('Cancel', 'link', () => { schedResetDraft(); render() }))
+  }
+  if (!canSave) {
+    acts.appendChild(el('span', 'muted small', 'Needs a name, an instruction, a time and at least one day.'))
+  }
+  form.appendChild(acts)
+  return form
+}
+
+/** The lines under a schedule row that tell the run's story: when it fires
+ *  next (or that it is due), and what the last attempt did. A failed attempt
+ *  is ALWAYS shown — it is the one signal that must not get lost under a
+ *  row that still looks fine. */
+function schedFacts(s) {
+  const out = []
+  if (s.enabled && s.nextAt !== undefined) {
+    if (s.nextAt <= Date.now()) {
+      out.push(el('div', 'small sched-due', 'Due now — starts at the next check'))
+    } else {
+      out.push(el('div', 'muted small', nextRunLabel(s.nextAt)))
+    }
+  }
+  if (s.lastRun) {
+    if (!s.lastRun.ok) {
+      out.push(el('div', 'small row-fail',
+        'Last run did not start' + (s.lastRun.note ? ' — ' + s.lastRun.note : '') + '.'))
+    } else if (!s.enabled || s.nextAt === undefined || s.nextAt <= Date.now()) {
+      // A healthy schedule with a next run ahead does not need this line; the
+      // "Next: …" one above IS the story. When there is no next run (paused,
+      // no days, due), the last one is what happened.
+      out.push(el('div', 'muted small', 'Last run started ' + since(s.lastRun.at) + '.'))
+    }
+  }
+  return out
+}
+
+function nextRunLabel(at) {
+  const d = new Date(at)
+  const now = new Date()
+  const hh = pad2(d.getHours()) + ':' + pad2(d.getMinutes())
+  if (d.toDateString() === now.toDateString()) return 'Next: today at ' + hh
+  const tomorrow = new Date(now)
+  tomorrow.setDate(tomorrow.getDate() + 1)
+  if (d.toDateString() === tomorrow.toDateString()) return 'Next: tomorrow at ' + hh
+  return 'Next: ' + DAY_FULL[d.getDay()] + ' at ' + hh
+}
+
+function schedRow(s, canRun) {
+  const row = el('div', 'row' + (schedEditingId === s.id ? ' active' : ''))
+  const left = el('div', 'row-main sched-main')
+  const title = el('div', 'row-title')
+  title.appendChild(el('span', '', s.title))
+  if (!s.enabled) title.appendChild(el('span', 'badge quiet', 'Paused'))
+  left.appendChild(title)
+
+  /* When + instruction on one ellipsising line: several schedules can share
+     a title, and the instruction is what tells them apart. The full prompt
+     is in the tooltip and in the Edit form. */
+  const meta = el('div', 'sched-meta')
+  meta.appendChild(el('span', 'muted', s.when))
+  meta.appendChild(el('span', 'sched-sep', '·'))
+  meta.appendChild(el('span', 'row-prompt', s.prompt))
+  meta.title = s.prompt
+  left.appendChild(meta)
+
+  for (const line of schedFacts(s)) left.appendChild(line)
+  row.appendChild(left)
+
+  const acts = el('div', 'row-actions')
+  const runNow = button('Run now', 'link', () => post({ type: 'runSchedule', id: s.id }))
+  if (!canRun) {
+    // A control that cannot succeed is disabled and says why — never a click
+    // that fails with a toast the banner above already explained.
+    runNow.disabled = true
+    runNow.title = 'A git repository must be open for a session to start'
+  }
+  acts.appendChild(runNow)
+  acts.appendChild(button('Edit', 'link', () => {
+    schedEditingId = s.id
+    schedDraft.title = s.title
+    schedDraft.prompt = s.prompt
+    schedDraft.time = pad2(s.hour) + ':' + pad2(s.minute)
+    schedDraft.days = s.days.slice()
+    schedDraft.enabled = s.enabled
+    render()
+  }))
+  acts.appendChild(button(s.enabled ? 'Pause' : 'Resume', 'link',
+    () => post({ type: 'toggleSchedule', id: s.id })))
+  acts.appendChild(button('Remove', 'link danger',
+    () => post({ type: 'removeSchedule', id: s.id })))
+  row.appendChild(acts)
+  return row
+}
+
+function scheduledSection() {
+  const sch = state.schedules
+  if (!sch) return null
+  const sec = el('section', 'panel')
+  const head = el('div', 'panel-head')
+  head.appendChild(el('h2', '', 'Scheduled runs'))
+  head.appendChild(el('span', 'muted small', 'start a session at set times'))
+  sec.appendChild(head)
+  sec.appendChild(el('p', 'blurb',
+    'At a set time on set days, a NEW session starts with a fixed instruction — your morning ' +
+    'bug-board patrol, an afternoon build check. Fires only while this window is open; a run ' +
+    'due while it was closed starts once at the next check, never once per missed day.'))
+
+  /* The one signal that would otherwise be silent: a schedule that cannot
+     fire because no session could start. Shown as a banner, not hidden, and
+     never painted as a failure of the schedule itself. */
+  if (sch.problem) sec.appendChild(el('div', 'sched-problem', sch.problem))
+
+  const list = el('div', 'rows')
+  if (!sch.rows.length) {
+    list.appendChild(el('div', 'muted small',
+      'Nothing scheduled yet — the form below starts a session at a set time.'))
+  } else {
+    for (const s of sch.rows) list.appendChild(schedRow(s, sch.canRun))
+  }
+  sec.appendChild(list)
+
+  sec.appendChild(el('div', 'sched-subhead', schedEditingId ? 'Edit schedule' : 'New schedule'))
+  sec.appendChild(schedForm())
+  return sec
+}
+
+/* --- the composer's mic ------------------------------------------------
+ *
+ * Dictation is two LOCAL tools — ffmpeg records, whisper-cli transcribes —
+ * and the audio never leaves the machine, which is the entire point of it.
+ * Each piece is checked by actually asking the binary, and each missing one
+ * is its own row with its own fix, because "install the thing" is wallpaper
+ * the moment a user has one of the two installed.
+ */
+const VOICE_SETTING_KEYS = { whisper: 'agentsKanban.whisperPath', model: 'agentsKanban.whisperModel', ffmpeg: 'agentsKanban.ffmpegPath' }
+
+function dictationSection() {
+  const sec = el('section', 'panel')
+  const head = el('div', 'panel-head')
+  head.appendChild(el('h2', '', 'Dictation'))
+  head.appendChild(el('span', 'muted small', 'the composer mic — recorded and transcribed on this machine'))
+  sec.appendChild(head)
+
+  const intro = el('div', 'muted small')
+  intro.appendChild(el('span', '', 'The composer’s 🎤 needs whisper-cli and ffmpeg, found on your PATH or pointed to by four settings. Nothing is uploaded: the recording and the transcription both happen here.'))
+  sec.appendChild(intro)
+
+  const v = state.voice
+  if (!v) {
+    const row = el('div', 'status-row')
+    // NEVER "not installed" when we simply have not looked.
+    row.appendChild(el('span', 'dot unknown'))
+    row.appendChild(el('span', 'status-text', 'Not checked yet.'))
+    row.appendChild(button('Check', 'link', () => post({ type: 'checkVoice' })))
+    sec.appendChild(row)
+  } else {
+    for (const r of v.rows) {
+      const row = el('div', 'status-row')
+      row.appendChild(el('span', 'dot ' + (r.ok ? 'ok' : 'bad')))
+      const label = el('span', 'status-text', r.label)
+      row.appendChild(label)
+      if (r.ok) {
+        row.appendChild(el('span', 'muted small', r.detail))
+      } else {
+        // A missing piece opens the very setting that fixes it — a fix is a
+        // place, not just a sentence.
+        const fix = el('code', 'fix')
+        fix.textContent = r.detail
+        fix.style.cursor = 'pointer'
+        fix.title = 'Open the setting for this'
+        fix.addEventListener('click', () => {
+          post({ type: 'openSetting', key: VOICE_SETTING_KEYS[r.key] || 'agentsKanban' })
+        })
+        row.appendChild(fix)
+      }
+      const age = el('span', 'muted small', 'checked ' + since(v.at))
+      age.title = 'When the binaries were last asked. Press Check to ask again.'
+      row.appendChild(age)
+      sec.appendChild(row)
+    }
+    sec.appendChild(button('Check again', 'link', () => post({ type: 'checkVoice' })))
+  }
+  return sec
+}
+
+/* --- Remote Control ----------------------------------------------------------
+ *
+ * This machine PUSHES the board to a small site the user deploys — Netlify's
+ * free tier is enough, and the remote/ folder in this repo lifts into its own
+ * repo. The remote page is read-only, and the redaction happens ONCE, here, in
+ * cards.ts: the page never sees more than the board shows.
+ *
+ * Two rules this section must keep:
+ *
+ *  - The pairing code NEVER renders. It is a change-only field: blank even
+ *    when a code is stored, and blank means "keep the stored one" (the host
+ *    parses that). Clearing it is its own button — emptying a field must
+ *    never be what wipes the keychain.
+ *  - The status line is the relay's actual answers, success AND failure, and
+ *    says "not asked yet" before the first one — the same rule as every other
+ *    status row on this page. A tick that no attempt ever produced is the
+ *    page's one forbidden signal.
+ */
+const remoteDraft = { url: '', code: '' }
+let remoteDraftInited = false
+
+function remoteSection() {
+  const r = state.remote
+  if (!r) return null
+  // The URL is prefilled once, from the host. A later render must not stomp
+  // on a half-typed edit, so after this the drafts win — the same discipline
+  // as the model filter and the schedule form.
+  if (!remoteDraftInited) {
+    remoteDraft.url = r.url || ''
+    remoteDraftInited = true
+  }
+  const sec = el('section', 'panel')
+  const head = el('div', 'panel-head')
+  head.appendChild(el('h2', '', 'Remote Control'))
+  head.appendChild(el('span', 'muted small', 'watch this board from any browser'))
+  sec.appendChild(head)
+  sec.appendChild(el('p', 'blurb',
+    'Streams the board — cards, phases and the chats — to a small page you deploy ' +
+    '(the remote/ folder in this repo lifts into its own Netlify site). Only what the ' +
+    'board itself shows ever leaves: no code, no file paths, no credentials. The page ' +
+    'is read-only, and only changes travel — a quiet board pushes at most every 90 ' +
+    'seconds, so the free tier covers it.'))
+
+  /* The status line. Four states, four texts: paused, connected-but-never-asked,
+     last attempt went out, last attempt failed. */
+  const row = el('div', 'status-row')
+  const st = r.status
+  if (!r.enabled) {
+    row.appendChild(el('span', 'dot idle'))
+    row.appendChild(el('span', 'status-text', 'Paused — nothing is being pushed. The relay keeps what it has.'))
+    row.appendChild(button('Resume', 'link',
+      () => post({ type: 'setRemote', enabled: true })))
+  } else if (!st) {
+    row.appendChild(el('span', 'dot unknown'))
+    row.appendChild(el('span', 'status-text', 'Connected, but the relay has not answered yet.'))
+  } else if (st.ok) {
+    row.appendChild(el('span', 'dot ok'))
+    const text = el('span', 'status-text', st.note || 'Pushing.')
+    row.appendChild(text)
+    row.appendChild(el('span', 'muted small', '· ' + since(st.at)))
+    row.appendChild(button('Pause', 'link',
+      () => post({ type: 'setRemote', enabled: false })))
+  } else {
+    row.appendChild(el('span', 'dot bad'))
+    row.appendChild(el('span', 'status-text', 'Last push failed.'))
+    if (st.error) row.appendChild(el('code', 'fix', st.error))
+    row.appendChild(el('span', 'muted small', '· ' + since(st.at)))
+    row.appendChild(button('Retry', 'link', () => post({ type: 'setRemote', enabled: true })))
+  }
+  sec.appendChild(row)
+
+  const form = el('div', 'remote-form')
+
+  const url = el('input', 'remote-input')
+  url.type = 'text'
+  url.placeholder = 'https://your-board.netlify.app'
+  url.value = remoteDraft.url
+  url.setAttribute('data-focus', 'remote::url')
+  url.title = 'The relay site you deployed from the remote/ folder'
+  url.addEventListener('input', (e) => {
+    remoteDraft.url = (e && e.target && e.target.value != null ? e.target.value : url.value) || ''
+    render()
+  })
+  form.appendChild(url)
+
+  const code = el('input', 'remote-input remote-code')
+  code.type = 'text'
+  code.placeholder = r.hasCode
+    ? 'A code is stored — leave blank to keep it'
+    : 'A pairing code you choose — the relay page asks for the same one'
+  code.value = remoteDraft.code
+  code.setAttribute('data-focus', 'remote::code')
+  code.title = 'A new pairing code replaces the stored one. Blank keeps the stored code.'
+  code.addEventListener('input', (e) => {
+    remoteDraft.code = (e && e.target && e.target.value != null ? e.target.value : code.value) || ''
+    render()
+  })
+  form.appendChild(code)
+
+  const acts = el('div', 'remote-acts')
+  const canConnect = !!(remoteDraft.url.trim() && (remoteDraft.code.trim() || r.hasCode))
+  acts.appendChild(button('Save and connect', 'primary', () => {
+    const msg = { type: 'saveRemote', url: remoteDraft.url.trim() }
+    if (remoteDraft.code.trim()) msg.code = remoteDraft.code.trim()
+    remoteDraft.code = ''
+    post(msg)
+    // Same discipline as the schedule form: the code lives in the keychain from
+    // this instant, so the field that held it empties NOW, not on some later
+    // host reply.
+    render()
+  }, {
+    disabled: !canConnect,
+    title: 'A relay URL is needed, and a pairing code unless one is already stored',
+  }))
+  if (r.hasCode) {
+    acts.appendChild(button('Remove the stored code', 'link danger',
+      () => post({ type: 'clearRemoteCode' })))
+  }
+  if (!remoteDraft.url.trim()) {
+    acts.appendChild(el('span', 'muted small', 'Deploy the remote/ folder first — its README walks through it.'))
+  } else if (!r.hasCode && !remoteDraft.code.trim()) {
+    acts.appendChild(el('span', 'muted small',
+      'A pairing code is needed once: choose one here, and enter the same one on the relay page to watch the board.'))
+  }
+  form.appendChild(acts)
+  sec.appendChild(form)
+  return sec
+}
+
 function render() {
   const root = document.getElementById('root')
   /* THE SAME RULE THE BOARD HAS: anything the user is typing into is destroyed
@@ -448,6 +890,16 @@ function render() {
   // Offering a backend picker for a board whose agents all sign in as
   // themselves would be a setting that cannot take effect.
   if (state.runtimes.some((r) => r.providerProfiles)) page.appendChild(providerSection())
+
+  // Always rendered when the host provides the section — an empty rows list
+  // is a real state ("nothing scheduled yet"), not an absent feature. Old
+  // hosts that never send `schedules` simply show no section.
+  if (state.schedules) page.appendChild(scheduledSection())
+
+  const remote = remoteSection()
+  if (remote) page.appendChild(remote)
+
+  page.appendChild(dictationSection())
 
   const foot = el('footer', 'settings-footer')
   foot.appendChild(el('span', 'muted small',

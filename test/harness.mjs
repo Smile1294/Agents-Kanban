@@ -117,6 +117,11 @@ export function makeVscodeStub(ctl) {
     },
     EventEmitter: class { constructor() { this.event = () => disposable } fire() {} dispose() {} },
     ViewColumn: { Active: -1, One: 1, Beside: -2 },
+    /* Just a carrier for base+pattern — mentionFiles scopes its search to the
+       workspace folder with one of these, and nothing in the stub walks globs. */
+    RelativePattern: class {
+      constructor(base, pattern) { this.base = base; this.pattern = pattern }
+    },
     ProgressLocation: { SourceControl: 1, Window: 10, Notification: 15 },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     QuickPickItemKind: { Separator: -1, Default: 0 },
@@ -311,6 +316,29 @@ export function makeVscodeStub(ctl) {
       }),
       openTextDocument: async () => ({}),
       updateWorkspaceFolders: () => true,
+      /* A walk of what a test seeded (`ctl.files`, workspace-relative, forward
+         slashes) minus what the real glob excludes. Glob engines are not what
+         the suite tests — that the host asks lazily, scoped to the folder, and
+         answers in workspace-relative paths, is. */
+      findFiles: async (include, _exclude, maxResults) => {
+        const base = include?.base?.uri?.fsPath ?? folders[0]?.uri?.fsPath ?? ''
+        const skipSeg = new Set(['.git', 'node_modules', '.agentskanban', '.vscode', 'out', 'dist', 'build', 'coverage', '.next', 'vendor', 'bin', 'obj'])
+        const skipExt = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.woff', '.woff2', '.wasm', '.zip', '.tar', '.gz', '.mp3', '.mp4', '.mov', '.wav']
+        const hits = (ctl.files ?? [])
+          .filter((p) => {
+            const dirs = p.split('/').slice(0, -1)
+            return !dirs.some((d) => skipSeg.has(d)) && !skipExt.some((e) => p.endsWith(e))
+          })
+          .slice(0, maxResults ?? 2000)
+        return hits.map((p) => ({ fsPath: path.join(base, ...p.split('/')), scheme: 'file' }))
+      },
+      asRelativePath: (u, includeWorkspaceFolder) => {
+        const base = folders[0]?.uri?.fsPath ?? ''
+        const rel = base && u.fsPath.startsWith(base + path.sep)
+          ? u.fsPath.slice(base.length + 1)
+          : u.fsPath
+        return includeWorkspaceFolder === false ? rel.replaceAll(path.sep, '/') : rel
+      },
       registerTextDocumentContentProvider: (scheme, provider) => {
         calls.push('contentProvider:' + scheme)
         ctl.contentProvider = provider
