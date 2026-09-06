@@ -1022,6 +1022,7 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   }).text()
   ok(streaming.includes('thinking out loud'), 'the streaming block renders')
   ok(!streaming.includes('Claude Agent'), 'and is not labelled Claude either')
+}
 // 18. The composer's mic, gated on a real check of whisper and ffmpeg. ---------
 // The mic is drawn ONLY when the host's probe of the two binaries answered —
 // a control that cannot take effect is not drawn (this project's rule), and
