@@ -36,11 +36,13 @@ const ctxFor = (over: Partial<BoardToolContext> = {}): BoardToolContext => ({
 // Every board tool the agent is handed must also be one it may call without
 // stopping. This is the assertion that would have caught the shipped bug.
 const names = boardToolNames(DEFAULT_BOARD, tool)
-ok(names.length === 5, `five board tools are auto-allowed (${names.join(', ')})`)
+ok(names.length === 6, `six board tools are auto-allowed (${names.join(', ')})`)
 ok(names.includes(boardToolName('set_phase')), 'set_phase is among them — moving a card is the whole point')
 ok(names.includes(boardToolName('notify_user')), 'and notify_user, for when the agent is stuck mid-run')
 ok(names.includes(boardToolName('set_title')),
    'and set_title — a card named from the first line of a request needs no permission to be corrected')
+ok(names.includes(boardToolName('schedule_list')),
+   'and schedule_list — reading the triggers costs nothing, so it never stops for a click')
 
 // `split_task` starts other agents, so it is the one board tool the user is
 // asked about. The exclusion is by NAME, which is the same shape as the bug at
@@ -88,6 +90,147 @@ for (const n of ['Read', 'Grep', 'Glob']) {
 }
 for (const n of ['Bash', 'Edit', 'Write']) {
   ok(!AUTO_ALLOWED_FOR_TEST(n), `${n} still goes through the user`)
+}
+
+// --- the spawn allowlist reaches the DESCRIPTION, not just the gate -----------
+//
+// The gate in `AgentManager.split()` is the fence; the description is what the
+// agent reads before it ever calls. An agent can only ask for a model it has
+// been told exists, so the allowed set must be named here — and an empty set
+// must say the tool will be refused, rather than inviting a doomed call.
+{
+  const splitWith = (spawnModels: string[] | undefined) => {
+    const [t] = buildBoardTools(DEFAULT_BOARD, ctxFor({ spawnModels }), tool)
+      .filter((x) => x.name === 'split_task')
+    return t as unknown as {
+      description?: string | string[]
+      inputSchema?: { subtasks?: { element?: { shape?: Record<string, unknown> } } }
+    }
+  }
+  const textOf = (t: { description?: string | string[] }) =>
+    Array.isArray(t.description) ? t.description.join('\n') : String(t.description ?? '')
+
+  const withList = splitWith(['haiku-5', 'deepseek-chat'])
+  ok(textOf(withList).includes('one of: haiku-5, deepseek-chat'),
+     'the split_task description names the models a spawned agent may run on')
+  ok(withList.inputSchema?.subtasks?.element?.shape?.model !== undefined,
+     'and the schema offers the `model` field to ask for one')
+
+  const plain = splitWith(undefined)
+  ok(!textOf(plain).includes('may name a `model`'), 'with no allowlist the description says nothing about models')
+  ok(plain.inputSchema?.subtasks?.element?.shape?.model === undefined,
+     'and the schema has no model field — a control with no gate behind it cannot be offered')
+
+  const empty = splitWith([])
+  ok(textOf(empty).includes('will be refused'),
+     'an empty allowlist says the tool will be refused rather than inviting a doomed call')
+  ok(empty.inputSchema?.subtasks?.element?.shape?.model === undefined,
+     'and offers no model field, because there is nothing to offer')
+}
+
+// --- the scheduled-run tools --------------------------------------------------
+//
+// A schedule fires a session with a bill, so the boundary is the same one
+// `split_task` has: the description is policy, `parseScheduleDraft` in the
+// handler is the fence, and the tools that create, delete or fire are in
+// ASKS_FIRST (checked by the drift guard above). What this block adds is the
+// behaviour behind the names: junk never reaches the host callback, and the
+// list marks whose each schedule is.
+import type { Schedule } from '../../board/schedules.ts'
+{
+  const created: { drafts: unknown[]; by: string[] } = { drafts: [], by: [] }
+  const schedCtx = ctxFor({
+    onScheduleList: async () => [
+      {
+        id: 'a1', title: 'Bug patrol', prompt: 'Fix them.', hour: 9, minute: 0,
+        days: [1, 2, 3, 4, 5], enabled: true, createdAt: 1,
+        createdBy: 'Pricing, spawn policy and schedules',
+      },
+      {
+        id: 'a2', title: 'Build check', prompt: 'Run the build.', hour: 14, minute: 30,
+        days: [0], enabled: false, createdAt: 1,
+        createdBy: 'Some other card',
+      },
+      {
+        id: 'a3', title: 'Deploy watch', prompt: 'Watch the deploy.', hour: 8, minute: 0,
+        days: [6], enabled: true, createdAt: 1,
+        lastRun: { at: 2, ok: false, note: 'no provider' },
+      },
+    ] as Schedule[],
+    onScheduleCreate: async (draft, by) => {
+      created.drafts.push(draft)
+      created.by.push(by)
+      return { ok: true, id: 'new-1' }
+    },
+    sessionTitle: () => 'Pricing, spawn policy and schedules',
+  })
+  const all = buildBoardTools(DEFAULT_BOARD, schedCtx, tool)
+  const by = (name: string) => all.find((t) => t.name === name) as unknown as {
+    handler: (a: unknown, e: unknown) => Promise<unknown>
+  }
+
+  const createTool = by('schedule_create')
+  const createdRes = await createTool.handler({
+    title: ' Nightly sweep ', prompt: 'Sweep the board.', hour: 3, minute: 15,
+    days: [1, 1, 5], enabled: false,
+  }, {})
+  ok(created.drafts.length === 1, 'schedule_create reaches the host callback once')
+  ok(created.drafts[0] !== null && typeof created.drafts[0] === 'object'
+    && (created.drafts[0] as { title?: string }).title === 'Nightly sweep',
+    'with the title trimmed — the host stamps the id, not the agent')
+  ok(created.by[0] === 'Pricing, spawn policy and schedules',
+    'and the creator stamp is this session\'s card title, from sessionTitle')
+  ok(String((createdRes as { content?: { text?: string }[] }).content?.[0]?.text ?? '')
+    .includes('new-1'),
+    'and the result carries the id the next tools key on')
+  const paused = created.drafts[0] as { enabled?: boolean }
+  ok(paused.enabled === false, 'an explicit enabled:false is kept, not defaulted away')
+
+  const before = created.drafts.length
+  const junkRes = await createTool.handler({
+    title: 'Bad time', prompt: 'x', hour: 42, minute: 0, days: [1],
+  }, {})
+  ok(created.drafts.length === before, 'a junk draft never reaches the host callback')
+  ok(String((junkRes as { content?: { text?: string }[] }).content?.[0]?.text ?? '').includes('hour'),
+    'and the refusal names the field so the agent can fix it')
+
+  const listRes = await by('schedule_list').handler({}, {})
+  const listText = String((listRes as { content?: { text?: string }[] }).content?.[0]?.text ?? '')
+  ok(listText.includes('Bug patrol') && listText.includes('Mon–Fri at 09:00'),
+    'schedule_list shows each schedule with its one-line when')
+  ok(listText.includes('you created this'), 'a schedule whose creator is THIS session says "you created this"')
+  ok(listText.includes('created by "Some other card"'), 'another agent\'s schedule names its creator card')
+  ok(listText.includes('user-created'), 'a schedule with no stamp reads as the user\'s')
+  ok(listText.includes('paused') && listText.includes('last run did not start: no provider'),
+    'and the flags say paused and the failed last run — the signals that cannot say bad are absent')
+
+  const delCtx = ctxFor({
+    onScheduleDelete: async (id) => (id === 'a1' ? { ok: true } : { ok: false, message: 'No schedule with id "x".' }),
+    onScheduleRun: async () => ({ ok: false, message: 'No git repo open.' }),
+  })
+  const delTool = buildBoardTools(DEFAULT_BOARD, delCtx, tool).find((t) => t.name === 'schedule_delete') as unknown as {
+    handler: (a: unknown, e: unknown) => Promise<unknown>
+  }
+  const delRes = await delTool.handler({ id: 'a1' }, {})
+  ok(String((delRes as { content?: { text?: string }[] }).content?.[0]?.text ?? '').includes('deleted'),
+    'schedule_delete reports the deletion')
+  const delMiss = await delTool.handler({ id: 'x' }, {})
+  ok(String((delMiss as { content?: { text?: string }[] }).content?.[0]?.text ?? '').includes('No schedule'),
+    'and relays the host\'s refusal rather than inventing success')
+  const runTool = buildBoardTools(DEFAULT_BOARD, delCtx, tool).find((t) => t.name === 'schedule_run') as unknown as {
+    handler: (a: unknown, e: unknown) => Promise<unknown>
+  }
+  const runRes = await runTool.handler({ id: 'a1' }, {})
+  ok(String((runRes as { content?: { text?: string }[] }).content?.[0]?.text ?? '').includes('No git repo open'),
+    'schedule_run relays the host\'s reason when the run could not start')
+
+  const bare = ctxFor({})
+  const bareCreate = buildBoardTools(DEFAULT_BOARD, bare, tool).find((t) => t.name === 'schedule_create') as unknown as {
+    handler: (a: unknown, e: unknown) => Promise<unknown>
+  }
+  const bareRes = await bareCreate.handler({ title: 'x', prompt: 'y', hour: 1, minute: 2, days: [1] }, {})
+  ok(String((bareRes as { content?: { text?: string }[] }).content?.[0]?.text ?? '').includes('not available'),
+    'with no host behind them the tools say unavailable, never invent a store')
 }
 
 // --- the approval boundary, enforced at the tool boundary --------------------

@@ -9,7 +9,7 @@ import {
   mainWindowOf,
   CACHE_READ, CACHE_WRITE_1H, CACHE_WRITE_5M, MODEL_RATES, MODEL_WINDOWS,
   contextOfUsage, costOfUsage, normaliseModel, rateFor, summariseUsage, windowFor,
-  type UsageMessage,
+  type ModelBook, type UsageMessage,
 } from '../usage.ts'
 
 let fails = 0
@@ -55,13 +55,36 @@ const growing = summariseUsage([
 ])
 ok(growing.output === 500, `the last frame of a response wins (got ${growing.output})`)
 
-// A frame with no id cannot be deduplicated against anything, so it counts once
-// under a key of its own rather than overwriting the response before it.
+// A frame with no id cannot be deduplicated by identity. But a gateway whose
+// streaming frames carry no id writes one frame per content block, each
+// repeating the same cumulative usage — so consecutive id-less frames whose
+// usage is IDENTICAL are one response's blocks and must merge, or a
+// block-streamed answer is billed once per block. The merge is charge-neutral:
+// identical usage costs the same as one entry or several.
 const noIds = summariseUsage([
   { type: 'assistant', message: { model: 'claude-opus-5', usage: { output_tokens: 7 } } },
   { type: 'assistant', message: { model: 'claude-opus-5', usage: { output_tokens: 7 } } },
 ])
-ok(noIds.responses === 2 && noIds.output === 14, 'id-less frames are not collapsed into each other')
+ok(noIds.responses === 1 && noIds.output === 7,
+   `id-less frames with identical usage merge — one response, one charge (got ${noIds.responses} responses, ${noIds.output} tokens)`)
+
+// Different usage is a different response, and must never merge.
+const noIdsDistinct = summariseUsage([
+  { type: 'assistant', message: { model: 'claude-opus-5', usage: { output_tokens: 7 } } },
+  { type: 'assistant', message: { model: 'claude-opus-5', usage: { output_tokens: 8 } } },
+])
+ok(noIdsDistinct.responses === 2 && noIdsDistinct.output === 15,
+   'id-less frames whose usage differs stay separate')
+
+// Only CONSECUTIVE frames merge — anything in between ends the response.
+const noIdsReset = summariseUsage([
+  { type: 'assistant', message: { model: 'claude-opus-5', usage: { output_tokens: 7 } } },
+  frame('mid', { output_tokens: 9 }),
+  { type: 'assistant', message: { model: 'claude-opus-5', usage: { output_tokens: 7 } } },
+  { type: 'user', message: { content: 'go on' }, parent_tool_use_id: null },
+  { type: 'assistant', message: { model: 'claude-opus-5', usage: { output_tokens: 7 } } },
+])
+ok(noIdsReset.responses === 4, `an id or user message between id-less frames ends the merge (got ${noIdsReset.responses})`)
 
 // ---------------------------------------------------------------------------
 // 2. Every token kind at its own rate, cache writes split by TTL.
@@ -315,6 +338,77 @@ ok(noUsage.responses === 0, 'an assistant frame without usage is skipped rather 
   }])
   ok(!unpriced.priced && unpriced.unpriced[0] === 'deepseek/deepseek-chat-v3.1',
      'while an unknown model still reports itself as unpriced — the book adds knowledge, it never invents it')
+}
+
+// ---------------------------------------------------------------------------
+// 6. The DeepSeek 65x: an impossible cache-read price must not price the meter.
+//
+// The real session that reported it: the board showed ~$102, the platform's
+// usage page said $1.56 — a factor of 65. Its tokens (deduplicated, exactly as
+// the transcript has them): 1,041,831 input, 792,272 output, 87,772,032 cache
+// reads. The reads were 98% of the bill, so the meter was pricing cache reads
+// at ~$1.12 per million — four times the fresh-input rate. The endpoint had
+// published a cache-read price ABOVE its input price, which cannot be a price
+// on any vendor (a cache hit is never billed above a miss); the only way such
+// a number exists is a unit misread at the parse boundary. `rateFor` must
+// refuse it and let the read rate be derived (10% of input, the convention
+// Anthropic, DeepSeek and the routers all follow) instead of silently
+// multiplying the session by 65.
+{
+  const REAL_TOKENS = {
+    input_tokens: 1_041_831,
+    output_tokens: 792_272,
+    cache_read_input_tokens: 87_772_032,
+  }
+  // The poisoned book: what the misread endpoint published.
+  const poisoned: ModelBook = {
+    'deepseek-v4-pro': { rate: { input: 0.28, output: 0.42, cacheRead: 1.12 } },
+  }
+  const clean: ModelBook = {
+    'deepseek-v4-pro': { rate: { input: 0.28, output: 0.42, cacheRead: 0.028 } },
+  }
+  // Streamed as the CLI writes it: one frame per block, all repeating the
+  // whole response's usage.
+  const streamed: UsageMessage[] = [
+    frame('ds_1', REAL_TOKENS, { model: 'deepseek-v4-pro' }),
+    frame('ds_1', REAL_TOKENS, { model: 'deepseek-v4-pro' }),
+    frame('ds_1', REAL_TOKENS, { model: 'deepseek-v4-pro' }),
+  ]
+
+  // What the platform's usage page computes: tokens x published rates.
+  const platform =
+    (1_041_831 * 0.28 + 792_272 * 0.42 + 87_772_032 * 0.028) / 1_000_000
+
+  const got = summariseUsage(streamed, poisoned)
+  ok(got.responses === 1, `the three frames are still one response (got ${got.responses})`)
+  ok(got.priced === true, 'the model stays priced — the guard derives, it does not give up')
+  ok(near(got.costUsd, platform),
+     `the poisoned book prices the real token mix at the platform's arithmetic: ` +
+     `$${got.costUsd.toFixed(4)} (want $${platform.toFixed(4)})`)
+
+  // The failure this guards, spelled out: had the published cacheRead been
+  // trusted, the reads alone would have been ~$98 — the board's $102 class.
+  const trusting = (87_772_032 * 1.12 + 1_041_831 * 0.28 + 792_272 * 0.42) / 1_000_000
+  ok(trusting > got.costUsd * 30,
+     `trusting the impossible rate would have shown $${trusting.toFixed(2)} — the 65x over-report`)
+
+  // The guard is at the lookup, so every arithmetic path is covered at once.
+  ok(rateFor('deepseek-v4-pro', poisoned)?.cacheRead === undefined,
+     'rateFor refuses the impossible rate at the single entry point')
+  ok(rateFor('deepseek-v4-pro', clean)?.cacheRead === 0.028,
+     'and keeps a published cache-read price at or below the input rate')
+  // A router that prices a cache read AT the full input rate is a real price,
+  // not a misread — the guard must not eat it.
+  ok(rateFor('m', { m: { rate: { input: 0.5, output: 1, cacheRead: 0.5 } } })?.cacheRead === 0.5,
+     'a cache read priced equal to input survives (OpenRouter does this on some models)')
+  // And zero is a price: free cache reads must not be "corrected" to 10%.
+  ok(rateFor('m', { m: { rate: { input: 0.28, output: 0.42, cacheRead: 0 } } })?.cacheRead === 0,
+     'a free cache read stays free')
+
+  // Same tokens with the clean book: the two books now agree, so the number
+  // on the board cannot depend on which fetch of the endpoint wrote the cache.
+  ok(near(summariseUsage(streamed, clean).costUsd, got.costUsd),
+     'clean and poisoned books price the session identically')
 }
 
 console.log(fails ? `\n${fails} FAILED` : '\nall usage tests passed')

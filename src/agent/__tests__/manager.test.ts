@@ -595,13 +595,146 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
   ok(unknown.ok === false, 'a session that is not running cannot start subtasks')
 }
 
-// The brief has to mention splitting, or the agent never considers it — and has
-// to say when NOT to, or it splits work that has to be done in one place.
+// --- the spawn-model allowlist ----------------------------------------------
+//
+// A subtask spec may name a `model`, and that id starts a process with a real
+// bill — so it is gated here, in code, before the user is asked to approve
+// anything. The tool description can only name the allowed set; this is the
+// fence, and the only one.
+{
+  const makeGated = (spawnModels: () => string[], defaults: Record<string, unknown> = {}) => {
+    const startedWith: { opts: Record<string, unknown> }[] = []
+    const patches: { patch: Record<string, unknown> }[] = []
+    let asked = 0
+    const g = new AgentManager({
+      store: {
+        card: async () => ({ phase: 'planning', tags: [], parent: undefined }),
+        childrenOf: async () => [],
+        setTags: async () => {},
+        patch: async (_key: string, patch: Record<string, unknown>) => { patches.push({ patch }) },
+      } as never,
+      confirmSplit: async () => { asked++; return true },
+      worktrees: { isClean: async () => true, aheadOf: async () => 0 } as never,
+      board: DEFAULT_BOARD,
+      defaults,
+      permissionMode: 'acceptEdits',
+      maxConcurrent: 3,
+      spawnModels,
+    })
+    const inner = g as unknown as {
+      agents: Map<string, RunningAgent>
+      start: (prompt: string, opts: Record<string, unknown>) => Promise<string>
+    }
+    inner.agents.set('run-1', {
+      runId: 'run-1', runtime: 'claude', sessionId: 'sess-parent', title: 'Split me',
+      state: { kind: 'working' }, worktreePath: '/tmp/wt/p', branch: 'task/p', base: 'main',
+      live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
+    })
+    inner.start = async (_p, opts) => {
+      startedWith.push({ opts })
+      return `run-child-${startedWith.length}`
+    }
+    return { g, startedWith, patches, asked: () => asked }
+  }
+  const specs = (over: Record<string, unknown>[] = [{}, {}]) => [
+    { title: 'One', prompt: 'Do one.', scope: ['src/a/'], ...over[0] },
+    { title: 'Two', prompt: 'Do two.', scope: ['src/b/'], ...over[1] },
+  ]
+
+  // An allowed model is accepted, and it travels as `chosen` — the same path a
+  // resumed session uses, so the card and the runtime are handed one value.
+  {
+    const { g, startedWith } = makeGated(() => ['deepseek-chat', 'opus-5'])
+    const r = await g.split('sess-parent', specs([{ model: 'deepseek-chat' }, { model: 'opus-5' }]))
+    ok(r.ok === true, `naming allowed models runs the split (${r.ok ? 'yes' : r.message})`)
+    const chosen0 = startedWith[0]?.opts.chosen as { model?: string } | undefined
+    const chosen1 = startedWith[1]?.opts.chosen as { model?: string } | undefined
+    ok(chosen0?.model === 'deepseek-chat',
+       'the chosen model reaches start() as chosen.model')
+    ok(chosen1?.model === 'opus-5',
+       'for every subtask, not just the first')
+  }
+
+  // A disallowed model is refused BEFORE the approval modal — the user is never
+  // asked to approve a plan the host already knows it will refuse — and the
+  // refusal names the allowed set, because that is the only way the agent can
+  // re-propose something the gate will accept.
+  {
+    const { g, startedWith, patches, asked } = makeGated(() => ['deepseek-chat'])
+    const r = await g.split('sess-parent', specs([{ model: 'opus-5' }]))
+    ok(r.ok === false, 'a model outside the allowlist is refused')
+    ok(r.ok === false && /deepseek-chat/.test(r.message),
+       `and the refusal names what IS allowed (${r.ok === false ? r.message : 'it ran'})`)
+    ok(r.ok === false && /opus-5/.test(r.message),
+       'and the model that was asked for, so the gap is visible')
+    ok(startedWith.length === 0, `and starts NOTHING (${startedWith.length})`)
+    ok(asked() === 0, 'without ever opening the approval dialog')
+    ok(patches.some((p) => p.patch.decomposition && (p.patch.decomposition as { rule?: string }).rule === 'spawn-model'),
+       'and records the refusal, so a session that then did the work alone does not look adaptive')
+  }
+
+  // The EFFECTIVE model is gated, not just the named one: a spec that names
+  // nothing inherits the default for new sessions, and unticking that default
+  // is the user saying "not even on my default".
+  {
+    const { g, startedWith } = makeGated(() => ['deepseek-chat'], { model: 'opus-5' })
+    const r = await g.split('sess-parent', specs())
+    ok(r.ok === false, 'a split that would run on the disallowed DEFAULT is refused')
+    ok(r.ok === false && /default for new sessions/.test(r.message),
+       `and says the default is what it would have run on (${r.ok === false ? r.message : 'it ran'})`)
+    ok(startedWith.length === 0, `and starts NOTHING (${startedWith.length})`)
+  }
+
+  // No name and no explicit default is the pre-policy behaviour, untouched: the
+  // gate can only compare what it knows, and inventing a refusal for a model
+  // the runtime has not chosen yet would break every ordinary split.
+  {
+    const { g, startedWith } = makeGated(() => ['deepseek-chat'])
+    const r = await g.split('sess-parent', specs())
+    ok(r.ok === true && startedWith.length === 2,
+       `a split naming nothing, with no default set, still runs (${r.ok ? 'yes' : r.message})`)
+  }
+
+  // An EMPTY allowed set is the user having unticked every model: no spawned
+  // agent is sanctioned, so every split is refused — even one that names
+  // nothing at all.
+  {
+    const { g, startedWith } = makeGated(() => [])
+    const r = await g.split('sess-parent', specs([{ model: 'opus-5' }]))
+    ok(r.ok === false && /no model is allowed/i.test(r.message),
+       `an empty allowlist refuses the split outright (${r.ok === false ? r.message : 'it ran'})`)
+    ok(startedWith.length === 0, `and starts NOTHING (${startedWith.length})`)
+    const r2 = await g.split('sess-parent', specs())
+    ok(r2.ok === false, 'even one that names no model at all')
+  }
+
+  // No policy supplied — a host too old, or the unit tests above — is no gate,
+  // which is the behaviour every existing split test depends on.
+  {
+    const { g, startedWith } = makeGated(undefined as never)
+    const r = await g.split('sess-parent', specs([{ model: 'claude-from-the-future' }]))
+    ok(r.ok === true, 'with no allowlist supplied, a named model is not gated')
+    ok(startedWith.length === 2, 'and the split runs as it always did')
+  }
+}
 {
   const b = buildBrief(DEFAULT_BOARD, 'Do two things', 'task/x')
   ok(b.includes('split_task'), 'the brief names the split tool')
   ok(/unrelated/i.test(b), 'and the condition that justifies it')
   ok(/before you change anything/i.test(b), 'and that it has to happen before any edits')
+  // The spawn allowlist, named in the same paragraph. The brief is baked at
+  // launch; the gate re-reads the policy at split time, so this sentence can
+  // only ever be a stale but honest answer, never a wrong one that passes.
+  ok(buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, true, ['haiku-5'])
+    .includes('Spawned agents may only run on: haiku-5'),
+  'with an allowlist, the brief names the models a spawned agent may run on')
+  ok(buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, true, [])
+    .includes('will be refused'),
+  'and an empty allowlist says splitting will be refused rather than inviting a doomed call')
+  ok(!buildBrief(DEFAULT_BOARD, 'T', 'task/x').includes('Spawned agents'),
+     'without an allowlist the brief says nothing about models')
+  ok(!buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, false, ['haiku-5']).includes('Spawned agents'),
+     'and a session that cannot split is not told about spawn models either')
 }
 
 // --- the tools' side of a run is actually wired up ---------------------------

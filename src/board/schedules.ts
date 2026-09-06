@@ -37,6 +37,13 @@ export interface Schedule {
   days: number[]
   enabled: boolean
   createdAt: number
+  /**
+   * The card title of the agent session that created this schedule, when an
+   * agent did. Absent on user-created schedules — the settings page marks only
+   * the ones an agent made, so the user can tell whose word they are taking
+   * when a run they did not write fires.
+   */
+  createdBy?: string
   /** When the last fire was ATTEMPTED. The anchor for `nextFireAt`, and the
    *  thing that makes catch-up fire once rather than once per missed day. Set
    *  before the attempt, so a crash between persist and start costs one day's
@@ -108,6 +115,7 @@ export function parseSchedules(raw: unknown): Schedule[] {
       enabled: o.enabled !== false,
       createdAt,
     }
+    if (typeof o.createdBy === 'string' && o.createdBy.trim()) s.createdBy = o.createdBy.trim().slice(0, 200)
     if (typeof o.lastFiredAt === 'number' && Number.isFinite(o.lastFiredAt)) s.lastFiredAt = o.lastFiredAt
     const lr = o.lastRun as Record<string, unknown> | undefined
     if (lr && typeof lr === 'object' && typeof lr.at === 'number' && Number.isFinite(lr.at)) {
@@ -140,4 +148,56 @@ export function describeWhen(s: Pick<Schedule, 'hour' | 'minute' | 'days'>): str
   }
   parts.push(start === prev ? DAY_NAMES[start]! : `${DAY_NAMES[start]}–${DAY_NAMES[prev]!}`)
   return `${parts.join(', ')} at ${time}`
+}
+
+/**
+ * The fields a schedule creator names; the host assigns the id and stamps
+ * `createdAt` (and `createdBy` when the creator is an agent).
+ */
+export interface ScheduleDraft {
+  title: string
+  prompt: string
+  hour: number
+  minute: number
+  days: number[]
+  enabled: boolean
+}
+
+/**
+ * A schedule draft read off the board tools — parsed, never cast.
+ *
+ * The in-process MCP path gets zod validation free, but the socket bridge
+ * (Codex) enforces the advertised schema at the transport and this is still the
+ * host's last word: a future transport, a drift in the schema, or a runtime
+ * that does not enforce its own published JSON Schema all land here, and a
+ * schedule that fires sessions with a bill is not the thing to validate with
+ * prose. Every refusal names the field and the fix, because the tool result is
+ * the one message the agent reads at the moment it acts.
+ *
+ * Bounds deliberately match `parseSchedules`' own: a draft that would not
+ * survive a read-back is refused rather than written and then silently dropped.
+ */
+export function parseScheduleDraft(raw: unknown): { ok: true; draft: ScheduleDraft } | { ok: false; message: string } {
+  const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const title = typeof o.title === 'string' ? o.title.trim() : ''
+  if (!title) return { ok: false, message: 'A schedule needs a title — it becomes the fired session\'s card title.' }
+  if (title.length > 200) return { ok: false, message: 'The title is longer than 200 characters — shorten it.' }
+  const prompt = typeof o.prompt === 'string' ? o.prompt : ''
+  if (!prompt.trim()) return { ok: false, message: 'A schedule needs an instruction — it is the prompt the fired session starts with.' }
+  if (prompt.length > 20_000) return { ok: false, message: 'The instruction is longer than 20,000 characters — shorten it.' }
+  const hour = typeof o.hour === 'number' && Number.isInteger(o.hour) && o.hour >= 0 && o.hour <= 23 ? o.hour : -1
+  if (hour === -1) return { ok: false, message: '`hour` must be an integer 0–23, local wall-clock time.' }
+  const minute = typeof o.minute === 'number' && Number.isInteger(o.minute) && o.minute >= 0 && o.minute <= 59 ? o.minute : -1
+  if (minute === -1) return { ok: false, message: '`minute` must be an integer 0–59.' }
+  const days = Array.isArray(o.days)
+    ? [...new Set(o.days.filter((d): d is number =>
+        typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 6))]
+    : []
+  if (!days.length) {
+    return { ok: false, message: '`days` must list at least one day (0 = Sunday … 6 = Saturday) — a schedule with no days never fires.' }
+  }
+  return {
+    ok: true,
+    draft: { title, prompt, hour, minute, days, enabled: o.enabled !== false },
+  }
 }

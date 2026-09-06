@@ -22,6 +22,7 @@ import { z } from 'zod'
 import type { SessionStore } from '../sessions/store.ts'
 import { isHumanOnly, isReviewColumn, isStartedColumn, type BoardConfig } from '../board/config.ts'
 import { normaliseTestPlan, normaliseTitle } from '../sessions/meta.ts'
+import { describeWhen, parseScheduleDraft, type Schedule, type ScheduleDraft } from '../board/schedules.ts'
 import { loadSdk } from './sdk.ts'
 
 /** The MCP namespace these tools are mounted under; `mcpServers: { board: … }`. */
@@ -58,11 +59,21 @@ export interface SubtaskProposal {
   /** Files this piece expects to touch. Checked host-side; see `checkProposal`. */
   scope?: string[]
   tags?: string[]
+  /** The model this subtask asks to run on. Gated host-side by the spawn
+   *  allowlist — the description below only names the allowed set. */
+  model?: string
 }
 
 export type SplitOutcome =
   | { ok: true; started: { key: string; title: string; branch: string }[] }
   | { ok: false; message: string }
+
+/** What `schedule_create` gets back: the id the list and delete tools key on. */
+export type ScheduleCreateOutcome =
+  | { ok: true; id: string }
+  | { ok: false; message: string }
+
+export type ScheduleActOutcome = { ok: boolean; message?: string }
 
 export interface BoardToolContext {
   store: SessionStore
@@ -90,6 +101,13 @@ export interface BoardToolContext {
    */
   onSplit?: (subtasks: SubtaskProposal[], reason: string) => Promise<SplitOutcome>
   /**
+   * The models a spawned agent may run on — the host's spawn allowlist, read
+   * fresh when the tools are built. Named in `split_task`'s description and
+   * schema; the actual gate is behind `onSplit`, in `AgentManager.split()`.
+   * Absent means no policy, and the tool says nothing about models.
+   */
+  spawnModels?: string[]
+  /**
    * Rename this session's card.
    *
    * A callback rather than a `store.rename()` from in here, because the title
@@ -111,6 +129,33 @@ export interface BoardToolContext {
    * it has just learned enough to name the thing.
    */
   derivedTitle?: () => string | undefined
+  /**
+   * The card's CURRENT title. Unlike `derivedTitle` it never goes undefined
+   * after a rename — `schedule_list` marks a schedule "you created this" by
+   * comparing its `createdBy` stamp against this string, and the stamp is the
+   * title at creation time, so a rename mid-session must not make the agent's
+   * own schedules look like someone else's.
+   */
+  sessionTitle?: () => string | undefined
+  /**
+   * The board's scheduled runs, behind callbacks into the host.
+   *
+   * The schedules themselves are host state (workspace storage beside the
+   * board's sidecar); the manager supplies the callbacks and the tool handlers
+   * fence them with `parseScheduleDraft`, because a schedule that fires a
+   * session with a bill is not the thing to validate with prose. Absent in the
+   * noop contexts (`boardToolNames`) and in a workspace with no manager — the
+   * handlers say so rather than pretend.
+   */
+  onScheduleList?: () => Promise<Schedule[]> | Schedule[]
+  /**
+   * `createdBy` is supplied here, from `sessionTitle` — the stamp is the one
+   * fact only this context knows, and the settings page reads it back to mark
+   * the schedule as this agent's.
+   */
+  onScheduleCreate?: (draft: ScheduleDraft, createdBy: string) => Promise<ScheduleCreateOutcome>
+  onScheduleDelete?: (id: string) => Promise<ScheduleActOutcome>
+  onScheduleRun?: (id: string) => Promise<ScheduleActOutcome>
 }
 
 type Content = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -370,6 +415,20 @@ export function buildBoardTools(
       'When this returns successfully your job is finished — say what you split and',
       'why, and STOP. Do not start doing one of the subtasks yourself; an agent is',
       'already on it.',
+      // The allowlist, named here because an agent can only ask for what it has
+      // been told exists. The fence itself is behind `onSplit` — a description
+      // that changes mid-session or a model that ignores it cannot make a
+      // disallowed spawn happen.
+      ...(ctx.spawnModels
+        ? [
+            '',
+            ctx.spawnModels.length
+              ? 'A subtask may name a `model` it runs on — one of: ' + ctx.spawnModels.join(', ') + '. ' +
+                'The host refuses any other id, and a subtask that names none runs on the default for new sessions.'
+              : 'No model is currently allowed for spawned agents, so this tool will be refused. ' +
+                'Ask the user to re-tick a model on the settings page.',
+          ]
+        : []),
     ].join('\n'),
     {
       reason: z
@@ -392,6 +451,16 @@ export function buildBoardTools(
                 'the split was right.',
               ),
             tags: z.array(z.string()).optional().describe('Tags for the subtask\'s card.'),
+            // Offered only when there is a policy to name — a field the host has
+            // no gate for would be a control that cannot say no.
+            ...(ctx.spawnModels?.length
+              ? {
+                  model: z.string().optional().describe(
+                    'A model id for this subtask — one of: ' + ctx.spawnModels.join(', ') + '. ' +
+                    'Anything else is refused.',
+                  ),
+                }
+              : {}),
           }),
         )
         .describe('At least 2, at most 4 — and fewer if this card is set to a lower ' +
@@ -406,8 +475,16 @@ export function buildBoardTools(
       // will see it ("Shown when they approve the split") and the handler used
       // to call `onSplit(args.subtasks)` — so the one sentence explaining why a
       // card became four billed agents reached nothing at all, and the approval
-      // prompt rendered the bare string `split_task`.
-      const result = await ctx.onSplit(args.subtasks ?? [], args.reason ?? '')
+      // prompt rendered the bare string `split_task`. The model id is kept
+      // string-or-absent at this boundary — the gate behind `onSplit` is the
+      // fence, but a junk-typed id must not even reach it.
+      const result = await ctx.onSplit(
+        (args.subtasks ?? []).map(({ model, ...rest }) => ({
+          ...rest,
+          ...(typeof model === 'string' && model.trim() ? { model: model.trim() } : {}),
+        })),
+        args.reason ?? '',
+      )
       if (!result.ok) return err(result.message)
       const lines = result.started.map((s) => `  - ${s.title}  [${s.branch}]`)
       return ok(
@@ -450,23 +527,155 @@ export function buildBoardTools(
     },
   )
 
-  return [setPhase, setTitle, setTags, listBoard, splitTask, notifyUser]
+  const scheduleLine = (s: Schedule): string => {
+    const when = describeWhen(s)
+    const flags: string[] = []
+    if (!s.enabled) flags.push('paused')
+    if (s.lastRun && !s.lastRun.ok) {
+      flags.push(`last run did not start${s.lastRun.note ? `: ${s.lastRun.note}` : ''}`)
+    }
+    const mine = ctx.sessionTitle?.()
+    if (mine && s.createdBy && s.createdBy === mine) flags.push('you created this')
+    else if (s.createdBy) flags.push(`created by "${s.createdBy}"`)
+    else flags.push('user-created')
+    return `  ${s.id}  ${s.title} — ${when}${flags.length ? `  [${flags.join('; ')}]` : ''}`
+  }
+
+  const listSchedules = tool(
+    'schedule_list',
+    [
+      'List the board\'s scheduled runs — time triggers that start NEW agent sessions',
+      'with a fixed instruction at a set time on set days.',
+      '',
+      'The id of each is what `schedule_run` and `schedule_delete` key on. Read',
+      'this before creating one, so you do not duplicate a trigger that already',
+      'exists.',
+    ].join('\n'),
+    {},
+    async () => {
+      if (!ctx.onScheduleList) return err('Scheduled runs are not available in this workspace.')
+      const all = await ctx.onScheduleList()
+      if (!all.length) return ok('No schedules yet. `schedule_create` adds one.')
+      return ok(
+        [
+          'Schedules (id — title — when, and whose):',
+          ...all.map(scheduleLine),
+        ].join('\n'),
+      )
+    },
+    { annotations: { readOnlyHint: true }, searchHint: 'scheduled runs' },
+  )
+
+  const createSchedule = tool(
+    'schedule_create',
+    [
+      'Create a time trigger that starts a NEW agent session — a real process',
+      'with a real bill — at a set time on set days.',
+      '',
+      'The fired session starts with `prompt` as its full instruction, in its own',
+      'git worktree, and appears on the board like any other card.',
+      '',
+      'A schedule fires only while this window (the extension) is open. A moment',
+      'that passed while it was closed is caught up once at the next check — never',
+      'once per missed day.',
+      '',
+      'The user is asked before this tool runs, and every schedule you create is',
+      'on the settings page marked as yours. If a trigger outlives its purpose,',
+      '`schedule_delete` it yourself rather than leaving it to fire sessions the',
+      'user did not ask for.',
+    ].join('\n'),
+    {
+      title: z.string().describe('A name for the schedule — it becomes the fired session\'s card title.'),
+      prompt: z
+        .string()
+        .describe('The instruction the fired session starts with. Complete on its own, like a ' +
+          'kanban-card brief: what to do, where, what done looks like.'),
+      hour: z.number().int().min(0).max(23).describe('Local wall-clock hour, 0–23.'),
+      minute: z.number().int().min(0).max(59).describe('Local wall-clock minute, 0–59.'),
+      days: z
+        .array(z.number().int().min(0).max(6))
+        .min(1)
+        .describe('The weekdays to fire on: 0 = Sunday, 1 = Monday, … 6 = Saturday.'),
+      enabled: z.boolean().optional().describe('Defaults to true. Set false to create it paused.'),
+    },
+    async (args) => {
+      if (!ctx.onScheduleCreate) return err('Scheduled runs are not available in this workspace.')
+      // The fence, for every transport: the in-process path gets zod validation
+      // free, but a schedule that fires billed sessions is not validated with
+      // prose, and the socket bridge must not be the one transport where a
+      // model-written time reaches the store unchecked.
+      const parsed = parseScheduleDraft(args)
+      if (!parsed.ok) return err(parsed.message)
+      const result = await ctx.onScheduleCreate(parsed.draft, ctx.sessionTitle?.() ?? '')
+      if (!result.ok) return err(result.message)
+      return ok(
+        `Created "${parsed.draft.title}" (id ${result.id}) — ${describeWhen(parsed.draft)}, ` +
+        `${parsed.draft.enabled ? 'enabled' : 'paused'}. It is on the settings page; pause or ` +
+        'remove it there.',
+      )
+    },
+  )
+
+  const deleteSchedule = tool(
+    'schedule_delete',
+    [
+      'Delete a scheduled run by id, from `schedule_list`.',
+      '',
+      'Use it to clean up a trigger that outlived its purpose — in particular one',
+      'YOU created. Do not delete a schedule the user made without asking them:',
+      'the list marks who created each one.',
+    ].join('\n'),
+    { id: z.string().describe('The schedule id, exactly as `schedule_list` printed it.') },
+    async (args) => {
+      if (!ctx.onScheduleDelete) return err('Scheduled runs are not available in this workspace.')
+      const result = await ctx.onScheduleDelete(String(args.id).trim())
+      return result.ok ? ok('Schedule deleted.') : err(result.message ?? 'Could not delete it.')
+    },
+  )
+
+  const runSchedule = tool(
+    'schedule_run',
+    [
+      'Start a scheduled run NOW, by id from `schedule_list`, without waiting for',
+      'its next time. A session starts immediately and is billed like any other.',
+      '',
+      'Running it now counts as its fire for this moment: the schedule itself is',
+      'unchanged, and the next automatic fire happens at the next scheduled',
+      'moment after now. The user is asked before this tool runs.',
+    ].join('\n'),
+    { id: z.string().describe('The schedule id, exactly as `schedule_list` printed it.') },
+    async (args) => {
+      if (!ctx.onScheduleRun) return err('Scheduled runs are not available in this workspace.')
+      const result = await ctx.onScheduleRun(String(args.id).trim())
+      return result.ok
+        ? ok('Run started — the new session is on the board.')
+        : err(result.message ?? 'The run did not start.')
+    },
+  )
+
+  return [
+    setPhase, setTitle, setTags, listBoard, splitTask, notifyUser,
+    listSchedules, createSchedule, deleteSchedule, runSchedule,
+  ]
 }
 
 /**
  * Board tools that are NOT auto-allowed — the user is asked first.
  *
- * `split_task` starts other agents, and an agent is a process with a bill. That
- * is a decision worth one click, and the existing permission prompt already
- * renders it ("Claude wants to run split_task: Add SSO + Fix the flaky test"),
- * so it needs no new surface. Everything else here only writes to our own
- * sidecar and is auto-allowed, because an agent that has to ask permission to
- * move its own card cannot keep the board honest.
+ * `split_task` starts other agents, `schedule_create` arranges for billed
+ * sessions to start later, and `schedule_run` starts one right now — an agent
+ * is a process with a bill, whether it starts in ten seconds or on Tuesday.
+ * `schedule_delete` is here for the other reason a click is worth it: it
+ * removes a record the user made by hand. All four ride the existing permission
+ * prompt ("Claude wants to run schedule_create: …"), so they need no new
+ * surface. Everything else here only writes to our own sidecar and is
+ * auto-allowed, because an agent that has to ask permission to move its own
+ * card cannot keep the board honest.
  *
  * Under `dontAsk` or `bypassPermissions` this is not consulted, as with any
  * other tool — that is what those modes mean.
  */
-export const ASKS_FIRST = new Set(['split_task'])
+export const ASKS_FIRST = new Set(['split_task', 'schedule_create', 'schedule_delete', 'schedule_run'])
 
 /**
  * The fully-qualified names of the board tools.

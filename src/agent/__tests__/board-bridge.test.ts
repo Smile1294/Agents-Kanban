@@ -99,12 +99,21 @@ async function main(): Promise<void> {
     childrenOf: async () => [],
     patch: async () => {},
   }
+  const createdSchedules: unknown[] = []
   const ctx: BoardToolContext = {
     store: store as never,
     key: () => 'session-1',
     onChanged: () => {},
     onRename: (t: string) => { title = t; return { renamed: true } },
     derivedTitle: () => 'guessed from the prompt',
+    sessionTitle: () => 'session-1',
+    onScheduleList: async () => [],
+    onScheduleCreate: async (draft, createdBy) => {
+      createdSchedules.push({ draft, createdBy })
+      return { ok: true, id: 'sched-1' }
+    },
+    onScheduleDelete: async () => ({ ok: true }),
+    onScheduleRun: async () => ({ ok: true }),
   }
 
   const bridge = await startBoardBridge(DEFAULT_BOARD, ctx, { dir, script })
@@ -113,6 +122,9 @@ async function main(): Promise<void> {
   // tool deliberately left off it.
   ok(bridge.autoAllow.includes('mcp__board__set_phase'), 'set_phase is auto-allowed')
   ok(!bridge.autoAllow.some((n) => n.endsWith('split_task')), 'split_task still asks first')
+  ok(bridge.autoAllow.some((n) => n.endsWith('schedule_list')), 'schedule_list is auto-allowed — reading triggers costs nothing')
+  ok(!bridge.autoAllow.some((n) => n.endsWith('schedule_create') || n.endsWith('schedule_run') || n.endsWith('schedule_delete')),
+    'the tools that create, fire or delete a trigger still ask first')
 
   const client = new McpClient(bridge.descriptor.command, bridge.descriptor.args, bridge.descriptor.env)
 
@@ -145,6 +157,36 @@ async function main(): Promise<void> {
   const renamed = await client.send('tools/call', { name: 'set_title', arguments: { title: 'Drive Codex from the board' } })
   ok(title === 'Drive Codex from the board', `set_title renamed the card (title is now "${title}")`)
   ok(!(renamed.result as { isError?: boolean })?.isError, 'set_title reported success')
+
+  // --- the schedule tools cross the socket too -------------------------------
+  //
+  // A schedule fires a session with a bill, so it gets the same double boundary
+  // as every other tool here: the auto-allow list leaves it out (above), and
+  // the handler fence refuses junk the transport's schema cannot see. The
+  // transport validates SHAPE; a schema-valid empty title is still junk, and
+  // the fence is the one thing that catches it on every transport.
+  {
+    const made = await client.send('tools/call', {
+      name: 'schedule_create',
+      arguments: { title: 'Bug patrol', prompt: 'Fix them.', hour: 9, minute: 0, days: [1, 2] },
+    })
+    ok(createdSchedules.length === 1, 'a schedule_create over the socket reached the REAL host callback')
+    ok(!(made.result as { isError?: boolean })?.isError, `and reported success (${textOf(made.result)})`)
+    const draft = (createdSchedules[0] as { draft: { title?: string; days?: number[] } }).draft
+    ok(draft?.title === 'Bug patrol' && draft?.days?.join(',') === '1,2',
+      'with the draft it named, not a paraphrase')
+    ok((createdSchedules[0] as { createdBy?: string }).createdBy === 'session-1',
+      'and the creator stamp rides along, so the settings page can mark it')
+
+    const emptyTitle = await client.send('tools/call', {
+      name: 'schedule_create',
+      arguments: { title: '', prompt: 'x', hour: 9, minute: 0, days: [1] },
+    })
+    ok(createdSchedules.length === 1,
+      'a schema-valid but empty title never reaches the host — the handler fence, not just the transport')
+    ok((emptyTitle.result as { isError?: boolean })?.isError === true,
+      'and comes back as a tool error the agent can act on')
+  }
 
   // --- the boundary ---------------------------------------------------------
   // `complete` is humanOnly. The guard lives in the host, on our side of the

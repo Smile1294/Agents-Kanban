@@ -21,7 +21,7 @@ import {
   type UiCard, type UiState,
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
-import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
+import { MetaStore, EFFORT_LEVELS, MODELS, resolveOrchestration, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, type ModelBook, type ModelFacts } from './sessions/usage.ts'
 import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
 import { searchEntries } from './sessions/search.ts'
@@ -44,12 +44,13 @@ import {
   type ProviderEnv, type ProviderProfile,
 } from './agent/providers.ts'
 import { probeProvider } from './agent/probe.ts'
+import { allowedSpawnModels, parseSpawnPolicy, toggledSpawn, type SpawnPolicy } from './agent/spawn-policy.ts'
 import {
   fetchEndpointModels, parseEndpointModels, type EndpointModel,
 } from './agent/endpoint.ts'
 import {
   collectRuntimeStatus, SettingsPanel,
-  type RemoteState, type ScheduleRowState, type SettingsHost, type SettingsMessage,
+  type ScheduleRowState, type SettingsHost, type SettingsMessage,
   type SettingsState,
 } from './board/settings.ts'
 import {
@@ -70,7 +71,7 @@ import { toRemoteCard } from './remote/cards.ts'
 import './agent/runtimes/index.ts'
 import {
   allRuntimes, DEFAULT_RUNTIME, getRuntime, parseRuntimeId,
-  type LoginState, type Meter, type RuntimeId, type RuntimeStatus,
+  type Meter, type RuntimeId, type RuntimeStatus,
 } from './agent/runtime.ts'
 import {
   ALL_EFFORTS, catalogueFor, discoverModels, effortsFor, fastModeFor, parseCachedChoices,
@@ -1176,6 +1177,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           when: describeWhen(s),
           ...(nextAt !== undefined ? { nextAt } : {}),
           ...(s.lastRun ? { lastRun: s.lastRun } : {}),
+          ...(s.createdBy ? { createdBy: s.createdBy } : {}),
         }
       }),
     }
@@ -1490,6 +1492,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         providers: providers.map((p) => {
           const served = p.kind === 'gateway' ? cachedEndpoint(p.id) : []
           const offered = new Set(p.models ?? [])
+          // The spawn allowlist's per-model tick, alongside "offered in the
+          // composer" — the two are separate choices on purpose: what the
+          // composer shows, and what a spawned agent may bill.
+          const spawnBlocked = new Set(readSpawnPolicy()[p.id] ?? [])
           return {
             id: p.id,
             label: profileLabel(p),
@@ -1506,6 +1512,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     context: windowLabel(m.contextWindow ?? p.contextWindow),
                     ...(priceLabel(m.rate) ? { price: priceLabel(m.rate)! } : {}),
                     offered: offered.has(m.id),
+                    spawnAllowed: !spawnBlocked.has(m.id),
                   })),
                 }
               : {}),
@@ -1706,6 +1713,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (msg.models.length) next.models = msg.models
           else delete next.models
           await saveProfiles(providers.map((x) => (x.id === next.id ? next : x)))
+          return
+        }
+        case 'setSpawnAllowed': {
+          const p = providers.find((x) => x.id === msg.id)
+          if (!p) return
+          await state.update(
+            SPAWN_POLICY_KEY,
+            toggledSpawn(readSpawnPolicy(), msg.id, msg.modelId, msg.allowed),
+          )
+          // The board itself needs no repaint — the policy is read fresh at
+          // split time — but the tick must not appear stale on this page.
+          void SettingsPanel.refreshIfOpen()
           return
         }
         case 'openSetting':
@@ -2013,6 +2032,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return ws
   }
 
+  /* The spawn allowlist: which models an agent-SPLIT session may run on.
+     Workspace state rather than settings, like `provider` above it — it is a
+     policy about THIS board's spawned agents, not a credential or a profile
+     that should follow the user's machines. The DISALLOWED half is what is
+     stored (absence means allowed); the parsing and toggling arithmetic live
+     in `agent/spawn-policy.ts` because "anything read back out of storage is
+     parsed, not cast", and a parse with no unit test is a parse that has
+     already been shown to lose fields. */
+  const SPAWN_POLICY_KEY = 'spawnPolicy'
+  const readSpawnPolicy = (): SpawnPolicy => parseSpawnPolicy(state.get(SPAWN_POLICY_KEY))
+  /** Everything the ACTIVE backend offers, minus what the user unticked.
+   *  Composed in exactly one place — the manager gates on this list, the tool
+   *  descriptions name it, and the refusal repeats it, so three consumers
+   *  cannot drift into three answers. */
+  const spawnAllowedList = (): string[] =>
+    allowedSpawnModels(readSpawnPolicy(), providerId, catalogue.choices.map((m) => m.id))
+
   const ensureManager = (): AgentManager => {
     const w = requireWs()
     if (!w.worktrees) {
@@ -2040,6 +2076,58 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         provider: currentProvider(),
         providerEnv,
         modelBook: modelBook(),
+        // The models a spawned agent may run on, read FRESH at split time —
+        // the settings page can change the policy between sessions, and the
+        // gate in `split()` is the one place it is enforced.
+        spawnModels: spawnAllowedList,
+        // The board's scheduled runs, bound once for every session. The tool
+        // handlers have already fenced the args with `parseScheduleDraft` —
+        // that fence is host-side code in every transport, in-process and
+        // through the socket bridge alike — so what lands here is a draft, not
+        // a suggestion. The schedules themselves are the closure state the
+        // settings page reads; `saveSchedules` keeps the store and the
+        // in-memory list in step, as everywhere else in this file.
+        schedules: {
+          list: () => schedules,
+          create: async (draft, createdBy) => {
+            const s: Schedule = {
+              id: crypto.randomUUID(),
+              title: draft.title, prompt: draft.prompt, hour: draft.hour,
+              minute: draft.minute, days: draft.days, enabled: draft.enabled,
+              createdAt: Date.now(),
+              ...(createdBy.trim() ? { createdBy: createdBy.trim() } : {}),
+            }
+            await saveSchedules([...schedules, s])
+            void SettingsPanel.refreshIfOpen()
+            refreshAll()
+            // Same semantics as the settings-page save: a schedule whose time
+            // has already passed today starts TOMORROW, not in the next sixty
+            // seconds — the agent is setting up a future run. The 60s tick
+            // handles anything that is genuinely due.
+            log.info(`Agent-created schedule "${s.title}" (${s.id}) at ${describeWhen(s)}`)
+            return { ok: true, id: s.id }
+          },
+          remove: async (id) => {
+            const hit = schedules.find((s) => s.id === id)
+            if (!hit) return { ok: false, message: `No schedule with id "${id}". \`schedule_list\` prints the ids.` }
+            await saveSchedules(schedules.filter((s) => s.id !== id))
+            void SettingsPanel.refreshIfOpen()
+            refreshAll()
+            return { ok: true }
+          },
+          run: async (id) => {
+            const hit = schedules.find((s) => s.id === id)
+            if (!hit) return { ok: false, message: `No schedule with id "${id}". \`schedule_list\` prints the ids.` }
+            if (!canRunScheduled()) {
+              return {
+                ok: false,
+                message: 'A scheduled run needs a folder with a git repo open — a session must start in a worktree.',
+              }
+            }
+            await fireScheduleNow(hit, true)
+            return { ok: true }
+          },
+        },
         // The boundary in CODE for fanning one card out into N billed agents.
         //
         // `split_task` is excluded from the auto-allow list, and that exclusion
@@ -2054,7 +2142,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // this starts processes that cost money. Dismissing it is a refusal —
         // `showWarningMessage` resolves undefined, which is not the button.
         confirmSplit: async (parent, subtasks, reason) => {
-          const titles = subtasks.map((t, i) => `${i + 1}. ${t.title}`).join('\n')
+          // The model each piece asked for rides on its line: the allowlist
+          // gate has already vetted it, and the user approving a split should
+          // see what each of N new bills will run on.
+          const titles = subtasks
+            .map((t, i) => `${i + 1}. ${t.title}${t.model ? ` — ${t.model}` : ''}`)
+            .join('\n')
           const choice = await vscode.window.showWarningMessage(
             `"${parent.title}" wants to split into ${subtasks.length} subtasks, each its own agent in its own worktree.`,
             {

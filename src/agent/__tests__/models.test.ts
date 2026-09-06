@@ -17,8 +17,9 @@
  * rather than setting them false).
  */
 import {
-  ALL_EFFORTS, catalogueFor, effortsFor, fastModeFor, mergeModels, parseCachedChoices,
-  priceLabel, thinkingFor, toChoices, ultracodeFor, type SdkModelInfo,
+  ALL_EFFORTS, catalogueFor, effortsFor, endpointChoices, fastModeFor, mergeModels,
+  modelsForProfile, parseCachedChoices, priceLabel, thinkingFor, toChoices,
+  ultracodeFor, type SdkModelInfo,
 } from '../models.ts'
 import type { EndpointModel } from '../endpoint.ts'
 import type { ProviderProfile } from '../providers.ts'
@@ -306,6 +307,60 @@ const by = (id: string) => choices.find((c) => c.id === id)
   ok(compose(declares(), []).source === 'builtin',
      'with no declaration and no CLI answer, the built-in list is the floor')
   ok(compose(declares(), []).choices.length === builtin.length, 'and it is not empty')
+}
+
+// --- endpoint models have NO capabilities until someone says so --------------
+//
+// The effort dial is Anthropic's reasoning effort. `deepseek-v4-pro` has no
+// such dial, and the composer was showing it the full low…max picker and an
+// Extended-thinking toggle anyway — controls that cannot say no, which is the
+// same class of bug as a spinner over a wedged process. The endpoint's model
+// list carries no capability fields, so nothing here is known-true, and the
+// composer gates every capability on `=== true`: unknown renders as ABSENT,
+// and the controls disappear. This section is the gate for that.
+{
+  const endpoint: EndpointModel[] = [
+    { id: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro', contextWindow: 161_000, rate: { input: 0.28, output: 0.42 } },
+  ]
+  const got = endpointChoices(endpoint, undefined, windowLabel)
+  ok(got.length === 1 && got[0]!.efforts.length === 0,
+     'an endpoint model is offered NO effort levels — the dial disappears')
+  ok(got[0]!.thinking === false, 'and no extended-thinking toggle')
+  ok(got[0]!.ultracode === false && got[0]!.fastMode === false,
+     'and neither ultracode nor fast mode')
+  ok(got[0]!.rate?.input === 0.28, 'while the price the endpoint DID publish still arrives')
+
+  // A profile-declared list: capabilities come from the KNOWN match, or not at
+  // all. A Bedrock id normalises to a Claude model, whose capabilities are real
+  // knowledge and carry over; an id nothing knows gets none.
+  const known = MODELS.map((m) => ({
+    ...m, efforts: [...ALL_EFFORTS], thinking: true, ultracode: false, fastMode: false,
+  }))
+  const declared = modelsForProfile(
+    { models: ['us.anthropic.claude-opus-5', 'deepseek-v4-pro'] },
+    known, normaliseModel, MODEL_WINDOWS, windowLabel,
+  )
+  const opus = declared.find((c) => c.id === 'us.anthropic.claude-opus-5')
+  const deepseek = declared.find((c) => c.id === 'deepseek-v4-pro')
+  ok(opus?.efforts.length === ALL_EFFORTS.length && opus.thinking === true,
+     'a Bedrock id that normalises to a known model keeps the model’s real capabilities')
+  ok(deepseek?.efforts.length === 0 && deepseek.thinking === false,
+     'an id nothing knows gets none — the controls disappear, they do not grey out')
+
+  // And the composition the host actually runs: a gateway serving DeepSeek ends
+  // in a catalogue whose choices carry no capabilities, so the composer shows
+  // no dial for any of them.
+  const composed = catalogueFor(
+    { models: ['deepseek-v4-pro'] },
+    choices, known,
+    { normaliseModel, windows: MODEL_WINDOWS, windowLabel },
+    undefined,
+    { models: endpoint },
+  )
+  ok(composed.source === 'profile',
+     'the declared list is in force — the endpoint serves what it declares (source: ' + composed.source + ')')
+  ok(composed.choices.every((c) => c.efforts.length === 0 && c.thinking === false),
+     'and every choice in it has no effort and no thinking — the composer has nothing to render')
 }
 
 // --- the ultracode read-back ------------------------------------------------

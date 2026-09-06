@@ -13,7 +13,7 @@
  */
 import { loadSdk, resolveClaudeExecutable, type Options, type PermissionResult, type Query, type SDKMessage, type SDKUserMessage } from './sdk.ts'
 import {
-  contextOfUsage, costOfUsage, mainWindowOf, windowFor, SYNTHETIC_MODEL,
+  contextOfUsage, costOfUsage, mainWindowOf, sameUsage, windowFor, SYNTHETIC_MODEL,
   type ModelBook, type TokenUsage,
 } from '../sessions/usage.ts'
 import { describeImages, userContent, type AttachedImage } from './images.ts'
@@ -331,6 +331,10 @@ export class AgentSession extends EventEmitter implements AgentRun {
    * carried 21 responses. Keying by id makes a repeat frame an overwrite.
    */
   private readonly turnCosts = new Map<string, number>()
+  /** The last frame that carried no `message.id`, so consecutive identical
+   *  ones can be merged exactly like the disk path does (`summariseUsage`).
+   *  The two must agree, or the number on the board changes when a run ends. */
+  private lastNoIdSpend: { key: string; model: string; usage: TokenUsage } | undefined
   /** Turns that have ended, so their cost can no longer change. */
   private billedUsd = 0
   /** Models seen with no published rate. Their tokens are real spend that this
@@ -720,9 +724,27 @@ export class AgentSession extends EventEmitter implements AgentRun {
   private recordSpend(id: string | undefined, model: string | undefined, usage: TokenUsage): void {
     const cost = costOfUsage(model ?? '', usage, this.opts.modelBook)
     if (cost === undefined) this.unpricedModels.add(model || 'unknown')
-    // No id means nothing to deduplicate against, so it is counted once under
-    // a key of its own rather than overwriting the previous response.
-    this.turnCosts.set(id || `@${this.turnCosts.size}`, cost ?? 0)
+    // Same merge as the disk path: frames of one streamed response are
+    // deduplicated by `message.id`, and every frame repeats the same
+    // cumulative usage. With no id, consecutive frames whose usage is
+    // IDENTICAL are one response's blocks — merging them is charge-neutral
+    // (`sameUsage`), it can only undo an overcount — while different usage is
+    // a different response and counts separately.
+    const modelName = model ?? ''
+    let key: string
+    if (id) {
+      this.lastNoIdSpend = undefined
+      key = id
+    } else {
+      const prev = this.lastNoIdSpend
+      if (prev && prev.model === modelName && sameUsage(prev.usage, usage)) {
+        key = prev.key
+      } else {
+        key = `@${this.turnCosts.size}`
+        this.lastNoIdSpend = { key, model: modelName, usage }
+      }
+    }
+    this.turnCosts.set(key, cost ?? 0)
     this.emitSpend()
   }
 
@@ -775,7 +797,8 @@ export class AgentSession extends EventEmitter implements AgentRun {
         this.opts.log?.(
           `Spend estimate is ${(drift * 100).toFixed(0)}% off the billed figure ` +
           `(computed $${this.billedUsd.toFixed(4)}, billed $${billedUsd.toFixed(4)}). ` +
-          `MODEL_RATES in sessions/usage.ts is probably out of date.`,
+          `The rate table is out of date: MODEL_RATES in sessions/usage.ts, or the ` +
+          `prices this model's endpoint published (agentsKanban.providers).`,
         )
       }
     }

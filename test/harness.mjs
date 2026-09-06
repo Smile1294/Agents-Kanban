@@ -402,11 +402,26 @@ export async function makeContext(storage) {
    *  would make "the key went into settings.json" pass. */
   const secretStore = new Map()
   const globalStore = new Map()
+  const workspaceStore = new Map()
   return {
     subscriptions: [],
     extensionUri: { fsPath: repoRoot },
     globalStorageUri: { fsPath: storage ?? (await fs.mkdtemp(path.join(os.tmpdir(), 'ck-storage-'))) },
-    workspaceState: { get: () => undefined, update: async () => {} },
+    /** A REAL store, like `globalState` below it and for the same reason.
+     *
+     *  It was a no-op, so `workspaceState.update()` went nowhere and `get()`
+     *  always came back undefined — which made every workspace-persisted field
+     *  invisible to the launch gate. The spawn allowlist lives there, and the
+     *  rule it must obey is this project's own: anything persisted must be
+     *  READ BACK by a test, not just written. A stub that swallows writes
+     *  cannot fail on that, and did not. */
+    workspaceState: {
+      get: (k, fallback) => (workspaceStore.has(k) ? workspaceStore.get(k) : fallback),
+      update: async (k, v) => { workspaceStore.set(k, v) },
+      keys: () => [...workspaceStore.keys()],
+    },
+    /** Test handle: what survived into workspace storage. */
+    _workspaceState: workspaceStore,
     /** A REAL store, like `secrets` above and for the same reason.
      *
      *  It was a no-op, so every `globalState.update()` went nowhere and every
