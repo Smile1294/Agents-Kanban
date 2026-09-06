@@ -24,6 +24,14 @@
  *     trailing run. The last state always paints; nothing is dropped.
  *  3. Runs never overlap. `run` is async, and a rate limiter that ignores that
  *     just moves the pile-up rather than removing it.
+ *  4. The interval ADAPTS to what a repaint actually costs. A fixed 100ms is a
+ *     budget, not a measurement: it assumes a repaint is cheap, and a repaint
+ *     is O(transcript). A reasoning model's session — measured at 145 entries
+ *     and 121KB of thinking — takes several times longer to build than one with
+ *     six, so ten a second means the host and the webview never finish one
+ *     before the next arrives. That is what "it lags and sometimes crashes"
+ *     looks like. The floor stays `intervalMs`, so a small session is exactly
+ *     as live as before.
  *
  * Pure and timer-injectable, so the behaviour above can be tested without
  * waiting for real time to pass and without VS Code.
@@ -44,6 +52,20 @@ export interface CoalesceDeps {
   setTimeout?: (fn: () => void, ms: number) => unknown
   clearTimeout?: (h: unknown) => void
   onError?: (e: unknown) => void
+  /**
+   * How much of the wall clock repaints may occupy, as a divisor: 4 means a
+   * repaint that takes 40ms is followed by at least 160ms of quiet, so painting
+   * never costs more than a quarter of the time it is trying to describe.
+   *
+   * A share rather than a fixed ceiling because the right answer scales with
+   * the session: six entries stay at the floor, and a 145-entry one backs off
+   * on its own rather than needing a number someone guessed.
+   */
+  dutyCycle?: number
+  /** Never wait longer than this, however slow a repaint is. A board that
+   *  updates twice a second still reads as live; one that updates every four
+   *  seconds reads as broken, which is worse than being slow. */
+  maxIntervalMs?: number
 }
 
 export function coalesce(
@@ -55,19 +77,35 @@ export function coalesce(
   const setT = deps.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
   const clearT = deps.clearTimeout ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>))
 
+  const dutyCycle = deps.dutyCycle ?? 4
+  const maxIntervalMs = deps.maxIntervalMs ?? 500
+
   let timer: unknown
   let inflight: Promise<void> | undefined
   let pending = false
   let lastStart = -Infinity
   let runs = 0
+  /** What the last repaint cost, smoothed. Smoothed rather than taken raw so
+   *  one slow frame — a garbage collection, a cold file read — does not pin the
+   *  board at its slowest rate for the rest of the session. */
+  let cost = 0
+
+  /** How long to leave between repaints, given what they cost. */
+  const gap = (): number =>
+    Math.min(maxIntervalMs, Math.max(intervalMs, Math.round(cost * dutyCycle)))
 
   const start = (): Promise<void> => {
     lastStart = now()
     runs++
+    const began = now()
     const p = Promise.resolve()
       .then(run)
       .catch((e) => deps.onError?.(e))
       .then(() => {
+        // Measured AFTER the run, including everything it awaited: the point is
+        // how long the board is unresponsive, not how long our own code ran.
+        const took = Math.max(0, now() - began)
+        cost = cost === 0 ? took : Math.round(cost * 0.6 + took * 0.4)
         inflight = undefined
         // Anything that asked while this was in flight gets exactly one run,
         // scheduled from here rather than stacked behind it.
@@ -81,7 +119,7 @@ export function coalesce(
     schedule(): void {
       if (inflight) { pending = true; return }
       if (timer !== undefined) return
-      const wait = intervalMs - (now() - lastStart)
+      const wait = gap() - (now() - lastStart)
       if (wait <= 0) { void start(); return }
       timer = setT(() => { timer = undefined; void start() }, wait)
     },

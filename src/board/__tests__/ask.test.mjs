@@ -69,7 +69,11 @@ const src = await boardSource()
 // The picker must not swallow the Allow/Deny prompt it sits beside.
 {
   const v = renderBoardWith(src, stateWith({ id: 'p1', summary: 'Bash — rm -rf build' }))
-  ok(v.text().includes('Claude wants to run'), 'a real permission request still says so')
+  /* The fallback names whatever is RUNNING, not a vendor we are guessing at —
+     it said "Claude wants to run" over a `deepseek-v4-pro` session. */
+  ok(/wants to run/.test(v.text()), 'a real permission request still says so')
+  ok(!v.text().includes('Claude wants to run'),
+     'attributed to the model in front of you rather than to Claude by default')
   ok(!!buttonSaying(v.root, 'Allow'), 'and still offers Allow')
   click(buttonSaying(v.root, 'Allow'))
   const posted = v.posted.filter((m) => m.type === 'permission').pop()
@@ -224,7 +228,7 @@ const ask = { id: 'q1', summary: 'AskUserQuestion', questions: QUESTIONS }
 // depend on that: a blank panel is the worst possible failure here.
 for (const [label, q] of [['missing', undefined], ['empty', []]]) {
   const v = renderBoardWith(src, stateWith({ id: 'p9', summary: 'AskUserQuestion', questions: q }))
-  ok(v.text().includes('Claude wants to run'), `${label} questions fall back to Allow/Deny instead of an empty picker`)
+  ok(/wants to run/.test(v.text()), `${label} questions fall back to Allow/Deny instead of an empty picker`)
 }
 
 console.log(fails === 0 ? 'PASS — questions render, choices survive repaints, and selections are posted' : `${fails} FAILURES`)

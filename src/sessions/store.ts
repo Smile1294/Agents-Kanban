@@ -78,7 +78,18 @@ export type Entry =
        *  already has a postmortem about. */
       images?: number
     }
-  | { kind: 'text'; at: number; text: string }
+  | {
+      kind: 'text'; at: number; text: string
+      /** Which model wrote this block.
+       *
+       *  The transcript header said the literal string "Claude Agent" over
+       *  every answer, including ones produced by `deepseek-v4-pro` on a
+       *  gateway. Naming the SESSION's current model instead would be a
+       *  different lie: a session can change model between turns, and an
+       *  answer from an hour ago was not written by whatever is selected now.
+       *  It is carried per block because that is the only place the truth is. */
+      model?: string
+    }
   | { kind: 'thinking'; at: number; text: string }
   | {
       kind: 'tool'; at: number; id: string; name: string; summary: string
@@ -611,7 +622,11 @@ export class SessionStore {
             if (e?.kind === 'tool') e.status = b.is_error === true ? 'error' : 'ok'
           }
         } else if (m.type === 'assistant' && b.type === 'text' && typeof b.text === 'string') {
-          target.push({ kind: 'text', at, text: b.text })
+          const wrote = (m.message as { model?: unknown } | undefined)?.model
+          target.push({
+            kind: 'text', at, text: b.text,
+            ...(typeof wrote === 'string' && wrote ? { model: wrote } : {}),
+          })
         } else if (m.type === 'assistant' && b.type === 'thinking' && typeof b.thinking === 'string') {
           target.push({ kind: 'thinking', at, text: b.thinking })
         } else if (m.type === 'assistant' && b.type === 'tool_use' && typeof b.name === 'string') {

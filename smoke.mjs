@@ -53,6 +53,8 @@ const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-storage-'))
 const claudeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-claude-'))
 process.env.CLAUDE_CONFIG_DIR = claudeHome
 const STORED_SESSION = '11111111-2222-3333-4444-555555555555'
+/** A card that records the agent, backend and model it was launched with. */
+const ON_GATEWAY = '5c5c5c5c-0000-4000-8000-00000000feed'
 const STORED_USAGE = {
   input_tokens: 100,
   output_tokens: 1000,
@@ -92,6 +94,25 @@ const STORED_CONTEXT = 100 + 200_000 + 4_000
         content: [{ type: 'text', text: ' and more' }], usage: STORED_USAGE,
       } },
   ].map((l) => JSON.stringify(l)).join('\n') + '\n')
+
+  /* A second real session, for the card that RECORDS what it is running on.
+     Its own session rather than fields bolted onto the one above, so the
+     assertions about that one stay about that one — and a real transcript,
+     because a sidecar entry with no session is not a card and cannot be
+     selected. */
+  const onGw = { ...common, sessionId: ON_GATEWAY }
+  await fs.writeFile(path.join(projectDir, `${ON_GATEWAY}.jsonl`), [
+    { ...onGw, type: 'user', uuid: 'g1', parentUuid: null,
+      timestamp: new Date(1e12).toISOString(),
+      message: { role: 'user', content: 'run this on the gateway' } },
+    { ...onGw, type: 'assistant', uuid: 'g2', parentUuid: 'g1',
+      timestamp: new Date(1e12 + 1000).toISOString(),
+      message: {
+        id: 'msg_gw', model: 'deepseek-v4-pro', role: 'assistant', type: 'message',
+        content: [{ type: 'text', text: 'working on it' }],
+        usage: { input_tokens: 10, output_tokens: 20 },
+      } },
+  ].map((l) => JSON.stringify(l)).join('\n') + '\n')
 }
 
 const SEEDED = 'seeded-session-with-worktree'
@@ -110,6 +131,16 @@ await fs.writeFile(
     [STORED_SESSION]: {
       phase: 'implementing', tags: [], archived: false, pinned: false, activity: [],
       running: INTERRUPTED_AT,
+    },
+    /* A card that RECORDS WHAT IT IS RUNNING ON — the fields `durablePatch`
+       writes at launch. Its own entry rather than fields bolted onto one of the
+       above, so the assertions about those stay about those.
+       `litellm` is the id the add-a-provider flow below produces from the
+       preset of the same name; a mismatch here is a card pointing at a backend
+       that does not exist, which is itself worth not shipping. */
+    [ON_GATEWAY]: {
+      phase: 'implementing', tags: [], archived: false, pinned: false, activity: [],
+      runtime: 'claude', provider: 'litellm', model: 'deepseek-v4-pro', effort: 'low',
     },
   }),
 )
@@ -877,6 +908,83 @@ console.log('\n— providers: the picker, and where the credential goes')
     ok(listed().some((k) => k.startsWith('claude|')),
        'while the agent that IS here stays')
     await ctl.changeConfig({ codexExecutable: '' })
+  }
+
+  /* --- A SESSION KEEPS WHAT IT IS RUNNING ON ------------------------------
+   *
+   * Reported: "if I switch chats, the models that are working on it should stay
+   * selected — it shouldn't change, then it gets confusing, because I go to
+   * that chat and it shows as if Claude was working on it, not deepseek."
+   *
+   * Exactly right. The composer was built from the WORKSPACE DEFAULT and never
+   * looked at the session in front of it, so opening a card that had been on
+   * `deepseek-v4-pro` all morning said "Claude Code · Opus 5". The fields were
+   * on `SessionMeta` and were parsed on the way back in — nothing ever wrote
+   * them, and nothing ever read them. A whole feature that existed only as
+   * types, which is the mirror of the write-with-no-round-trip rule.
+   */
+  {
+    // A card launched on the gateway, with a model only that backend serves.
+    ctx3._globalState.set(`endpointModels:${saved[0].id}`, [
+      { id: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro', contextWindow: 128000, rate: { input: 0.28, output: 0.42 } },
+    ])
+    ok(saved[0].id === 'litellm',
+       `the seeded card points at a backend that exists (${saved[0].id})`)
+
+    // The workspace default is something else entirely.
+    await send({ type: 'composer', provider: 'inherit' })
+    await send({ type: 'ready' })
+    const dflt = latestState().composer
+    ok(dflt.model !== 'deepseek-v4-pro',
+       `the workspace default is a different model (${dflt.model})`)
+
+    await send({ type: 'setMode', mode: 'chat' })
+    await send({ type: 'select', id: ON_GATEWAY })
+    await send({ type: 'ready' })
+    const open = latestState().composer
+    ok(open.model === 'deepseek-v4-pro',
+       `opening the card shows the model that is working on it (${open.model})`)
+    ok(open.provider === saved[0].id,
+       `and the backend it is on, not the active one (${open.provider})`)
+    ok(open.agent === `claude|${saved[0].id}`,
+       `so the agent chip names that combination (${open.agent})`)
+    ok(open.effort === 'low', `and the effort it was launched with (${open.effort})`)
+    ok(open.models.some((m) => m.id === 'deepseek-v4-pro'),
+       'with a model list from THAT backend — not the active one, which has never served it')
+    ok(open.agentLocked === true,
+       'and the agent chip is a readout, not a picker: a started session cannot change agent or backend')
+
+    // Switching away and back must not move it.
+    await send({ type: 'select', id: STORED_SESSION })
+    await send({ type: 'ready' })
+    await send({ type: 'select', id: ON_GATEWAY })
+    await send({ type: 'ready' })
+    ok(latestState().composer.model === 'deepseek-v4-pro',
+       'and it is still there after switching to another chat and back')
+
+    // A card with nothing recorded — every session that predates this — falls
+    // through to the workspace default rather than showing a blank.
+    await send({ type: 'select', id: STORED_SESSION })
+    await send({ type: 'ready' })
+    const old = latestState().composer
+    ok(!!old.model && old.models.some((m) => m.id === old.model),
+       `a session from before this was recorded still shows a usable model (${old.model})`)
+    ok(old.agentLocked !== true || !!old.agent, 'and still names something to be running on')
+
+    // Deselect: back to the default, because THAT is what a new session gets.
+    await send({ type: 'select', id: '' })
+    await send({ type: 'setMode', mode: 'kanban' })
+    await send({ type: 'ready' })
+    ok(latestState().composer.agentLocked === false,
+       'with nothing selected the agent picker is a picker again — a new session can choose')
+
+    // Put the board back where the rest of this file found it: a chat, with the
+    // card the earlier sections use. A gate that leaves the window somewhere
+    // else makes the next section's failure about this one.
+    ctx3._globalState.delete(`endpointModels:${saved[0].id}`)
+    await send({ type: 'setMode', mode: 'chat' })
+    await send({ type: 'select', id: SEEDED })
+    await send({ type: 'ready' })
   }
 
   // --- switching back -------------------------------------------------------

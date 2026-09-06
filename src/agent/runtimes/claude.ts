@@ -20,7 +20,8 @@
  * runtime by name.
  */
 import { AgentSession, agentEnv } from '../session.ts'
-import { loadSdk, resolveClaudeExecutable, type Options } from '../sdk.ts'
+import { resolveClaudeExecutable, type Options } from '../sdk.ts'
+import { withSilentQuery } from '../connect.ts'
 import { MODELS } from '../../sessions/meta.ts'
 import { MODEL_WINDOWS } from '../../sessions/usage.ts'
 import type { ProviderEnv } from '../providers.ts'
@@ -89,45 +90,44 @@ export const claudeRuntime: AgentRuntime = {
    */
   async login(loc: RuntimeLocation, provider?: ProviderEnv): Promise<LoginState> {
     try {
-      const { query } = await loadSdk()
-      const q = query({
-        // A prompt that never yields: the handshake completes, we ask, we abort.
-        prompt: (async function* () { await new Promise(() => {}) })(),
-        options: {
-          pathToClaudeCodeExecutable: loc.command,
-          cwd: process.cwd(),
-          // THE ACTIVE BACKEND'S environment, so this answers about the sessions
-          // the board will start rather than about `claude` on its own. Without
-          // it the page reported a first-party subscription while every session
-          // went to a gateway.
-          ...(provider ? { env: agentEnv(process.env, provider.set, provider.clear) } : {}),
-        },
-      })
-      try {
-        const info = await q.accountInfo()
-        const account = info as unknown as Record<string, unknown>
-        const email = typeof account.emailAddress === 'string' ? account.emailAddress
-          : typeof account.email === 'string' ? account.email : undefined
-        const provider = typeof account.apiProvider === 'string' ? account.apiProvider : undefined
-        return {
-          kind: 'signedIn',
-          // `firstParty` is a subscription or a Console key; the cloud backends
-          // authenticate through their own credential chains, which is a
-          // different thing to tell the user about.
-          via: provider && provider !== 'firstParty' ? 'cloud' : 'subscription',
-          ...(email ? { account: email } : {}),
-          /* `apiProvider` used to be reported as the PLAN, which is how the raw
-             string `firstParty` came to be printed on the settings page next to
-             an email address. It is not a plan, it is somebody else's word for a
-             backend — and the backend is named properly on its own row now. */
-        }
-      } finally {
-        await q.interrupt().catch(() => {})
+      /* Through `withSilentQuery`, and that is not a tidy-up.
+         This used to build its own `query()` and `await q.accountInfo()` with
+         NO timeout and no guaranteed abort — the one CLI call in this codebase
+         that had neither, while `connect.ts` says out loud that a wall clock
+         "is part of the contract rather than defensive habit".
+         It survived only because it always ran first-party, where the handshake
+         answers. Running it with the ACTIVE BACKEND's environment — which is
+         what makes the answer true — points it at whatever the profile points
+         at, and a gateway on a host that drops packets does not fail, it hangs.
+         An unbounded await inside the settings page's status collection is a
+         page that never paints and a CLI process left behind for the life of
+         the window. */
+      const info = await withSilentQuery(
+        provider ?? { set: {}, clear: [] },
+        { claudeExecutable: loc.command, timeoutMs: 15_000 },
+        (q, race) => race(q.accountInfo?.()) as Promise<Record<string, unknown> | undefined>,
+      )
+      if (!info) return { kind: 'unknown', reason: 'The CLI did not report an account.' }
+      const email = typeof info.emailAddress === 'string' ? info.emailAddress
+        : typeof info.email === 'string' ? info.email : undefined
+      const providerId = typeof info.apiProvider === 'string' ? info.apiProvider : undefined
+      return {
+        kind: 'signedIn',
+        // `firstParty` is a subscription or a Console key; the cloud backends
+        // authenticate through their own credential chains, which is a
+        // different thing to tell the user about.
+        via: providerId && providerId !== 'firstParty' ? 'cloud' : 'subscription',
+        ...(email ? { account: email } : {}),
+        /* `apiProvider` used to be reported as the PLAN, which is how the raw
+           string `firstParty` came to be printed on the settings page next to
+           an email address. It is not a plan, it is somebody else's word for a
+           backend — and the backend is named properly on its own row now. */
       }
     } catch (e) {
       return { kind: 'unknown', reason: e instanceof Error ? e.message : String(e) }
     }
   },
+
 
   /**
    * What this install can run.

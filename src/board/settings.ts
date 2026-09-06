@@ -35,8 +35,10 @@
  * never collapsed into one grey dot.
  */
 import * as vscode from 'vscode'
-import { allRuntimes, type LoginState, type RuntimeId, type RuntimeStatus } from '../agent/runtime.ts'
-import type { ProviderEnv } from '../agent/providers.ts'
+import { allRuntimes, type RuntimeId, type RuntimeStatus } from '../agent/runtime.ts'
+// Re-exported so the settings page stays the one import for its own callers,
+// while the collection itself lives somewhere a test can reach it.
+export { collectRuntimeStatus } from '../agent/status.ts'
 
 /** What the page renders. Everything is a snapshot with a timestamp on it, so a
  *  readout can be shown as stale rather than as current. */
@@ -148,50 +150,6 @@ export type SettingsMessage =
 export interface SettingsHost {
   getState: () => Promise<SettingsState>
   handle: (msg: SettingsMessage) => Promise<void>
-}
-
-/**
- * Ask every registered runtime where it is and who it thinks we are.
- *
- * Runs them in parallel and lets each one fail on its own: a runtime whose CLI
- * hangs must not stop the page rendering the one that answered. That is why the
- * catch produces an `unknown` login rather than propagating — "could not tell"
- * is a real, renderable state, and an exception here would blank the page.
- *
- * Never called on the render path or on activation. It spawns processes.
- */
-export async function collectRuntimeStatus(
-  configured: Partial<Record<RuntimeId, string | undefined>> = {},
-  /** The active backend's environment patch. Passed to `login()` so the answer
-   *  is about the sessions this board starts, not about the CLI on its own —
-   *  see `AgentRuntime.login`. */
-  providerEnv?: ProviderEnv,
-): Promise<RuntimeStatus[]> {
-  return Promise.all(allRuntimes().map(async (rt): Promise<RuntimeStatus> => {
-    const at = Date.now()
-    try {
-      const location = await rt.detect(configured[rt.id])
-      if (!location) {
-        return {
-          id: rt.id, label: rt.label, at,
-          login: { kind: 'notInstalled', fix: rt.installHint },
-        }
-      }
-      const login: LoginState = await rt.login(
-        location,
-        // Only where a provider profile can take effect. Handing one to a
-        // runtime that signs in as itself would be configuring something that
-        // cannot apply.
-        rt.capabilities.providerProfiles ? providerEnv : undefined,
-      )
-      return { id: rt.id, label: rt.label, at, location, login }
-    } catch (e) {
-      return {
-        id: rt.id, label: rt.label, at,
-        login: { kind: 'unknown', reason: e instanceof Error ? e.message : String(e) },
-      }
-    }
-  }))
 }
 
 /**

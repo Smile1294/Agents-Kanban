@@ -81,6 +81,17 @@ run, since each session needs a worktree.
   icon click that closes the board reopens the side bar first, so a restoring
   `toggleSidebarVisibility` closed it instead. Nine attempts; see
   [docs/DECISIONS.md](docs/DECISIONS.md).
+- **Nothing expensive may be SENT per streamed token either, and the repaint
+  rate is a measurement, not a budget.** Measured on a real reasoning-model
+  session: 326KB posted to the webview on every frame, ten times a second —
+  161KB of it the model catalogue (431 entries with a paragraph each, which
+  changes when you switch backend and at no other time) and 121KB of it thinking
+  blocks that are collapsed by default and were being written into fresh DOM
+  nodes unread. So: `composer.models` is OMITTED when it has not changed (never
+  sent as `[]` — empty is a real state) and the view keeps the last one it saw;
+  a closed `<details>` does not build its body; and `coalesce()` scales its
+  interval to what a repaint actually cost, floor `intervalMs`, cap 500ms. A
+  fixed 100ms assumes a repaint is cheap, and a repaint is O(transcript).
 - **Nothing expensive may run per streamed token.** `refreshAll()` fires on every
   frame an agent produces. It used to do a full `getState()` — a session-index
   scan and a transcript parse — twice over, which cost more per minute than the
@@ -186,6 +197,29 @@ run, since each session needs a worktree.
   provider concept returns `providerProfiles: false` and the backend controls
   DISAPPEAR — offering a setting that cannot take effect is the same class of
   bug as a control that cannot say no.
+- **The transcript names WHO WROTE each block, and it is not always Claude.**
+  The header was the literal string `Claude Agent` over every answer, including
+  ones produced by `deepseek-v4-pro` on a gateway — the same stale assumption
+  `providerName()` already carries a comment about, in the one place the fix was
+  never applied. `Entry.text` carries the `model` that wrote it, because naming
+  the session's CURRENT model would be a different lie: a session can change
+  model between turns and an answer from an hour ago was not written by whatever
+  is selected now. Falls back to the session's model, then to the raw id, then
+  to the neutral word — never to a vendor we are guessing at. Same rule for the
+  permission prompt's fallback sentence.
+- **The composer describes the SELECTED session, not the workspace default.**
+  Model, effort, thinking, agent and backend are per session; the globals are
+  only what the NEXT new session gets. `SessionMeta` had the fields and
+  `parseMeta` read them back, but nothing wrote them and nothing read them — so
+  a card running `deepseek-v4-pro` on a gateway opened saying "Claude Code ·
+  Opus 5", with Anthropic's models in the picker. `durablePatch` records them at
+  launch (including the new `provider`), `getState()` applies them when a
+  session is selected, and the model LIST comes from that session's backend
+  (memoised per profile — `getState()` is the render path). `launch()` resolves
+  session-then-default and hands the SAME values to the runtime and to the
+  sidecar, or a resume moves the card to a model its backend never served. A
+  started session's agent chip is a READOUT: changing it would alter the next
+  session while appearing to alter this one.
 - **A session keeps the runtime it started on, and that is not a limitation to
   work around.** Its transcript lives in that runtime's own store, its model ids
   are that runtime's, and its login is that runtime's — so there is no honest

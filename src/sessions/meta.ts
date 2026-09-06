@@ -341,6 +341,16 @@ export interface SessionMeta {
   /** Why this card became several — or why it did not. Written once, on the
    *  parent, at the moment of the decision. */
   decomposition?: DecompositionRecord
+  /**
+   * The backend profile this session runs on, by id.
+   *
+   * Recorded at launch beside `runtime`, and for the same reason: a provider is
+   * environment on the CLI process, so it is fixed for the life of the session.
+   * Without it the composer had nothing to read and showed the WORKSPACE
+   * default — open a card that has been on DeepSeek all morning and the bar
+   * says Claude Code, which is the confusion this field exists to end.
+   */
+  provider?: string
   /** Per-session overrides; unset means fall through to the workspace default. */
   model?: string
   effort?: EffortLevel
@@ -398,6 +408,7 @@ export function parseMeta(v: unknown): SessionMeta | undefined {
       ? { scope: m.scope.filter((s): s is string => typeof s === 'string' && !!s.trim()).map((s) => s.trim()) }
       : {}),
     ...(parseDecomposition(m.decomposition) ? { decomposition: parseDecomposition(m.decomposition)! } : {}),
+    ...(typeof m.provider === 'string' ? { provider: m.provider } : {}),
     ...(typeof m.model === 'string' ? { model: m.model } : {}),
     // Closed unions, so a value from an older build cannot reach the picker.
     ...(EFFORT_LEVELS.some((e) => e.key === m.effort) ? { effort: m.effort as EffortLevel } : {}),

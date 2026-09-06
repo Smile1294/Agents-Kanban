@@ -127,5 +127,84 @@ const settle = () => new Promise<void>((r) => setImmediate(r))
   ok(runs === 2, 'dispose cancels a scheduled run rather than leaving a timer behind')
 }
 
+// --- the interval adapts to what a repaint COSTS ----------------------------
+//
+// A fixed 100ms is a budget, not a measurement. A repaint is O(transcript), and
+// a reasoning model's session — measured at 145 entries and 121KB of thinking —
+// takes several times longer to build than one with six. Ten a second then
+// means the host never finishes one before the next arrives, which is what "it
+// lags and sometimes crashes" is.
+//
+// Asserted on the DELAY the limiter asks for, rather than by counting runs
+// through async plumbing: the delay is the decision, and reading it directly is
+// what makes this a test of the rule instead of a test of a timer mock.
+{
+  const bench = (costMs: number) => {
+    let t = 0
+    const asked: number[] = []
+    const c = coalesce(async () => { t += costMs }, 100, {
+      now: () => t,
+      setTimeout: (_fn: () => void, ms: number) => { asked.push(ms); return asked.length },
+      clearTimeout: () => {},
+      dutyCycle: 4,
+      maxIntervalMs: 500,
+    })
+    return { c, asked, advance: (ms: number) => { t += ms } }
+  }
+
+  // A cheap repaint stays at the floor. A small session must be exactly as live
+  // as it was before any of this existed.
+  {
+    const b = bench(1)
+    await b.c.flush()
+    b.c.schedule()
+    ok(b.asked.length === 1 && b.asked[0]! >= 95 && b.asked[0]! <= 100,
+       `a 1ms repaint waits the floor interval (${b.asked[0]}ms)`)
+  }
+
+  // An expensive one backs off, so painting never occupies more than its share
+  // of the clock it is trying to describe.
+  {
+    const b = bench(50)
+    await b.c.flush()
+    b.c.schedule()
+    ok(b.asked[0]! > 100,
+       `a 50ms repaint waits longer than the floor (${b.asked[0]}ms)`)
+    ok(b.asked[0]! >= 140 && b.asked[0]! <= 200,
+       `about four times what it cost, minus what has already elapsed (${b.asked[0]}ms)`)
+  }
+
+  // And the backoff is BOUNDED. A board that updates every four seconds reads
+  // as broken, which is worse than being slow.
+  {
+    const b = bench(5_000)
+    await b.c.flush()
+    b.c.schedule()
+    ok(b.asked.length === 0 || b.asked[0]! <= 500,
+       `however slow a repaint is, the wait is capped (${b.asked[0] ?? 0}ms)`)
+  }
+
+  // One slow frame — a garbage collection, a cold file read — must not pin the
+  // board at its slowest rate for the rest of the session.
+  {
+    let t = 0
+    let cost = 200
+    const asked: number[] = []
+    const c = coalesce(async () => { t += cost }, 100, {
+      now: () => t,
+      setTimeout: (_fn: () => void, ms: number) => { asked.push(ms); return asked.length },
+      clearTimeout: () => {},
+      dutyCycle: 4,
+      maxIntervalMs: 500,
+    })
+    await c.flush()
+    cost = 1
+    for (let i = 0; i < 8; i++) await c.flush()
+    c.schedule()
+    ok(asked[asked.length - 1]! <= 100,
+       `it comes back down once repaints are cheap again (${asked[asked.length - 1]}ms)`)
+  }
+}
+
 console.log(fails === 0 ? 'PASS — repaints coalesce, never overlap, and never go missing' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

@@ -266,7 +266,22 @@ export interface UiState {
      * `price` is ABSENT rather than "unknown" when nothing published one: a
      * blank says "not stated", where `$0.00` would say "free".
      */
-    models: {
+    /**
+     * ABSENT when it has not changed since the last state this webview was
+     * sent — the view keeps the one it has.
+     *
+     * Not an optimisation looking for a problem: measured on a real session
+     * against a gateway, this was 161KB of a 326KB state, re-serialised and
+     * re-posted ten times a second while an agent streamed, for a list that
+     * changes when you switch backend and at no other time. The rule this
+     * board already has is "nothing expensive may run per streamed token";
+     * a 431-entry catalogue on every frame is exactly that.
+     *
+     * Omitted, never sent as `[]` — an empty list is a real state ("this
+     * backend serves nothing we can read") and must stay distinguishable from
+     * "unchanged".
+     */
+    models?: {
       id: string; label: string; context: string; detail?: string
       contextTokens?: number; price?: string
     }[]
@@ -334,6 +349,18 @@ export interface UiState {
     agents: {
       key: string; label: string; detail: string; runtime: string; provider: string
     }[]
+    /**
+     * True when the selected session has already been launched, so its agent
+     * and backend are decided.
+     *
+     * A session's transcript lives in its runtime's own store and its backend
+     * is environment on a process that is already running — neither can move.
+     * The chip still names them, because that is a statement about the run in
+     * front of you; it just stops being a control, rather than being a control
+     * that quietly changes what the NEXT session does while appearing to change
+     * this one.
+     */
+    agentLocked?: boolean
     runtime: string
     /** Every agent program this build can drive. `providerProfiles` is carried
      *  so the chip can name a backend only where one is a real choice — a Codex
@@ -427,6 +454,10 @@ export interface BoardHost {
   /** Open the settings tab: agents, backends and logins. Synchronous because
    *  showing a panel is not something to await — the page fills itself in. */
   openSettings(): void
+  /** A webview has (re)loaded and holds no cached state. Optional: the side bar
+   *  and the panel both send it, and a host that carries nothing across states
+   *  need not care. */
+  onReady?(): void
 }
 
 /** Shared message plumbing for both the sidebar view and the editor panel. */
@@ -435,7 +466,12 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
     try {
       const id = () => String(msg.id ?? '')
       switch (msg.type) {
-        case 'ready': await refresh(); break
+        /* A webview saying it has just loaded, so it holds nothing.
+           `onReady` exists for one reason: the state omits anything the view
+           already has — the model catalogue — and a freshly loaded view has
+           none of it. Without this, a reload leaves an empty model picker until
+           the next backend switch. */
+        case 'ready': host.onReady?.(); await refresh(); break
         case 'init': await host.init(); break
         case 'openFolder': await host.openFolder(); break
         case 'setMode': host.setMode(msg.mode === 'chat' ? 'chat' : 'kanban'); refresh(); break

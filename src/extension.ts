@@ -291,7 +291,74 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ws?.manager?.setModelBook(book)
   }
 
+  /**
+   * The catalogue for a profile that is NOT the active one.
+   *
+   * Needed because the composer follows the SELECTED SESSION, and a session may
+   * be running on a backend nobody is pointed at right now — open yesterday's
+   * DeepSeek card while the active profile is first-party and the picker would
+   * list Anthropic's models under a `deepseek-v4-pro` session.
+   *
+   * Memoised because `getState()` is the render path: it runs ten times a
+   * second while an agent streams, and building this means parsing a cached
+   * catalogue of up to 500 entries. Cleared wherever a catalogue can change —
+   * which is `recomputeCatalogue`, the one function every such path already
+   * calls.
+   */
+  const perProfileCatalogue = new Map<string, ModelCatalogue>()
+  /**
+   * Bumped whenever any catalogue changes. The whole point is that it changes
+   * RARELY — a backend switch, a refresh — while `getState()` runs ten times a
+   * second, so this is what lets the state omit a 431-entry model list that is
+   * identical to the one the webview already has.
+   */
+  let catalogueVersion = 0
+  /** The list this webview was last sent, as `<version>:<profile>`. Reset on
+   *  `ready`, which is a webview saying it has just loaded and has nothing. */
+  let sentCatalogue: string | undefined
+
+  const forgetSentCatalogue = (): void => { sentCatalogue = undefined }
+
+  /**
+   * The model list for a state message, or `undefined` when the view already
+   * has it.
+   *
+   * ONE place that maps a catalogue into the wire shape, called once per state.
+   * It was inlined twice — the default branch and the selected-session branch —
+   * so a 431-model catalogue was formatted twice per repaint and posted in full
+   * ten times a second. Measured: 161KB of a 326KB state.
+   */
+  function sendModels(cat: ModelCatalogue, profileId: string):
+      { id: string; label: string; context: string; detail?: string; contextTokens?: number; price?: string }[] | undefined {
+    const key = `${catalogueVersion}:${profileId}:${cat.source}`
+    if (key === sentCatalogue) return undefined
+    sentCatalogue = key
+    return cat.choices.map((m) => {
+      // Formatted once, here, so the composer and the settings page cannot
+      // disagree about how a price reads. Absent when nothing published one —
+      // a blank is "not stated", `$0.00` would be "free".
+      const price = priceLabel(m.rate)
+      return {
+        id: m.id, label: m.label, context: m.context,
+        ...(m.detail ? { detail: m.detail } : {}),
+        ...(m.contextTokens ? { contextTokens: m.contextTokens } : {}),
+        ...(price ? { price } : {}),
+      }
+    })
+  }
+
+  function catalogueForProfile(p: ProviderProfile): ModelCatalogue {
+    const hit = perProfileCatalogue.get(p.id)
+    if (hit) return hit
+    const built = catalogueFor(p, cachedChoices(p.id), builtinChoices(),
+      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, undefined, endpointFor(p))
+    perProfileCatalogue.set(p.id, built)
+    return built
+  }
+
   function recomputeCatalogue(discovered?: readonly ModelChoice[], problem?: string): void {
+    perProfileCatalogue.clear()
+    catalogueVersion++
     const p = currentProvider()
     const cached = discovered ?? cachedChoices(p.id)
     catalogue = catalogueFor(p, cached, builtinChoices(),
@@ -1675,6 +1742,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   const host: BoardHost = {
+    // A webview has reloaded and holds nothing, so the next state must carry
+    // the model catalogue in full again.
+    onReady: forgetSentCatalogue,
     async getState(): Promise<UiState> {
       const active = currentProvider()
       // The effort levels are the SELECTED MODEL's, not a global list. Haiku 4.5
@@ -1682,17 +1752,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // say no, which is the same class of bug as a spinner over a wedged
       // process.
       const levels = effortsFor(catalogue.choices, model)
+      /* Built by `sendModels` below, ONCE per state and only when the list has
+         actually changed. It used to be mapped inline here — and then AGAIN in
+         the selected-session branch, so a 431-model catalogue was formatted
+         twice and serialised in full on every repaint. */
       const composer = {
         model, effort, thinking,
-        models: catalogue.choices.map((m) => ({
-          id: m.id, label: m.label, context: m.context,
-          ...(m.detail ? { detail: m.detail } : {}),
-          ...(m.contextTokens ? { contextTokens: m.contextTokens } : {}),
-          // Formatted once, here, so the composer and the settings page cannot
-          // disagree about how a price reads. Absent when nothing published
-          // one — a blank is "not stated", `$0.00` would be "free".
-          ...(priceLabel(m.rate) ? { price: priceLabel(m.rate)! } : {}),
-        })),
+        // Filled in once, at the end: which catalogue is in force depends on
+        // whether a session is selected, and asking twice would send the list
+        // on every repaint — the exact cost this is here to avoid.
+        models: undefined as undefined | ReturnType<typeof sendModels>,
         // Ultracode owns effort — it IS xhigh — so the effort picker steps aside
         // rather than showing a level that is being overridden.
         efforts: ultracode ? [] : EFFORT_LEVELS.filter((e) => levels.includes(e.key)),
@@ -1704,6 +1773,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(catalogue.problem ? { modelNote: catalogue.problem } : {}),
         agent: agentKey(runtime, active.id),
         agents: agentChoices(),
+        agentLocked: false,
         runtime,
         runtimes: allRuntimes().map((rt) => ({
           id: rt.id,
@@ -1741,6 +1811,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         orchestrationNote: undefined as string | undefined,
       }
       if (!ws) {
+        composer.models = sendModels(catalogue, active.id)
         return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
       }
 
@@ -1873,9 +1944,67 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
          already launched keeps the level its BRIEF was written with, so the
          note says what a change would actually do rather than letting the
          picker imply it takes effect now. */
+      /* THE COMPOSER FOLLOWS THE SELECTED SESSION.
+       *
+       * Everything above is the workspace DEFAULT — what the next new session
+       * would run on. For a session that already exists, that is somebody
+       * else's setting: open a card that has been on `deepseek-v4-pro` all
+       * morning and the bar said "Claude Code · Opus 5", because the composer
+       * had never read what the session was launched with. Reported as
+       * "it shows as if Claude was working on it, not deepseek", and it is
+       * exactly that.
+       *
+       * The fields were on `SessionMeta` and were parsed on the way back in.
+       * Nothing wrote them and nothing read them — a whole feature that existed
+       * only as types. `durablePatch` now records them at launch; this reads
+       * them back.
+       */
+      /* Which model list this state is about. The ACTIVE backend's by default;
+         the SELECTED SESSION's when there is one, because a card that ran on a
+         gateway must not be shown the models of whatever is selected now. Sent
+         once, below, and only when it differs from what the view already has. */
+      let effectiveCatalogue = catalogue
+      let effectiveProfile = active.id
+      const sessionMeta = selectedKey ? metas[selectedKey] : undefined
+      if (sessionMeta) {
+        const ranOn = sessionMeta.provider
+          ? providers.find((p) => p.id === sessionMeta.provider)
+          : undefined
+        // A profile that has since been deleted still names itself, because the
+        // session did run on it. Silently showing the ACTIVE one instead is the
+        // bug this whole block is about, in a smaller place.
+        const cat = ranOn ? catalogueForProfile(ranOn) : catalogue
+        effectiveCatalogue = cat
+        effectiveProfile = ranOn?.id ?? active.id
+        composer.modelSource = cat.source
+        if (cat.problem) composer.modelNote = cat.problem
+        if (sessionMeta.model) composer.model = sessionMeta.model
+        if (sessionMeta.effort) composer.effort = sessionMeta.effort
+        if (sessionMeta.thinking) composer.thinking = sessionMeta.thinking
+        if (sessionMeta.runtime) composer.runtime = sessionMeta.runtime
+        if (ranOn) composer.provider = ranOn.id
+        composer.agent = agentKey(
+          (sessionMeta.runtime ?? runtime) as RuntimeId,
+          ranOn?.id ?? ((sessionMeta.provider ?? active.id)),
+        )
+        /* A session cannot change agent OR backend, and the picker must not
+           pretend otherwise. Its transcript lives in that runtime's own store
+           and its backend is environment on a process that is already running,
+           so both are decided and gone. The chip still SAYS which — that is a
+           statement about the run in front of you, not a control. */
+        composer.agentLocked = true
+        // Everything derived from "which model", recomputed against the list
+        // this session actually has.
+        const levels = effortsFor(cat.choices, composer.model)
+        composer.efforts = composer.ultracode ? [] : EFFORT_LEVELS.filter((e) => levels.includes(e.key))
+        composer.thinkingSupported = thinkingFor(cat.choices, composer.model)
+        composer.ultracodeSupported = ultracodeFor(cat.choices, composer.model)
+        composer.fastModeSupported = fastModeFor(cat.choices, composer.model)
+      }
+
       if (ws.repoRoot) {
         composer.orchestrationLevels = ORCHESTRATION_CHOICES.map((c) => ({ ...c }))
-        const meta = selectedKey ? metas[selectedKey] : undefined
+        const meta = sessionMeta
         composer.orchestration = resolveOrchestration(meta?.orchestration, orchestration)
         const live = selectedKey ? ws.manager?.byKey(selectedKey) : undefined
         if (live?.orchestration && live.orchestration !== composer.orchestration) {
@@ -1884,6 +2013,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             'change here applies to the next session.'
         }
       }
+
+      // ONE call, after everything that can decide which list is in force.
+      composer.models = sendModels(effectiveCatalogue, effectiveProfile)
 
       const kind = (k: string) => live.filter((a) => a.state.kind === k).length
       return {
@@ -1971,6 +2103,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     setComposer(patch) {
       if (patch.model) {
+        /* Per SESSION when one is selected, exactly as the split level already
+           is. Without this, changing the model while looking at a card edited
+           the WORKSPACE DEFAULT: the bar appeared to change that session and
+           changed the next one instead, and reopening the card put the old
+           value back. */
+        if (patch.forKey) {
+          void ws?.store.patch(patch.forKey, { model: patch.model }).catch(() => {})
+        }
         model = patch.model
         void state.update('model', model)
         // Effort is per model, so a switch can strand it on a level the new one
@@ -2001,8 +2141,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void state.update('orchestration', level)
         ws?.manager?.setDefaults({ orchestration: level })
       }
-      if (patch.effort) { effort = patch.effort as EffortLevel; void state.update('effort', effort) }
-      if (patch.thinking) { thinking = patch.thinking as ThinkingMode; void state.update('thinking', thinking) }
+      if (patch.effort) {
+        if (patch.forKey) void ws?.store.patch(patch.forKey, { effort: patch.effort as EffortLevel }).catch(() => {})
+        effort = patch.effort as EffortLevel
+        void state.update('effort', effort)
+      }
+      if (patch.thinking) {
+        if (patch.forKey) void ws?.store.patch(patch.forKey, { thinking: patch.thinking as ThinkingMode }).catch(() => {})
+        thinking = patch.thinking as ThinkingMode
+        void state.update('thinking', thinking)
+      }
       if (patch.permissionMode && PERMISSION_MODES.some((m) => m.key === patch.permissionMode)) {
         permissionMode = patch.permissionMode as typeof permissionMode
         void state.update('permissionMode', permissionMode)

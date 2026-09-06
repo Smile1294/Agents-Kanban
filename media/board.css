@@ -509,6 +509,11 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 }
 .picker:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
 
+/* A readout in the shape of a picker: same size and rhythm on the bar, no
+   affordance. It says what this session is running on; that is decided. */
+.picker.static { border-style: dashed; cursor: default; }
+.picker.static:hover { color: var(--muted); border-color: var(--line); }
+
 .ctx { font-variant-numeric: tabular-nums; color: var(--faint); font-size: 0.94em; }
 /* The two readouts that must never be squeezed out of the bar. `flex: none` and
    `nowrap` because the pickers to their left will happily take the whole row —

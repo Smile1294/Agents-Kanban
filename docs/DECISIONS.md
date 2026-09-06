@@ -1996,6 +1996,98 @@ Three things are load-bearing:
   the same mistake as asserting a state we did not read, which is the rule this
   whole thread kept breaking.
 
+### Opening a session showed the workspace default, not the session
+
+> if I switch chats the models that are working on it should stay selected […]
+> I go to that chat and it shows as if Claude was working on it not deepseek
+
+The composer was built entirely from the workspace defaults — `model`, `effort`,
+`thinking`, `runtime`, the active provider — and never looked at the session in
+front of it. So a card that had been running `deepseek-v4-pro` on a gateway all
+morning opened with "Claude Code · Opus 5" on the bar, and the model picker
+listed Anthropic's models under it.
+
+The strange part is that the fix was already half-written. `SessionMeta` has
+`model`, `effort`, `thinking` — documented as *"per-session overrides; unset
+means fall through to the workspace default"* — and `runtime`, and `parseMeta`
+reads all four back. **Nothing ever wrote them, and nothing ever read them.** A
+whole feature that existed only as types, invisible because both halves were
+missing: a written field with no reader is the failure this project has a rule
+about, and this was its mirror.
+
+Three parts:
+
+- **`durablePatch` records what a run is on** — the backend profile (a new
+  `provider` field), the model, the effort and the thinking mode, beside the
+  `runtime` it already recorded.
+- **`getState()` reads them back** when a session is selected, including the
+  model LIST, which comes from that session's backend rather than the active
+  one. Otherwise a DeepSeek card opened while first-party is selected offers
+  Anthropic's models under a DeepSeek session. That list is memoised per
+  profile, because `getState()` is the render path.
+- **A started session's agent and backend stop being a control.** Its transcript
+  lives in that runtime's own store and its backend is environment on a process
+  that is already running, so neither can move — and a picker there would change
+  what the NEXT session does while appearing to change this one. The chip still
+  names them; it just is not a menu any more.
+
+And the resolution had to go both ways, or the readout would be a new lie:
+`launch()` now resolves model/effort/thinking from the session first and the
+workspace default second, and hands the SAME resolved values to the runtime and
+to the sidecar. Resuming a DeepSeek card on a day when the default is Opus would
+otherwise have moved it to a model its backend has never served.
+
+### 326KB per frame, ten times a second
+
+> when I try to open these chats […] mainly the deepseek one sometimes the whole
+> extension crashes and it lags
+
+Measured against the real session rather than guessed at — activate the built
+bundle over the user's own workspace, select the card, and weigh what goes over
+the wire:
+
+```
+one posted state          326.5 KB
+  composer.models         161.6 KB   (431 entries)
+  transcript              158.4 KB   (141 entries)
+    of which thinking     121.2 KB
+  cards                     1.5 KB
+at 10 repaints/sec                    3.2 MB/s
+webview render                        5.8 ms/frame  (58% of the thread, on a STUB DOM)
+```
+
+Three separate faults, and two of them were new:
+
+- **The model catalogue was on every frame.** When the picker held three Claude
+  models this was invisible; asking the endpoint what it serves made it 431
+  entries with a description each. It changes when you switch backend and at no
+  other time. It is now omitted when unchanged — the view keeps the last one it
+  saw — and `onReady` forces a resend, because a webview that has just reloaded
+  holds nothing. Omitted, never `[]`: an empty list is a real state ("this
+  backend serves nothing we can read") and has to stay distinguishable from
+  "unchanged". It was also being formatted TWICE per state, once for the active
+  backend and once for the selected session's.
+- **Thinking blocks were built while collapsed.** A reasoning model's thinking
+  is the biggest thing in a transcript by a wide margin, it is closed by
+  default, and every byte was written into a fresh DOM node on every frame for
+  text nobody was looking at. A closed `<details>` now builds no body, and
+  `disclosure()` re-renders on toggle so opening one materialises it.
+- **The repaint interval was a budget, not a measurement.** 100ms assumes a
+  repaint is cheap; a repaint is O(transcript). `coalesce()` now scales the gap
+  to what the last repaint actually cost (smoothed, so one slow frame does not
+  pin it), with the floor at `intervalMs` and a 500ms cap — a board that updates
+  twice a second still reads as live, one that updates every four seconds reads
+  as broken.
+
+Result: 326KB → 172KB on a steady frame, the 431-entry map gone from the hot
+path, and the rate self-tuning instead of assuming.
+
+The lesson is the one this project already has a rule about, arriving through a
+door nobody was watching: the per-token rule was written about WORK, and this
+was payload. Making a list authoritative made it large, and nothing in the type
+system or the tests notices when a field that used to hold three things starts
+holding four hundred.
+
 ## Still open
 
 - **`verify` tests before it builds, and one test reads the build.**

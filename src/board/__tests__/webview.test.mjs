@@ -322,8 +322,13 @@ ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no clai
       agent: { kind: 'needsInput', contextTokens: 0, pendingPermission: { id: 'p1', summary: 'Bash npm test' } },
     }],
   }).text()
-  ok(noPrompt.includes('Claude wants to run') && noPrompt.includes('npm test'),
-     'a runtime with no sentence of its own falls back to the summary')
+  /* The fallback names the MODEL that is running, not a vendor we are guessing
+     at. It said "Claude wants to run" over a `deepseek-v4-pro` session, which
+     is the same stale assumption the transcript header had. */
+  ok(/Opus 5 wants to run/.test(noPrompt) && noPrompt.includes('npm test'),
+     `a runtime with no sentence of its own falls back to the summary, attributed to whatever is running (${/\S+ \S* ?wants to run/.exec(noPrompt)?.[0] ?? 'nothing'})`)
+  ok(!noPrompt.includes('Claude wants to run'),
+     'and never to Claude on a session that is not on Claude')
 
   // And a second request must be VISIBLE. One slot used to hold them all, so
   // answering the one on screen left the agent blocked on an invisible one
@@ -915,6 +920,79 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   ok(!v.root.querySelector('.menu-filter'),
      'three models get no filter box — below a certain length it is one more thing to look at')
   ok(!/Showing/.test(v.text()), 'and nothing is hidden, so nothing is announced')
+}
+
+// --- WHO WROTE THIS ---------------------------------------------------------
+//
+// Reported: "even though it's DeepSeek running, it still says 'Claude Agent' in
+// the chat." It was the literal string, over every answer, forever — the same
+// stale assumption the composer chip has a comment about, in the one place the
+// fix was never applied. A transcript that misattributes its own answers is a
+// transcript you cannot reason about.
+{
+  const composer = {
+    ...COMPOSER,
+    model: 'deepseek-v4-pro',
+    models: [
+      { id: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro', context: '128K' },
+      { id: 'claude-opus-5', label: 'Opus 5', context: '1M' },
+    ],
+  }
+  const v = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [
+      { kind: 'prompt', at: 1, text: 'do the thing' },
+      { kind: 'text', at: 2, text: 'on it', model: 'deepseek-v4-pro' },
+    ],
+    composer,
+  })
+  const text = v.text()
+  ok(text.includes('DeepSeek V4 Pro'), 'the block names the model that wrote it')
+  ok(!text.includes('Claude Agent'), 'and never "Claude Agent" over an answer Claude did not write')
+
+  // Per BLOCK, not per session: a session can change model between turns, and
+  // an answer from an hour ago was not written by whatever is selected now.
+  const mixed = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [
+      { kind: 'text', at: 1, text: 'earlier', model: 'claude-opus-5' },
+      { kind: 'text', at: 2, text: 'later', model: 'deepseek-v4-pro' },
+    ],
+    composer,
+  }).text()
+  ok(mixed.includes('Opus 5') && mixed.includes('DeepSeek V4 Pro'),
+     'two turns on two models are attributed separately, not both to the current one')
+
+  // A block from before this was recorded falls back to the session's model —
+  // and to the raw id when the list cannot name it, never to a vendor guess.
+  const old = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [{ kind: 'text', at: 1, text: 'from an older build' }],
+    composer,
+  }).text()
+  ok(old.includes('DeepSeek V4 Pro'), 'an entry with no model recorded falls back to the session\u2019s')
+  ok(!old.includes('Claude Agent'), 'still without inventing a vendor')
+
+  const unknown = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [{ kind: 'text', at: 1, text: 'x', model: 'some/model-nobody-lists' }],
+    composer,
+  }).text()
+  ok(unknown.includes('some/model-nobody-lists'),
+     'a model the picker cannot name is shown by its id rather than mislabelled')
+
+  // The LIVE block too — that is the one on screen while an agent is working.
+  const streaming = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [{ kind: 'prompt', at: 1, text: 'go' }],
+    // `streaming` is top-level state, not a field on the card — it is the text
+    // arriving right now for the SELECTED session.
+    streaming: 'thinking out loud',
+    cards: [{ ...CARD, agent: { kind: 'working', contextTokens: 0 } }],
+    composer,
+  }).text()
+  ok(streaming.includes('thinking out loud'), 'the streaming block renders')
+  ok(!streaming.includes('Claude Agent'), 'and is not labelled Claude either')
 }
 
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)

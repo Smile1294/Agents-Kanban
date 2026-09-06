@@ -83,9 +83,28 @@
    *  the very click it came from. */
   let disclosuresSeeded = false
 
+  /**
+   * The model catalogue, kept HERE rather than arriving with every frame.
+   *
+   * It was `composer.models` on every state message: 431 entries with a
+   * paragraph of description each — 161KB — re-serialised, posted and re-parsed
+   * ten times a second while an agent streams, for a list that changes when you
+   * switch backend and at no other time. Measured against a real session, the
+   * state was 326KB and the catalogue was half of it.
+   *
+   * The host now sends it only when it has changed. An absent `models` means
+   * "the one you already have", which is why this lives outside `s`.
+   */
+  let catalogue = []
+
   window.addEventListener('message', (e) => {
     if (e.data.type === 'state') {
       s = e.data.state
+      // Carried over when the host omitted it. Never the other way round: an
+      // empty list arriving would be indistinguishable from "unchanged", so the
+      // host omits the FIELD rather than sending `[]`.
+      if (s.composer && s.composer.models) catalogue = s.composer.models
+      if (s.composer) s.composer.models = catalogue
       if (!disclosuresSeeded) {
         disclosuresSeeded = true
         for (const k in s.disclosures || {}) disclosed[k] = !!s.disclosures[k]
@@ -242,6 +261,11 @@
       // and seeds a future window with it, and never applies it back over a
       // click that has already happened.
       post('disclosure', { key, open: box.open })
+      /* And REDRAWN, because a closed panel's body is not built at all — see
+         the thinking case. Safe against a loop: `disclosed[key]` is set above,
+         so the rebuilt node's programmatic `open` matches and the guard on the
+         first line returns. */
+      render()
     }
     return box
   }
@@ -801,7 +825,7 @@
        worktree" and it was dropped at this boundary, so the dialog that
        authorises a write to the user's worktree withheld the file count, the
        file names and the reason all at once. */
-    ask.append(el('div', 'ask-h', p.prompt || 'Claude wants to run'))
+    ask.append(el('div', 'ask-h', p.prompt || (speakerName() + ' wants to run')))
     if (!p.prompt) { const code = el('code'); code.textContent = p.summary; ask.append(code) }
     // A second request is WAITING, not gone. One slot used to hold them all, so
     // answering the visible one left the agent blocked on an invisible one
@@ -1208,7 +1232,9 @@
   function renderStreaming(text) {
     const b = el('div', 'block streaming')
     const h = el('div', 'block-head')
-    h.append(el('span', 'who', 'Claude Agent'))
+    // The live block is being written by the session's CURRENT model, which is
+    // the one case where "whatever is selected" is the right answer.
+    h.append(el('span', 'who', speakerName()))
     b.append(h)
     const d = renderMarkdown(text)
     // The caret goes on the line being written, when there is one.
@@ -1242,7 +1268,7 @@
         m.price || '',
         m.detail || '',
       ].filter(Boolean).join(' · '),
-    })), undefined, modelSourceNote()))
+    })), s.selectedKey, modelSourceNote()))
     /* WHAT THIS SESSION RUNS ON: one entry per agent-and-backend combination.
        This was two pickers — an agent picker and, before that, a backend
        picker — and splitting them made the user do the cross product in their
@@ -1255,11 +1281,25 @@
        installed is not in the list at all — it is not something you can run on.
        The last entry still opens the settings page, which is where backends are
        added and edited. */
-    bar.append(picker('agent', '🤖 ' + agentName(), (s.composer.agents || []).map((a) => ({
-      value: a.key,
-      label: a.label,
-      meta: a.detail,
-    })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }])))
+    /* A STARTED session states what it is on; it does not offer to change it.
+       Its transcript belongs to that runtime's own store and its backend is
+       environment on a process that is already running, so neither can move.
+       A picker here would change what the NEXT session does while appearing to
+       change this one — a control that cannot say no, which this board has a
+       rule about. The chip keeps the full description in its tooltip. */
+    if (s.composer.agentLocked) {
+      const chip = el('span', 'picker static', '🤖 ' + agentName())
+      const on = (s.composer.agents || []).find((a) => a.key === s.composer.agent)
+      chip.title = (on ? on.label + ' — ' + on.detail + '. ' : '')
+        + 'This session is running on it. An agent and its backend are fixed when the session starts.'
+      bar.append(chip)
+    } else {
+      bar.append(picker('agent', '🤖 ' + agentName(), (s.composer.agents || []).map((a) => ({
+        value: a.key,
+        label: a.label,
+        meta: a.detail,
+      })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }])))
+    }
     /* HOW EAGERLY this card should break its work into subtasks.
        Per card, beside the model, because it is a judgement about THIS piece of
        work: someone with one huge objective and five trivial ones must not have
@@ -1290,13 +1330,14 @@
        class of bug as a spinner over a wedged process. Hidden rather than
        greyed out: "why is this disabled" has no answer worth reading. */
     if (s.composer.efforts.length) {
-      bar.append(picker('effort', effortLabel(), s.composer.efforts.map((e) => ({ value: e.key, label: e.label }))))
+      bar.append(picker('effort', effortLabel(),
+        s.composer.efforts.map((e) => ({ value: e.key, label: e.label })), s.selectedKey))
     }
     if (s.composer.thinkingSupported !== false) {
       bar.append(picker('thinking', 'Extended: ' + (s.composer.thinking === 'disabled' ? 'Off' : 'On'), [
         { value: 'enabled', label: 'Extended: On' },
         { value: 'disabled', label: 'Extended: Off' },
-      ]))
+      ], s.selectedKey))
     }
     /* Ultracode: xhigh effort plus standing workflow orchestration. Offered
        ONLY on a model the CLI says can run it, because the flag itself is
@@ -1674,6 +1715,23 @@
     const key = s.composer.orchestration
     const found = (s.composer.orchestrationLevels || []).find((o) => o.key === key)
     return found ? found.label : (key || 'Split')
+  }
+
+  /* WHO WROTE THIS BLOCK.
+     It was the literal string "Claude Agent" over every answer, including ones
+     produced by `deepseek-v4-pro` on a gateway — the same stale assumption the
+     composer chip already had a comment about, in the one place it was never
+     applied. The header is not decoration: a transcript that misattributes its
+     own answers is a transcript you cannot reason about.
+     Per BLOCK, from the model recorded on it, because a session can change
+     model between turns and an answer from an hour ago was not written by
+     whatever is selected now. Falls back to the session's current model, and
+     then to a neutral word — never to a vendor we are guessing at. */
+  function speakerName(model) {
+    const id = model || s.composer.model
+    if (!id) return 'Agent'
+    const known = (s.composer.models || []).find((x) => x.id === id)
+    return known ? known.label : id
   }
 
   function modelLabel(id) {
@@ -2212,7 +2270,7 @@
         }
         return block('You', e.at, body)
       }
-      case 'text': return block('Claude Agent', e.at, renderMarkdown(e.text))
+      case 'text': return block(speakerName(e.model), e.at, renderMarkdown(e.text))
       case 'thinking': {
         /* Through disclosure(), like every other <details>. These two were the
            only ones that were not, so `forEachDisclosure()` — which selects
@@ -2225,7 +2283,18 @@
            Keyed by entry, so two thinking blocks are independent. */
         const d = disclosure(el('details', 'thinking'), thinkKey(e), false)
         const sum = el('summary', null, 'Thought for a moment')
-        d.append(sum, el('div', 'thinking-body', e.text))
+        d.append(sum)
+        /* THE BODY ONLY WHEN IT IS OPEN.
+           A reasoning model's thinking is the biggest thing in a transcript by
+           a long way — measured on a real DeepSeek session, 121KB of a 163KB
+           payload across 145 entries — and every byte of it was written into a
+           fresh DOM node on every frame, for text inside a collapsed
+           `<details>` that nobody was looking at. The panel rebuilds its whole
+           tree several times a second while an agent streams, so that is the
+           "nothing expensive per streamed token" rule broken in the one place
+           where the content is largest and least often read.
+           `disclosure()` re-renders on toggle, so opening one materialises it. */
+        if (d.open) d.append(el('div', 'thinking-body', e.text))
         return d
       }
       case 'tool': {

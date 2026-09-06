@@ -149,6 +149,22 @@ export function durablePatch(a: {
   worktree: { path: string; branch: string; base?: string }
   startedAt: number
   parent?: string
+  /**
+   * WHAT THIS RUN IS ACTUALLY ON: the backend profile, the model, and the two
+   * per-turn dials.
+   *
+   * `runtime` was recorded here from the start and the rest were not, so the
+   * composer had nothing to read and fell back to the workspace default — open
+   * a session that has been running on `deepseek-v4-pro` all morning and the
+   * bar said Claude Code, Opus. The fields existed on `SessionMeta` and were
+   * parsed on the way back; nothing had ever written them. A field with no
+   * writer is the mirror of the one this project has a postmortem about, and it
+   * fails the same way: silently, on the render path.
+   */
+  provider?: string
+  model?: string
+  effort?: EffortLevel
+  thinking?: ThinkingMode
 }): Partial<SessionMeta> {
   return {
     phase: a.startedPhase ?? 'implementing',
@@ -158,6 +174,10 @@ export function durablePatch(a: {
     running: a.startedAt,
     ...(a.worktree.base ? { base: a.worktree.base } : {}),
     ...(a.parent ? { parent: a.parent } : {}),
+    ...(a.provider ? { provider: a.provider } : {}),
+    ...(a.model ? { model: a.model } : {}),
+    ...(a.effort ? { effort: a.effort } : {}),
+    ...(a.thinking ? { thinking: a.thinking } : {}),
   }
 }
 
@@ -186,6 +206,17 @@ export type SplitResult =
   | { ok: false; message: string }
 
 interface LaunchOptions {
+  /**
+   * What this session is already running on, resolved once by `launch()`.
+   *
+   * A resumed session keeps ITS model, effort and thinking, not the workspace
+   * default — otherwise picking a model on a card is a control that reverts the
+   * moment the card is reopened, and resuming a DeepSeek session on a day when
+   * the default is Opus would move it to a backend's model it has never used.
+   * Resolved in one place so the values recorded on the card and the values
+   * handed to the runtime cannot disagree.
+   */
+  chosen?: { model?: string; effort?: EffortLevel; thinking?: ThinkingMode }
   /** Resume a Claude Code session (and reuse its worktree). */
   resume?: string
   title?: string
@@ -221,6 +252,10 @@ export interface RunningAgent {
   base?: string
   /** The level this run LAUNCHED under. What the brief said, and therefore what
    *  the split gate must read — not whatever the picker says a turn later. */
+  /** The model this run was started on. Carried onto every live text block so
+   *  the transcript names who is speaking — it said "Claude Agent" over answers
+   *  written by `deepseek-v4-pro`. */
+  model?: string
   orchestration?: OrchestrationLevel
   /** The session this one was split out of, if it is a subtask. */
   parent?: string
@@ -850,9 +885,22 @@ export class AgentManager extends EventEmitter {
     }
     this.touch()
 
+    /* Resolved ONCE, here, because two places need the same answer: the runtime
+       that is about to be started, and the sidecar entry that records what this
+       card is on. Computing it twice is how they come to disagree. */
+    const chosen = {
+      ...(prior?.model ?? this.opts.defaults.model
+        ? { model: prior?.model ?? this.opts.defaults.model } : {}),
+      ...(resolveEffort(prior?.effort, this.opts.defaults.effort)
+        ? { effort: resolveEffort(prior?.effort, this.opts.defaults.effort) } : {}),
+      thinking: resolveThinking(prior?.thinking, this.opts.defaults.thinking),
+    }
+
+    if (chosen.model) agent.model = chosen.model
+
     let session: AgentRun
     try {
-      session = await this.startRun(runtime, runId, agent, wt, title, opts)
+      session = await this.startRun(runtime, runId, agent, wt, title, { ...opts, chosen })
     } catch (e) {
       // A runtime that cannot start must SAY why on the card, naming the fix —
       // "Codex is not installed" is actionable, a card stuck in `starting`
@@ -903,6 +951,12 @@ export class AgentManager extends EventEmitter {
         worktree: wt,
         startedAt: agent.startedAt,
         ...(opts.parent ? { parent: opts.parent } : {}),
+        // What this run is on, so opening the card later says so rather than
+        // repeating the workspace default back.
+        ...(this.opts.provider ? { provider: this.opts.provider.id } : {}),
+        ...(chosen.model ? { model: chosen.model } : {}),
+        ...(chosen.effort ? { effort: chosen.effort } : {}),
+        ...(chosen.thinking ? { thinking: chosen.thinking } : {}),
       })))
         // `agent.title`, not the launch-time `title`: `set_title` may have already
         // renamed the card during the window before this id existed.
@@ -951,7 +1005,12 @@ export class AgentManager extends EventEmitter {
       delete agent.streaming
       const last = agent.live[agent.live.length - 1]
       if (last?.kind === 'text') last.text += chunk
-      else agent.live.push({ kind: 'text', at: Date.now(), text: chunk })
+      else {
+        agent.live.push({
+          kind: 'text', at: Date.now(), text: chunk,
+          ...(agent.model ? { model: agent.model } : {}),
+        })
+      }
       this.touch()
     })
     // A flag the CLI could not honour. Surfaced like any other warning, because
@@ -1165,7 +1224,8 @@ export class AgentManager extends EventEmitter {
         }
       : {}
 
-    const effort = resolveEffort(undefined, this.opts.defaults.effort)
+    // The SESSION's, when it has one — see `LaunchOptions.chosen`.
+    const effort = opts.chosen?.effort ?? resolveEffort(undefined, this.opts.defaults.effort)
     /* The level, captured HERE and remembered on the card.
        `buildBrief()` bakes the matching sentence into the system prompt once,
        and the split arrives a turn later — so the gate must read what the brief
@@ -1191,13 +1251,14 @@ export class AgentManager extends EventEmitter {
       // spread into a typed argument gets no excess-property check, so an
       // undeclared one compiles and is dropped in silence.
       ...(this.opts.modelBook ? { modelBook: this.opts.modelBook } : {}),
-      ...(this.opts.defaults.model ? { model: this.opts.defaults.model } : {}),
+      ...(opts.chosen?.model ?? this.opts.defaults.model
+        ? { model: opts.chosen?.model ?? this.opts.defaults.model } : {}),
       ...(effort ? { effort } : {}),
       // Only sent when the runtime has the concept. `thinking` is Claude's
       // adaptive-thinking switch; Codex expresses the same thing through effort
       // and would be receiving an option it has no meaning for.
       ...(rt.capabilities.thinkingToggle
-        && resolveThinking(undefined, this.opts.defaults.thinking) === 'disabled'
+        && (opts.chosen?.thinking ?? resolveThinking(undefined, this.opts.defaults.thinking)) === 'disabled'
         ? { thinking: 'disabled' as const } : {}),
       ...(this.opts.defaults.ultracode ? { ultracode: true } : {}),
       ...(this.opts.defaults.fastMode ? { fastMode: true } : {}),
