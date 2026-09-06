@@ -2386,6 +2386,53 @@ mapping is the entire adapter, and it is pinned by a test because a store
 whose list returns the wrong shape silently breaks the orphan-tail GC, not
 the reads.
 
+### The remote page WAS the text "undefined"
+
+> when I try to access the remote board or in general setup the remote access
+> I just get "undefined". is it not done or is it just broken or was it never
+> done?
+
+The whole remote feature was done, deployed-side and extension-side, and the
+relay worked — the page rendered the literal text node **`undefined`** the
+moment a board id existed, which is every real use: entering the pairing code,
+or opening a link with the hash. Everything behind the page was tested; the
+page itself had no rendering gate, which is the exact seam this bug lived in.
+
+**`boardScreen()` drew into the root itself and returned nothing.** The page
+builds screens as functions and `render()` draws whatever they return —
+`pairScreen()` returned its box, `boardScreen()` called
+`root.replaceChildren(head, wrap)` in two places and then fell off the end. So
+`render()` ran `root.replaceChildren(undefined)`, which stringifies, and the
+whole board — a perfectly good push, sitting on the relay — was replaced by
+the one-word page. Reported as a feature that was "never done", which is the
+usual cost of a blank-or-garbage screen: it cannot show what is broken, so it
+reads as absent.
+
+Three more things were found behind it, all in the same never-rendered page:
+
+- **A typed pairing code never polled.** `ensurePolling()` ran the poll chain
+  exactly once, at boot — before a typed code exists — and the no-id poll
+  returned without re-arming. A paired page (the user's flow) would have sat
+  on "waiting" forever; only the hash-link flow worked. The chain now re-arms
+  without an id, and pairing fires the pending poll immediately instead of
+  making a freshly paired page wait out the 15s error interval.
+- **The page said "The relay did not answer" before it had asked.** The
+  no-board screen chose its text by a `waiting` flag that started false, so a
+  fresh pairing briefly claimed the relay was unreachable before the first
+  poll had run — a lie of exactly the "signal that cannot say bad" family.
+  A fresh id now starts in the waiting state, which is the true one.
+- **`PORT=0` never meant an ephemeral port.** `remote/server.js` computed
+  `Number(process.env.PORT) || 8787`, and `0` is falsy, so the documented
+  test path silently bound the default port — which failed the whole suite
+  the day a real relay was already running there. `0` is a real port request.
+
+**The viewer page now has the same DOM gate the extension webviews have.**
+`src/remote/__tests__/viewer.test.mjs` runs `remote/public/board.js` in the
+shared stub DOM against a stubbed `fetch`, driving the real boot and poll
+sequence — and every assertion starts with the rule the fix encodes: the
+page's text must never *be* the string "undefined". Shown to fail against
+the unfixed page, as a new gate must be.
+
 ## Still open
 
 - **`verify` tests before it builds, and one test reads the build.**

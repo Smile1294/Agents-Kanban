@@ -25,7 +25,11 @@ import { fileURLToPath } from 'node:url'
 import { handle } from './functions/board-core.mjs'
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
-const PORT = Number(process.env.PORT) || 8787
+// `|| 8787` made PORT=0 — the ephemeral port the tests spawn on — fall back to
+// the default instead of meaning anything, so a relay already running on 8787
+// (the user's own) killed every test spawn. 0 is a real port request.
+const port = Number(process.env.PORT ?? 8787)
+const PORT = Number.isFinite(port) ? port : 8787
 const STORE_FILE = join(process.env.RC_DATA || join(ROOT, 'data'), 'store.json')
 /** A push is bounded by the extension (chunks of ~150KB, commands of 20k
  *  chars); anything much bigger than a chunk of chunks is not a board update. */

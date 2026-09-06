@@ -45,8 +45,12 @@ let index = null // { at, columns, sessions }
 let tails = {} // session key -> { at, entries }
 let openKey = '' // the session whose chat is open
 let error = ''
-let waiting = false // the relay answered, but has no board yet
+// "No board yet" is also the honest first word on boot, before the first poll
+// has even run — an id remembered from last time is not an answer from the
+// relay, and claiming "did not answer" before asking would be a lie.
+let waiting = !!id
 let polling = false // the poll chain runs once, however it started
+let pendingPoll = 0 // the re-armed poll while no board id exists — so pairing can fire it now
 
 /* Composer state lives OUTSIDE the DOM: the page rebuilds the whole tree on
  * every poll, and a draft held in a textarea would be destroyed mid-word. The
@@ -109,8 +113,15 @@ function pairScreen() {
     }
     tvs = {}
     openKey = ''
+    // A freshly derived id has not asked the relay anything yet — the screen
+    // between now and the first poll must say "waiting", not "did not answer".
+    waiting = true
     saveState()
     render()
+    // The boot poll re-armed itself while there was no id yet; fire it now,
+    // or a freshly paired page stares at "waiting" for the whole interval.
+    clearTimeout(pendingPoll)
+    void poll()
     ensurePolling()
   }
   go.addEventListener('click', watch)
@@ -118,7 +129,7 @@ function pairScreen() {
   box.append(input, go, err)
   // The board address is the id; a link to it skips the code on a new device.
   const m = /^#([0-9a-f]{24})$/.exec(location.hash)
-  if (m) { id = m[1].toLowerCase(); saveState() }
+  if (m) { id = m[1].toLowerCase(); waiting = true; saveState() }
   return box
 }
 
@@ -188,8 +199,7 @@ function boardScreen() {
     wrap.appendChild(el('p', 'muted', waiting
       ? 'Nothing has arrived yet. Open Agents Kanban → settings → Remote Control and press "Save and connect". This page updates by itself.'
       : 'The relay did not answer. Check that the site is deployed.'))
-    root.replaceChildren(head, wrap)
-    return
+    return [head, wrap]
   }
 
   const board = el('div', 'board')
@@ -224,7 +234,7 @@ function boardScreen() {
       sendText: 'Start a session',
     }))
   }
-  root.replaceChildren(head, wrap)
+  return [head, wrap]
 }
 
 /* --- the chat --------------------------------------------------------------- */
@@ -403,7 +413,14 @@ const humanMs = (ms) => (ms < 60_000 ? Math.round(ms / 1000) + 's' : Math.round(
 /* --- polling ---------------------------------------------------------------- */
 
 async function poll() {
-  if (!id) return
+  if (!id) {
+    // No board address yet — the pairing screen will set one. The chain must
+    // re-arm anyway: the boot poll runs BEFORE a typed code exists, and if it
+    // died here, pairing on the page would never be polled. A hash link needs
+    // no special case because it sets the id before the first poll runs.
+    pendingPoll = setTimeout(poll, POLL_ERROR)
+    return
+  }
   let next = POLL_ERROR
   error = ''
   try {
@@ -474,7 +491,12 @@ function render() {
   const caret = active && typeof active.selectionStart === 'number'
     ? { start: active.selectionStart, end: active.selectionEnd }
     : null
-  root.replaceChildren(id ? boardScreen() : pairScreen())
+  // Both screens RETURN what render draws. A screen that drew into the root
+  // itself and returned nothing once replaced the whole page with the text
+  // node "undefined" — render() draws whatever it is given, and `undefined`
+  // stringifies. The one rule: these builders never touch the root.
+  const nodes = id ? boardScreen() : [pairScreen()]
+  root.replaceChildren(...nodes)
   if (focusKey) {
     const next = root.querySelector('[data-focus="' + focusKey + '"]')
     if (next) {
