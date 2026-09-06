@@ -91,6 +91,35 @@ ok(ct.includes('git status'), 'chat renders tool rows')
 ok(ct.includes('Session Meta') && ct.includes('Planning') && ct.includes('Implementing'), 'chat renders the phase transition')
 ok(ct.includes('37s'), 'chat renders the result duration')
 
+// 4a. "Try again from here" anchors a fork at a prompt row — but only a row
+// that names the transcript uuid a fork cuts at (Codex transcripts and rows
+// written before the id was kept have none), on a session that can fork.
+{
+  const page = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    cards: [{ ...CARD, agent: undefined }],
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'please fix the sort', id: 'uuid-1' },
+      { kind: 'text', at: Date.now(), text: 'on it' },
+      { kind: 'prompt', at: Date.now(), text: 'please fix the sort too' },
+    ],
+  })
+  const count = page.text().split('Try again from here').length - 1
+  ok(count === 1, `only the uuid-carrying prompt row offers the fork (${count} shown)`)
+  const retry = findButton(page.root, 'Try again from here')
+  ok(!!retry, 'the affordance is a real button')
+  retry.onclick({ stopPropagation() {} })
+  ok(page.posted.some((m) => m.type === 'forkAt' && m.id === 'abc-123' && m.messageId === 'uuid-1'),
+    'clicking it asks the host to fork the SELECTED session at THAT message')
+
+  const codex = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    cards: [{ ...CARD, agent: undefined, runtime: 'codex' }],
+    transcript: [{ kind: 'prompt', at: Date.now(), text: 'do the thing', id: 'uuid-9' }],
+  })
+  ok(!codex.text().includes('Try again from here'), 'a Codex card offers no fork even on an id-carrying row')
+}
+
 // 5. The composer carries the controls that were missing entirely.
 ok(ct.includes('Opus 5'), 'composer shows the model picker')
 ok(ct.includes('High'), 'composer shows the effort picker')
@@ -993,6 +1022,279 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   }).text()
   ok(streaming.includes('thinking out loud'), 'the streaming block renders')
   ok(!streaming.includes('Claude Agent'), 'and is not labelled Claude either')
+// 18. The composer's mic, gated on a real check of whisper and ffmpeg. ---------
+// The mic is drawn ONLY when the host's probe of the two binaries answered —
+// a control that cannot take effect is not drawn (this project's rule), and
+// before the probe there is nothing honest to draw.
+{
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  ok(!findButton(v.root, '🎤'), 'no mic before the voice probe answered')
+}
+
+{
+  const voice = { available: true, recording: false }
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice } })
+  const mic = findButton(v.root, '🎤')
+  ok(!!mic, 'a checked-in voice pipeline draws the mic')
+  mic.onclick()
+  ok(v.posted.some((m) => m.type === 'voiceStart'), 'pressing the mic asks the host to start recording')
+
+  // The host says recording is live (it rides the next state), and the mic
+  // turns into the stop control.
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: true } })
+  for (const fn of v.listeners) fn({ data: { type: 'state', state: { ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: true, recording: true } } } } })
+  const stop = findButton(v.root, '⏺')
+  ok(!!stop, 'while recording the mic is a stop control')
+  ok(stop.className.includes('live'), 'and is marked live')
+
+  // Stop, and the transcript arrives as a message — not as part of any state —
+  // and lands in the draft where the caret was.
+  stop.onclick()
+  ok(v.posted.some((m) => m.type === 'voiceStop'), 'pressing again asks the host to stop and transcribe')
+  const ta = findByTag(v.root, 'textarea')
+  ok(!!ta, 'the composer textarea is there')
+  ta.value = 'look at the log:'
+  ta.oninput({ target: ta })
+  ta.onclick() // caret tracked at end of the draft
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, text: 'the build broke' } })
+  const after = findByTag(v.root, 'textarea')
+  ok(after.value === 'look at the log: the build broke ', `the transcript lands in the draft: "${after.value}"`)
+}
+
+{
+  // A second dictation right after the first appends where the first left off.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: true, recording: false } } })
+  const ta = findByTag(v.root, 'textarea')
+  ta.value = 'fix'
+  ta.oninput({ target: ta })
+  ta.onclick()
+  findButton(v.root, '🎤').onclick()
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, text: 'the parser' } })
+  const ta2 = findByTag(v.root, 'textarea')
+  ok(ta2.value === 'fix the parser ', 'transcript is spaced off the existing word')
+  findButton(v.root, '🎤').onclick()
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, text: 'and rerun it' } })
+  const ta3 = findByTag(v.root, 'textarea')
+  ok(ta3.value === 'fix the parser and rerun it ', 'two dictations do not weld together')
+}
+
+{
+  // Whisper or ffmpeg missing: no dead mic. The mic shows, dimmed, and goes to
+  // the settings page — the place that says how to install each piece.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: false, why: 'whisper-cli not found' } } })
+  const mic = findButton(v.root, '🎤')
+  ok(!!mic && mic.className.includes('missing'), 'an unavailable pipeline draws the mic dimmed, not hidden and not dead')
+  mic.onclick()
+  ok(v.posted.some((m) => m.type === 'openSettings'), 'the dimmed mic opens the settings page, which says how to fix each piece')
+}
+
+{
+  // A pipeline that refused to start says so, and does not pretend to record.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { available: true, recording: false } } })
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, error: 'Recording stopped itself — no default device' } })
+  ok(v.text().includes('Recording stopped itself'), 'a failed capture is shown under the composer')
+  ok(!findButton(v.root, '⏺'), 'and the mic is not left pretending to record')
+}
+
+// 19. The @-mention picker: naming a file so the agent reads it itself. --------
+{
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  const ta = findByTag(v.root, 'textarea')
+  ok(!ta.value.includes('@'), 'draft starts empty')
+  ta.value = '@con'
+  ta.oninput({ target: ta })
+  // The FIRST @ asks the host for the file list — once, lazily, never on a
+  // repaint — and shows nothing until the list is really there.
+  ok(v.posted.some((m) => m.type === 'mentionFiles'), 'the first @ asks the host for the file list')
+  ok(!v.text().includes('constants.ts'), 'nothing is offered before the host answered')
+  for (const fn of v.listeners) fn({ data: { type: 'mentions', files: ['src/constants.ts', 'src/main.ts', 'readme.md'] } })
+  const menu = v.text()
+  ok(menu.includes('@src/constants.ts'), 'typing @con offers the files that match')
+  ok(!menu.includes('readme.md'), 'and not the ones that do not')
+  const item = findButton(v.root, 'src/constants.ts')
+  ok(!!item, 'the match is a button')
+  item.onclick({ stopPropagation() {} })
+  const after = findByTag(v.root, 'textarea')
+  ok(after.value === '@src/constants.ts ', `choosing a file replaces the half-typed @: "${after.value}"`)
+}
+
+{
+  // Tab completes the highlighted row; Enter would send the message, so it
+  // completes instead while the menu is open — same bargain the slash menu
+  // makes.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  for (const fn of v.listeners) fn({ data: { type: 'mentions', files: ['src/a.ts', 'src/b.ts', 'lib/c.ts'] } })
+  const ta = findByTag(v.root, 'textarea')
+  ta.value = '@lib'
+  ta.oninput({ target: ta })
+  ok(v.text().includes('lib/c.ts'), 'matches come from the middle of the path too')
+  ta.onkeydown({ key: 'Tab', preventDefault() {}, shiftKey: false })
+  const after = findByTag(v.root, 'textarea')
+  ok(after.value === '@lib/c.ts ', 'Tab inserts the highlighted file')
+}
+
+{
+  // No file list — a workspace with nothing mentionable — and the @ stays a
+  // plain character: no empty menu, no dead picker.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  for (const fn of v.listeners) fn({ data: { type: 'mentions', files: [] } })
+  const ta = findByTag(v.root, 'textarea')
+  ta.value = '@'
+  ta.oninput({ target: ta })
+  const bare = findByTag(v.root, 'textarea')
+  ok(bare.value === '@', 'a bare @ with no files to offer stays a plain character')
+  ok(!v.root.querySelector('.mention-menu'), 'and no empty menu is drawn')
+}
+
+// ---------------------------------------------------------------- transcript search
+
+// The search screen is a third main area over both modes, opened from the
+// rail head (the one thing both modes keep), and answered on its own channel
+// like mentions and voice.
+{
+  const v = run(base)
+  const pill = findButton(v.root, 'Search')
+  ok(!!pill, 'the rail offers a Search pill beside the mode pill')
+  pill.onclick({})
+  ok(v.text().includes('Search transcripts'), 'clicking it opens the search screen')
+  ok(!v.root.querySelector('.board'), 'the kanban board stands down while searching')
+  ok(v.text().includes('Every prompt you sent'), 'the idle hint says what the search covers')
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  ok(!!box && box.placeholder.includes('jira'), 'the screen leads with a search box')
+
+  box.value = ''
+  box.onkeydown({ key: 'Escape' })
+  ok(!!v.root.querySelector('.board'), 'Escape closes the screen back to the board')
+
+  pill.onclick({})
+  ok(v.text().includes('Search transcripts'), 'and it opens again on the next click')
+  const close = findButton(v.root, '✕ Close')
+  ok(!!close, 'the screen carries an explicit close control')
+  close.onclick({})
+  ok(!!v.root.querySelector('.board') && !v.text().includes('Search transcripts'), 'Close returns to the board')
+
+  // The same pill exists from chat mode, and the composer is stood down with
+  // the chat — one screen at a time.
+  const cv = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  ok(!!findButton(cv.root, 'Search'), 'the pill is there in chat mode too')
+  findButton(cv.root, 'Search').onclick({})
+  ok(cv.text().includes('Search transcripts'), 'and opens from chat mode')
+  ok(!findByTag(cv.root, 'textarea'), 'the composer is gone while searching')
+}
+
+// Typing defers to the debounce; Enter searches immediately; the answer
+// renders hits joined to their sessions, marked, with busy states between.
+{
+  const v = run(base)
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = '  jira  '
+  box.oninput({ target: box })
+  ok(!v.posted.some((m) => m.type === 'search'), 'a keystroke alone does not search — the debounce owns it')
+  box.onkeydown({ key: 'Enter' })
+  const posted = v.posted.filter((m) => m.type === 'search')
+  ok(posted.length === 1 && posted[0].q === 'jira', 'Enter searches once, with the query trimmed')
+  ok(v.text().includes('Searching…'), 'busy is painted while every transcript is read')
+
+  // The answer arrives on its own channel, echoing the query it answers.
+  const at = Date.now()
+  const matches = [
+    { key: 'abc-123', title: 'Fix login', entryIndex: 0, at, kind: 'prompt', snippet: 'please look at jira now', lead: false },
+    { key: 'abc-123', title: 'Fix login', entryIndex: 2, at: at - 60_000, kind: 'text', snippet: 'earlier I said a thing then JIRA is fixed', lead: true },
+  ]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches, more: 3 } })
+  ok(v.text().includes('2 matches') && v.text().includes('and 3 more — narrow the query'), 'the count is stated, with the overflow')
+  ok(v.text().includes('Fix login'), 'a hit is shown under its session title')
+  ok(v.text().includes('you asked') && v.text().includes('agent answered'), 'each hit says which side of the conversation it is from')
+  ok(!v.text().includes('Searching…'), 'the busy state clears when the answer lands')
+  const mark = findByTag(v.root, 'mark')
+  ok(!!mark && mark.textContent === 'jira', 'the occurrence is a <mark> whose text was set, never HTML')
+  ok(v.text().includes('…'), 'a snippet that starts mid-text says so with a lead ellipsis')
+}
+
+// An answer for a query the box no longer holds is dropped, not painted.
+{
+  const v = run(base)
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = 'jira'
+  box.oninput({ target: box })
+  box.onkeydown({ key: 'Enter' })
+  const stale = [{ key: 'abc-123', entryIndex: 0, at: Date.now(), kind: 'prompt', snippet: 'older query text', lead: false }]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'older', matches: stale, more: 0 } })
+  ok(!v.text().includes('older query text'), 'an answer to a query that was not asked is dropped')
+  ok(v.text().includes('Searching…'), 'and the search still reads as in flight')
+
+  // The right query's answer, zero matches: an honest no, not a blank.
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches: [], more: 0 } })
+  ok(v.text().includes('No matches for “jira”'), 'a real miss says so, naming the query')
+  ok(v.text().includes('tool call'), 'and reminds why — the filter is the point')
+}
+
+// Clicking a hit jumps to the session and flashes the exact row the snippet
+// came from. The jump survives the couple of refreshes the select takes.
+{
+  const v = run(base)
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = 'jira'
+  box.oninput({ target: box })
+  box.onkeydown({ key: 'Enter' })
+  const matches = [
+    { key: 'abc-123', entryIndex: 1, at: Date.now(), kind: 'text', snippet: 'the answer that mentions jira', lead: false },
+  ]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches, more: 0 } })
+  const row = walkAll(v.root).find((n) => n.className === 'srow')
+  ok(!!row, 'the hit is drawn as a row')
+  row.onclick({})
+  ok(v.posted.some((m) => m.type === 'select' && m.id === 'abc-123'), 'clicking a hit selects its session')
+  ok(v.posted.some((m) => m.type === 'setMode' && m.mode === 'chat'), 'and asks for the chat view')
+  ok(!v.posted.some((m) => m.type === 'toggleArchived'), 'a session already on the board jumps without revealing anything')
+
+  // The chat renders the session — an intermediate frame may show another
+  // session first, so the jump must wait for ITS session, then flash.
+  v.deliver({ ...base, mode: 'kanban' })
+  ok(!walkAll(v.root).some((n) => (n.className || '').includes('hit-jump')), 'an intermediate frame flashes nothing')
+  ok(!v.text().includes('Search transcripts'), 'the state frame after the click has closed the search screen')
+  v.deliver({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+      { kind: 'text', at: Date.now(), text: 'the answer that mentions jira' },
+    ],
+  })
+  const flash = walkAll(v.root).find((n) => (n.className || '').includes('hit-jump'))
+  ok(!!flash && flash.textContent.includes('the answer that mentions jira'),
+    'the row the entryIndex named is the one flashed')
+  v.deliver({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+      { kind: 'text', at: Date.now(), text: 'the answer that mentions jira' },
+    ],
+  })
+  ok(!walkAll(v.root).some((n) => (n.className || '').includes('hit-jump')),
+    'the flash is one-shot — a later frame does not repeat it')
+}
+
+// Archived sessions are searched too (that is where the old work is); a hit
+// whose card the rail is hiding reveals it first, and the row names it with
+// the title the search read rather than a raw id.
+{
+  const v = run({ ...base, cards: [] })
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = 'jira'
+  box.oninput({ target: box })
+  box.onkeydown({ key: 'Enter' })
+  const matches = [{ key: 'old-9', title: 'The archived saga', entryIndex: 0, at: Date.now(), kind: 'prompt', snippet: 'about jira again', lead: false }]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches, more: 0 } })
+  ok(v.text().includes('The archived saga'), 'a hit from a hidden archived session is still named, by the title the search read')
+  const row = walkAll(v.root).find((n) => n.className === 'srow')
+  row.onclick({})
+  const ti = v.posted.findIndex((m) => m.type === 'toggleArchived')
+  const si = v.posted.findIndex((m) => m.type === 'select' && m.id === 'old-9')
+  ok(ti !== -1 && si !== -1 && ti < si, 'jumping reveals the archived session before selecting it')
 }
 
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)

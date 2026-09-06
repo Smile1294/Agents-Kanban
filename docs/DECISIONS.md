@@ -2087,6 +2087,60 @@ door nobody was watching: the per-token rule was written about WORK, and this
 was payload. Making a list authoritative made it large, and nothing in the type
 system or the tests notices when a field that used to hold three things starts
 holding four hundred.
+### Remote Control: the board leaves as a redacted mirror
+
+> this would be such great thing to have figure out how could we privately
+> stream this board to online somewhere where only the board moves and the
+> chats no code I guess or something like that, can be in separate repo like
+> some hosting and you'd personally put it to netlify for free and just loging
+> and all that yk
+
+One direction, six decisions that follow from it:
+
+**What leaves is decided by types, in one module.** `src/remote/relay.ts`
+declares `RemoteCardSource` and `RemoteEntry` — the only shapes that cross —
+and the host maps its own cards onto them. A `tool` row is the subtle one: its
+`summary` is derived from the tool's INPUT (a Bash row summarises as its
+command, an Edit row as its path), so `RemoteEntry` carries the tool's name and
+status but never its summary, and the redaction drops fields, never rows,
+because the viewer's per-session `tv` is a row count. The transcript tail is
+capped at 120 rows.
+
+**The relay stores nothing secret, so it cannot be robbed for a code.** A
+board's address is the first 24 hex chars of the sha-256 of the pairing code
+(~96 bits). The code exists in exactly two places — the pushing machine's
+keychain and the watcher's browser, which keeps only the derived id. The
+relay's POST gate is knowing the id (`x-rc-key`); possession of the id grants
+read and write of the MIRROR only — the real board is never touched by any of
+it. That is the honest price of a server with no secrets, and it is the reason
+the relay page's "login" is a code field and can never be a session.
+
+**The lift-out folder is part of the repo.** `remote/` carries its own
+`package.json`, `netlify.toml` and README, is excluded from the .vsix, and its
+function logic (`board-core.mjs`) takes the store injected so the repo's test
+suite runs the real relay code against a Map. A gate the deployable could not
+run would be no gate.
+
+**Cadence is a separate module from content.** `pusher.ts` decides when (2s
+minimum between attempts, nothing sent while unchanged, a 90s heartbeat so the
+viewer's "live Ns ago" keeps climbing — the number must not depend on a process
+being alive, and here the process is the machine pushing). `feed.ts` decides
+what: a tail travels exactly when its transcript GREW, so a quiet board does
+not resend the same 120 rows forever. The viewer polls adaptively (12s while
+the board is moving, 60s once quiet) because every poll is a Netlify function
+invocation.
+
+**The settings page treats the code as a credential.** It is a change-only
+field (blank means keep the stored one; wiping is its own button), never
+rendered from state — the host sends `hasCode`, never the code — and it goes to
+`SecretStorage` like every other secret. The status line shows the relay's
+actual answers: paused, connected-but-not-yet-answered, last push went out,
+last push failed with its reason. "Not asked yet" is not a green tick, the
+page's oldest rule.
+
+**The viewer is a static page with the same hygiene as the webviews.** No
+framework, no build, no innerHTML — the chat rows it renders are another
+program's output. Node and text only.
 
 ## Still open
 

@@ -6,18 +6,25 @@
  * plain Node and unit-tested without VS Code.
  */
 import * as path from 'node:path'
+import * as fs from 'node:fs/promises'
 import * as vscode from 'vscode'
 import { AgentManager, followKey, type RunningAgent } from './agent/manager.ts'
-import type { Options as AgentOptions } from './agent/sdk.ts'
+import { loadSdk, type Options as AgentOptions } from './agent/sdk.ts'
+import {
+  applyRestore, checkpointMapFor, claudeHome, historyDirFor, planRestore,
+  sessionFileFor, waitForQuiescent, type CheckpointMap,
+} from './sessions/checkpoints.ts'
 import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
   setBoardFocusMode, showSideBarView, toUiAgent,
-  type BoardHost, type FocusMode, type Mode, type UiCard, type UiState,
+  type BoardHost, type FocusMode, type Mode, type SearchAnswer, type SearchRow,
+  type UiCard, type UiState,
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, type ModelBook, type ModelFacts } from './sessions/usage.ts'
 import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
+import { searchEntries } from './sessions/search.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
 import { linkSubtasks, rollUpState } from './board/subtasks.ts'
@@ -42,8 +49,21 @@ import {
 } from './agent/endpoint.ts'
 import {
   collectRuntimeStatus, SettingsPanel,
-  type SettingsHost, type SettingsMessage, type SettingsState,
+  type RemoteState, type ScheduleRowState, type SettingsHost, type SettingsMessage,
+  type SettingsState,
 } from './board/settings.ts'
+import {
+  describeWhen, nextFireAt, parseSchedules,
+  type Schedule,
+} from './board/schedules.ts'
+import {
+  checkVoice, rowsFromChecks, startCapture, verdict,
+  type Capture, type VoiceChecks, type VoiceConfig,
+} from './agent/dictation.ts'
+import { RemoteFeed, type TailSource } from './remote/feed.ts'
+import { RemotePusher, type PushSnapshot } from './remote/pusher.ts'
+import { boardIdOf, projectTail, relayBase, type RemoteTail } from './remote/relay.ts'
+import { toRemoteCard } from './remote/cards.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
 // See agent/runtimes/index.ts for why registration is explicit rather than
 // happening wherever an implementation happens to be imported first.
@@ -1032,10 +1052,373 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const runtimeModels = new Map<RuntimeId, { models: { id: string; label: string }[]; source: string; note?: string }>()
   let settingsBusy: string | undefined
 
+  // ——— Voice dictation (the composer's mic) ———
+  //
+  // The mic is gated on an actual check of two user-installed binaries, and a
+  // check SPAWNS THEM, so it is never on the render path and never at
+  // activation: the board's first paint does not wait for two `--version`
+  // probes. `voiceResult` is written once per real check and invalidated when
+  // the config it describes changes; `liveCapture` is live state, cleared when
+  // the capture ends however it ends.
+
+  /** The four settings that describe the pipeline, read together so the cached
+   *  result always knows which config it was an answer to. Spelled `cfg().get`
+   *  (not a saved `const c`) because the smoke gate counts declared settings by
+   *  that exact spelling — a read through a local variable is a setting that
+   *  looks unread. */
+  const voiceConfig = (): VoiceConfig => {
+    return {
+      whisperPath: cfg().get<string>('whisperPath') ?? '',
+      whisperModel: cfg().get<string>('whisperModel') ?? '',
+      ffmpegPath: cfg().get<string>('ffmpegPath') ?? '',
+      recordDevice: cfg().get<string>('recordDevice') ?? '',
+    }
+  }
+
+  /** The config keys the voice cache depends on — one invalidation list for the
+   *  config listener, so a new key cannot be forgotten there. */
+  const VOICE_KEYS = ['whisperPath', 'whisperModel', 'ffmpegPath', 'recordDevice']
+
+  interface VoiceResult { checks: VoiceChecks; cfg: VoiceConfig; at: number }
+  let voiceResult: VoiceResult | undefined
+  let voiceChecking: Promise<VoiceResult> | undefined
+  /** A recording in progress, if there is one. */
+  let liveCapture: Capture | undefined
+
+  /** Ask the two binaries where they are — once, never twice at once. */
+  function voiceCheckNow(): Promise<VoiceResult> {
+    if (voiceResult) return Promise.resolve(voiceResult)
+    voiceChecking ??= Promise.resolve().then(() => {
+      const cfg = voiceConfig()
+      const checks = checkVoice(cfg)
+      voiceResult = { checks, cfg, at: Date.now() }
+      return voiceResult
+    }).finally(() => { voiceChecking = undefined })
+    return voiceChecking
+  }
+
+  /** The composer's mic facts from the last check. Runs on every repaint, so
+   *  it is pure — the check it summarises never does. */
+  const voiceState = (r: VoiceResult) => {
+    const v = verdict(r.checks)
+    return {
+      voice: {
+        available: v.ok,
+        ...(v.why ? { why: v.why } : {}),
+        recording: !!liveCapture,
+      },
+    }
+  }
+
+  /** The first check, after the window has had a second to paint. */
+  let voiceKicked = false
+  const kickVoiceCheck = (): void => {
+    if (voiceKicked) return
+    voiceKicked = true
+    setTimeout(() => {
+      voiceCheckNow()
+        .then(() => { refreshAll(); void SettingsPanel.refreshIfOpen() })
+        .catch((e: unknown) => log.error(`Voice check failed: ${String(e)}`))
+    }, 2000)
+  }
+
   const configuredPathFor = (id: RuntimeId): string | undefined =>
     id === 'claude' ? (cfg().get<string>('claudeExecutable') || undefined)
       : id === 'codex' ? (cfg().get<string>('codexExecutable') || undefined)
       : undefined
+
+  // ——— Scheduled runs (time triggers) ———
+  //
+  // A schedule says "at HH:MM on these days, start a session with this
+  // prompt". It lives in workspace state, fires only while the extension is
+  // running, and catches up when the due moment passed with no window open —
+  // once, because `nextFireAt` is anchored to `lastFiredAt`. The rules of a
+  // fire (when, whether a draft parses) live in schedules.ts and are tested
+  // there; everything here is the act of firing — creating the session — which
+  // only the host can do.
+
+  /** Read back once, at activation: storage outlives the version that wrote it,
+   *  so this is a parse, never a cast. Every later write goes through
+   *  `saveSchedules`, which keeps the in-memory list and the store in step. */
+  let schedules: Schedule[] = parseSchedules(state.get<unknown>('schedules'))
+
+  const saveSchedules = async (next: Schedule[]): Promise<void> => {
+    schedules = next
+    await state.update('schedules', schedules)
+  }
+
+  /** Whether a scheduled run could start a session right now. A schedule that
+   *  cannot fire is left DUE rather than marked failed — opening a repo later
+   *  the same day should still catch today's run up. */
+  const canRunScheduled = (): boolean => !!ws?.worktrees
+
+  /** The rows the settings page shows, derived. */
+  const scheduleView = (): { rows: ScheduleRowState[]; canRun: boolean; problem?: string } => {
+    const canRun = canRunScheduled()
+    return {
+      canRun,
+      ...(!canRun
+        ? { problem: !ws
+            ? 'A scheduled run needs a folder open. Open one and the runs catch up.'
+            : 'This folder is not a git repository, so no session can start in a worktree.' }
+        : {}),
+      rows: schedules.map((s): ScheduleRowState => {
+        const after = s.lastFiredAt ?? s.createdAt
+        const nextAt = s.enabled && s.days.length ? nextFireAt(s, after) : undefined
+        return {
+          id: s.id,
+          title: s.title,
+          prompt: s.prompt,
+          hour: s.hour,
+          minute: s.minute,
+          days: s.days,
+          enabled: s.enabled,
+          when: describeWhen(s),
+          ...(nextAt !== undefined ? { nextAt } : {}),
+          ...(s.lastRun ? { lastRun: s.lastRun } : {}),
+        }
+      }),
+    }
+  }
+
+  /** Fire one schedule's session NOW. Shared by the due-check, "Run now" and
+   *  the catch-up after a resume — one path, so a session that starts from any
+   *  of the three behaves the same.
+   *
+   *  The attempt is recorded BEFORE the session is asked for: `lastFiredAt` is
+   *  the anchor that stops the next tick firing the same schedule again, so it
+   *  must be in place before any await that could fail. A crash between the
+   *  record and the start costs one day's run (the catch-up semantics), never a
+   *  double fire. `lastRun` records whether the session actually STARTED; a
+   *  session that starts and then fails is a failed session on the board, which
+   *  is its own card's story. */
+  async function fireScheduleNow(s: Schedule, manual: boolean): Promise<void> {
+    if (!canRunScheduled()) {
+      if (manual) {
+        void vscode.window.showWarningMessage(
+          'A scheduled run needs a folder with a git repo open. Open one and press Run again.')
+      }
+      return
+    }
+    const stamp = Date.now()
+    // Synchronous in-memory first: the next tick (or a concurrent Run now) must
+    // already see this schedule as fired, no matter what the persist does.
+    schedules = schedules.map((x) => (x.id === s.id ? { ...x, lastFiredAt: stamp } : x))
+    const title = s.title
+    settingsBusy = `Starting scheduled run "${title}"…`
+    void SettingsPanel.refreshIfOpen()
+    try {
+      // The same pre-flight as a composer send: a half-configured provider does
+      // not fail here at first contact — it fails at the first API call after a
+      // card has appeared, and nobody connects the two.
+      const problem = providerProblem()
+      if (problem) throw new Error(problem)
+      await refreshProviderEnv()
+      const mgr = ensureManager()
+      mgr.setProvider(currentProvider(), providerEnv)
+      const runId = await mgr.start(s.prompt, { title })
+      const queued = ws?.manager?.byKey(runId)?.state.kind === 'queued'
+      await saveSchedules(schedules.map((x) =>
+        x.id === s.id ? { ...x, lastRun: { at: Date.now(), ok: true } } : x))
+      log.info(`Scheduled run "${title}" started (${runId})`)
+      refreshAll()
+      void SettingsPanel.refreshIfOpen()
+      void vscode.window.showInformationMessage(
+        queued
+          ? `Scheduled run "${title}" is queued behind running sessions and will start when one finishes.`
+          : `Scheduled run "${title}" started.`)
+    } catch (e) {
+      const note = e instanceof Error ? e.message : String(e)
+      await saveSchedules(schedules.map((x) =>
+        x.id === s.id ? { ...x, lastRun: { at: Date.now(), ok: false, note } } : x))
+      void SettingsPanel.refreshIfOpen()
+      void vscode.window.showWarningMessage(`Scheduled run "${title}" did not start: ${note}`)
+    } finally {
+      settingsBusy = undefined
+      void SettingsPanel.refreshIfOpen()
+    }
+  }
+
+  /** Fire every enabled schedule whose moment has passed. Runs at most one pass
+   *  at a time — a fire awaits the CLI setup, and a second pass starting inside
+   *  that window must not fire the same schedule twice. */
+  let schedulePassInFlight = false
+  async function fireDueSchedules(): Promise<void> {
+    if (schedulePassInFlight || !canRunScheduled()) return
+    schedulePassInFlight = true
+    try {
+      for (const s of schedules) {
+        if (!s.enabled) continue
+        const next = nextFireAt(s, s.lastFiredAt ?? s.createdAt)
+        if (next === undefined || next > Date.now()) continue
+        await fireScheduleNow(s, false)
+      }
+    } finally {
+      schedulePassInFlight = false
+    }
+  }
+
+  // The heartbeat. Sixty seconds because a fire needs nothing faster, and a
+  // one-minute delay on a schedule whose hour has passed is invisible next to
+  // the catch-up that already happened at activation.
+  const scheduleTimer = setInterval(
+    () => { void fireDueSchedules().catch((e) => log.error(`Schedule check failed: ${String(e)}`)) },
+    60_000,
+  )
+  context.subscriptions.push({ dispose: () => clearInterval(scheduleTimer) })
+  // Catch-up for a morning that passed while the window was closed: activation
+  // IS the moment the extension can run again, so it is the check. Never a bare
+  // `void`: a rejection here is a schedule that silently did not fire.
+  void fireDueSchedules().catch((e) => log.error(`Schedule catch-up failed: ${String(e)}`))
+
+  /* --- Remote Control: the half on this machine ------------------------------
+   *
+   * The board can be watched from anywhere through a small site the user
+   * deploys (see remote/README.md — that folder lifts into its own repo). This
+   * machine is the only writer; the site only stores and serves. The tested
+   * decisions live in src/remote/: relay.ts is the SHAPE of what may leave
+   * (its tests pin the redaction field by field), pusher.ts is WHEN (cadence,
+   * heartbeat, backoff), feed.ts is WHAT changed (a transcript tail travels
+   * only when it grew). Left for the host is the act itself: where the pieces
+   * are stored, what a snapshot is built from, and the settings-page buttons.
+   *
+   * Storage follows the house rules: the URL and the on/off flag are plain
+   * workspace state, parsed on the way back; the pairing code is a credential,
+   * so it lives in SecretStorage and never crosses the postMessage boundary in
+   * either direction — the page sees only `hasCode`, a boolean from the one
+   * read at activation.
+   */
+  const remoteCodeKey = 'remote.code'
+  const storedRemoteUrl = String(state.get<unknown>('remote.url') ?? '')
+  let remoteUrl = storedRemoteUrl ? (relayBase(storedRemoteUrl) ?? '') : ''
+  let remoteEnabled = state.get<unknown>('remote.enabled') === true
+  let remoteHasCode = false
+  let remoteBoardId = ''
+  let remoteStatus: { at: number; ok: boolean; note?: string; error?: string } | undefined
+  let remotePusher: RemotePusher | undefined
+  const remoteFeed = new RemoteFeed()
+
+  /** How fresh a stored session's last update must be to ride the one-time
+   *  backfill, and how big one backfill POST may be (a tail is at most
+   *  TAIL_MAX rows; bytes are what actually bounds a POST). */
+  const REMOTE_FRESH_MS = 14 * 24 * 60 * 60 * 1000
+  const REMOTE_CHUNK_BYTES = 150_000
+
+  /** The snapshot one push carries: the CURRENT board from the host's own
+   *  getState — the same state the window paints — with each card mapped
+   *  through `toRemoteCard`, the one place a card is filtered. Tails come from
+   *  live runs only: a run that is not live cannot grow, so it has nothing new
+   *  to send; sessions that ended while the relay was unreachable are
+   *  re-synced by `remoteBackfill` at enable time. With no folder open the
+   *  board IS empty, so an empty snapshot is the truth, not a bug. */
+  async function buildRemoteSnapshot(): Promise<PushSnapshot> {
+    const ui = await host.getState()
+    const columns = ui.columns.map((c) => ({ id: c.id, name: c.name }))
+    const cards = ui.cards.map((c) => toRemoteCard(c))
+    const tails: TailSource[] = (ws?.manager?.list() ?? []).map((a) => ({
+      key: a.sessionId ?? a.runId,
+      history: a.history,
+      live: a.live,
+    }))
+    return remoteFeed.build(Date.now(), columns, cards, tails)
+  }
+
+  /** (Re)build the engine from the CURRENT settings. Called at activation and
+   *  after every change from the settings page, so enabling, repointing or
+   *  clearing the code takes effect immediately. Cadence state is dropped on
+   *  purpose: a fresh engine's first tick compares against nothing and pushes,
+   *  which is exactly what a config change should do. `remoteFeed` is NOT
+   *  dropped — what the relay already holds is still true until the code
+   *  changes, and the reset for that lives in the saveRemote case. */
+  function syncRemoteEngine(): void {
+    const baseUrl = remoteUrl ? relayBase(remoteUrl) : undefined
+    remotePusher = new RemotePusher({
+      now: Date.now,
+      baseUrl,
+      boardId: remoteBoardId,
+      enabled: remoteEnabled && remoteHasCode && !!baseUrl,
+      fetch,
+      build: buildRemoteSnapshot,
+      onStatus: (s) => {
+        remoteStatus = s
+        // The settings page's status line must move on success too — a green
+        // tick that no attempt ever produced is the page's own forbidden
+        // signal, and so is a red one that a later success never clears.
+        void SettingsPanel.refreshIfOpen()
+      },
+    })
+  }
+
+  /** Push the recent board to the relay in one bounded pass: the sync when a
+   *  relay is first configured, and again at activation, because counts live
+   *  only in memory and the relay may hold a board from days ago. Sessions the
+   *  board shows whose last update is fresh enough each send their transcript
+   *  tail; chunks keep one POST bounded, and every chunk carries its own
+   *  freshly built index, so the relay is never left claiming a tail it does
+   *  not have. A chunk that did not go out rolls its sessions' counts back, so
+   *  the next backfill sends them again. */
+  async function remoteBackfill(): Promise<void> {
+    if (!remotePusher || !ws) return
+    const live = new Set((ws.manager?.list() ?? []).map((a) => a.sessionId ?? a.runId))
+    const stored = await ws.store.list({ includeArchived: false })
+    const fresh = stored.filter((s) =>
+      !live.has(s.id) && Date.now() - s.updated < REMOTE_FRESH_MS && remoteFeed.tvOf(s.id) === 0)
+    let chunk: RemoteTail[] = []
+    let bytes = 0
+    const flush = async (): Promise<void> => {
+      if (!chunk.length) return
+      const ui = await host.getState()
+      const index = remoteFeed.build(
+        Date.now(),
+        ui.columns.map((c) => ({ id: c.id, name: c.name })),
+        ui.cards.map((c) => toRemoteCard(c)),
+        [],
+      ).index
+      const pushed = remotePusher ? await remotePusher.pushRaw(index, chunk) : false
+      if (!pushed) {
+        for (const t of chunk) remoteFeed.setCount(t.key, 0)
+      }
+      chunk = []
+      bytes = 0
+    }
+    for (const s of fresh) {
+      const hist = await ws.store.transcript(s.id)
+      if (!hist.length) continue
+      const tail = projectTail(Date.now(), s.id, hist, [])
+      if (!tail) continue
+      // Marked BEFORE the index is built: the chunk's own index must claim the
+      // tail it carries, or the page would never fetch it.
+      remoteFeed.setCount(s.id, hist.length)
+      bytes += JSON.stringify(tail).length
+      chunk.push(tail)
+      if (bytes >= REMOTE_CHUNK_BYTES) await flush()
+    }
+    await flush()
+  }
+
+  // The pairing code is read ONCE, here: `hasCode` for the settings page is
+  // this boolean, and the code itself is never kept anywhere but the keychain.
+  // One SecretStorage IPC before the rest of activation is cheaper than a page
+  // that can show the wrong half of "is this connected".
+  const storedCode = await context.secrets.get(remoteCodeKey)
+  if (storedCode) {
+    remoteHasCode = true
+    remoteBoardId = boardIdOf(storedCode)
+  }
+  syncRemoteEngine()
+  if (remoteEnabled && remoteHasCode && remoteUrl) {
+    log.info('Remote Control is on — syncing the board to the relay site')
+    void remoteBackfill().catch((e) => log.error(`Remote backfill failed: ${String(e)}`))
+  }
+
+  // The engine's own ticker. Repaints nudge it too (see `paint`), but a board
+  // with no agent running produces no repaints, so this is what keeps the
+  // idle heartbeat honest. Cheap when there is nothing to do: tick() checks
+  // its gates before building anything.
+  const remoteTimer = setInterval(() => {
+    void remotePusher?.tick().catch((e) => log.error(`Remote tick failed: ${String(e)}`))
+  }, 30_000)
+  context.subscriptions.push({ dispose: () => clearInterval(remoteTimer) })
 
   async function refreshRuntimeStatus(only?: RuntimeId): Promise<void> {
     settingsBusy = only ? `Checking ${only}…` : 'Checking which agents are installed…'
@@ -1143,6 +1526,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               : {}),
           }
         }),
+        // One row per piece of the dictation pipeline. Absent until the user
+        // presses "Check" (or the config changed and the host re-checked) —
+        // checking spawns the binaries, which is never something a page paint
+        // does, so the section says "not checked yet" when this is missing.
+        ...(voiceResult
+          ? {
+              voice: {
+                at: voiceResult.at,
+                rows: rowsFromChecks(voiceResult.cfg, voiceResult.checks),
+              },
+            }
+          : {}),
+        // Always present — empty is a real state ("no schedules yet"), not an
+        // absence the page has to guess about. `canRun: false` with its reason
+        // travels here so a schedule that cannot fire is never shown with a
+        // countdown that can never reach zero.
+        schedules: scheduleView(),
+        // Always present, same reasoning. `status` is absent until the first
+        // push attempt, which the page renders as "not asked yet" rather than
+        // as a green tick — the code never travels, only `hasCode`.
+        remote: {
+          enabled: remoteEnabled,
+          url: remoteUrl,
+          hasCode: remoteHasCode,
+          ...(remoteStatus ? { status: remoteStatus } : {}),
+        },
       }
     },
 
@@ -1302,6 +1711,136 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         case 'openSetting':
           await vscode.commands.executeCommand('workbench.action.openSettings', msg.key)
           return
+        case 'checkVoice':
+          // The settings page's own probe: always ask again, cache or no cache
+          // — that is what a Check button is for.
+          settingsBusy = 'Checking whisper-cli and ffmpeg…'
+          void SettingsPanel.refreshIfOpen()
+          try {
+            voiceResult = undefined
+            await voiceCheckNow()
+          } finally {
+            settingsBusy = undefined
+          }
+          return
+        case 'saveSchedule': {
+          const d = msg.draft
+          const now = Date.now()
+          const hit = schedules.find((s) => s.id === d.id)
+          const list: Schedule[] = hit
+            ? schedules.map((s) => s.id === d.id
+                ? {
+                    ...s, title: d.title, prompt: d.prompt, hour: d.hour,
+                    minute: d.minute, days: d.days, enabled: d.enabled,
+                  }
+                : s)
+            : [...schedules, {
+                id: crypto.randomUUID(), title: d.title, prompt: d.prompt,
+                hour: d.hour, minute: d.minute, days: d.days,
+                enabled: d.enabled, createdAt: now,
+              }]
+          await saveSchedules(list)
+          // A schedule whose time has already passed today starts TOMORROW, not
+          // in the next sixty seconds — the user set up tomorrow's run. So no
+          // catch-up here; the 60s tick handles a schedule that is due because
+          // it was RESUME-enabled (that one is an explicit re-arm).
+          void SettingsPanel.refreshIfOpen()
+          refreshAll()
+          return
+        }
+        case 'removeSchedule':
+          await saveSchedules(schedules.filter((s) => s.id !== msg.id))
+          void SettingsPanel.refreshIfOpen()
+          refreshAll()
+          return
+        case 'toggleSchedule': {
+          const hit = schedules.find((s) => s.id === msg.id)
+          if (!hit) return
+          await saveSchedules(schedules.map((s) =>
+            s.id === msg.id ? { ...s, enabled: !s.enabled } : s))
+          void SettingsPanel.refreshIfOpen()
+          refreshAll()
+          // Re-arming may mean a due moment passed while it was off: fire the
+          // catch-up check now rather than waiting for the next heartbeat.
+          if (!hit.enabled) {
+            await fireDueSchedules().catch((e) =>
+              log.error(`Schedule catch-up after resume failed: ${String(e)}`))
+          }
+          return
+        }
+        case 'runSchedule': {
+          const hit = schedules.find((s) => s.id === msg.id)
+          if (!hit) return
+          await fireScheduleNow(hit, true)
+          return
+        }
+        case 'setRemote': {
+          remoteEnabled = msg.enabled
+          await state.update('remote.enabled', remoteEnabled)
+          syncRemoteEngine()
+          if (remoteEnabled) {
+            log.info(remoteHasCode && remoteUrl
+              ? 'Remote Control enabled — pushing to the relay'
+              : 'Remote Control cannot connect yet: ' +
+                (remoteHasCode ? 'no relay URL set' : 'no pairing code set'))
+            void SettingsPanel.refreshIfOpen()
+            // A fresh engine compares against nothing, so the first tick
+            // pushes the current board — re-enabling after a pause needs no
+            // backfill, because the relay still holds everything the feed
+            // counts describe.
+            void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+          }
+          return
+        }
+        case 'saveRemote': {
+          // Saving a valid URL and (optionally) a code IS the connect action.
+          // The pairing code is change-only: saving without one keeps the
+          // stored code, and clearing it is its own message.
+          const url = relayBase(msg.url)
+          if (!url) throw new Error(`"${msg.url}" is not an http(s) address the relay can live at.`)
+          const codeChanged = !!msg.code
+          const relayChanged = url !== remoteUrl || codeChanged
+          remoteUrl = url
+          remoteEnabled = true
+          await state.update('remote.url', url)
+          await state.update('remote.enabled', true)
+          if (codeChanged) {
+            await context.secrets.store(remoteCodeKey, msg.code!)
+            remoteHasCode = true
+            remoteBoardId = boardIdOf(msg.code!)
+          }
+          syncRemoteEngine()
+          if (relayChanged) {
+            // A new code names a NEW board on the relay: counts describe what
+            // the old board held, so they must not claim the new one.
+            remoteFeed.reset()
+            settingsBusy = 'Copying recent sessions to the relay…'
+            try {
+              await remoteBackfill()
+              void vscode.window.showInformationMessage(
+                'Remote Control connected. Open the relay page on another device and enter the code.')
+            } catch (e) {
+              log.error(`Remote backfill failed: ${e instanceof Error ? e.message : String(e)}`)
+            } finally {
+              settingsBusy = undefined
+              void SettingsPanel.refreshIfOpen()
+            }
+          }
+          return
+        }
+        case 'clearRemoteCode': {
+          await context.secrets.delete(remoteCodeKey)
+          remoteHasCode = false
+          remoteBoardId = ''
+          // Without a code nothing can connect, so the toggle steps down with
+          // it rather than sitting "on" while every attempt is refused.
+          if (remoteEnabled) {
+            remoteEnabled = false
+            await state.update('remote.enabled', false)
+          }
+          syncRemoteEngine()
+          return
+        }
       }
     },
   }
@@ -1406,6 +1945,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await provider.post(state).catch((e) => log.error(`Side bar refresh failed: ${String(e)}`))
     await BoardPanel.postCurrent(state).catch((e) => log.error(`Panel refresh failed: ${String(e)}`))
     refreshStatus()
+    // Something changed or the board would not be repainting — let the relay
+    // cadence know without waiting for its own timer, which exists for the
+    // idle case where nothing repaints. tick() gates itself: this fires on
+    // every frame an agent streams, and at most one push per MIN_INTERVAL
+    // ever leaves.
+    if (remotePusher) {
+      remotePusher.nudge().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+    }
   }, REPAINT_INTERVAL_MS, { onError: (e) => log.error(`Repaint failed: ${String(e)}`) })
 
   const refreshAll = () => paint.schedule()
@@ -1809,6 +2356,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
            missing. */
         orchestrationLevels: undefined as { key: string; label: string; detail: string }[] | undefined,
         orchestrationNote: undefined as string | undefined,
+        // The mic's gate: absent until the lazy probe answered, so the first
+        // paint of the board never waits on two `--version` spawns.
+        ...(voiceResult ? voiceState(voiceResult) : {}),
       }
       if (!ws) {
         composer.models = sendModels(catalogue, active.id)
@@ -1835,6 +2385,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         cards.push({
           key,
           ...(a.sessionId ? { sessionId: a.sessionId } : {}),
+          runtime: m?.runtime ?? a.runtime,
           title: s?.title ?? a.title,
           phase: phase ?? ws.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing',
           tags: s?.tags ?? m?.tags ?? [],
@@ -1855,7 +2406,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       for (const s of stored) {
         if (seen.has(s.id)) continue
         cards.push({
-          key: s.id, sessionId: s.id, title: s.title, phase: s.phase, tags: s.tags,
+          key: s.id, sessionId: s.id,
+          ...(s.runtime ? { runtime: s.runtime } : {}),
+          title: s.title, phase: s.phase, tags: s.tags,
           updated: s.updated, archived: s.archived, pinned: s.pinned,
         ...(() => {
           const d = metas[s.id]?.decomposition
@@ -2079,6 +2632,126 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     async selectProvider() { await selectProvider() },
     openSettings() { openSettings() },
+
+    /** Workspace-relative paths for the @-mention picker.
+     *
+     * This is the one payload too big to ride the state channel on every
+     * repaint, so the view asks for it once, lazily, and keeps it. The first
+     * workspace folder is the board's folder — `ws.root` is built from it — so
+     * a multi-root workspace does not mix two projects' paths into one list.
+     */
+    async mentionFiles(): Promise<string[]> {
+      const folder = vscode.workspace.workspaceFolders?.[0]
+      if (!folder) return []
+      try {
+        // What a mention could plausibly name: source and documents, not the
+        // vendored, the generated or the binary. 2000 is a picker, not a disk
+        // sweep — the view only ever shows the first handful of matches.
+        const uris = await vscode.workspace.findFiles(
+          new vscode.RelativePattern(folder, '**/*'),
+          '{**/.git/**,**/node_modules/**,**/.agentskanban/**,**/.vscode/**,**/out/**,**/dist/**,**/build/**,**/coverage/**,**/.next/**,**/vendor/**,**/bin/**,**/obj/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.webp,**/*.svg,**/*.ico,**/*.woff,**/*.woff2,**/*.wasm,**/*.zip,**/*.tar,**/*.gz,**/*.mp3,**/*.mp4,**/*.mov,**/*.wav}',
+          2000,
+        )
+        return uris
+          .map((u) => vscode.workspace.asRelativePath(u, false))
+          .filter((p): p is string => !!p)
+          .sort()
+      } catch (e) {
+        // A closed folder races any async ask. An empty list is honest — the
+        // picker says "nothing to mention" instead of pretending.
+        log.warn(`Mention file search failed: ${String(e)}`)
+        return []
+      }
+    },
+
+    /** Search what the conversations actually were.
+     *
+     * Answered on its own channel, never through `refresh`: it reads every
+     * session's transcript, which is never something a repaint does. The
+     * filter is deliberate and tested elsewhere — prompts and agent answers
+     * only; no tool rows, no thinking, no subagent frames. And each session
+     * is searched through the SAME array its chat view renders — a live
+     * run's own history plus its streaming tail, a finished one's store
+     * parse — so a hit's `entryIndex` is the row the chat will show when
+     * the hit is opened, not an index into a differently-cut file.
+     */
+    async searchTranscript(qRaw: string): Promise<SearchAnswer> {
+      const q = qRaw.trim().slice(0, 200)
+      if (!ws || !q) return { q, matches: [], more: 0 }
+      const stored = await ws.store.list({ includeArchived: true })
+      const live = ws.manager?.list() ?? []
+      const rows: SearchRow[] = []
+      const push = (key: string, title: string | undefined, entries: readonly Entry[]): void => {
+        for (const h of searchEntries(entries, q)) {
+          rows.push({ key, ...(title ? { title } : {}), ...h })
+        }
+      }
+      for (const a of live) {
+        const key = a.sessionId ?? a.runId
+        // The chat renders the run's own history + live tail, NOT the session
+        // file: the file is a message behind, and reading both would double
+        // every row that has already flushed.
+        push(key, a.title, [...a.history, ...a.live])
+      }
+      const liveKeys = new Set(live.map((a) => a.sessionId ?? a.runId))
+      for (const s of stored) {
+        if (liveKeys.has(s.id)) continue
+        try {
+          // The store's parse cache (keyed on the file's identity) makes this
+          // cheap once each session has been read; the entry indices line up
+          // with the chat because both are the store's own tail parse.
+          push(s.id, s.title, await ws.store.transcript(s.id))
+        } catch {
+          // A session whose file vanished mid-search contributes nothing.
+          // `transcript()` already returns [] for a read failure; this guard
+          // is for anything its own catch does not cover.
+        }
+      }
+      rows.sort((a, b) => b.at - a.at)
+      const cap = 200
+      return { q, matches: rows.slice(0, cap), more: Math.max(0, rows.length - cap) }
+    },
+
+    /** Start dictating: check the pipeline, then record the microphone.
+     *  Idempotent — a second press while recording is a no-op that returns ok.
+     */
+    async voiceStart(): Promise<{ ok: true } | { ok: false; error: string }> {
+      if (liveCapture) return { ok: true }
+      const r = await voiceCheckNow()
+      const v = verdict(r.checks)
+      if (!v.ok) return { ok: false, error: v.why ?? 'Dictation is unavailable' }
+      const cap = startCapture(voiceConfig())
+      liveCapture = cap
+      // However the capture ends — user stop, device busy, ffmpeg dying — the
+      // mic must stop reading as recording. Live state, picked up by the next
+      // repaint through composer.voice.recording.
+      void cap.stopped.then((o) => {
+        if (liveCapture === cap) liveCapture = undefined
+        if (!o.ok) log.warn(`Dictation stopped itself: ${o.error}`)
+      })
+      // ffmpeg fails fast when the device is busy or there is no default, so
+      // give it a moment before telling the mic "recording": a capture that is
+      // already dead must come back as the error it is, not as one frame of
+      // pulsing that ends on its own.
+      const early = await Promise.race([
+        cap.stopped,
+        new Promise<null>((res) => setTimeout(() => res(null), 500)),
+      ])
+      if (early && !early.ok) return { ok: false, error: early.error }
+      return { ok: true }
+    },
+
+    /** Stop dictating and transcribe what was captured, locally. */
+    async voiceStop(): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+      const cap = liveCapture
+      if (!cap) return { ok: false, error: 'Not recording' }
+      liveCapture = undefined
+      cap.stop()
+      const outcome = await cap.stopped
+      return outcome.ok
+        ? { ok: true, text: outcome.text }
+        : { ok: false, error: outcome.error }
+    },
 
     async newSessionPrompt() {
       const text = await vscode.window.showInputBox({
@@ -2372,6 +3045,172 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const n = ws?.manager?.clearQueue(key) ?? 0
       if (n) vscode.window.showInformationMessage(`Discarded ${n} queued message${n === 1 ? '' : 's'}.`)
       refreshAll()
+    },
+
+    /**
+     * "Try again from here": put the card back to one of its messages.
+     *
+     * The worktree files are restored to the state that message was sent into
+     * (from Claude Code's file checkpoints — see checkpoints.ts), the session
+     * is forked at that message so everything after it is gone from the card,
+     * and the sidecar entry is re-keyed to the fork. The user then sends the
+     * corrected instruction, and the card resumes the fork in the same
+     * worktree — nothing is tracked in the user's repository, and the original
+     * session stays in Claude Code's history untouched.
+     *
+     * Every refusal names its reason, and success with a caveat (no checkpoints
+     * at that point, a file that could not be restored) says the caveat — a
+     * "try again" that silently kept the current files is a control that lied.
+     */
+    async forkAt(key, messageId) {
+      const w = requireWs()
+      if (!messageId) {
+        vscode.window.showWarningMessage('Choose a message to start over from first.')
+        return
+      }
+      const card = await w.store.get(key)
+      if (!card) {
+        vscode.window.showWarningMessage(
+          'This session has not been given an id yet, so it cannot be forked. Wait for it to start, then try again.')
+        return
+      }
+      if (card.runtime && card.runtime !== 'claude') {
+        vscode.window.showWarningMessage(
+          'A Codex session cannot be forked — Claude Code\'s fork works on its own transcripts.')
+        return
+      }
+      const children = await w.store.childrenOf(card.id)
+      if (children.length) {
+        vscode.window.showWarningMessage(
+          'Merge or remove its subtasks first — a fork re-keys this card to a new session, ' +
+          'and each subtask remembers its parent by the id that would be left behind.')
+        return
+      }
+      // The anchor must be a real prompt row of this session's transcript. The
+      // view names it from the same parse this reads, so a miss means the
+      // transcript moved under us — say so rather than fork at nothing.
+      const rows = await w.store.transcript(card.id)
+      const prompts = rows.filter((e): e is Entry & { kind: 'prompt'; id: string } =>
+        e.kind === 'prompt' && e.id !== undefined)
+      const anchor = prompts.find((e) => e.id === messageId)
+      if (!anchor) {
+        vscode.window.showWarningMessage(
+          'That message is not in this session\'s transcript any more — refresh and try again.')
+        return
+      }
+      const snippet = anchor.text.replace(/\s+/g, ' ').trim().slice(0, 90) ||
+        '(message with no text)'
+      const later = prompts.length - prompts.indexOf(anchor) - 1
+      const live = w.manager?.byKey(key)
+      const wt = await worktreeOf(key).catch(() => undefined)
+
+      // What the files looked like when that message was sent: the snapshot
+      // marker at that message, from the raw JSONL the SDK does not expose.
+      // When a run is LIVE the file can still gain a snapshot update (the CLI
+      // re-issues the marker when the file set changes mid-turn), so the map
+      // for a live session is only read AFTER the run is stopped below; the
+      // modal then cannot promise a count it does not have yet.
+      const readMap = async (): Promise<CheckpointMap | undefined> => {
+        const loc = await sessionFileFor(claudeHome(), card.id)
+        if (!loc) return undefined
+        const text = await fs.readFile(loc.file, 'utf8').catch(() => '')
+        return checkpointMapFor(text.split('\n'), messageId)
+      }
+      const mapNow = live ? undefined : await readMap()
+
+      const choice = await vscode.window.showWarningMessage(
+        `Start over from "${snippet}"?`,
+        {
+          modal: true,
+          detail: [
+            `This forks the session at that message. Everything after it — its answer and the ` +
+              `${later} later message${later === 1 ? '' : 's'} — is discarded from this card. The original ` +
+              `session stays in Claude Code's history, untouched.`,
+            live ? 'The run in progress is stopped first.' : '',
+            !wt ? 'This session has no worktree, so no files are restored.'
+              : live ? 'The worktree files are restored to how they were when you sent it.'
+              : mapNow === undefined
+                ? 'No file checkpoints exist at this point (this session ran before they were recorded), so the files keep their current state.'
+                : Object.keys(mapNow).length
+                  ? `Files are restored to how they were: ${Object.keys(mapNow).length} tracked file${Object.keys(mapNow).length === 1 ? '' : 's'}.`
+                  : 'No files had been touched by that point, so there is nothing to restore.',
+          ].filter(Boolean).join('\n\n'),
+        },
+        'Try again from here',
+      )
+      if (choice !== 'Try again from here') return
+
+      // The fork reads the transcript file, so a dying CLI — which can flush a
+      // frame or two on the way out — has to be finished before we cut. Only
+      // now is the checkpoint map read for a live session.
+      if (live) {
+        w.manager?.stop(key)
+        const loc = await sessionFileFor(claudeHome(), card.id)
+        const settled = loc
+          ? await waitForQuiescent(loc.file)
+          : await new Promise((r) => setTimeout(r, 1500))
+        if (!settled) {
+          vscode.window.showWarningMessage(
+            'The run is still stopping — wait a moment and try again.')
+          return
+        }
+      }
+      const map = mapNow ?? await readMap()
+
+      // Restore first: the fork shares this worktree, and the redo must start
+      // from the state the anchor message was sent into, not the state the
+      // discarded turns left behind. applyRestore never throws per file; a
+      // missing backup is a note afterwards, not a reason to skip the rest.
+      let restored: string[] = []
+      let failedFiles: { rel: string; reason: string }[] = []
+      if (wt && map) {
+        const plan = planRestore(wt.dir, historyDirFor(claudeHome(), card.id), map)
+        const out = await applyRestore(plan.copies)
+        restored = out.restored
+        failedFiles = out.failed
+      }
+
+      try {
+        const { forkSession } = await loadSdk()
+        const forked = await forkSession(card.id, {
+          upToMessageId: messageId,
+          title: card.title,
+        })
+        const forkId = forked.sessionId
+        // Re-key the card to the fork, keeping phase, tags and the worktree
+        // mapping, and clear the run mark: the fork has never run.
+        await w.store.adoptKey(card.id, forkId)
+        await w.store.patch(forkId, { running: 0 })
+        if (selectedKey === key) selectedKey = forkId
+        log.info(`Forked session ${card.id} at ${messageId} -> ${forkId}; restored ${restored.length} file(s)`)
+        refreshAll()
+
+        const notes: string[] = []
+        if (restored.length) {
+          notes.push(`Restored ${restored.length} tracked file${restored.length === 1 ? '' : 's'} to how they were.`)
+        } else if (wt && map && !Object.keys(map).length) {
+          notes.push('No files had been touched by that point, so nothing needed restoring.')
+        }
+        if (failedFiles.length) {
+          notes.push(`Could not restore: ${failedFiles.slice(0, 3).map((f) => f.rel).join(', ')}` +
+            (failedFiles.length > 3 ? ` and ${failedFiles.length - 3} more` : '') +
+            ` (${failedFiles[0]?.reason ?? 'unknown'}).`)
+        }
+        if (map === undefined && wt) {
+          notes.push('No file checkpoints existed at that point, so the files kept their current state.')
+        }
+        const text = `Forked at "${snippet}". ` + (notes.length ? notes.join(' ') : 'Send the corrected instruction to continue here.')
+        if (notes.length) vscode.window.showWarningMessage(text)
+        else vscode.window.showInformationMessage(text)
+      } catch (e) {
+        // The files are already restored at this point — say so, or the card
+        // looks untouched while the worktree quietly went backwards.
+        vscode.window.showWarningMessage(
+          `Could not fork: ${e instanceof Error ? e.message : String(e)}. ` +
+          (restored.length
+            ? `The files were restored to that message's state; the card still points at the original session.`
+            : 'The card still points at the original session.'))
+      }
     },
 
     /**
@@ -3059,6 +3898,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (e.affectsConfiguration('agentsKanban.focusMode')) {
         setBoardFocusMode(cfg().get<FocusMode>('focusMode') ?? 'wide')
       }
+      // A whisper/ffmpeg path changed, so the mic's gate must be re-asked: the
+      // cache describes the OLD config, and without this, installing whisper
+      // while the window is open leaves the mic missing until a reload — the
+      // fix reading as not having worked, exactly like a corrected executable
+      // path above.
+      if (VOICE_KEYS.some((k) => e.affectsConfiguration(`agentsKanban.${k}`))) {
+        voiceResult = undefined
+        voiceCheckNow()
+          .then(() => { refreshAll(); void SettingsPanel.refreshIfOpen() })
+          .catch((err: unknown) => log.error(`Could not re-check the dictation pipeline: ${String(err)}`))
+      }
     }),
     { dispose: () => ws?.manager?.stopAll() },
     { dispose: () => paint.dispose() },
@@ -3093,6 +3943,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   detectRuntimes()
     .then(() => refreshAll())
     .catch((e: unknown) => log.error(`Could not look for the installed agents: ${String(e)}`))
+
+  /* The composer's mic, probed once in the background. Two spawnSync probes are
+     too slow to sit on first paint; 2s later nobody is watching the frame rate. */
+  kickVoiceCheck()
 
   const startupEndpoint = currentProvider()
   if (cfg().get<boolean>('discoverModels') !== false
