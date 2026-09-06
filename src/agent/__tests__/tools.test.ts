@@ -8,7 +8,7 @@
    happened on its own. Found by the first real agent run, not by any unit test. */
 import { loadSdk } from '../sdk.ts'
 import { DEFAULT_BOARD, type BoardConfig } from '../../board/config.ts'
-import { ASKS_FIRST, boardToolName, boardToolNames, buildBoardTools, type BoardToolContext } from '../tools.ts'
+import { ASKS_FIRST, boardToolName, boardToolNames, buildBoardTools, conventionalMessage, type BoardToolContext } from '../tools.ts'
 import { guessLinkKind, normaliseTestPlan } from '../../sessions/meta.ts'
 import { AUTO_ALLOWED_FOR_TEST } from '../session.ts'
 
@@ -319,6 +319,63 @@ const byName = (list: ReturnType<typeof buildBoardTools>, name: string) => list.
   phase = 'validating'
   await call({ phase: 'implementing', howToTest: { summary: 's', steps: ['x'] } })
   ok(cleared === 0, 'and a move that supplies a NEW plan keeps it rather than clearing it')
+}
+
+// The move into review commits the worktree, so the user's Merge button always
+// has commits to merge. The message is the agent's, or derived from the title.
+{
+  const commits: { message: string }[] = []
+  const ctxCommit = ctxFor({
+    store: {
+      get: async () => ({ phase: 'implementing', tags: [] }),
+      card: async () => ({ phase: 'implementing', tags: [], title: 'Add a merge button to the toolbar' }),
+      childrenOf: async () => [],
+      setPhase: async () => {}, setTags: async () => {}, setTestPlan: async () => {},
+      clearTestPlan: async () => {},
+      list: async () => [],
+    } as never,
+    commitWorktree: async (message) => {
+      commits.push({ message })
+      return { ok: true, sha: 'a1b2c3d', message }
+    },
+    sessionTitle: () => 'Add a merge button to the toolbar',
+  })
+  const sp = byName(buildBoardTools(DEFAULT_BOARD, ctxCommit, tool), 'set_phase')
+  const call = (a: unknown) =>
+    (sp as unknown as { handler: (x: unknown, e: unknown) => Promise<unknown> }).handler(a, {})
+
+  const withPlan = { howToTest: { summary: 's', steps: ['npm test'] } }
+  const first = await call({ phase: 'validating', ...withPlan, commitMessage: 'feat: toolbar merge button' })
+  ok(commits.length === 1 && commits[0]!.message === 'feat: toolbar merge button',
+     'moving to Validating commits the worktree, with the agent\'s message')
+  ok(String((first as { content: { text: string }[] }).content[0]?.text).includes('Committed a1b2c3d'),
+     'and the reply says what was committed')
+
+  commits.length = 0
+  await call({ phase: 'validating', ...withPlan })
+  ok(commits.length === 1 && commits[0]!.message === 'feat: add a merge button to the toolbar',
+     `without one, the message derives from the card title (${commits[0]?.message})`)
+
+  commits.length = 0
+  await call({ phase: 'planning' })
+  ok(commits.length === 0, 'a move that is not into review commits nothing')
+}
+
+// conventionalMessage: the derivation the fallback commit rides on.
+{
+  const cases: [string, string][] = [
+    ['Fix the flaky snapshot test', 'fix: the flaky snapshot test'],
+    ['Add a Merge button to the toolbar', 'feat: add a Merge button to the toolbar'],
+    ['docs for the remote relay', 'docs: for the remote relay'],
+    ['Refactor the session store', 'refactor: the session store'],
+    ['Test the merge flow', 'test: the merge flow'],
+    ['FEAT: something already conventional', 'feat: something already conventional'],
+    ['If I push this repo to public github will it expose secrets',
+     'feat: if I push this repo to public github will it expose secrets'],
+  ]
+  for (const [title, want] of cases) {
+    ok(conventionalMessage(title) === want, `conventionalMessage("${title}") -> "${want}"`)
+  }
 }
 
 const built = buildBoardTools(DEFAULT_BOARD, ctx, tool)

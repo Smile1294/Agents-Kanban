@@ -893,6 +893,21 @@ export class AgentManager extends EventEmitter {
         }
         return result
       },
+      commitWorktree: async (message: string) => {
+        const path = agent.worktreePath
+        if (!path) {
+          return { ok: false, reason: 'no-worktree', message: 'This session has no worktree to commit.' }
+        }
+        if (await this.opts.worktrees.isClean(path)) {
+          return { ok: false, reason: 'clean', message: 'The worktree is already clean — nothing to commit.' }
+        }
+        try {
+          const sha = await this.opts.worktrees.commitAll(path, message)
+          return { ok: true, sha, message }
+        } catch (e) {
+          return { ok: false, reason: 'failed', message: e instanceof Error ? e.message : String(e) }
+        }
+      },
       // Mechanical 1:1 wires — the tool handlers own every decision, including
       // the creator stamp (`onScheduleCreate` gets `createdBy` from
       // `sessionTitle`, which the tools test pins). This file supplies only the
