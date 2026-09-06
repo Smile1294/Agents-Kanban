@@ -63,7 +63,37 @@ export interface SettingsState {
    * the page says so instead of showing a countdown that can never reach zero.
    */
   schedules?: { rows: ScheduleRowState[]; canRun: boolean; problem?: string }
+  /**
+   * Remote Control: the board streamed to a relay site so it can be watched
+   * from anywhere. Always present. `hasCode` says a pairing code is in the
+   * keychain — the host reads it once at activation, so this is a cached
+   * boolean, and the code itself never crosses the postMessage boundary in
+   * either direction.
+   */
+  remote?: RemoteState
 }
+
+/**
+ * Remote Control, as the settings page shows it. `status` is the relay's last
+ * answer — success AND failure both, so a page cannot show a green tick that
+ * no attempt ever produced. Absent before the first attempt, which the page
+ * renders as "not asked yet", not as "fine".
+ */
+export interface RemoteState {
+  enabled: boolean
+  /** The relay site origin, "" when never set. */
+  url: string
+  /** True when a pairing code is in the keychain. The code never renders. */
+  hasCode: boolean
+  status?: { at: number; ok: boolean; note?: string; error?: string }
+}
+
+/** What the page sends to change Remote Control. A `saveRemote` with no code
+ *  keeps the stored code — the input is a change-only field. */
+export type RemoteMessage =
+  | { type: 'setRemote'; enabled: boolean }
+  | { type: 'saveRemote'; url: string; code?: string }
+  | { type: 'clearRemoteCode' }
 
 /** One scheduled run as the page shows it. The schedule itself, plus the
  *  derived facts: `when` ("Mon–Fri at 09:00") and `nextAt`, both host-computed,
@@ -209,6 +239,7 @@ export type SettingsMessage =
   | { type: 'removeSchedule'; id: string }
   | { type: 'toggleSchedule'; id: string }
   | { type: 'runSchedule'; id: string }
+  | RemoteMessage
 
 export interface SettingsHost {
   getState: () => Promise<SettingsState>
@@ -396,6 +427,21 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
     case 'toggleSchedule':
     case 'runSchedule':
       return id ? ({ type, id } as SettingsMessage) : undefined
+    case 'setRemote':
+      return typeof m.enabled === 'boolean' ? { type, enabled: m.enabled } : undefined
+    case 'clearRemoteCode':
+      return { type }
+    case 'saveRemote': {
+      // The URL is validated host-side too (relayBase) — this keeps the shape
+      // check here: non-empty strings with sane lengths, nothing more.
+      const url = typeof m.url === 'string' ? m.url.trim().slice(0, 2000) : ''
+      if (!url) return undefined
+      // A blank or absent code field means "keep the stored one" — the code is
+      // a change-only field, and emptying it must not wipe the keychain entry
+      // (there is a dedicated message for that, `clearRemoteCode`).
+      const code = typeof m.code === 'string' ? m.code.trim().slice(0, 500) : undefined
+      return code ? { type, url, code } : { type, url }
+    }
     case 'saveSchedule': {
       const d = m.draft as Record<string, unknown> | undefined
       if (!d || typeof d !== 'object') return undefined

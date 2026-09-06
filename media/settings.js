@@ -702,6 +702,135 @@ function dictationSection() {
   return sec
 }
 
+/* --- Remote Control ----------------------------------------------------------
+ *
+ * This machine PUSHES the board to a small site the user deploys — Netlify's
+ * free tier is enough, and the remote/ folder in this repo lifts into its own
+ * repo. The remote page is read-only, and the redaction happens ONCE, here, in
+ * cards.ts: the page never sees more than the board shows.
+ *
+ * Two rules this section must keep:
+ *
+ *  - The pairing code NEVER renders. It is a change-only field: blank even
+ *    when a code is stored, and blank means "keep the stored one" (the host
+ *    parses that). Clearing it is its own button — emptying a field must
+ *    never be what wipes the keychain.
+ *  - The status line is the relay's actual answers, success AND failure, and
+ *    says "not asked yet" before the first one — the same rule as every other
+ *    status row on this page. A tick that no attempt ever produced is the
+ *    page's one forbidden signal.
+ */
+const remoteDraft = { url: '', code: '' }
+let remoteDraftInited = false
+
+function remoteSection() {
+  const r = state.remote
+  if (!r) return null
+  // The URL is prefilled once, from the host. A later render must not stomp
+  // on a half-typed edit, so after this the drafts win — the same discipline
+  // as the model filter and the schedule form.
+  if (!remoteDraftInited) {
+    remoteDraft.url = r.url || ''
+    remoteDraftInited = true
+  }
+  const sec = el('section', 'panel')
+  const head = el('div', 'panel-head')
+  head.appendChild(el('h2', '', 'Remote Control'))
+  head.appendChild(el('span', 'muted small', 'watch this board from any browser'))
+  sec.appendChild(head)
+  sec.appendChild(el('p', 'blurb',
+    'Streams the board — cards, phases and the chats — to a small page you deploy ' +
+    '(the remote/ folder in this repo lifts into its own Netlify site). Only what the ' +
+    'board itself shows ever leaves: no code, no file paths, no credentials. The page ' +
+    'is read-only, and only changes travel — a quiet board pushes at most every 90 ' +
+    'seconds, so the free tier covers it.'))
+
+  /* The status line. Four states, four texts: paused, connected-but-never-asked,
+     last attempt went out, last attempt failed. */
+  const row = el('div', 'status-row')
+  const st = r.status
+  if (!r.enabled) {
+    row.appendChild(el('span', 'dot idle'))
+    row.appendChild(el('span', 'status-text', 'Paused — nothing is being pushed. The relay keeps what it has.'))
+    row.appendChild(button('Resume', 'link',
+      () => post({ type: 'setRemote', enabled: true })))
+  } else if (!st) {
+    row.appendChild(el('span', 'dot unknown'))
+    row.appendChild(el('span', 'status-text', 'Connected, but the relay has not answered yet.'))
+  } else if (st.ok) {
+    row.appendChild(el('span', 'dot ok'))
+    const text = el('span', 'status-text', st.note || 'Pushing.')
+    row.appendChild(text)
+    row.appendChild(el('span', 'muted small', '· ' + since(st.at)))
+    row.appendChild(button('Pause', 'link',
+      () => post({ type: 'setRemote', enabled: false })))
+  } else {
+    row.appendChild(el('span', 'dot bad'))
+    row.appendChild(el('span', 'status-text', 'Last push failed.'))
+    if (st.error) row.appendChild(el('code', 'fix', st.error))
+    row.appendChild(el('span', 'muted small', '· ' + since(st.at)))
+    row.appendChild(button('Retry', 'link', () => post({ type: 'setRemote', enabled: true })))
+  }
+  sec.appendChild(row)
+
+  const form = el('div', 'remote-form')
+
+  const url = el('input', 'remote-input')
+  url.type = 'text'
+  url.placeholder = 'https://your-board.netlify.app'
+  url.value = remoteDraft.url
+  url.setAttribute('data-focus', 'remote::url')
+  url.title = 'The relay site you deployed from the remote/ folder'
+  url.addEventListener('input', (e) => {
+    remoteDraft.url = (e && e.target && e.target.value != null ? e.target.value : url.value) || ''
+    render()
+  })
+  form.appendChild(url)
+
+  const code = el('input', 'remote-input remote-code')
+  code.type = 'text'
+  code.placeholder = r.hasCode
+    ? 'A code is stored — leave blank to keep it'
+    : 'A pairing code you choose — the relay page asks for the same one'
+  code.value = remoteDraft.code
+  code.setAttribute('data-focus', 'remote::code')
+  code.title = 'A new pairing code replaces the stored one. Blank keeps the stored code.'
+  code.addEventListener('input', (e) => {
+    remoteDraft.code = (e && e.target && e.target.value != null ? e.target.value : code.value) || ''
+    render()
+  })
+  form.appendChild(code)
+
+  const acts = el('div', 'remote-acts')
+  const canConnect = !!(remoteDraft.url.trim() && (remoteDraft.code.trim() || r.hasCode))
+  acts.appendChild(button('Save and connect', 'primary', () => {
+    const msg = { type: 'saveRemote', url: remoteDraft.url.trim() }
+    if (remoteDraft.code.trim()) msg.code = remoteDraft.code.trim()
+    remoteDraft.code = ''
+    post(msg)
+    // Same discipline as the schedule form: the code lives in the keychain from
+    // this instant, so the field that held it empties NOW, not on some later
+    // host reply.
+    render()
+  }, {
+    disabled: !canConnect,
+    title: 'A relay URL is needed, and a pairing code unless one is already stored',
+  }))
+  if (r.hasCode) {
+    acts.appendChild(button('Remove the stored code', 'link danger',
+      () => post({ type: 'clearRemoteCode' })))
+  }
+  if (!remoteDraft.url.trim()) {
+    acts.appendChild(el('span', 'muted small', 'Deploy the remote/ folder first — its README walks through it.'))
+  } else if (!r.hasCode && !remoteDraft.code.trim()) {
+    acts.appendChild(el('span', 'muted small',
+      'A pairing code is needed once: choose one here, and enter the same one on the relay page to watch the board.'))
+  }
+  form.appendChild(acts)
+  sec.appendChild(form)
+  return sec
+}
+
 function render() {
   const root = document.getElementById('root')
   /* THE SAME RULE THE BOARD HAS: anything the user is typing into is destroyed
@@ -766,6 +895,9 @@ function render() {
   // is a real state ("nothing scheduled yet"), not an absent feature. Old
   // hosts that never send `schedules` simply show no section.
   if (state.schedules) page.appendChild(scheduledSection())
+
+  const remote = remoteSection()
+  if (remote) page.appendChild(remote)
 
   page.appendChild(dictationSection())
 

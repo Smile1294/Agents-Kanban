@@ -472,3 +472,42 @@ button.link:disabled {
   cursor: default;
 }
 button.link:disabled:hover { text-decoration: none; }
+
+/* --- Remote Control ----------------------------------------------------------
+ *
+ * Streaming the board to a page the user deploys. The form's job is to keep the
+ * pairing code OUT of the page: it is a change-only field, never prefilled
+ * (blank means "keep the stored one"), and wiping it is a separate button. The
+ * URL is the one thing that can be prefilled, once, from the host.
+ */
+.remote-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+.remote-input {
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--line));
+  border-radius: 4px;
+  padding: 6px 9px;
+  font: inherit;
+  font-size: 0.9em;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.remote-input:focus { outline: 1px solid var(--vscode-focusBorder); }
+.remote-input::placeholder { color: var(--faint); }
+/* The pairing code is a secret worth typing carefully; a monospace field makes
+   a misread character visible while it is still in front of the user. */
+.remote-code {
+  font-family: var(--vscode-editor-font-family, monospace);
+  letter-spacing: 0.03em;
+}
+.remote-acts {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+}

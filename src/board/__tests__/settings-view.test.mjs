@@ -582,5 +582,119 @@ const state = (over = {}) => ({
   ok(findButton(secOf(c), 'Add schedule') !== null, 'Cancel leaves editing and returns to Add')
 }
 
+// --- Remote Control: the board streamed to a page the user deploys -----------
+// The section's honesty rules: the status line renders the relay's actual
+// answers (or "not asked yet" before the first one), and the pairing code
+// NEVER appears on the page — the host sends only `hasCode`, and the field is
+// change-only, blank meaning "keep the stored one".
+{
+  const secOf = (v) => [...v.root.querySelectorAll('section')]
+    .find((s) => s.textContent.includes('Remote Control'))
+  const remote = (over = {}) => state({
+    remote: { enabled: true, url: 'https://board.example.com', hasCode: true, ...over },
+  })
+  const typed = { url: 'https://board.example.com' }
+
+  // The host always sends `remote`; a state without the key (an old host) must
+  // simply not offer the section — the same rule as `schedules`.
+  const none = await renderSettings(state())
+  ok(!none.text().includes('Remote Control'),
+     'a state without remote renders no section — the page does not depend on the new field')
+
+  // The status row has four states, four texts. Paused first.
+  const paused = await renderSettings(remote({ enabled: false, status: undefined }))
+  ok(paused.text().includes('Paused'), 'a disabled relay says Paused')
+  const sec0 = secOf(paused)
+  findButton(sec0, 'Resume').onclick()
+  ok(paused.posted.some((m) => m.type === 'setRemote' && m.enabled === true),
+     'Resume asks the host to start pushing')
+
+  // Enabled but never answered: NOT a green tick. Nothing has been attempted.
+  const fresh = await renderSettings(remote({ status: undefined }))
+  ok(fresh.text().includes('has not answered yet'),
+     'enabled before the first answer says so — a tick that no attempt produced is the page’s one forbidden signal')
+
+  // A push that went out says what went out, and when.
+  const okStatus = await renderSettings(remote({ status: { at: Date.now() - 2000, ok: true, note: 'pushed the board and 2 chat tails' } }))
+  ok(okStatus.text().includes('pushed the board and 2 chat tails'), 'a good status says what went out')
+  ok(okStatus.text().includes('just now'), 'and when — the age of the last push')
+  findButton(secOf(okStatus), 'Pause').onclick()
+  ok(okStatus.posted.some((m) => m.type === 'setRemote' && m.enabled === false),
+     'Pause asks the host to stop pushing')
+
+  // A push that failed stays visible, with the relay’s reason, and offers Retry.
+  const bad = await renderSettings(remote({
+    status: { at: Date.now() - 30_000, ok: false, error: 'relay answered 401' },
+  }))
+  ok(bad.text().includes('Last push failed.'), 'a failed push says it failed')
+  ok(bad.text().includes('relay answered 401'), 'and shows the relay’s reason')
+  findButton(secOf(bad), 'Retry').onclick()
+  ok(bad.posted.some((m) => m.type === 'setRemote' && m.enabled === true),
+     'Retry re-arms the push after a failure')
+
+  // The form. URL prefilled ONCE from the host; the code is change-only.
+  const v = await renderSettings(remote())
+  const sec = secOf(v)
+  const inputs = [...sec.querySelectorAll('.remote-input')]
+  ok(inputs[0].value === 'https://board.example.com', 'the relay URL is prefilled from the host')
+  const codeField = sec.querySelector('.remote-code')
+  ok(codeField && codeField.value === '',
+     'the stored code is never rendered — the field is change-only, blank meaning keep')
+  ok(codeField.placeholder.includes('A code is stored'), 'and the placeholder says so instead')
+
+  // Blank code + stored code: Save posts the URL alone — blank must NOT clear.
+  findButton(sec, 'Save and connect').onclick()
+  const kept = v.posted.find((m) => m.type === 'saveRemote')
+  ok(!!kept && kept.url === 'https://board.example.com' && kept.code === undefined,
+     'Save with a stored code posts the URL and no code — blank means keep the stored one')
+
+  findButton(secOf(v), 'Remove the stored code').onclick()
+  ok(v.posted.some((m) => m.type === 'clearRemoteCode'),
+     'wiping the code is its own button — emptying the field is never what clears the keychain')
+
+  // First connect: no code stored yet, so Save stays disabled until one is
+  // typed — and the page says what is missing instead of a silent dead button.
+  const noCode = await renderSettings(state({
+    remote: { enabled: false, url: 'https://board.example.com', hasCode: false },
+  }))
+  const secN = secOf(noCode)
+  ok(secN.querySelector('.remote-code').placeholder.includes('you choose'),
+     'with no code stored the field says a code must be chosen')
+  ok(findButton(secN, 'Save and connect').disabled === true,
+     'Save stays disabled while no code is typed')
+  ok(noCode.text().includes('A pairing code is needed once'),
+     'and the page says what is missing')
+
+  // Type a code; Save enables; the message carries it and the draft clears.
+  const freshConnect = await renderSettings(state({
+    remote: { enabled: false, url: '', hasCode: false },
+  }))
+  const secF = secOf(freshConnect)
+  ok(findButton(secF, 'Save and connect').disabled === true,
+     'with no URL either, Save is disabled')
+  ok(freshConnect.text().includes('Deploy the remote/ folder first'),
+     'and the page says the deploy comes first, not just that the button is dead')
+  const urlF = secF.querySelectorAll('.remote-input')[0]
+  urlF.value = 'https://board.example.com'
+  urlF.oninput({ target: urlF })
+  const secF2 = secOf(freshConnect)
+  const codeF = secF2.querySelector('.remote-code')
+  ok(codeF && codeF.placeholder.includes('you choose'), 'the URL survives the re-render')
+  codeF.value = 'my-secret-code'
+  codeF.oninput({ target: codeF })
+  const secF3 = secOf(freshConnect)
+  ok(!findButton(secF3, 'Save and connect').disabled,
+     'typing URL and code enables Save')
+  findButton(secF3, 'Save and connect').onclick()
+  const sent = freshConnect.posted.find((m) => m.type === 'saveRemote')
+  ok(sent?.url === 'https://board.example.com' && sent.code === 'my-secret-code',
+     'Save posts the URL and the new code')
+  const afterSave = secOf(freshConnect)
+  ok(afterSave.querySelector('.remote-code').value === '',
+     'the typed code is cleared after saving — it lives in the keychain, not in the page')
+  ok(!freshConnect.text().includes('my-secret-code'),
+     'and the code never appears in the page text')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

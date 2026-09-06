@@ -49,7 +49,8 @@ import {
 } from './agent/endpoint.ts'
 import {
   collectRuntimeStatus, SettingsPanel,
-  type ScheduleRowState, type SettingsHost, type SettingsMessage, type SettingsState,
+  type RemoteState, type ScheduleRowState, type SettingsHost, type SettingsMessage,
+  type SettingsState,
 } from './board/settings.ts'
 import {
   describeWhen, nextFireAt, parseSchedules,
@@ -59,6 +60,10 @@ import {
   checkVoice, rowsFromChecks, startCapture, verdict,
   type Capture, type VoiceChecks, type VoiceConfig,
 } from './agent/dictation.ts'
+import { RemoteFeed, type TailSource } from './remote/feed.ts'
+import { RemotePusher, type PushSnapshot } from './remote/pusher.ts'
+import { boardIdOf, projectTail, relayBase, type RemoteTail } from './remote/relay.ts'
+import { toRemoteCard } from './remote/cards.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
 // See agent/runtimes/index.ts for why registration is explicit rather than
 // happening wherever an implementation happens to be imported first.
@@ -1199,6 +1204,155 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // `void`: a rejection here is a schedule that silently did not fire.
   void fireDueSchedules().catch((e) => log.error(`Schedule catch-up failed: ${String(e)}`))
 
+  /* --- Remote Control: the half on this machine ------------------------------
+   *
+   * The board can be watched from anywhere through a small site the user
+   * deploys (see remote/README.md — that folder lifts into its own repo). This
+   * machine is the only writer; the site only stores and serves. The tested
+   * decisions live in src/remote/: relay.ts is the SHAPE of what may leave
+   * (its tests pin the redaction field by field), pusher.ts is WHEN (cadence,
+   * heartbeat, backoff), feed.ts is WHAT changed (a transcript tail travels
+   * only when it grew). Left for the host is the act itself: where the pieces
+   * are stored, what a snapshot is built from, and the settings-page buttons.
+   *
+   * Storage follows the house rules: the URL and the on/off flag are plain
+   * workspace state, parsed on the way back; the pairing code is a credential,
+   * so it lives in SecretStorage and never crosses the postMessage boundary in
+   * either direction — the page sees only `hasCode`, a boolean from the one
+   * read at activation.
+   */
+  const remoteCodeKey = 'remote.code'
+  const storedRemoteUrl = String(state.get<unknown>('remote.url') ?? '')
+  let remoteUrl = storedRemoteUrl ? (relayBase(storedRemoteUrl) ?? '') : ''
+  let remoteEnabled = state.get<unknown>('remote.enabled') === true
+  let remoteHasCode = false
+  let remoteBoardId = ''
+  let remoteStatus: { at: number; ok: boolean; note?: string; error?: string } | undefined
+  let remotePusher: RemotePusher | undefined
+  const remoteFeed = new RemoteFeed()
+
+  /** How fresh a stored session's last update must be to ride the one-time
+   *  backfill, and how big one backfill POST may be (a tail is at most
+   *  TAIL_MAX rows; bytes are what actually bounds a POST). */
+  const REMOTE_FRESH_MS = 14 * 24 * 60 * 60 * 1000
+  const REMOTE_CHUNK_BYTES = 150_000
+
+  /** The snapshot one push carries: the CURRENT board from the host's own
+   *  getState — the same state the window paints — with each card mapped
+   *  through `toRemoteCard`, the one place a card is filtered. Tails come from
+   *  live runs only: a run that is not live cannot grow, so it has nothing new
+   *  to send; sessions that ended while the relay was unreachable are
+   *  re-synced by `remoteBackfill` at enable time. With no folder open the
+   *  board IS empty, so an empty snapshot is the truth, not a bug. */
+  async function buildRemoteSnapshot(): Promise<PushSnapshot> {
+    const ui = await host.getState()
+    const columns = ui.columns.map((c) => ({ id: c.id, name: c.name }))
+    const cards = ui.cards.map((c) => toRemoteCard(c))
+    const tails: TailSource[] = (ws?.manager?.list() ?? []).map((a) => ({
+      key: a.sessionId ?? a.runId,
+      history: a.history,
+      live: a.live,
+    }))
+    return remoteFeed.build(Date.now(), columns, cards, tails)
+  }
+
+  /** (Re)build the engine from the CURRENT settings. Called at activation and
+   *  after every change from the settings page, so enabling, repointing or
+   *  clearing the code takes effect immediately. Cadence state is dropped on
+   *  purpose: a fresh engine's first tick compares against nothing and pushes,
+   *  which is exactly what a config change should do. `remoteFeed` is NOT
+   *  dropped — what the relay already holds is still true until the code
+   *  changes, and the reset for that lives in the saveRemote case. */
+  function syncRemoteEngine(): void {
+    const baseUrl = remoteUrl ? relayBase(remoteUrl) : undefined
+    remotePusher = new RemotePusher({
+      now: Date.now,
+      baseUrl,
+      boardId: remoteBoardId,
+      enabled: remoteEnabled && remoteHasCode && !!baseUrl,
+      fetch,
+      build: buildRemoteSnapshot,
+      onStatus: (s) => {
+        remoteStatus = s
+        // The settings page's status line must move on success too — a green
+        // tick that no attempt ever produced is the page's own forbidden
+        // signal, and so is a red one that a later success never clears.
+        void SettingsPanel.refreshIfOpen()
+      },
+    })
+  }
+
+  /** Push the recent board to the relay in one bounded pass: the sync when a
+   *  relay is first configured, and again at activation, because counts live
+   *  only in memory and the relay may hold a board from days ago. Sessions the
+   *  board shows whose last update is fresh enough each send their transcript
+   *  tail; chunks keep one POST bounded, and every chunk carries its own
+   *  freshly built index, so the relay is never left claiming a tail it does
+   *  not have. A chunk that did not go out rolls its sessions' counts back, so
+   *  the next backfill sends them again. */
+  async function remoteBackfill(): Promise<void> {
+    if (!remotePusher || !ws) return
+    const live = new Set((ws.manager?.list() ?? []).map((a) => a.sessionId ?? a.runId))
+    const stored = await ws.store.list({ includeArchived: false })
+    const fresh = stored.filter((s) =>
+      !live.has(s.id) && Date.now() - s.updated < REMOTE_FRESH_MS && remoteFeed.tvOf(s.id) === 0)
+    let chunk: RemoteTail[] = []
+    let bytes = 0
+    const flush = async (): Promise<void> => {
+      if (!chunk.length) return
+      const ui = await host.getState()
+      const index = remoteFeed.build(
+        Date.now(),
+        ui.columns.map((c) => ({ id: c.id, name: c.name })),
+        ui.cards.map((c) => toRemoteCard(c)),
+        [],
+      ).index
+      const pushed = remotePusher ? await remotePusher.pushRaw(index, chunk) : false
+      if (!pushed) {
+        for (const t of chunk) remoteFeed.setCount(t.key, 0)
+      }
+      chunk = []
+      bytes = 0
+    }
+    for (const s of fresh) {
+      const hist = await ws.store.transcript(s.id)
+      if (!hist.length) continue
+      const tail = projectTail(Date.now(), s.id, hist, [])
+      if (!tail) continue
+      // Marked BEFORE the index is built: the chunk's own index must claim the
+      // tail it carries, or the page would never fetch it.
+      remoteFeed.setCount(s.id, hist.length)
+      bytes += JSON.stringify(tail).length
+      chunk.push(tail)
+      if (bytes >= REMOTE_CHUNK_BYTES) await flush()
+    }
+    await flush()
+  }
+
+  // The pairing code is read ONCE, here: `hasCode` for the settings page is
+  // this boolean, and the code itself is never kept anywhere but the keychain.
+  // One SecretStorage IPC before the rest of activation is cheaper than a page
+  // that can show the wrong half of "is this connected".
+  const storedCode = await context.secrets.get(remoteCodeKey)
+  if (storedCode) {
+    remoteHasCode = true
+    remoteBoardId = boardIdOf(storedCode)
+  }
+  syncRemoteEngine()
+  if (remoteEnabled && remoteHasCode && remoteUrl) {
+    log.info('Remote Control is on — syncing the board to the relay site')
+    void remoteBackfill().catch((e) => log.error(`Remote backfill failed: ${String(e)}`))
+  }
+
+  // The engine's own ticker. Repaints nudge it too (see `paint`), but a board
+  // with no agent running produces no repaints, so this is what keeps the
+  // idle heartbeat honest. Cheap when there is nothing to do: tick() checks
+  // its gates before building anything.
+  const remoteTimer = setInterval(() => {
+    void remotePusher?.tick().catch((e) => log.error(`Remote tick failed: ${String(e)}`))
+  }, 30_000)
+  context.subscriptions.push({ dispose: () => clearInterval(remoteTimer) })
+
   async function refreshRuntimeStatus(only?: RuntimeId): Promise<void> {
     settingsBusy = only ? `Checking ${only}…` : 'Checking which agents are installed…'
     void SettingsPanel.refreshIfOpen()
@@ -1322,6 +1476,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // travels here so a schedule that cannot fire is never shown with a
         // countdown that can never reach zero.
         schedules: scheduleView(),
+        // Always present, same reasoning. `status` is absent until the first
+        // push attempt, which the page renders as "not asked yet" rather than
+        // as a green tick — the code never travels, only `hasCode`.
+        remote: {
+          enabled: remoteEnabled,
+          url: remoteUrl,
+          hasCode: remoteHasCode,
+          ...(remoteStatus ? { status: remoteStatus } : {}),
+        },
       }
     },
 
@@ -1544,6 +1707,73 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           await fireScheduleNow(hit, true)
           return
         }
+        case 'setRemote': {
+          remoteEnabled = msg.enabled
+          await state.update('remote.enabled', remoteEnabled)
+          syncRemoteEngine()
+          if (remoteEnabled) {
+            log.info(remoteHasCode && remoteUrl
+              ? 'Remote Control enabled — pushing to the relay'
+              : 'Remote Control cannot connect yet: ' +
+                (remoteHasCode ? 'no relay URL set' : 'no pairing code set'))
+            void SettingsPanel.refreshIfOpen()
+            // A fresh engine compares against nothing, so the first tick
+            // pushes the current board — re-enabling after a pause needs no
+            // backfill, because the relay still holds everything the feed
+            // counts describe.
+            void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+          }
+          return
+        }
+        case 'saveRemote': {
+          // Saving a valid URL and (optionally) a code IS the connect action.
+          // The pairing code is change-only: saving without one keeps the
+          // stored code, and clearing it is its own message.
+          const url = relayBase(msg.url)
+          if (!url) throw new Error(`"${msg.url}" is not an http(s) address the relay can live at.`)
+          const codeChanged = !!msg.code
+          const relayChanged = url !== remoteUrl || codeChanged
+          remoteUrl = url
+          remoteEnabled = true
+          await state.update('remote.url', url)
+          await state.update('remote.enabled', true)
+          if (codeChanged) {
+            await context.secrets.store(remoteCodeKey, msg.code!)
+            remoteHasCode = true
+            remoteBoardId = boardIdOf(msg.code!)
+          }
+          syncRemoteEngine()
+          if (relayChanged) {
+            // A new code names a NEW board on the relay: counts describe what
+            // the old board held, so they must not claim the new one.
+            remoteFeed.reset()
+            settingsBusy = 'Copying recent sessions to the relay…'
+            try {
+              await remoteBackfill()
+              void vscode.window.showInformationMessage(
+                'Remote Control connected. Open the relay page on another device and enter the code.')
+            } catch (e) {
+              log.error(`Remote backfill failed: ${e instanceof Error ? e.message : String(e)}`)
+            } finally {
+              settingsBusy = undefined
+              void SettingsPanel.refreshIfOpen()
+            }
+          }
+          return
+        }
+        case 'clearRemoteCode': {
+          await context.secrets.delete(remoteCodeKey)
+          remoteHasCode = false
+          remoteBoardId = ''
+          // Without a code nothing can connect, so the toggle steps down with
+          // it rather than sitting "on" while every attempt is refused.
+          if (remoteEnabled) {
+            remoteEnabled = false
+            await state.update('remote.enabled', false)
+          }
+          syncRemoteEngine()
+          return
+        }
       }
     },
   }
@@ -1648,6 +1878,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await provider.post(state).catch((e) => log.error(`Side bar refresh failed: ${String(e)}`))
     await BoardPanel.postCurrent(state).catch((e) => log.error(`Panel refresh failed: ${String(e)}`))
     refreshStatus()
+    // Something changed or the board would not be repainting — let the relay
+    // cadence know without waiting for its own timer, which exists for the
+    // idle case where nothing repaints. tick() gates itself: this fires on
+    // every frame an agent streams, and at most one push per MIN_INTERVAL
+    // ever leaves.
+    if (remotePusher) {
+      remotePusher.nudge().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+    }
   }, REPAINT_INTERVAL_MS, { onError: (e) => log.error(`Repaint failed: ${String(e)}`) })
 
   const refreshAll = () => paint.schedule()
