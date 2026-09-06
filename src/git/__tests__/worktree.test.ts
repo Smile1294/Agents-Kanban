@@ -27,6 +27,16 @@ const svc = new WorktreeService(root!)
 ok(await svc.currentBranch() === 'main', 'reads current branch')
 ok((await svc.list()).length === 0, 'no worktrees initially (main excluded)')
 
+// branches() and checkout() — the merge target picker runs on these.
+await g(['branch', 'staging'])
+const branchList = await svc.branches()
+ok(branchList.includes('main') && branchList.includes('staging'),
+   `branches() lists every local branch: ${branchList.join(', ')}`)
+await svc.checkout('staging')
+ok(await svc.currentBranch() === 'staging', 'checkout() moves the repo checkout')
+await svc.checkout('main')
+ok(await svc.currentBranch() === 'main', 'and back again')
+
 // create
 const wt = await svc.create({ taskId: 'TASK-001', title: 'Fix the login flow' })
 ok(wt.branch === 'task/TASK-001-fix-the-login-flow', `branch named from task: ${wt.branch}`)

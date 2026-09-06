@@ -502,7 +502,7 @@ export interface BoardHost {
   openDiff(key: string, file: string): Promise<void>
   openTestLink(key: string, kind: string, target: string): Promise<void>
   commitWorktree(key: string): Promise<void>
-  mergeWorktree(key: string): Promise<void>
+  mergeWorktree(key: string, into?: string): Promise<void>
   archive(key: string, archived: boolean): Promise<void>
   pin(key: string, pinned: boolean): Promise<void>
   remove(key: string): Promise<void>
@@ -613,7 +613,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
           await host.openTestLink(id(), String(msg.kind ?? ''), String(msg.target ?? ''))
           break
         case 'commit': await host.commitWorktree(id()); await refresh(); break
-        case 'merge': await host.mergeWorktree(id()); await refresh(); break
+        case 'merge': await host.mergeWorktree(id(), typeof msg.into === 'string' ? msg.into : undefined); await refresh(); break
         case 'archive': await host.archive(id(), msg.archived !== false); break
       case 'pin': await host.pin(id(), msg.pinned !== false); break
         case 'remove': await host.remove(id()); break

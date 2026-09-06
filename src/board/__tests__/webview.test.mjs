@@ -487,6 +487,23 @@ ok(merge && merge.disabled === true, 'with nothing committed, merge is disabled 
 // A session with no worktree must not grow a review panel at all.
 const noWt = run({ ...base, mode: 'chat', selectedKey: 'abc-123', cards: [CARD], transcript: [] })
 ok(!noWt.text().includes('Show changes'), 'a session without a worktree shows no review panel')
+const noWtMerge = findButton(noWt.root, 'Merge')
+ok(!noWtMerge, 'and no Merge button in the toolbar — there is no branch to merge')
+
+// The toolbar's Merge button: the same flow, without opening Changes first.
+const toolbar = run({ ...reviewBase, review: undefined })
+const tb = findButton(toolbar.root, 'Merge')
+ok(tb && tb.disabled === false, 'a worktree session has a live Merge button in the toolbar')
+tb.onclick()
+ok(toolbar.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && !('into' in m)),
+  'the toolbar button posts merge without a target — the host offers the branch picker')
+
+// The panel's button names its base, so that path stays one click.
+const panelMerge = findButton(reviewed.root, 'Merge into main')
+ok(panelMerge && panelMerge.disabled === false, 'with commits, the panel merge button is live')
+panelMerge.onclick()
+ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.into === 'main'),
+  'the panel button posts its base as the merge target')
 
 // 9. The test plan: the agent's own instructions, made clickable.
 const PLAN = {
