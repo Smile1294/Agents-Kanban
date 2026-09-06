@@ -47,8 +47,12 @@ import {
 } from './agent/endpoint.ts'
 import {
   collectRuntimeStatus, SettingsPanel,
-  type SettingsHost, type SettingsMessage, type SettingsState,
+  type ScheduleRowState, type SettingsHost, type SettingsMessage, type SettingsState,
 } from './board/settings.ts'
+import {
+  describeWhen, nextFireAt, parseSchedules,
+  type Schedule,
+} from './board/schedules.ts'
 import {
   checkVoice, rowsFromChecks, startCapture, verdict,
   type Capture, type VoiceChecks, type VoiceConfig,
@@ -1049,6 +1053,150 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       : id === 'codex' ? (cfg().get<string>('codexExecutable') || undefined)
       : undefined
 
+  // ——— Scheduled runs (time triggers) ———
+  //
+  // A schedule says "at HH:MM on these days, start a session with this
+  // prompt". It lives in workspace state, fires only while the extension is
+  // running, and catches up when the due moment passed with no window open —
+  // once, because `nextFireAt` is anchored to `lastFiredAt`. The rules of a
+  // fire (when, whether a draft parses) live in schedules.ts and are tested
+  // there; everything here is the act of firing — creating the session — which
+  // only the host can do.
+
+  /** Read back once, at activation: storage outlives the version that wrote it,
+   *  so this is a parse, never a cast. Every later write goes through
+   *  `saveSchedules`, which keeps the in-memory list and the store in step. */
+  let schedules: Schedule[] = parseSchedules(state.get<unknown>('schedules'))
+
+  const saveSchedules = async (next: Schedule[]): Promise<void> => {
+    schedules = next
+    await state.update('schedules', schedules)
+  }
+
+  /** Whether a scheduled run could start a session right now. A schedule that
+   *  cannot fire is left DUE rather than marked failed — opening a repo later
+   *  the same day should still catch today's run up. */
+  const canRunScheduled = (): boolean => !!ws?.worktrees
+
+  /** The rows the settings page shows, derived. */
+  const scheduleView = (): { rows: ScheduleRowState[]; canRun: boolean; problem?: string } => {
+    const canRun = canRunScheduled()
+    return {
+      canRun,
+      ...(!canRun
+        ? { problem: !ws
+            ? 'A scheduled run needs a folder open. Open one and the runs catch up.'
+            : 'This folder is not a git repository, so no session can start in a worktree.' }
+        : {}),
+      rows: schedules.map((s): ScheduleRowState => {
+        const after = s.lastFiredAt ?? s.createdAt
+        const nextAt = s.enabled && s.days.length ? nextFireAt(s, after) : undefined
+        return {
+          id: s.id,
+          title: s.title,
+          prompt: s.prompt,
+          hour: s.hour,
+          minute: s.minute,
+          days: s.days,
+          enabled: s.enabled,
+          when: describeWhen(s),
+          ...(nextAt !== undefined ? { nextAt } : {}),
+          ...(s.lastRun ? { lastRun: s.lastRun } : {}),
+        }
+      }),
+    }
+  }
+
+  /** Fire one schedule's session NOW. Shared by the due-check, "Run now" and
+   *  the catch-up after a resume — one path, so a session that starts from any
+   *  of the three behaves the same.
+   *
+   *  The attempt is recorded BEFORE the session is asked for: `lastFiredAt` is
+   *  the anchor that stops the next tick firing the same schedule again, so it
+   *  must be in place before any await that could fail. A crash between the
+   *  record and the start costs one day's run (the catch-up semantics), never a
+   *  double fire. `lastRun` records whether the session actually STARTED; a
+   *  session that starts and then fails is a failed session on the board, which
+   *  is its own card's story. */
+  async function fireScheduleNow(s: Schedule, manual: boolean): Promise<void> {
+    if (!canRunScheduled()) {
+      if (manual) {
+        void vscode.window.showWarningMessage(
+          'A scheduled run needs a folder with a git repo open. Open one and press Run again.')
+      }
+      return
+    }
+    const stamp = Date.now()
+    // Synchronous in-memory first: the next tick (or a concurrent Run now) must
+    // already see this schedule as fired, no matter what the persist does.
+    schedules = schedules.map((x) => (x.id === s.id ? { ...x, lastFiredAt: stamp } : x))
+    const title = s.title
+    settingsBusy = `Starting scheduled run "${title}"…`
+    void SettingsPanel.refreshIfOpen()
+    try {
+      // The same pre-flight as a composer send: a half-configured provider does
+      // not fail here at first contact — it fails at the first API call after a
+      // card has appeared, and nobody connects the two.
+      const problem = providerProblem()
+      if (problem) throw new Error(problem)
+      await refreshProviderEnv()
+      const mgr = ensureManager()
+      mgr.setProvider(currentProvider(), providerEnv)
+      const runId = await mgr.start(s.prompt, { title })
+      const queued = ws?.manager?.byKey(runId)?.state.kind === 'queued'
+      await saveSchedules(schedules.map((x) =>
+        x.id === s.id ? { ...x, lastRun: { at: Date.now(), ok: true } } : x))
+      log.info(`Scheduled run "${title}" started (${runId})`)
+      refreshAll()
+      void SettingsPanel.refreshIfOpen()
+      void vscode.window.showInformationMessage(
+        queued
+          ? `Scheduled run "${title}" is queued behind running sessions and will start when one finishes.`
+          : `Scheduled run "${title}" started.`)
+    } catch (e) {
+      const note = e instanceof Error ? e.message : String(e)
+      await saveSchedules(schedules.map((x) =>
+        x.id === s.id ? { ...x, lastRun: { at: Date.now(), ok: false, note } } : x))
+      void SettingsPanel.refreshIfOpen()
+      void vscode.window.showWarningMessage(`Scheduled run "${title}" did not start: ${note}`)
+    } finally {
+      settingsBusy = undefined
+      void SettingsPanel.refreshIfOpen()
+    }
+  }
+
+  /** Fire every enabled schedule whose moment has passed. Runs at most one pass
+   *  at a time — a fire awaits the CLI setup, and a second pass starting inside
+   *  that window must not fire the same schedule twice. */
+  let schedulePassInFlight = false
+  async function fireDueSchedules(): Promise<void> {
+    if (schedulePassInFlight || !canRunScheduled()) return
+    schedulePassInFlight = true
+    try {
+      for (const s of schedules) {
+        if (!s.enabled) continue
+        const next = nextFireAt(s, s.lastFiredAt ?? s.createdAt)
+        if (next === undefined || next > Date.now()) continue
+        await fireScheduleNow(s, false)
+      }
+    } finally {
+      schedulePassInFlight = false
+    }
+  }
+
+  // The heartbeat. Sixty seconds because a fire needs nothing faster, and a
+  // one-minute delay on a schedule whose hour has passed is invisible next to
+  // the catch-up that already happened at activation.
+  const scheduleTimer = setInterval(
+    () => { void fireDueSchedules().catch((e) => log.error(`Schedule check failed: ${String(e)}`)) },
+    60_000,
+  )
+  context.subscriptions.push({ dispose: () => clearInterval(scheduleTimer) })
+  // Catch-up for a morning that passed while the window was closed: activation
+  // IS the moment the extension can run again, so it is the check. Never a bare
+  // `void`: a rejection here is a schedule that silently did not fire.
+  void fireDueSchedules().catch((e) => log.error(`Schedule catch-up failed: ${String(e)}`))
+
   async function refreshRuntimeStatus(only?: RuntimeId): Promise<void> {
     settingsBusy = only ? `Checking ${only}…` : 'Checking which agents are installed…'
     void SettingsPanel.refreshIfOpen()
@@ -1167,6 +1315,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               },
             }
           : {}),
+        // Always present — empty is a real state ("no schedules yet"), not an
+        // absence the page has to guess about. `canRun: false` with its reason
+        // travels here so a schedule that cannot fire is never shown with a
+        // countdown that can never reach zero.
+        schedules: scheduleView(),
       }
     },
 
@@ -1338,6 +1491,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             settingsBusy = undefined
           }
           return
+        case 'saveSchedule': {
+          const d = msg.draft
+          const now = Date.now()
+          const hit = schedules.find((s) => s.id === d.id)
+          const list: Schedule[] = hit
+            ? schedules.map((s) => s.id === d.id
+                ? {
+                    ...s, title: d.title, prompt: d.prompt, hour: d.hour,
+                    minute: d.minute, days: d.days, enabled: d.enabled,
+                  }
+                : s)
+            : [...schedules, {
+                id: crypto.randomUUID(), title: d.title, prompt: d.prompt,
+                hour: d.hour, minute: d.minute, days: d.days,
+                enabled: d.enabled, createdAt: now,
+              }]
+          await saveSchedules(list)
+          // A schedule whose time has already passed today starts TOMORROW, not
+          // in the next sixty seconds — the user set up tomorrow's run. So no
+          // catch-up here; the 60s tick handles a schedule that is due because
+          // it was RESUME-enabled (that one is an explicit re-arm).
+          void SettingsPanel.refreshIfOpen()
+          refreshAll()
+          return
+        }
+        case 'removeSchedule':
+          await saveSchedules(schedules.filter((s) => s.id !== msg.id))
+          void SettingsPanel.refreshIfOpen()
+          refreshAll()
+          return
+        case 'toggleSchedule': {
+          const hit = schedules.find((s) => s.id === msg.id)
+          if (!hit) return
+          await saveSchedules(schedules.map((s) =>
+            s.id === msg.id ? { ...s, enabled: !s.enabled } : s))
+          void SettingsPanel.refreshIfOpen()
+          refreshAll()
+          // Re-arming may mean a due moment passed while it was off: fire the
+          // catch-up check now rather than waiting for the next heartbeat.
+          if (!hit.enabled) {
+            await fireDueSchedules().catch((e) =>
+              log.error(`Schedule catch-up after resume failed: ${String(e)}`))
+          }
+          return
+        }
+        case 'runSchedule': {
+          const hit = schedules.find((s) => s.id === msg.id)
+          if (!hit) return
+          await fireScheduleNow(hit, true)
+          return
+        }
       }
     },
   }

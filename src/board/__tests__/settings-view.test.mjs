@@ -382,5 +382,205 @@ const state = (over = {}) => ({
      'the fix sits on the row of the piece it fixes — a working whisper row is not blamed for the missing model')
 }
 
+// --- scheduled runs: the board's time triggers ------------------------------
+// The rows tell the run's story honestly: next fire (or "due now"), and what
+// the last attempt did — a failed attempt is always visible, never lost under
+// a row that still looks fine.
+{
+  const secOf = (v) => [...v.root.querySelectorAll('section')]
+    .find((s) => s.textContent.includes('Scheduled runs'))
+  const rowOf = (sec, title) => [...sec.querySelectorAll('.row')]
+    .find((r) => r.textContent.includes(title))
+
+  // The host always sends `schedules`; a state without the key (an old host)
+  // must simply not offer the section.
+  const none = await renderSettings(state())
+  ok(!none.text().includes('Scheduled runs'),
+     'a state without schedules renders no section — the page does not depend on the new field')
+
+  const row = (over) => ({
+    id: 's1', title: 'Morning bug patrol', prompt: 'Check the bug board\nand start fixing.',
+    hour: 9, minute: 0, days: [1, 2, 3, 4, 5], enabled: true, when: 'Mon–Fri at 09:00',
+    ...over,
+  })
+  const v = await renderSettings(state({
+    schedules: { canRun: true, rows: [
+      row({ nextAt: Date.now() + 3_600_000, lastRun: { at: Date.now() - 3_600_000, ok: true } }),
+      row({ id: 's2', title: 'Nightly', prompt: 'Run the full build', days: [0, 1, 2, 3, 4, 5, 6],
+        when: 'Daily at 23:00', enabled: false, nextAt: undefined, lastRun: { at: Date.now() - 3_600_000, ok: true } }),
+      row({ id: 's3', title: 'Due one', days: [0, 1, 2, 3, 4, 5, 6], when: 'Daily at 06:00',
+        nextAt: Date.now() - 60_000 }),
+      row({ id: 's4', title: 'Broken run', prompt: 'Wake the db', days: [0], when: 'Sun at 09:00',
+        nextAt: Date.now() + 86_400_000, lastRun: { at: Date.now() - 3_600_000, ok: false, note: 'no provider' } }),
+    ] },
+  }))
+  const t = v.text()
+  const sec = secOf(v)
+  ok(!!sec, 'the section renders when the host provides schedules')
+  ok(t.includes('Morning bug patrol') && t.includes('Mon–Fri at 09:00'),
+     'a schedule row names itself and its shape')
+  ok(t.includes('Check the bug board') && t.includes('Run the full build'),
+     'the instruction is on the row — two schedules can share a name, and the prompt tells them apart')
+  ok(/Next: (today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) at \d\d:\d\d/.test(t),
+     'a schedule with a next run says when')
+  ok(t.includes('Paused') && t.includes('Resume'),
+     'a paused schedule says Paused and offers Resume, not Pause')
+  ok(t.includes('Due now — starts at the next check'),
+     'a moment that has passed is DUE — it reads as waiting, not as fine')
+  ok(t.includes('Last run did not start — no provider.'),
+     'a failed attempt is always shown, with its reason')
+  ok(!rowOf(sec, 'Morning bug patrol').textContent.includes('Last run started'),
+     'a healthy run with a next fire ahead does not also carry a stale "last run" line')
+
+  // The row actions post what the host handles.
+  findButton(rowOf(sec, 'Morning bug patrol'), 'Run now').onclick()
+  ok(v.posted.some((m) => m.type === 'runSchedule' && m.id === 's1'),
+     '"Run now" asks the host to start that schedule right now')
+  findButton(rowOf(sec, 'Nightly'), 'Resume').onclick()
+  ok(v.posted.some((m) => m.type === 'toggleSchedule' && m.id === 's2'),
+     'Resume re-arms a paused schedule')
+  findButton(rowOf(sec, 'Due one'), 'Pause').onclick()
+  ok(v.posted.some((m) => m.type === 'toggleSchedule' && m.id === 's3'),
+     'and Pause silences one that is due')
+  findButton(rowOf(sec, 'Broken run'), 'Remove').onclick()
+  ok(v.posted.some((m) => m.type === 'removeSchedule' && m.id === 's4'),
+     'Remove posts the deletion')
+}
+
+{
+  // No git repo open: the runs cannot fire, and the page says why instead of
+  // showing a countdown that can never reach zero. Run now is disabled — never
+  // a click that fails with a toast the banner above already explained.
+  const v = await renderSettings(state({
+    schedules: {
+      canRun: false,
+      problem: 'This folder is not a git repository, so no session can start in a worktree.',
+      rows: [{ id: 's1', title: 'Morning patrol', prompt: 'Go', hour: 9, minute: 0,
+        days: [1, 2, 3, 4, 5], enabled: true, when: 'Mon–Fri at 09:00',
+        nextAt: Date.now() + 3_600_000 }],
+    },
+  }))
+  ok(v.text().includes('not a git repository'),
+     'a schedule that cannot fire is explained, not silently waiting')
+  const runNow = findButton(v.root, 'Run now')
+  ok(!!runNow && runNow.disabled === true, 'and Run now is disabled while it could not succeed')
+  ok(runNow.title.includes('git repository'), 'the disabled button says why')
+}
+
+{
+  // The form: add a schedule with a name, a time, picked days and an
+  // instruction. Fields live module-level, so typing survives the re-render —
+  // the model-filter test above proves the same machinery for its input.
+  const sched = (v) => [...v.root.querySelectorAll('section')]
+    .find((s) => s.textContent.includes('Scheduled runs'))
+  const fresh = await renderSettings(state({ schedules: { canRun: true, rows: [] } }))
+  ok(fresh.text().includes('Nothing scheduled yet'), 'an empty list says so')
+  ok(fresh.text().includes('New schedule'), 'and the form to fix that is right there')
+
+  const add = findButton(sched(fresh), 'Add schedule')
+  ok(!!add && add.disabled === true, 'the save button starts disabled')
+  ok(fresh.text().includes('Needs a name, an instruction, a time and at least one day.'),
+     'and the page says what a schedule needs instead of silently disabling the button')
+
+  // Type into the three fields, one render between each keystroke.
+  const title = sched(fresh).querySelector('.sched-title')
+  title.value = '  Morning bug patrol  '
+  title.oninput({ target: title })
+  let sec = sched(fresh)
+  let prompt = sec.querySelector('.sched-prompt')
+  prompt.value = 'Check the bug board and start fixing.'
+  prompt.oninput({ target: prompt })
+  sec = sched(fresh)
+  const time = sec.querySelector('.sched-time')
+  time.value = '07:45'
+  time.oninput({ target: time })
+  sec = sched(fresh)
+  ok(sec.querySelector('.sched-title').value === '  Morning bug patrol  ',
+     'the typed title survives the re-renders — nothing was lost to the rebuild (trim happens on save)')
+  ok(!findButton(sec, 'Add schedule').disabled, 'once complete the save button enables')
+
+  // Days are chips; Su is off by default (Mon–Fri), so click it on.
+  const chips = sec.querySelectorAll('.sched-day')
+  ok(chips.length === 7 && chips[0].textContent === 'Su' && !chips[0].className.includes('on'),
+     'seven day chips, Sunday first (JS numbering), weekday default picked')
+  chips[0].onclick()
+  sec = sched(fresh)
+  ok([...sec.querySelectorAll('.sched-day')][0].className.includes('on'),
+     'clicking a chip picks the day')
+
+  findButton(sec, 'Add schedule').onclick()
+  const saved = fresh.posted.find((m) => m.type === 'saveSchedule')
+  ok(!!saved, 'Save posts a saveSchedule')
+  ok(saved.draft.title === 'Morning bug patrol'
+     && saved.draft.prompt === 'Check the bug board and start fixing.'
+     && saved.draft.hour === 7 && saved.draft.minute === 45
+     && JSON.stringify(saved.draft.days) === JSON.stringify([0, 1, 2, 3, 4, 5])
+     && saved.draft.enabled === true && !saved.draft.id,
+     'the draft carries the typed schedule — trimmed title, full instruction, local time, the picked days')
+  ok(findButton(sched(fresh), 'Add schedule').disabled === true,
+     'and the form is reset for the next schedule')
+}
+
+{
+  // Editing loads the schedule into the form; saving sends it back with its
+  // id — and a PAUSED schedule stays paused, because editing a run is not
+  // the same as re-arming one.
+  const stateWith = (over) => state({
+    schedules: { canRun: true, rows: [
+      { id: 's1', title: 'Morning bug patrol', prompt: 'Check the bug board.',
+        hour: 9, minute: 0, days: [1, 2, 3, 4, 5], enabled: true, when: 'Mon–Fri at 09:00',
+        nextAt: Date.now() + 86_400_000 },
+      { id: 's2', title: 'Nightly', prompt: 'Run the full build.',
+        hour: 23, minute: 30, days: [0], enabled: false, when: 'Sun at 23:30', ...over },
+    ] },
+  })
+  const secOf = (v) => [...v.root.querySelectorAll('section')]
+    .find((s) => s.textContent.includes('Scheduled runs'))
+  const rowOf = (sec, title) => [...sec.querySelectorAll('.row')]
+    .find((r) => r.textContent.includes(title))
+
+  const v = await renderSettings(stateWith())
+  const sec0 = secOf(v)
+  findButton(rowOf(sec0, 'Morning bug patrol'), 'Edit').onclick()
+  let sec = secOf(v)
+  ok(sec.textContent.includes('Edit schedule'), 'editing announces itself')
+  ok(findButton(sec, 'Save changes') && !findButton(sec, 'Add schedule'),
+     'the save button says what it will do')
+  ok(sec.querySelector('.sched-title').value === 'Morning bug patrol'
+     && sec.querySelector('.sched-time').value === '09:00'
+     && sec.querySelector('.sched-prompt').value === 'Check the bug board.',
+     'the form is filled from the schedule — nothing has to be retyped')
+  const daysOn = [...sec.querySelectorAll('.sched-day')].filter((c) => c.className.includes('on'))
+  ok(daysOn.length === 5 && daysOn[0].textContent === 'Mo', 'and its days are picked')
+
+  // Change the time and save.
+  const time = sec.querySelector('.sched-time')
+  time.value = '08:30'
+  time.oninput({ target: time })
+  sec = secOf(v)
+  findButton(sec, 'Save changes').onclick()
+  const saved = v.posted.find((m) => m.type === 'saveSchedule')
+  ok(saved?.draft.id === 's1' && saved.draft.hour === 8 && saved.draft.minute === 30,
+     'saving an edit posts the id and the changed time')
+
+  // Editing a PAUSED schedule and saving must not resume it — Pause is the
+  // row's own button, and the edit must not be a second path to re-arming.
+  const p = await renderSettings(stateWith())
+  const secp = secOf(p)
+  findButton(rowOf(secp, 'Nightly'), 'Edit').onclick()
+  const secp2 = secOf(p)
+  ok(secp2.querySelector('.sched-time').value === '23:30', 'a paused row edits with its own time')
+  findButton(secp2, 'Save changes').onclick()
+  const savedP = p.posted.find((m) => m.type === 'saveSchedule')
+  ok(savedP?.draft.id === 's2' && savedP.draft.enabled === false,
+     'a paused schedule saved from Edit stays paused')
+
+  const c = await renderSettings(stateWith())
+  const secc = secOf(c)
+  findButton(rowOf(secc, 'Nightly'), 'Edit').onclick()
+  findButton(secOf(c), 'Cancel').onclick()
+  ok(findButton(secOf(c), 'Add schedule') !== null, 'Cancel leaves editing and returns to Add')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

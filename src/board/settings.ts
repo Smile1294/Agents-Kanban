@@ -57,6 +57,43 @@ export interface SettingsState {
    * can say how stale a green row is.
    */
   voice?: { at: number; rows: VoiceRowState[] }
+  /**
+   * Scheduled runs, with the derived facts the page must not compute itself.
+   * `canRun` is false when no git repo is open — the runs would not fire, and
+   * the page says so instead of showing a countdown that can never reach zero.
+   */
+  schedules?: { rows: ScheduleRowState[]; canRun: boolean; problem?: string }
+}
+
+/** One scheduled run as the page shows it. The schedule itself, plus the
+ *  derived facts: `when` ("Mon–Fri at 09:00") and `nextAt`, both host-computed,
+ *  so the page needs no clock of its own for WHEN — only for how long ago a
+ *  run was, which `since()` needs anyway. */
+export interface ScheduleRowState {
+  id: string
+  title: string
+  prompt: string
+  hour: number
+  minute: number
+  days: number[]
+  enabled: boolean
+  /** "Daily at 09:00" — the one-line shape of the schedule. */
+  when: string
+  /** When it will next fire, host-computed. Absent when no days are picked. */
+  nextAt?: number
+  lastRun?: { at: number; ok: boolean; note?: string }
+}
+
+/** What the page sends to add or change a schedule. */
+export interface ScheduleDraft {
+  /** Present on an edit, absent on a new one. */
+  id?: string
+  title: string
+  prompt: string
+  hour: number
+  minute: number
+  days: number[]
+  enabled: boolean
 }
 
 /** One piece of the dictation pipeline, as the settings page shows it. */
@@ -164,6 +201,14 @@ export type SettingsMessage =
   /** Run the voice-pipeline probe now, cache or no cache — a Check button is a
    *  check. Fills `state.voice`. */
   | { type: 'checkVoice' }
+  /** Add or change a schedule. The webview validates before sending, but a
+   *  message from a webview is model-written input all the same — this parses
+   *  every field a fire depends on. `runSchedule` and `toggleSchedule` can
+   *  START a billed session, so they parse too rather than cast. */
+  | { type: 'saveSchedule'; draft: ScheduleDraft }
+  | { type: 'removeSchedule'; id: string }
+  | { type: 'toggleSchedule'; id: string }
+  | { type: 'runSchedule'; id: string }
 
 export interface SettingsHost {
   getState: () => Promise<SettingsState>
@@ -347,6 +392,40 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
     }
     case 'openSetting':
       return typeof m.key === 'string' && m.key ? { type, key: m.key } : undefined
+    case 'removeSchedule':
+    case 'toggleSchedule':
+    case 'runSchedule':
+      return id ? ({ type, id } as SettingsMessage) : undefined
+    case 'saveSchedule': {
+      const d = m.draft as Record<string, unknown> | undefined
+      if (!d || typeof d !== 'object') return undefined
+      const did = typeof d.id === 'string' && d.id ? d.id.slice(0, 200) : undefined
+      const title = typeof d.title === 'string' ? d.title.trim() : ''
+      const prompt = typeof d.prompt === 'string' ? d.prompt : ''
+      const hour = typeof d.hour === 'number' && Number.isInteger(d.hour) && d.hour >= 0 && d.hour <= 23
+        ? d.hour : -1
+      const minute = typeof d.minute === 'number' && Number.isInteger(d.minute) && d.minute >= 0 && d.minute <= 59
+        ? d.minute : -1
+      const days = Array.isArray(d.days)
+        ? [...new Set(d.days.filter((v): v is number =>
+            typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 6))]
+        : []
+      // A draft that cannot fire (no title, no prompt, bad time) is refused
+      // wholesale, like every other malformed message on this page.
+      if (!title || !prompt || !prompt.trim() || hour === -1 || minute === -1) return undefined
+      return {
+        type,
+        draft: {
+          ...(did ? { id: did } : {}),
+          title,
+          prompt,
+          hour,
+          minute,
+          days,
+          enabled: d.enabled !== false,
+        },
+      } as SettingsMessage
+    }
     default:
       return undefined
   }

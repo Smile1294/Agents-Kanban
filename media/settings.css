@@ -368,3 +368,107 @@ button.primary:hover { background: var(--vscode-button-hoverBackground); }
   border: 1px dashed var(--line); border-radius: 6px;
   font-size: 12.5px; color: var(--muted);
 }
+
+/* --- scheduled runs ----------------------------------------------------------
+ *
+ * Time triggers: a prompt and a wall-clock time on chosen weekdays. The rows
+ * tell the run's story — when it next fires (or that it is due), and what the
+ * last attempt did; the form below adds or edits one. Every flex item that can
+ * hold an unbounded string carries `min-width: 0` and ellipsis, for the reason
+ * at the top of this file.
+ */
+/* The one signal that would otherwise be silent: the runs cannot fire right
+   now (no folder, no git repo). Warning-styled, never error-styled — nothing
+   has failed; the schedule is simply waiting for the window it needs. */
+.sched-problem {
+  border: 1px solid var(--vscode-inputValidation-warningBorder, #d29922);
+  background: var(--vscode-inputValidation-warningBackground, rgba(210, 153, 34, 0.08));
+  border-radius: 5px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.sched-main { display: flex; flex-direction: column; gap: 3px; }
+
+.sched-meta {
+  display: flex; gap: 7px; align-items: baseline;
+  min-width: 0; white-space: nowrap; overflow: hidden;
+}
+.sched-meta > span:first-child { flex: none; }
+.sched-sep { flex: none; color: var(--faint); }
+.row-prompt {
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--muted); font-size: 11.5px;
+}
+
+.sched-due {
+  color: var(--vscode-editorWarning-foreground, #d29922);
+  font-weight: 600;
+}
+.row-fail { color: var(--vscode-testing-iconFailed, #f85149); }
+
+.sched-subhead {
+  font-size: 0.72em; font-weight: 700;
+  letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--faint);
+  margin-top: 10px;
+}
+
+.sched-form {
+  display: flex; flex-direction: column; gap: 8px;
+  margin-top: 8px;
+  align-items: flex-start;
+}
+.sched-line {
+  display: flex; gap: 8px; align-items: center;
+  width: 100%; min-width: 0;
+}
+.sched-title { flex: 1; min-width: 0; }
+.sched-time { flex: none; font-variant-numeric: tabular-nums; }
+.sched-title, .sched-time, .sched-prompt {
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--line));
+  border-radius: 4px;
+  padding: 5px 8px;
+  font: inherit; font-size: 0.9em;
+}
+.sched-title:focus, .sched-time:focus, .sched-prompt:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+.sched-prompt {
+  width: 100%; box-sizing: border-box;
+  min-height: 52px; resize: vertical;
+  line-height: 1.45;
+}
+.sched-prompt::placeholder, .sched-title::placeholder { color: var(--faint); }
+
+.sched-days { display: flex; flex-wrap: wrap; gap: 4px; }
+button.sched-day {
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  color: var(--muted);
+  border-radius: 10px;
+  font-size: 11px; line-height: 1;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+button.sched-day:hover { border-color: var(--vscode-focusBorder); }
+button.sched-day.on {
+  background: var(--vscode-button-background);
+  border-color: transparent;
+  color: var(--vscode-button-foreground);
+}
+
+.sched-form-acts {
+  display: flex; gap: 14px; align-items: center;
+  flex-wrap: wrap;
+}
+/* A link button that cannot be pressed says so. The disabled state hides the
+   reason in the title, and the inline note next to it says it in words. */
+button.link:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+button.link:disabled:hover { text-decoration: none; }
