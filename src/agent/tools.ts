@@ -75,6 +75,33 @@ export type ScheduleCreateOutcome =
 
 export type ScheduleActOutcome = { ok: boolean; message?: string }
 
+export type CommitWorktreeOutcome =
+  | { ok: true; sha: string; message: string }
+  | { ok: false; reason: 'no-worktree' | 'clean' | 'failed'; message: string }
+
+/** A conventional commit message from the card title: an already-conventional
+ *  title is kept (its type lowercased), a leading verb picks the type,
+ *  everything else is a feat. The fallback for the commit that rides the move
+ *  into a review column. */
+export function conventionalMessage(title: string): string {
+  const subject = (title || 'agent changes').trim().split('\n')[0]!
+  const already = /^(feat|fix|docs|chore|refactor|test|style|perf|build|ci|revert)(\(.*\))?:/i.exec(subject)
+  if (already) return `${already[1]!.toLowerCase()}:${subject.slice(already[0].length)}`
+  const type =
+    /^(add|adding|new|introduce|create|support|build|make)/i.test(subject) ? 'feat' :
+    /^(fix|repair|handle|prevent|stop|guard|correct|avoid)/i.test(subject) ? 'fix' :
+    /^(doc|readme|explain|describe)/i.test(subject) ? 'docs' :
+    /^(refactor|move|rename|extract|tidy|clean|split)/i.test(subject) ? 'refactor' :
+    /^(test|assert)/i.test(subject) ? 'test' :
+    'feat'
+  // When the leading word IS the type ("Fix the flaky test"), drop it — the
+  // prefix already says it. Any other verb stays, since it is the change,
+  // not a label ("Handle the timeout" -> "fix: handle the timeout").
+  const [first = '', ...rest] = subject.split(' ')
+  const body = first!.toLowerCase() === type && rest.length ? rest.join(' ') : subject
+  return `${type}: ${body.charAt(0).toLowerCase()}${body.slice(1)}`
+}
+
 export interface BoardToolContext {
   store: SessionStore
   /**
@@ -107,6 +134,13 @@ export interface BoardToolContext {
    * Absent means no policy, and the tool says nothing about models.
    */
   spawnModels?: string[]
+  /**
+   * Commit the session's worktree. Called on the move into a review column, so
+   * the user's Merge button always has commits to merge. The host supplies it
+   * when a worktree exists; a clean tree and a failed commit both come back
+   * described, never thrown.
+   */
+  commitWorktree?: (message: string) => Promise<CommitWorktreeOutcome>
   /**
    * Rename this session's card.
    *
@@ -188,6 +222,11 @@ function phaseDescription(board: BoardConfig): string {
       'That column means "I am done, your turn to check it" — so say how. The user',
       'has not read your code and does not know what you touched.',
       '',
+      'Your uncommitted worktree changes are committed for you on that move, with a',
+      'conventional message — pass `commitMessage` to choose it (e.g. "feat: add a',
+      'Merge button"), or one is derived from the card title. The user\'s merge',
+      'button merges commits, so uncommitted work would never be mergeable.',
+      '',
       '  howToTest: {',
       '    summary: "One line: what changed and what to look at."',
       '    steps:   ["Numbered, concrete. \'Run npm test\', not \'verify it works\'."]',
@@ -219,6 +258,12 @@ export function buildBoardTools(
     {
       phase: z.string().describe(`The column to move to. One of: ${phases.join(', ')}`),
       note: z.string().optional().describe('A short line saying why, shown on the board.'),
+      commitMessage: z
+        .string()
+        .optional()
+        .describe('Conventional commit message for the work, e.g. "feat: add a Merge button" or "fix: honour PORT=0". ' +
+          'When moving to a review column the board commits your uncommitted worktree changes; ' +
+          'pass this to choose the message, or omit it for one derived from the card title.'),
       howToTest: z
         .object({
           summary: z.string().describe('One line: what changed and what to look at.'),
@@ -291,10 +336,23 @@ export function buildBoardTools(
         sessionId: id, phase: { from, to: args.phase },
         ...(args.note?.trim() ? { note: args.note.trim().slice(0, 200) } : {}),
       })
+      // The other half of handing work back: the board commits the worktree so
+      // the user's Merge button has commits to merge. The agent may name the
+      // message; the fallback is derived from the card title.
+      let committed: CommitWorktreeOutcome | undefined
+      if (isReviewColumn(board, args.phase)) {
+        const message = args.commitMessage?.trim() || conventionalMessage(ctx.sessionTitle?.() ?? '')
+        committed = await ctx.commitWorktree?.(message)
+      }
       const guessed = isStartedColumn(board, args.phase) ? ctx.derivedTitle?.() : undefined
       return ok(
         `Moved: ${from} -> ${args.phase}.` +
         (plan ? ` Test plan recorded (${plan.steps.length} step(s), ${plan.links.length} link(s)).` : '') +
+        (committed?.ok
+          ? ` Committed ${committed.sha.slice(0, 7)} — "${committed.message}".`
+          : committed && committed.reason !== 'clean'
+            ? ` Could not commit the worktree: ${committed.message}`
+            : '') +
         (guessed && ctx.onRename
           ? `\n\nThis card is still called "${guessed}", which was taken from the first line of the ` +
             'request rather than from the work. You now know what the work is, so give it a name: ' +
