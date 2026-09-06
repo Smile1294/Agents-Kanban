@@ -432,6 +432,38 @@ ok(resolveOrchestration('nonsense', 'nonsense') === 'balanced',
   ok(parseMeta({ phase: 'x', thinking: 'sometimes' })?.thinking === undefined, 'and an unknown thinking mode is dropped')
 }
 
+// --- a backend switch leaves a trail the composer can warn about -------------
+//
+// A started session's backend can change (the runtime cannot). `switchedFrom`
+// records the backend the conversation RAN on, so the bar can say the next
+// turn re-reads it all at the new backend's price — and the launch that
+// performs the switch clears the trail, or the warning would be permanent.
+{
+  ok(parseMeta({ phase: 'implementing', switchedFrom: 'or' })?.switchedFrom === 'or',
+     'a string `switchedFrom` survives parsing')
+  ok(parseMeta({ phase: 'implementing', switchedFrom: 42 })?.switchedFrom === undefined,
+     'and a non-string one is dropped, like every other field a webview writes')
+
+  await meta.update('switch-a', { switchedFrom: 'or', provider: 'inherit' })
+  const reread = await new MetaStore(dir, root).get('switch-a')
+  ok(reread.switchedFrom === 'or' && reread.provider === 'inherit',
+     `the switch is WRITTEN and READ BACK (${JSON.stringify({ switchedFrom: reread.switchedFrom, provider: reread.provider })})`)
+
+  // `null` in a patch is the clear sentinel — the same machinery as
+  // CLEAR_TEST_PLAN. The launch that performs the switch clears the trail, and
+  // the clear is asserted on DISK, not only on read: parse would drop a
+  // persisted `null` anyway, so the disk is the only place the delete is
+  // observable.
+  await meta.update('switch-a', { switchedFrom: null })
+  const cleared = await new MetaStore(dir, root).get('switch-a')
+  ok(cleared.switchedFrom === undefined,
+     `a null patch clears the trail on read (${String(cleared.switchedFrom)})`)
+  const raw = JSON.parse(await fs.readFile(
+    path.join(dir, 'sessions', `${encodeURIComponent(root)}.json`), 'utf8'))
+  ok(!('switchedFrom' in (raw['switch-a'] ?? {})),
+     'and on disk — the sidecar does not carry a dead trail forever')
+}
+
 // --- surviving the extension changing its own identity -----------------------
 //
 // The board's phases live in VS Code's global storage, whose path is derived

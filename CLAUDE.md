@@ -329,6 +329,16 @@ run, since each session needs a worktree.
   genuinely take effect next turn. The switch also re-checks the model
   selection, because the model list is per-provider and would otherwise strand
   it on an id the new backend does not serve.
+- **A STARTED session's BACKEND can change; its RUNTIME cannot.** The composer
+  locks the agent program (the transcript lives in that runtime's own store)
+  but offers the other same-runtime backends, and the NEXT LAUNCH of that
+  session resolves the profile from `SessionMeta.provider` (`providerFor`),
+  not from the active one — one global `providerEnv` for every launch would
+  make the picker a lie. The switch is a launch-time event with a cost: the
+  whole conversation is re-read at the new backend's input price, so
+  `switchedFrom` records the old provider, the composer warns from it, and
+  the launch that performs the switch clears it (`null` patch). A running
+  agent is untouched until it stops and the conversation resumes.
 - **A provider check must be able to say "bad", and `accountInfo()` cannot.**
   `Query.accountInfo()` reports the backend the CLI *would* use — at
   `initialize` time it has made no API request, so a gateway pointed at a dead

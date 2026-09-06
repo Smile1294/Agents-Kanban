@@ -523,6 +523,17 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 }
 .picker:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
 
+/* The settings gear: same rhythm as a picker, and it must NEVER wrap away.
+   It is the only path to the settings page once a session has started (the
+   agent picker's own entry disappears with it), so `flex: none` keeps it on
+   the bar however many pickers fill the rows in front of it. */
+.gear-btn {
+  font-size: inherit; padding: 2px 7px; border-radius: 4px; flex: none;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+  cursor: pointer; line-height: 1.4;
+}
+.gear-btn:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
+
 /* A readout in the shape of a picker: same size and rhythm on the bar, no
    affordance. It says what this session is running on; that is decided. */
 .picker.static { border-style: dashed; cursor: default; }
@@ -535,10 +546,16 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 /* The readouts travel as one group and are never squeezed. `flex: none` on
    both the group and its members because everything to their left in the bar
    is elastic and will take the whole row given the chance — and a clipped
-   number is worse than no number. */
+   number is worse than no number.
+   `order: 1` puts them AFTER the settings gear in the flex flow, which they
+   are not in the DOM: the gear is appended last so the readouts fast-path
+   keeps working, but flowing last is what strands it on a fourth line at
+   560px, where line three is exactly the width of the readouts and nothing
+   more. The gear packs against the spacer instead, and the readouts stay the
+   last thing on the bar, right-aligned, as the eye expects. */
 .readouts {
   display: flex; align-items: center; gap: 7px; flex: none;
-  margin-left: auto; white-space: nowrap;
+  margin-left: auto; white-space: nowrap; order: 1;
 }
 .ctx, .spend { flex: none; white-space: nowrap; }
 .spend {

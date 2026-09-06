@@ -92,6 +92,12 @@ export interface RemoteState {
    *  control only when a relay URL is set, because without one no command
    *  could ever arrive. */
   writesEnabled: boolean
+  /**
+   * The page a PHONE opens to watch the board — `<relay>/board`. Derived
+   * host-side from `url`, so the page shows it rather than a "Remote" toggle
+   * with no visible way to reach the remote. Absent until a URL is saved.
+   */
+  viewerUrl?: string
   status?: { at: number; ok: boolean; note?: string; error?: string }
 }
 
@@ -259,6 +265,11 @@ export type SettingsMessage =
   | { type: 'removeSchedule'; id: string }
   | { type: 'toggleSchedule'; id: string }
   | { type: 'runSchedule'; id: string }
+  /** Webview utilities. `openUrl` opens in the DEFAULT browser (not inside
+   *  the panel), so the link target is still restricted to http(s) — but the
+   *  page stays usable and the URL is never navigated by the webview itself. */
+  | { type: 'openUrl'; url: string }
+  | { type: 'copyText'; text: string }
   | RemoteMessage
 
 export interface SettingsHost {
@@ -406,6 +417,15 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
     }
     case 'openSetting':
       return typeof m.key === 'string' && m.key ? { type, key: m.key } : undefined
+    case 'openUrl': {
+      // The webview could also open links with a plain anchor, but only into
+      // itself — a browser tab needs the host, and only http(s) qualifies.
+      const url = typeof m.url === 'string' ? m.url.trim().slice(0, 2000) : ''
+      if (!/^https?:\/\//i.test(url)) return undefined
+      return { type, url }
+    }
+    case 'copyText':
+      return typeof m.text === 'string' && m.text ? { type, text: m.text } : undefined
     case 'removeSchedule':
     case 'toggleSchedule':
     case 'runSchedule':

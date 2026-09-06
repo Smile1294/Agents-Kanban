@@ -345,12 +345,29 @@ export interface SessionMeta {
    * The backend profile this session runs on, by id.
    *
    * Recorded at launch beside `runtime`, and for the same reason: a provider is
-   * environment on the CLI process, so it is fixed for the life of the session.
-   * Without it the composer had nothing to read and showed the WORKSPACE
-   * default — open a card that has been on DeepSeek all morning and the bar
-   * says Claude Code, which is the confusion this field exists to end.
+   * environment on the CLI process. Without it the composer had nothing to read
+   * and showed the WORKSPACE default — open a card that has been on DeepSeek
+   * all morning and the bar says Claude Code, which is the confusion this
+   * field exists to end.
+   *
+   * Unlike `runtime`, the backend of a STARTED session can be changed: the
+   * transcript lives in the runtime's store either way, and the next launch
+   * re-reads it on the new backend (at its input price — `switchedFrom` below
+   * is what the bar's warning reads). The RUNTIME stays fixed, and for the
+   * same reason it always did: no other runtime can read the transcript.
    */
   provider?: string
+  /**
+   * The backend this conversation was ON before the user switched it.
+   *
+   * Written when the composer changes a started session's backend, read by the
+   * bar to warn that the next turn re-reads the whole conversation at the new
+   * backend's input price, and cleared by `durablePatch` at the next launch —
+   * the launch is the moment the switch actually happened, and after it the
+   * session simply IS on the new backend.
+   */
+  /** `null` in a PATCH clears it — see `normalise()`. */
+  switchedFrom?: string | null
   /** Per-session overrides; unset means fall through to the workspace default. */
   model?: string
   effort?: EffortLevel
@@ -409,6 +426,7 @@ export function parseMeta(v: unknown): SessionMeta | undefined {
       : {}),
     ...(parseDecomposition(m.decomposition) ? { decomposition: parseDecomposition(m.decomposition)! } : {}),
     ...(typeof m.provider === 'string' ? { provider: m.provider } : {}),
+    ...(typeof m.switchedFrom === 'string' ? { switchedFrom: m.switchedFrom } : {}),
     ...(typeof m.model === 'string' ? { model: m.model } : {}),
     // Closed unions, so a value from an older build cannot reach the picker.
     ...(EFFORT_LEVELS.some((e) => e.key === m.effort) ? { effort: m.effort as EffortLevel } : {}),
@@ -426,6 +444,9 @@ export function normalise(m: SessionMeta): SessionMeta {
   // instruction, not a value. `null` reaches here because `stripUndefined`
   // deliberately lets it through — that is what makes it able to clear.
   if (out.testPlan === CLEAR_TEST_PLAN) delete out.testPlan
+  // Same convention, one field: `null` in a patch clears the switch warning
+  // once the launch it warned about has happened.
+  if (out.switchedFrom === null) delete out.switchedFrom
   return out
 }
 

@@ -209,6 +209,14 @@ ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no clai
   }).text()
   ok(withDial.includes('Maximum'), `the dial shows the level in force (${/Maximum|Balanced|Minimal/.exec(withDial)?.[0]})`)
 
+  // The dial SAYS what it is. It used to carry the glyph ⑂ and nothing else —
+  // reported as "I can't select anywhere the orchestration" — so the label now
+  // names the thing it dials: how readily THIS card splits into subtasks.
+  ok(withDial.includes('Split: Maximum'),
+     'the dial names what it dials — "Split: <level>" — not an unexplained glyph')
+  ok(!withDial.includes('⑂'),
+     'and the unexplained glyph is GONE — a label that keeps it has not been fixed')
+
   // HIDDEN, never greyed, where it cannot take effect. A workspace with no git
   // repository has no worktrees and therefore no `split_task` at all, so a dial
   // over it would be a control that cannot say no.
@@ -219,8 +227,8 @@ ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no clai
   // Asserted on the dial's own marker, not on the level names: a picker
   // rendered with no options would still pass a name check while being exactly
   // the inert control this hides.
-  ok(withDial.includes('\u2442'), 'the dial is drawn with its own marker when it can take effect')
-  ok(!noDial.includes('\u2442'),
+  ok(withDial.includes('Split:'), 'the dial is drawn with its own marker when it can take effect')
+  ok(!noDial.includes('Split:'),
      'and is absent entirely where splitting is impossible, rather than shown and inert')
 
   // A level this build does not serve must not silently read as the default.
@@ -228,7 +236,7 @@ ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no clai
     ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
     composer: { ...COMPOSER, orchestration: 'aggressive', orchestrationLevels: LEVELS },
   }).text()
-  ok(unknown.includes('aggressive') && !/⑂ Balanced/.test(unknown),
+  ok(unknown.includes('aggressive') && !/Split: Balanced/.test(unknown),
      'an unrecognised level shows itself rather than posing as Balanced')
 }
 
@@ -1696,6 +1704,100 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   cv.deliver(frame(2))
   ok(cv.root.querySelector('.control-list') === list,
      'the side bar control is not rebuilt by a frame that changes nothing it draws')
+}
+
+// --- the settings page has a standing door -----------------------------------
+//
+// It used to be reachable only from the command palette, or from an entry
+// inside the agent picker — which a STARTED session hides entirely. So the
+// moment a run started, backends, schedules, the spawn-model policy and the
+// remote pairing code all became unreachable at once. Reported as "how do I
+// even access the Remote board". The gear never disappears.
+{
+  const unlocked = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+  const gear = findButton(unlocked.root, '⚙')
+  ok(!!gear, 'an unlocked composer carries the settings gear')
+  gear.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(unlocked.posted.some((m) => m.type === 'openSettings'),
+     'clicking it asks the host for the settings page')
+
+  const locked = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: {
+      ...COMPOSER, agentLocked: true, runtime: 'claude',
+      runtimes: [{ id: 'claude', label: 'Claude Code', detail: 'Anthropic', providerProfiles: true }],
+      agent: 'claude|inherit',
+      agents: [{ key: 'claude|inherit', label: 'Claude Code', detail: 'Anthropic · default backend', runtime: 'claude', provider: 'inherit' }],
+    },
+  })
+  const lockedGear = findButton(locked.root, '⚙')
+  ok(!!lockedGear,
+     'a STARTED session still carries the gear — the agent picker is gone, the door to settings is not')
+  lockedGear.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(locked.posted.some((m) => m.type === 'openSettings'), 'and it opens the same page')
+}
+
+// --- a STARTED session: the agent is a readout, the backend a choice ----------
+//
+// "Once it ran I can't change from OpenRouter to Anthropic" — the bar locked
+// BOTH halves, because the picker treated a started session as finished. The
+// agent half is genuinely fixed (the transcript lives in that agent's own
+// store); the backend half is environment, and switching it re-reads the
+// conversation at the new backend's price. So: a readout chip for the agent,
+// and a same-agent-only backend picker beside it.
+{
+  const LOCKED = {
+    ...COMPOSER,
+    runtime: 'claude',
+    runtimes: [{ id: 'claude', label: 'Claude Code', detail: 'Anthropic', providerProfiles: true }],
+    provider: 'or',
+    agent: 'claude|or',
+    agents: [
+      { key: 'claude|inherit', label: 'Claude Code', detail: 'Anthropic · default backend', runtime: 'claude', provider: 'inherit' },
+      { key: 'claude|or', label: 'OpenRouter', detail: 'Claude Code · api.deepseek.com', runtime: 'claude', provider: 'or' },
+      { key: 'codex', label: 'Codex', detail: 'OpenAI', runtime: 'codex' },
+    ],
+    agentLocked: true,
+    backendNote: 'The agent is running — a backend change applies when it stops.',
+  }
+  const v = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: LOCKED,
+  })
+  const t = v.text()
+  ok(t.includes('🤖 Claude Code'), 'a started session names its agent program')
+  ok(t.includes('Backend: OpenRouter'), 'and beside it, a picker naming the backend it is on')
+  const chip = findButton(v.root, 'Backend: OpenRouter')
+  ok(!!chip, 'the backend is a control, not a readout')
+  chip.onclick({ stopPropagation() {}, preventDefault() {} })
+  const menu = v.text()
+  ok(menu.includes('Anthropic · default backend'), 'its menu offers the other backend on the same agent')
+  ok(!menu.includes('Codex'),
+     'and NOT another agent — a backend switch moves environment, an agent switch would move the transcript')
+  ok(menu.includes('applies when it stops'),
+     'the live-run caveat rides in the menu, so the choice is not silently accepted')
+  const picked = []
+  for (const b of walkAll(v.root)) {
+    if ((b.className || '').includes('menu-item') && String(b.textContent).includes('Anthropic · default')) picked.push(b)
+  }
+  picked[0].onclick({ stopPropagation() {}, preventDefault() {} })
+  const sent = v.posted.filter((m) => m.type === 'composer' && m.agent)
+  ok(sent.length === 1 && sent[0].agent === 'claude|inherit' && sent[0].id === 'abc-123',
+     `and choosing one posts the switch for THIS session, not the workspace default (${JSON.stringify(sent[0])})`)
+
+  // One same-agent combination means nothing to switch TO — no picker, the
+  // same rule that hides a control that cannot take effect.
+  const only = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: {
+      ...COMPOSER, agentLocked: true, runtime: 'claude',
+      runtimes: [{ id: 'claude', label: 'Claude Code', detail: 'Anthropic', providerProfiles: true }],
+      agent: 'claude|inherit',
+      agents: [{ key: 'claude|inherit', label: 'Claude Code', detail: 'Anthropic · default backend', runtime: 'claude', provider: 'inherit' }],
+    },
+  })
+  ok(!only.text().includes('Backend:'),
+     'a session on the only combination its agent has gets no backend picker — there is nothing to switch to')
 }
 
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)

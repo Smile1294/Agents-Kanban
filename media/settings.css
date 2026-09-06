@@ -530,3 +530,56 @@ button.link:disabled:hover { text-decoration: none; }
   border-top: 1px solid var(--line);
   margin-top: 8px;
 }
+/* The row that finally says where the remote IS: the URL a phone opens, with
+   Open and Copy beside it. Same divider rhythm as the write toggle above. */
+.remote-viewer {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  margin-top: 8px;
+  min-width: 0;
+}
+.remote-viewer code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* --- the table of contents -----------------------------------------------
+ *
+ * Five panels is a page nobody holds in their head, so the top gains a row of
+ * anchor links. Sticky, so it is still reachable from deep inside the model
+ * catalogue; the background must match the body or text scrolls through it.
+ */
+.settings-nav {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  padding: 8px 2px;
+  margin: -8px 0 0;
+  background: var(--vscode-editor-background);
+}
+
+/* The model table's two ticks, explained once above the list instead of on
+   each row: the spawn tick arrived as an unlabeled box at the row's end. */
+.model-legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.model-legend-part {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.model-legend-mark { color: var(--vscode-focusBorder); }

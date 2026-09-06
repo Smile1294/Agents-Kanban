@@ -21,7 +21,7 @@ import {
   type UiCard, type UiState,
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
-import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
+import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type SessionMeta, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts } from './sessions/usage.ts'
 import { SessionStore, TRANSCRIPT_LIMIT, interruptedSessions, type Entry } from './sessions/store.ts'
 import { searchEntries } from './sessions/search.ts'
@@ -215,6 +215,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       : undefined
     providerEnv = envForProfile(p, secret, process.env)
     ws?.manager?.setProvider(p, providerEnv)
+  }
+
+  /**
+   * The backend a RESUMED session launches on: its own recorded profile,
+   * compiled to an environment patch.
+   *
+   * The manager otherwise resolves every launch against the ACTIVE profile,
+   * which is right for a new session and wrong for a resumed one — a session
+   * switched to Anthropic must come back on Anthropic, not on whatever profile
+   * is active the day it resumes. Undefined means "use the active profile",
+   * which is also the honest answer for a session that never recorded a
+   * provider, for one whose profile has since been deleted, and when the
+   * session's profile happens to be the active one anyway.
+   */
+  async function sessionProviderFor(
+    key: string,
+  ): Promise<{ profile: ProviderProfile; env: ProviderEnv } | undefined> {
+    const meta = await ws?.store.get(key)
+    const p = meta?.provider ? providers.find((x) => x.id === meta.provider) : undefined
+    if (!p || p.id === providerId) return undefined
+    const secret = p.hasCredential
+      ? await context.secrets.get(credentialKey(p.id)).then((v) => v ?? undefined, () => undefined)
+      : undefined
+    return { profile: p, env: envForProfile(p, secret, process.env) }
   }
 
   /**
@@ -1693,6 +1717,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           url: remoteUrl,
           hasCode: remoteHasCode,
           writesEnabled: remoteWrites,
+          // The URL a phone opens to WATCH the board. Only shown once a relay
+          // is actually set — a viewer URL without one would be a lie the
+          // moment it is clicked.
+          ...(remoteUrl ? { viewerUrl: `${relayBase(remoteUrl)}/board` } : {}),
           ...(remoteStatus ? { status: remoteStatus } : {}),
         },
       }
@@ -1865,6 +1893,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         case 'openSetting':
           await vscode.commands.executeCommand('workbench.action.openSettings', msg.key)
+          return
+        case 'openUrl':
+          // parseMessage already restricted this to http(s), but a URI scheme
+          // slip here is an arbitrary-code-execution footgun — parse again.
+          if (/^https?:\/\//i.test(msg.url)) {
+            void vscode.env.openExternal(vscode.Uri.parse(msg.url))
+          }
+          return
+        case 'copyText':
+          await vscode.env.clipboard.writeText(msg.text)
           return
         case 'checkVoice':
           // The settings page's own probe: always ask again, cache or no cache
@@ -2571,6 +2609,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         agent: agentKey(runtime, active.id),
         agents: agentChoices(),
         agentLocked: false,
+        // Set only when the selected session is a live run whose backend is
+        // still switchable: the note says the one thing that choice changes
+        // while the process is running.
+        backendNote: undefined as undefined | string,
         runtime,
         runtimes: allRuntimes().map((rt) => ({
           id: rt.id,
@@ -2825,12 +2867,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           (sessionMeta.runtime ?? runtime) as RuntimeId,
           ranOn?.id ?? ((sessionMeta.provider ?? active.id)),
         )
-        /* A session cannot change agent OR backend, and the picker must not
-           pretend otherwise. Its transcript lives in that runtime's own store
-           and its backend is environment on a process that is already running,
-           so both are decided and gone. The chip still SAYS which — that is a
-           statement about the run in front of you, not a control. */
+        /* The RUNTIME half is decided — its transcript lives in that runtime's
+           own store, so the agent chip is a readout. The BACKEND half is not:
+           the view offers a same-runtime backend picker, and the note below
+           says the one thing that choice changes while the run is live. */
         composer.agentLocked = true
+        if (selectedKey && ws.manager?.byKey(selectedKey)) {
+          composer.backendNote =
+            'The agent is running — a backend change applies when it stops and the conversation resumes.'
+        }
         // Everything derived from "which model", recomputed against the list
         // this session actually has.
         const levels = effortsFor(cat.choices, composer.model)
@@ -2858,16 +2903,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
        * away from. When neither can be read, no claim is made: a warning that
        * could be wrong is worse than none, and a fresh session has nothing to
        * re-read anyway. */
-      if (selectedKey && transcript?.length) {
+      /* A BACKEND switch on a started session is the same re-read as a model
+         switch — the whole conversation is re-uploaded at the new backend's
+         input price — so it warns through the same note. `switchedFrom` is
+         written by `switchSessionBackend` and cleared by the launch that
+         performs the switch, so the warning lasts exactly as long as the
+         re-read is still in the future. */
+      if (selectedKey && (transcript?.length || sessionMeta?.switchedFrom)) {
+        // A provider-only switch has no transcript yet; the model the
+        // conversation was on is then unreadable, and no claim is made.
+        const tx = transcript ?? []
         const ranModel = (() => {
-          for (let i = transcript.length - 1; i >= 0; i--) {
-            const e = transcript[i]
+          for (let i = tx.length - 1; i >= 0; i--) {
+            const e = tx[i]
             if (!e || e.kind !== 'text') continue
             if (e.model) return e.model
           }
           return undefined
         })()
-        if (ranModel && composer.model && ranModel !== composer.model) {
+        const switched = sessionMeta?.switchedFrom
+        const providerChanged = !!switched && switched !== composer.provider
+        const modelChanged = !!ranModel && !!composer.model && ranModel !== composer.model
+        if (providerChanged || modelChanged) {
           const newModel = composer.model
           const labelOf = (id: string) => effectiveCatalogue.choices.find((c) => c.id === id)?.label ?? id
           const choice = effectiveCatalogue.choices.find((c) => c.id === newModel)
@@ -2884,10 +2941,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const costStr = cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`
             return `${count} ≈ ${costStr} at ${labelOf(newModel)}'s input price`
           })()
-          composer.modelSwitchNote =
-            `This conversation last ran on ${labelOf(ranModel)}. ` +
-            `Switching to ${labelOf(newModel)} re-reads it all` +
-            (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
+          let note: string
+          if (providerChanged) {
+            const from = providers.find((p) => p.id === switched)
+            const fromLabel = from ? profileLabel(from) : String(switched)
+            note =
+              `This conversation ran on ${fromLabel}. ` +
+              `The next turn re-reads it all on the new backend` +
+              (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
+          } else {
+            note =
+              // modelChanged being true means the transcript named a writer.
+              `This conversation last ran on ${labelOf(ranModel!)}. ` +
+              `Switching to ${labelOf(newModel)} re-reads it all` +
+              (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
+          }
+          // A live run's environment is fixed on its process: the re-read
+          // happens when it stops and the conversation resumes, not now.
+          if (selectedKey && ws.manager?.byKey(selectedKey)) {
+            note += ' The agent is running — this applies when it stops and the conversation resumes.'
+          }
+          composer.modelSwitchNote = note
         }
       }
 
@@ -3265,6 +3339,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const rt = parseRuntimeId(combined[0])
         const wanted = combined[1] ?? ''
         const profile = providers.find((p) => p.id === wanted)
+        /* A STARTED session: this picker changes THAT session's backend, not
+           the workspace default. The runtime half of the combination cannot
+           move (the view never offers another), and the active profile stays
+           where it is — it is what the NEXT new session gets. */
+        if (patch.forKey && rt && profile) {
+          void switchSessionBackend(patch.forKey, rt, profile)
+          return
+        }
         if (rt) {
           const runtimeChanged = rt !== runtime
           if (runtimeChanged) {
@@ -3377,7 +3459,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // text nor an image is nothing.
       if (!text.trim() && !ok.length) return
       if (dropped.length) reportDroppedImages(dropped)
-      await ensureManager().send(key, text, ok)
+      // The session's OWN backend, so a resume launches where the card says it
+      // is rather than on whichever profile is active today. `undefined` means
+      // "the active one", which the manager already holds.
+      const providerFor = await sessionProviderFor(key)
+      await ensureManager().send(key, text, ok, providerFor)
       selectedKey = key
       refreshAll()
     },
@@ -4035,6 +4121,52 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       refreshAll()
     },
+  }
+
+  /**
+   * Change a STARTED session's backend.
+   *
+   * The runtime cannot move — its transcript lives in that runtime's own
+   * store — but the backend can: the next launch re-reads the conversation
+   * on the new one at its input price, which is exactly what
+   * `SessionMeta.switchedFrom` makes the bar warn about, and the warning is
+   * cleared by the launch that performs the switch. The ACTIVE profile is
+   * left alone: it is what the NEXT NEW session gets.
+   *
+   * The model follows the catalogue. A gateway model id does not exist on
+   * Anthropic's list, so an unvalidated switch would strand the session on a
+   * model the new backend has never served — the same bug as a picker
+   * showing a value the run ignores. Effort is re-checked against the model
+   * for the same reason the model switch does it: `max` selected, then a
+   * move to a backend whose model accepts no levels.
+   */
+  async function switchSessionBackend(key: string, rt: RuntimeId, profile: ProviderProfile): Promise<void> {
+    const meta = await ws?.store.get(key)
+    if (!meta) return
+    if (meta.runtime && meta.runtime !== rt) return // the view never offers another runtime
+    if (meta.provider === profile.id) return
+    const cat = catalogueForProfile(profile)
+    const patch: Partial<SessionMeta> = { provider: profile.id }
+    // Only when we know what the conversation was on. A session that
+    // predates the provider field gets no cost warning rather than a wrong
+    // one — "never show a signal that cannot say bad" cuts both ways.
+    if (meta.provider) patch.switchedFrom = meta.provider
+    if (meta.model && !cat.choices.some((c) => c.id === meta.model)) {
+      const next = cat.choices[0]?.id
+      if (next) patch.model = next
+    }
+    const nextModel = patch.model ?? meta.model
+    if (nextModel) {
+      const levels = effortsFor(cat.choices, nextModel)
+      if (meta.effort && levels.length && !levels.includes(meta.effort as EffortLevel)) {
+        patch.effort = levels.includes('high') ? 'high' : levels[levels.length - 1]!
+      }
+    }
+    await ws?.store.patch(key, patch).catch(() => {})
+    // Same gate the ordinary model switch runs: a model change can revoke a
+    // session flag the CLI would otherwise accept silently.
+    regateFlags()
+    refreshAll()
   }
 
   // --- Registration. None of this may depend on a folder being open: an
