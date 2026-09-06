@@ -31,6 +31,7 @@
  */
 import type { EffortLevel } from '../sessions/meta.ts'
 import { withSilentQuery, type ConnectOptions } from './connect.ts'
+import type { EndpointModel, EndpointRate } from './endpoint.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
 
 /** What `Query.supportedModels()` returns, narrowed to what we use. Declared
@@ -62,6 +63,23 @@ export interface ModelChoice {
   label: string
   /** `1M`, `200K`, `?` — the shorthand under the picker. */
   context: string
+  /** The window as a NUMBER, when one is known.
+   *
+   *  `context` is a label and cannot be measured against anything. This is what
+   *  the context meter needs, and off first-party it is the only source there
+   *  is: `MODEL_WINDOWS` is keyed by Anthropic's ids, so a `deepseek-chat`
+   *  session had a fill with no denominator and drew nothing at all. */
+  contextTokens?: number
+  /**
+   * What this model costs, in USD per million tokens, when its own endpoint
+   * published a price.
+   *
+   * Same argument as the window. `MODEL_RATES` knows Anthropic's models and
+   * nobody else's, so every session on a gateway reported `≥ $0.00` — honest,
+   * because `priced: false` IS "unknown model", and useless. OpenRouter serves
+   * an exact per-token price for all 431 of its models; carrying it here is
+   * what turns that back into a number the board can defend. */
+  rate?: EndpointRate
   /** The CLI's own one-liner, shown as the menu item's detail. */
   detail?: string
   /** Effort levels this model accepts. EMPTY means it has none, and the effort
@@ -86,8 +104,13 @@ export interface ModelChoice {
 }
 
 /** Where the list in force came from. Shown in the picker, because "why is
- *  Fable missing" is answerable only if you can see whether we asked. */
-export type ModelSource = 'cli' | 'profile' | 'builtin'
+ *  Fable missing" is answerable only if you can see whether we asked.
+ *
+ *  `endpoint` is the custom endpoint's OWN answer — `GET <base>/v1/models` —
+ *  and it is a different claim from `cli`, which is Claude Code's list and is
+ *  about Claude Code whatever `ANTHROPIC_BASE_URL` points at. Collapsing the
+ *  two is the bug this source was added to make impossible to repeat. */
+export type ModelSource = 'cli' | 'profile' | 'builtin' | 'endpoint'
 
 export interface ModelCatalogue {
   choices: ModelChoice[]
@@ -150,6 +173,7 @@ export function toChoices(
       id,
       label: m.displayName?.trim() || id,
       context: windowLabel(tokens),
+      ...(tokens ? { contextTokens: tokens } : {}),
       ...(m.description?.trim() ? { detail: m.description.trim() } : {}),
       efforts,
       thinking: m.supportsAdaptiveThinking === true,
@@ -230,6 +254,13 @@ export function parseCachedChoices(raw: unknown): ModelChoice[] {
       label: c.label,
       context: c.context,
       ...(typeof c.detail === 'string' && c.detail ? { detail: c.detail } : {}),
+      // Optional and therefore ABSENT in every entry cached before they
+      // existed, which is why a missing one is not a rejection: this cache
+      // outlives the build that wrote it, and discarding it wholesale on an
+      // older shape would re-ask the CLI on every launch rather than once.
+      ...(typeof c.contextTokens === 'number' && Number.isFinite(c.contextTokens) && c.contextTokens > 0
+        ? { contextTokens: c.contextTokens } : {}),
+      ...(parseRate(c.rate) ? { rate: parseRate(c.rate)! } : {}),
       // Filtered THROUGH the known levels, so a cache from a build that knew a
       // level this one does not cannot reach a `query()` call that rejects it.
       efforts: ALL_EFFORTS.filter((e) => (c.efforts as unknown[]).includes(e)),
@@ -239,6 +270,97 @@ export function parseCachedChoices(raw: unknown): ModelChoice[] {
     })
   }
   return out
+}
+
+/**
+ * A price read back out of storage, or undefined.
+ *
+ * Zero is a real price — OpenRouter serves 22 free models — so the check is
+ * `Number.isFinite`, never truthiness. Reading `0` as "unknown" would put a `?`
+ * on a model whose price we know exactly, which is the same class of mistake as
+ * showing `$0.00` for a price we do not know.
+ */
+export function parseRate(raw: unknown): EndpointRate | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Record<string, unknown>
+  const n = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined
+  const input = n(r.input)
+  const output = n(r.output)
+  if (input === undefined || output === undefined) return undefined
+  const cacheRead = n(r.cacheRead)
+  const cacheWrite = n(r.cacheWrite)
+  return {
+    input, output,
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+  }
+}
+
+/**
+ * A price as the picker shows it: `$3/$15 per Mtok`.
+ *
+ * Here rather than in the view because both surfaces show it — the composer's
+ * model menu and the settings page's catalogue — and two copies of a money
+ * formatter is two places for a rounding rule to drift. The view does no
+ * arithmetic on money at all.
+ *
+ * Sub-dollar rates keep enough digits to stay distinct: DeepSeek at $0.28 and
+ * $0.42 both round to `$0` at zero decimals, which turns a price list into a
+ * column of identical zeroes.
+ */
+export function priceLabel(rate: EndpointRate | undefined): string | undefined {
+  if (!rate) return undefined
+  // Both sides zero is a FREE model, and there are 22 of them on OpenRouter.
+  // Rendering that as "$0/$0" reads as a formatting failure; saying "Free" is
+  // the same fact stated as a fact.
+  if (rate.input === 0 && rate.output === 0) return 'Free'
+  const money = (v: number): string => {
+    if (v === 0) return '$0'
+    // A price too small to write at four decimals must not round to `$0`. That
+    // would make a real price indistinguishable from a free model, which is the
+    // "never show a signal that cannot say bad" rule losing the one distinction
+    // this label exists to draw.
+    if (v < 0.0001) return '<$0.0001'
+    // Two decimals is the floor, four the ceiling: `$0.50` rather than `$0.5`,
+    // and `$0.0275` rather than `$0.03`, which is where several router prices
+    // actually sit and where rounding would make distinct models look equal.
+    if (v < 10) return `$${v.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, '$1')}`
+    return `$${Math.round(v)}`
+  }
+  return `${money(rate.input)}/${money(rate.output)} per Mtok`
+}
+
+/**
+ * A custom endpoint's own catalogue, as picker entries.
+ *
+ * The capabilities are the SAFE defaults, and for a stronger reason than in
+ * `modelsForProfile`: nobody has asked this endpoint what it supports, and half
+ * of what the composer offers is Claude Code's vocabulary rather than a
+ * model's. Effort and thinking stay available because losing them only costs a
+ * control; ultracode and fast mode stay off because offering them spends money
+ * on a mode the model may not have.
+ */
+export function endpointChoices(
+  models: readonly EndpointModel[],
+  fallbackWindow: number | undefined,
+  windowLabel: (tokens: number | undefined) => string,
+): ModelChoice[] {
+  return models.map((m) => {
+    const tokens = m.contextWindow ?? fallbackWindow
+    return {
+      id: m.id,
+      label: m.label?.trim() || m.id,
+      context: windowLabel(tokens),
+      ...(tokens ? { contextTokens: tokens } : {}),
+      ...(m.description ? { detail: m.description } : {}),
+      ...(m.rate ? { rate: m.rate } : {}),
+      efforts: [...ALL_EFFORTS],
+      thinking: true,
+      ultracode: false,
+      fastMode: false,
+    }
+  })
 }
 
 /**
@@ -277,15 +399,25 @@ export function modelsForProfile(
   normalise: (id: string) => string,
   windows: Record<string, number>,
   windowLabel: (tokens: number | undefined) => string,
+  /** The endpoint's own catalogue, when it answered. Consulted FIRST and by
+   *  EXACT id: `deepseek/deepseek-chat-v3.1` is not a Claude id with decoration
+   *  on it, so `normalise` has nothing to say about it and the window and price
+   *  can only come from the endpoint that published them. */
+  endpoint: readonly EndpointModel[] = [],
 ): ModelChoice[] {
   if (!profile.models?.length) return []
   return profile.models.map((id) => {
     const base = normalise(id)
+    const served = endpoint.find((e) => e.id === id)
     const match = known.find((f) => f.id === base)
+    const tokens = served?.contextWindow ?? windows[base] ?? profile.contextWindow
     return {
       id,
-      label: match?.label ?? id,
-      context: windowLabel(windows[base] ?? profile.contextWindow),
+      label: served?.label ?? match?.label ?? id,
+      context: windowLabel(tokens),
+      ...(tokens ? { contextTokens: tokens } : {}),
+      ...(served?.description ? { detail: served.description } : {}),
+      ...(served?.rate ? { rate: served.rate } : {}),
       efforts: [...ALL_EFFORTS],
       thinking: true,
       ultracode: false,
@@ -311,12 +443,18 @@ export function catalogueFor(
     windowLabel: (tokens: number | undefined) => string
   },
   problem?: string,
+  /** What the custom endpoint itself reported, and what to call it in a
+   *  sentence. Absent for every kind but `gateway`, which is the only one whose
+   *  endpoint is ours to ask. */
+  endpoint?: { models: readonly EndpointModel[]; host?: string },
 ): ModelCatalogue {
+  const fromEndpoint = endpointChoices(endpoint?.models ?? [], profile.contextWindow, deps.windowLabel)
   return mergeModels(
     discovered,
-    modelsForProfile(profile, builtin, deps.normaliseModel, deps.windows, deps.windowLabel),
+    modelsForProfile(profile, builtin, deps.normaliseModel, deps.windows, deps.windowLabel, endpoint?.models),
     builtin,
     problem,
+    { choices: fromEndpoint, ...(endpoint?.host ? { host: endpoint.host } : {}) },
   )
 }
 
@@ -337,13 +475,60 @@ export function catalogueFor(
  * Never empty. An empty picker reads as a broken extension, and the cause would
  * be something as ordinary as being on a train.
  */
+/** A few ids, then a count. A menu footer that lists 400 of them is a menu
+ *  footer nobody reads. */
+function nameSome(choices: readonly ModelChoice[], most = 3): string {
+  const shown = choices.slice(0, most).map((c) => c.id).join(', ')
+  return choices.length > most ? `${shown} +${choices.length - most} more` : shown
+}
+
 export function mergeModels(
   discovered: readonly ModelChoice[],
   fromProfile: readonly ModelChoice[] | undefined,
   builtin: readonly ModelChoice[],
   problem?: string,
+  endpoint?: { choices: readonly ModelChoice[]; host?: string },
 ): ModelCatalogue {
-  if (fromProfile?.length) return { choices: [...fromProfile], source: 'profile' }
+  const served = endpoint?.choices ?? []
+  const where = endpoint?.host || 'this endpoint'
+
+  if (fromProfile?.length) {
+    if (!served.length) return { choices: [...fromProfile], source: 'profile' }
+    const ids = new Set(served.map((c) => c.id))
+    const missing = fromProfile.filter((c) => !ids.has(c.id))
+    /* THE SELF-HEAL, and the reason it is not merely a warning.
+       A declared list that names nothing the endpoint serves is not a filter,
+       it is a filter that selects nothing — every entry in it fails at the
+       first request. That state is not hypothetical: `testProvider()` used to
+       write Claude Code's OWN model list onto a gateway profile, so a DeepSeek
+       endpoint ended up declaring `sonnet`, `haiku` and `opus[1m]`, and the
+       composer offered those six and nothing else. Honouring it would be
+       honouring a list this extension wrote by mistake. So the endpoint's
+       answer takes over and the picker SAYS what happened — the user has to be
+       able to see that their setting was overruled, or the next surprise is
+       "why is my list ignored?". */
+    /* Short on purpose. This is a footer under a menu, not a report: the long
+       version — which ids, and what to do — belongs on the settings page, where
+       there is room for it and where the fix actually is. */
+    if (missing.length === fromProfile.length) {
+      return {
+        choices: [...served],
+        source: 'endpoint',
+        problem: `${where} serves none of the ${missing.length} models this backend lists.`,
+      }
+    }
+    return {
+      choices: [...fromProfile],
+      source: 'profile',
+      ...(missing.length ? { problem: `${where} does not serve ${nameSome(missing)}.` } : {}),
+    }
+  }
+
+  // The endpoint outranks the CLI, and that ordering is the whole fix.
+  // `supportedModels()` is Claude Code's list and stays Claude Code's list
+  // whatever `ANTHROPIC_BASE_URL` points at, so against a custom endpoint it is
+  // a confident answer to a question nobody asked.
+  if (served.length) return { choices: [...served], source: 'endpoint' }
   if (discovered.length) return { choices: [...discovered], source: 'cli' }
   return { choices: [...builtin], source: 'builtin', ...(problem ? { problem } : {}) }
 }

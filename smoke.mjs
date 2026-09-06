@@ -817,10 +817,66 @@ console.log('\n— providers: the picker, and where the credential goes')
   try {
     const view = await renderBoard(latestState(), { layout: 'full' })
     const text = view.text()
-    ok(text.includes('LiteLLM'), 'the real view shows which provider the next session runs on')
+    // ONE list of things you can run on, and the entry names both halves: the
+    // backend (what distinguishes it) and, underneath, the agent program and
+    // the endpoint. Two pickers made this a cross product the user had to do in
+    // their head, and the bar showed only one half of it.
+    ok(text.includes('LiteLLM'), 'the real view names the combination the next session runs on')
+    const agents = latestState().composer.agents ?? []
+    ok(agents.some((a) => a.key === `claude|${saved[0].id}` && a.detail.includes('localhost:4000')),
+       'and the menu entry carries the endpoint, so which models it serves is explicable')
+    ok(agents.some((a) => a.key === 'claude|inherit'),
+       'with the default backend as its own entry beside it — the two are separate things to run on')
     ok(!text.includes(CREDENTIAL), 'and never the credential')
   } catch (e) {
     ok(false, `the view threw on a state with a provider — ${e.message}`)
+  }
+
+  /* --- an agent that is not installed is not offered ------------------------
+   *
+   * Reported, with feeling: "the OpenAI Codex shouldn't even appear because I
+   * didn't download the app in the first place and I didn't even log in to it."
+   * Fair. It was on the composer as a peer of the agent doing all the work, and
+   * picking it would have made every session fail at its first step.
+   *
+   * ABSENT means "we know it is missing". NOT CHECKED still shows, because
+   * hiding something we have not looked for is the same mistake as asserting a
+   * state we did not read.
+   */
+  {
+    const listed = () => (latestState().composer.agents ?? []).map((a) => a.key)
+    /* Looking for an executable is real I/O — `which`, and a `--version` for
+       Codex — and the settings listener starts it without waiting. So this
+       polls for the answer rather than sleeping a guessed number of
+       milliseconds, which is the difference between a gate and a flake. */
+    const settle = async (want) => {
+      for (let i = 0; i < 60; i++) {
+        await send({ type: 'ready' })
+        if (listed().some((k) => k.startsWith('codex|')) === want) return
+        await new Promise((r) => setTimeout(r, 50))
+      }
+    }
+    ok(listed().some((k) => k.startsWith('claude|')),
+       `Claude Code is offered (${listed().join(', ')})`)
+
+    /* Hermetic, and it has to be: `detect()` shells out to `which`, so a gate
+       that asked the machine would pass or fail depending on whose machine it
+       was. `codexExecutable` is the real setting people use to point at a
+       binary the search would miss, so pointing it at THIS process's own node
+       is a Codex that exists, and at a path that does not is one that does
+       not. Both go through the same code a user's setting does. */
+    await ctl.changeConfig({ codexExecutable: process.execPath })
+    await settle(true)
+    ok(listed().some((k) => k.startsWith('codex|')),
+       `an agent that IS installed is offered (${listed().join(', ')})`)
+
+    await ctl.changeConfig({ codexExecutable: path.join(repo, 'no-such-codex') })
+    await settle(false)
+    ok(!listed().some((k) => k.startsWith('codex|')),
+       `and one this machine does not have is not (${listed().join(', ')})`)
+    ok(listed().some((k) => k.startsWith('claude|')),
+       'while the agent that IS here stays')
+    await ctl.changeConfig({ codexExecutable: '' })
   }
 
   // --- switching back -------------------------------------------------------
@@ -1050,6 +1106,121 @@ console.log('\n— providers: the picker, and where the credential goes')
     ctx3._globalState.delete(KEY)
     await send({ type: 'composer', model: 'claude-opus-5' })
     await send({ type: 'ready' })
+
+    /* --- WHAT THE ENDPOINT ITSELF SERVES ---------------------------------
+     *
+     * The bug this gate is named after, driven end to end through the built
+     * bundle. A real profile from a real settings.json:
+     *
+     *   { id: "openrouter", kind: "gateway",
+     *     baseUrl: "https://api.deepseek.com/anthropic",
+     *     models: ["default","opus[1m]","claude-fable-5-1[1m]","sonnet","sonnet[1m]","haiku"] }
+     *
+     * Nobody typed those six. The provider test read them from
+     * `Query.supportedModels()` — Claude Code's own list, which answers for
+     * Claude Code however `ANTHROPIC_BASE_URL` is pointed — offered to "use
+     * these models in the picker", and saved them. A declared list outranks
+     * everything, so the composer offered six models that endpoint has never
+     * served and no way to select one it does. The owner's report: "I literally
+     * don't have access to it in my options."
+     *
+     * Hermetic: the catalogue is seeded into the same `globalState` key the
+     * host writes, so nothing here touches the network. The key string is the
+     * seam — a mismatch with `endpointKey()` is a cache written and never read,
+     * which this project already has a postmortem about.
+     */
+    {
+      const gw = saved[0].id
+      ctx3._globalState.set(`endpointModels:${gw}`, [
+        { id: 'deepseek-chat', label: 'DeepSeek Chat', contextWindow: 128000,
+          rate: { input: 0.28, output: 0.42 } },
+        { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner', contextWindow: 128000,
+          rate: { input: 0.55, output: 2.19 } },
+      ])
+      // The gateway profile still declares `qwen3-coder` and a Bedrock-shaped
+      // Claude id from the add-a-provider flow above. This endpoint serves
+      // neither, which is exactly the state the bug leaves behind.
+      await send({ type: 'composer', provider: 'inherit' })
+      await send({ type: 'composer', provider: gw })
+      await send({ type: 'ready' })
+      const c = latestState().composer
+
+      ok(c.modelSource === 'endpoint',
+         `the list comes from the endpoint, not from Claude Code (${c.modelSource})`)
+      ok(c.models.map((m) => m.id).join() === 'deepseek-chat,deepseek-reasoner',
+         `the picker offers what the endpoint serves (${c.models.map((m) => m.id).join()})`)
+      ok(!c.models.some((m) => /sonnet|haiku|opus|qwen/.test(m.id)),
+         'and nothing the endpoint has never heard of')
+      ok(c.model === 'deepseek-chat',
+         `the selection followed instead of being stranded on a dead id (${c.model})`)
+      ok(!!c.modelNote && c.modelNote.includes('localhost:4000'),
+         `and it SAYS so, naming the endpoint — a setting overruled in silence is the next surprise (${c.modelNote})`)
+      ok((c.modelNote ?? '').length < 90,
+         `in one line, because it is a menu footer and not a report (${(c.modelNote ?? '').length} chars)`)
+
+      // The two facts that make a list of ids a choice. Both are absent from
+      // the built-in tables for every model this extension has never heard of,
+      // and both are what the endpoint publishes about itself.
+      const chat = c.models.find((m) => m.id === 'deepseek-chat')
+      ok(chat?.context === '128K' && chat?.contextTokens === 128000,
+         `each model carries its window as a label AND as the meter's denominator (${chat?.context})`)
+      ok(chat?.price === '$0.28/$0.42 per Mtok', `and its published price (${chat?.price})`)
+
+      // The real view, on the real state. Either side can be right alone.
+      try {
+        const view = await renderBoard(latestState(), { layout: 'full' })
+        ok(view.text().includes('DeepSeek Chat'), 'the real view names the endpoint\u2019s model')
+      } catch (e) {
+        ok(false, `the view threw on an endpoint-sourced catalogue — ${e.message}`)
+      }
+
+      /* --- and the settings page can narrow it -------------------------- */
+      // The note above tells the user to pick the ones they want in Settings,
+      // so that has to be a real place where a real message does a real thing.
+      stub.cmds.get('agentsKanban.openSettings')()
+      await new Promise((r) => setTimeout(r, 0))
+      ok(!!ctl.settings, 'the settings tab opens as its own panel, not as a second board')
+      await ctl.settings.send({ type: 'ready' })
+      const page = ctl.settings.state()
+      const card = (page?.providers ?? []).find((p) => p.id === gw)
+      ok((card?.models ?? []).length === 2,
+         `the page lists what the endpoint serves (${(card?.models ?? []).length})`)
+      ok(card?.models?.[0]?.price === '$0.28/$0.42 per Mtok', 'with the price, formatted once, host-side')
+      ok(card?.models?.every((m) => m.offered === false),
+         'none of them ticked yet — the profile still declares the ids the endpoint does not serve')
+
+      await ctl.settings.send({ type: 'setProfileModels', id: gw, models: ['deepseek-reasoner'] })
+      const declared = (ctl.config.providers ?? []).find((p) => p.id === gw)?.models
+      ok(JSON.stringify(declared) === JSON.stringify(['deepseek-reasoner']),
+         `ticking one writes it to the profile (${JSON.stringify(declared)})`)
+      await send({ type: 'ready' })
+      const pinned = latestState().composer
+      ok(pinned.models.length === 1 && pinned.models[0].id === 'deepseek-reasoner',
+         `and the composer follows immediately (${pinned.models.map((m) => m.id).join()})`)
+      ok(pinned.modelSource === 'profile' && !pinned.modelNote,
+         'reported as the profile\u2019s own list, with nothing left to warn about')
+      ok(pinned.model === 'deepseek-reasoner',
+         `with the selection moved onto it (${pinned.model})`)
+
+      // Untick everything: back to the whole catalogue, not to an empty picker.
+      await ctl.settings.send({ type: 'setProfileModels', id: gw, models: [] })
+      await send({ type: 'ready' })
+      const all = latestState().composer
+      ok(all.models.length === 2 && all.modelSource === 'endpoint',
+         'unticking everything offers the whole catalogue again rather than nothing')
+      ok(!(ctl.config.providers ?? []).find((p) => p.id === gw)?.models,
+         'and the key is REMOVED from settings, not left as an empty list that parses back as undefined')
+
+      // Put the board back where the rest of this file expects it. The
+      // provider switch finishes its model refresh asynchronously, so a `ready`
+      // is what makes the next `latestState()` the state AFTER the switch
+      // rather than the one before it.
+      ctx3._globalState.delete(`endpointModels:${gw}`)
+      await send({ type: 'composer', provider: 'inherit' })
+      await send({ type: 'ready' })
+      ok(latestState().composer.modelSource === 'builtin',
+         'and with the endpoint forgotten, the picker falls back rather than remembering a list it can no longer justify')
+    }
   }
 
   // --- where the model list came from --------------------------------------

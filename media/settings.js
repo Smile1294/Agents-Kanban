@@ -21,6 +21,13 @@ const vscode = acquireVsCodeApi()
 /** Which runtime cards are expanded. Module-level: a render() would destroy it
  *  if it lived in the DOM, exactly as with the board's disclosures. */
 const expanded = new Set()
+/** Which backends have their model catalogue open, and what has been typed into
+ *  each one's filter. Module-level for the same reason: this page re-renders on
+ *  every host reply, and a filter kept in the DOM is destroyed between
+ *  keystrokes. A catalogue is 431 models on OpenRouter — the filter is not a
+ *  nicety, it is the only way to find one. */
+const catalogueOpen = new Set()
+const catalogueFilter = {}
 
 let state = { runtimes: [], providers: [], defaultRuntime: 'claude' }
 let error = ''
@@ -63,13 +70,21 @@ function loginRow(card) {
   const login = st.login
   switch (login.kind) {
     case 'signedIn': {
-      row.appendChild(el('span', 'dot ok'))
+      const idle = card.backend && card.backend.usesLogin === false
+      /* A login that pays for nothing is not a green tick.
+         This card said "Signed in as david@… (subscription)" while every
+         session went to api.deepseek.com on a key from the keychain. Both true,
+         together a lie — and the visible symptom was "why is Claude Code
+         offering me DeepSeek models?". The backend row below says what is
+         actually used; this one steps down to grey when it is not it. */
+      row.appendChild(el('span', 'dot ' + (idle ? 'idle' : 'ok')))
       const via = login.via === 'subscription' ? 'subscription'
         : login.via === 'apiKey' ? 'API key'
         : 'cloud credentials'
       const who = login.account ? ` as ${login.account}` : ''
       const plan = login.plan ? ` · ${login.plan}` : ''
-      row.appendChild(el('span', 'status-text', `Signed in${who} (${via})${plan}`))
+      row.appendChild(el('span', 'status-text' + (idle ? ' muted' : ''), `Signed in${who} (${via})${plan}`))
+      if (idle) row.appendChild(el('span', 'muted small', '· not used by this backend'))
       break
     }
     case 'signedOut':
@@ -122,6 +137,23 @@ function since(at) {
   return hours < 24 ? hours + 'h ago' : Math.round(hours / 24) + 'd ago'
 }
 
+/* WHICH SERVICE a session on this agent would talk to.
+ *
+ * One line, above the executable path, because it is the thing that decides
+ * which models exist and who gets billed — and because without it the page
+ * could show a subscription login beside a model list from somebody else's
+ * endpoint and never connect the two. */
+function backendRow(card) {
+  const b = card.backend
+  if (!b) return null
+  const row = el('div', 'status-row')
+  row.appendChild(el('span', 'dot ok'))
+  row.appendChild(el('span', 'status-text', 'Backend: ' + b.label))
+  if (b.detail && b.detail !== b.label) row.appendChild(el('span', 'muted small', b.detail))
+  if (b.credential) row.appendChild(el('span', 'muted small', '· ' + b.credential))
+  return row
+}
+
 function whereRow(card) {
   const st = card.status
   if (!st || !st.location) return null
@@ -172,7 +204,9 @@ function runtimeCard(card) {
   const actions = el('div', 'agent-actions')
   if (card.id === state.defaultRuntime) {
     actions.appendChild(el('span', 'badge', 'New sessions use this'))
-  } else {
+  } else if (!card.status || card.status.login.kind !== 'notInstalled') {
+    // Never offered for an agent that is not on the machine: pressing it would
+    // set a default whose every session fails at the first step.
     actions.appendChild(button('Use for new sessions', 'primary',
       () => post({ type: 'setDefaultRuntime', runtime: card.id })))
   }
@@ -180,6 +214,8 @@ function runtimeCard(card) {
   box.appendChild(head)
 
   box.appendChild(el('p', 'blurb', card.blurb))
+  const backend = backendRow(card)
+  if (backend) box.appendChild(backend)
   box.appendChild(loginRow(card))
   const where = whereRow(card)
   if (where) box.appendChild(where)
@@ -206,6 +242,17 @@ function runtimeCard(card) {
       'No proxy, no API key, no endpoint.'))
   }
   return box
+}
+
+/** An agent this machine does not have: one line, with the way to get it. */
+function missingRow(card) {
+  const row = el('div', 'agent-missing')
+  row.appendChild(el('span', 'muted', 'Not installed:'))
+  row.appendChild(el('span', '', card.label))
+  row.appendChild(el('code', 'fix', card.installHint))
+  row.appendChild(button('Copy', 'link', () => post({ type: 'install', runtime: card.id })))
+  row.appendChild(button('Check again', 'link', () => post({ type: 'refresh', runtime: card.id })))
+  return row
 }
 
 function providerSection() {
@@ -243,13 +290,119 @@ function providerSection() {
     acts.appendChild(button('Remove', 'link danger', () => post({ type: 'removeProvider', id: p.id })))
     row.appendChild(acts)
     list.appendChild(row)
+    const models = providerModels(p)
+    if (models) list.appendChild(models)
   }
   box.appendChild(list)
   return box
 }
 
+/* WHAT THIS BACKEND SERVES, and which of it the composer should offer.
+ *
+ * The whole reason this exists: the composer's model list used to come from
+ * `Query.supportedModels()`, which answers for CLAUDE CODE however
+ * `ANTHROPIC_BASE_URL` is pointed — so a DeepSeek endpoint reported `sonnet`,
+ * `haiku` and `opus[1m]`, those got saved onto the profile, and the picker
+ * offered six models that endpoint has never served with no way to choose one
+ * that it does. The list here comes from the endpoint's own `/v1/models`.
+ *
+ * Two lists, and keeping them distinct is the point: what the endpoint SERVES
+ * (this catalogue, cached, hundreds of entries) and what the composer OFFERS
+ * (the ticks, saved on the profile, as few as you like). Nothing ticked means
+ * "offer them all" — for OpenRouter that is 431, which is why the composer has
+ * a filter box too.
+ */
+function providerModels(p) {
+  if (p.kind !== 'gateway') return null
+  const box = el('div', 'row-models')
+  const head = el('div', 'row-models-head')
+
+  const count = (p.models || []).length
+  const chosen = (p.models || []).filter((m) => m.offered).length
+  const open = catalogueOpen.has(p.id)
+  head.appendChild(button(
+    (open ? '▾ ' : '▸ ') + (count
+      ? `${count} models available${chosen ? ` · ${chosen} offered in the composer` : ' · all offered'}`
+      : 'Models'),
+    'link',
+    () => { if (open) catalogueOpen.delete(p.id); else catalogueOpen.add(p.id); render() },
+  ))
+  head.appendChild(button(count ? 'Refresh from the endpoint' : 'Ask what it serves', 'link',
+    () => post({ type: 'refreshEndpoint', id: p.id })))
+  box.appendChild(head)
+
+  /* A page that cannot say "I could not ask" is a page that shows an empty list
+     and lets it read as "there are none". */
+  if (p.modelNote) box.appendChild(el('div', 'muted small', p.modelNote))
+  if (!count || !open) return box
+
+  const typed = catalogueFilter[p.id] || ''
+  const needle = typed.trim().toLowerCase()
+  const matches = p.models.filter((m) => !needle
+    || (m.id + ' ' + m.label + ' ' + (m.price || '')).toLowerCase().includes(needle))
+
+  const filter = el('input', 'model-filter')
+  filter.type = 'text'
+  filter.placeholder = 'Filter ' + count + ' models…'
+  filter.value = typed
+  filter.setAttribute('data-focus', 'catalogue::' + p.id)
+  filter.addEventListener('input', (e) => {
+    catalogueFilter[p.id] = (e && e.target ? e.target.value : filter.value) || ''
+    render()
+  })
+  box.appendChild(filter)
+
+  const SHOW = 60
+  const table = el('div', 'model-rows')
+  for (const m of matches.slice(0, SHOW)) {
+    const r = el('label', 'model-row' + (m.offered ? ' on' : ''))
+    const tick = el('input', 'model-tick')
+    tick.type = 'checkbox'
+    tick.checked = !!m.offered
+    tick.addEventListener('change', () => {
+      const next = p.models.filter((x) => (x.id === m.id ? !m.offered : x.offered)).map((x) => x.id)
+      post({ type: 'setProfileModels', id: p.id, models: next })
+    })
+    r.appendChild(tick)
+    const main = el('div', 'model-main')
+    main.appendChild(el('div', 'model-name', m.label))
+    /* The id, the window and the price on one line — the three facts that make
+       a list of names into a choice. The price is a STRING from the host and is
+       simply ABSENT when nobody published one: blank means "not stated", where
+       `$0.00` would mean "free". */
+    const meta = [m.id !== m.label ? m.id : '', m.context && m.context !== '?' ? m.context + ' context' : '', m.price || '']
+      .filter(Boolean).join(' · ')
+    if (meta) main.appendChild(el('div', 'muted small', meta))
+    r.appendChild(main)
+    table.appendChild(r)
+  }
+  box.appendChild(table)
+  if (!matches.length) box.appendChild(el('div', 'muted small', 'Nothing matches “' + typed + '”.'))
+  else if (matches.length > SHOW) {
+    box.appendChild(el('div', 'muted small',
+      `Showing ${SHOW} of ${matches.length} — type to narrow it.`))
+  }
+  if (chosen) {
+    box.appendChild(button('Offer all ' + count + ' in the composer', 'link',
+      () => post({ type: 'setProfileModels', id: p.id, models: [] })))
+  }
+  return box
+}
+
 function render() {
   const root = document.getElementById('root')
+  /* THE SAME RULE THE BOARD HAS: anything the user is typing into is destroyed
+     by the rebuild below, so it has to be handed back afterwards.
+     This page had nothing to type into until the model filter arrived, and
+     without this the first character typed moves focus to the body and the rest
+     of the word goes nowhere — the bug `board.js` has a postmortem about,
+     arriving here the moment this page grew an input. Anything that must
+     survive announces itself with `data-focus`. */
+  const active = document.activeElement
+  const focusKey = active && active.getAttribute ? active.getAttribute('data-focus') : null
+  const caret = active && typeof active.selectionStart === 'number'
+    ? { start: active.selectionStart, end: active.selectionEnd }
+    : null
   root.textContent = ''
 
   const page = el('div', 'settings-page')
@@ -278,7 +431,16 @@ function render() {
   if (!state.runtimes.length) {
     agents.appendChild(el('div', 'muted', 'Checking…'))
   } else {
-    for (const card of state.runtimes) agents.appendChild(runtimeCard(card))
+    /* An agent you do not have is not a peer of one you do.
+       Codex used to get a full card — blurb, login row, model list, "Use for
+       new sessions" — on a machine where it was never installed, above the
+       backend that was actually running everything. It is still listed, because
+       silently dropping it would make the board's second agent undiscoverable,
+       but as one line at the end. */
+    const here = state.runtimes.filter((r) => !r.status || r.status.login.kind !== 'notInstalled')
+    const missing = state.runtimes.filter((r) => r.status && r.status.login.kind === 'notInstalled')
+    for (const card of here) agents.appendChild(runtimeCard(card))
+    for (const card of missing) agents.appendChild(missingRow(card))
   }
   page.appendChild(agents)
 
@@ -295,6 +457,21 @@ function render() {
   page.appendChild(foot)
 
   root.appendChild(page)
+
+  if (focusKey) {
+    const back = root.querySelector('[data-focus="' + focusKey + '"]')
+    if (back && back.focus) {
+      back.focus()
+      // The caret too, not just the focus. Clamped to the current value, which
+      // can legitimately be shorter than it was.
+      if (back.setSelectionRange && caret) {
+        const n = (back.value || '').length
+        const start = Math.min(caret.start, n)
+        const end = Math.min(caret.end === undefined ? start : caret.end, n)
+        try { back.setSelectionRange(start, end) } catch (e) { /* not a real input */ }
+      }
+    }
+  }
 }
 
 window.addEventListener('message', (e) => {

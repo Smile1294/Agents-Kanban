@@ -185,6 +185,19 @@ export interface ProviderProfile {
    */
   models?: string[]
   /**
+   * The model for Claude Code's own background work, on a backend that does not
+   * serve Claude's models.
+   *
+   * Not a nicety. The CLI runs small errands on a haiku-class model of its own —
+   * session titles, and other things it never shows you — and it names that
+   * model by ANTHROPIC'S id. Against a gateway that serves `deepseek-chat`
+   * those requests 404 forever, quietly, while the main conversation works
+   * perfectly: the symptom is a session that never gets a title and a log full
+   * of errors nobody looks at. Setting it to a small model the endpoint does
+   * serve is the documented fix, and it costs less than the main one.
+   */
+  smallModel?: string
+  /**
    * Context window for this profile's models, when we cannot know it.
    *
    * The context meter needs a denominator. `MODEL_WINDOWS` only knows Claude's,
@@ -254,6 +267,12 @@ export const PROVIDER_VARS: readonly string[] = [
   'CLAUDE_CODE_SKIP_FOUNDRY_AUTH',
   'CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH',
   'CLAUDE_CODE_SKIP_MANTLE_AUTH',
+  // Which model the CLI reaches for on its own. These belong here for the same
+  // reason `ANTHROPIC_BASE_URL` does: left over from another profile they point
+  // a working backend at a model it does not serve, and the failure is silent
+  // because it is only the CLI's background errands that use them.
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL',
   // Placement that means nothing outside one backend.
   'CLOUD_ML_REGION',
   'ANTHROPIC_VERTEX_PROJECT_ID',
@@ -367,7 +386,12 @@ export const PROVIDER_KINDS: ProviderKindDef[] = [
     fields: [
       { key: 'baseUrl', label: 'Base URL', required: true, placeholder: 'http://localhost:3456' },
       CRED_FIELD_BEARER,
-      { key: 'models', label: 'Model ids', detail: 'Comma separated. What this endpoint actually serves.' },
+      { key: 'models', label: 'Model ids', detail: 'Comma separated. Leave empty and the endpoint is asked what it serves, which is usually better than typing them.' },
+      {
+        key: 'smallModel', label: 'Background model',
+        placeholder: 'deepseek-chat',
+        detail: 'What Claude Code should use for its own small errands, like naming a session. Leave empty on a backend that serves Claude\u2019s models.',
+      },
       { key: 'contextWindow', label: 'Context window', placeholder: '200000', detail: 'So the context meter has a denominator.' },
     ],
   },
@@ -476,6 +500,28 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
       // they say to blank ANTHROPIC_API_KEY out.
       authStyle: 'bearer',
       disableBetas: true, disableNonessentialTraffic: true,
+    },
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    needs:
+      'A DeepSeek API key. No proxy: DeepSeek serves an Anthropic-compatible endpoint at ' +
+      '/anthropic, so Claude Code talks to it directly. Its models are `deepseek-chat` and ' +
+      '`deepseek-reasoner` — nothing named sonnet, opus or haiku.',
+    profile: {
+      label: 'DeepSeek', kind: 'gateway',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      // Bearer: DeepSeek authenticates with `Authorization: Bearer`, which is
+      // what ANTHROPIC_AUTH_TOKEN sends. In ANTHROPIC_API_KEY the same correct
+      // key arrives as `x-api-key` and comes back 401.
+      authStyle: 'bearer',
+      // Claude Code's background errands name a haiku-class model by
+      // Anthropic's id, which DeepSeek does not serve. Without this they 404
+      // silently for the life of every session.
+      smallModel: 'deepseek-chat',
+      disableBetas: true, disableNonessentialTraffic: true,
+      contextWindow: 128_000,
     },
   },
   {
@@ -655,6 +701,14 @@ export function envForProfile(
     }
     case 'gateway': {
       if (profile.baseUrl?.trim()) set.ANTHROPIC_BASE_URL = profile.baseUrl.trim()
+      if (profile.smallModel?.trim()) {
+        // BOTH spellings. `ANTHROPIC_SMALL_FAST_MODEL` is the older name and
+        // `ANTHROPIC_DEFAULT_HAIKU_MODEL` the current one, and which a given
+        // CLI reads is not something this extension can know — writing one is a
+        // fix that works on some installs and silently does nothing on others.
+        set.ANTHROPIC_DEFAULT_HAIKU_MODEL = profile.smallModel.trim()
+        set.ANTHROPIC_SMALL_FAST_MODEL = profile.smallModel.trim()
+      }
       if (credential) {
         // Default to bearer. The docs say so, and it is the recoverable
         // mistake of the two: a bearer sent to an x-api-key gateway 401s
@@ -764,6 +818,32 @@ export function validateProfile(profile: ProviderProfile): string[] {
     out.push('The context window must be a positive number of tokens.')
   }
   return out
+}
+
+/**
+ * Does a session on this profile use the AGENT'S OWN LOGIN?
+ *
+ * The settings page asks because it was showing both and letting them
+ * contradict each other: *"Signed in as david@… (subscription)"* on the Claude
+ * Code card, while the active backend sent every request to `api.deepseek.com`
+ * with a key out of the keychain. The subscription was real, and completely
+ * unused. A green tick over a credential nothing spends is the same failure as
+ * a spinner over a wedged process.
+ *
+ * True only where the login is genuinely what pays: `inherit` (whatever the CLI
+ * itself resolves), first-party with no key of our own, and a gateway with no
+ * credential — which is the documented "proxy in front of Anthropic, still
+ * authenticated as me" setup. Every cloud kind authenticates through its own
+ * credential chain, and any explicit credential replaces the login outright.
+ */
+export function usesRuntimeLogin(profile: ProviderProfile): boolean {
+  const hasKey = profile.hasCredential === true || !!profile.credentialFromEnv
+  switch (profile.kind) {
+    case 'inherit': return true
+    case 'anthropic':
+    case 'gateway': return !hasKey
+    default: return false
+  }
 }
 
 /** What the picker and the board call this profile. */
@@ -915,7 +995,7 @@ export function parseProfiles(raw: unknown): ProviderProfile[] {
       if (typeof v === 'string' && v.trim()) (p as unknown as Record<string, unknown>)[k] = v.trim()
     }
     for (const k of ['label', 'baseUrl', 'resource', 'region', 'projectId',
-                     'regionPrefix', 'workspaceId', 'credentialFromEnv'] as const) str(k)
+                     'regionPrefix', 'workspaceId', 'credentialFromEnv', 'smallModel'] as const) str(k)
     if (r.authStyle === 'bearer' || r.authStyle === 'apiKey') p.authStyle = r.authStyle
     for (const k of ['hasCredential', 'gatewayAuth', 'disableBetas',
                      'disableNonessentialTraffic'] as const) {

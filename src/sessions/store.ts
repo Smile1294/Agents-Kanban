@@ -10,7 +10,7 @@
  */
 import { loadSdk, type SDKSessionInfo } from '../agent/sdk.ts'
 import { CLEAR_TEST_PLAN, MetaStore, type SessionMeta, type TestPlan } from './meta.ts'
-import { emptyTotals, summariseUsage, type UsageMessage, type UsageTotals } from './usage.ts'
+import { emptyTotals, summariseUsage, type ModelBook, type UsageMessage, type UsageTotals } from './usage.ts'
 import { allRuntimes, getRuntime, type HistoricSession, type Meter, type RuntimeHistory, type RuntimeId } from '../agent/runtime.ts'
 
 export interface BoardSession {
@@ -160,10 +160,35 @@ export class SessionStore {
     { at: number; key: string; limit: number; entries: Entry[]; usage: UsageTotals }
   >()
 
+  /**
+   * Prices and windows for models the built-in tables cannot know about.
+   *
+   * A custom endpoint publishes both, and without them every session on one
+   * reported `≥ $0.00` against a meter with no denominator. See `ModelBook`.
+   */
+  private book: ModelBook = {}
+
   constructor(workspaceDir: string, meta: MetaStore, defaultPhase = 'planning') {
     this.dir = workspaceDir
     this.meta = meta
     this.defaultPhase = defaultPhase
+  }
+
+  /**
+   * Learn what a custom endpoint's models cost.
+   *
+   * The parsed-transcript cache is DROPPED when this changes, and that is the
+   * whole reason this is a method rather than a field read on the way past:
+   * `transcripts` caches `{entries, usage}` keyed by the session FILE's size
+   * and mtime, so a file that has not changed is never re-totalled. Learning a
+   * price after that point would change no number on screen — every session
+   * would keep the `≥ $0.00` it was cached with until it was next written to,
+   * which for a finished session is never.
+   */
+  setModelBook(book: ModelBook): void {
+    if (JSON.stringify(book) === JSON.stringify(this.book)) return
+    this.book = book
+    this.transcripts.clear()
   }
 
   /**
@@ -524,7 +549,7 @@ export class SessionStore {
     }
     // Spend and context fill are totalled over the WHOLE session, including the
     // messages too old to render.
-    const usage = summariseUsage(all as readonly UsageMessage[])
+    const usage = summariseUsage(all as readonly UsageMessage[], this.book)
     const msgs = all.length > limit ? all.slice(all.length - limit) : all
     const entries: Entry[] = []
     const toolNames = new Map<string, { list: Entry[]; idx: number }>()

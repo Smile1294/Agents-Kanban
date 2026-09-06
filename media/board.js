@@ -20,6 +20,16 @@
   let draft = ''
   let stick = true
   let openMenu = null
+  /**
+   * What has been typed into an open menu's filter box, keyed by menu id.
+   *
+   * Module-level for the reason everything else here is: render() replaces the
+   * whole tree several times a second while an agent streams, so a filter kept
+   * in the DOM is destroyed between keystrokes. This one is not a nicety — a
+   * custom endpoint's catalogue is 431 models on OpenRouter, and a menu that
+   * long cannot be used at all without narrowing it.
+   */
+  let menuFilter = {}
   /** Index into the slash-command suggestions, or -1 when the list is closed. */
   let slashPick = -1
   /** The live composer textarea, so a repaint can hand focus back to it. */
@@ -1219,22 +1229,36 @@
        the model list. */
     bar.append(picker('model', modelLabel(s.composer.model), s.composer.models.map((m) => ({
       value: m.id,
-      label: `${m.label} (${m.context})` + (m.detail ? ' — ' + m.detail : ''),
+      label: m.label,
+      /* Everything known about the model, on its own line: the id (which is
+         what actually gets sent, and is not always visible in the name), the
+         context window, the price, and the endpoint's own one-liner.
+         The price is a STRING from the host — this file does no arithmetic on
+         money — and it is simply absent when nobody published one, because a
+         blank reads as "not stated" where `$0.00` would read as "free". */
+      meta: [
+        m.id !== m.label ? m.id : '',
+        m.context && m.context !== '?' ? m.context + ' context' : '',
+        m.price || '',
+        m.detail || '',
+      ].filter(Boolean).join(' · '),
     })), undefined, modelSourceNote()))
-    /* WHICH AGENT PROGRAM the next session runs on — Claude Code, Codex.
-       This replaced the backend picker that used to sit here, because the two
-       are different questions and only one of them belongs on a composer bar:
-       the agent is chosen per session, beside the prompt, like the model; the
-       backend is configuration, and configuration in a menu that closes when
-       you look away is configuration you lose halfway through typing.
-
-       For a runtime whose backend IS selectable, the chip still says which one
-       is active, because that is a statement about the run you are about to
-       start rather than a control. The menu's last entry opens the settings
-       page, which is now the only place a backend is edited. */
-    bar.append(picker('runtime', '🤖 ' + agentName(), (s.composer.runtimes || []).map((r) => ({
-      value: r.id,
-      label: r.label + (r.detail ? ' — ' + r.detail : ''),
+    /* WHAT THIS SESSION RUNS ON: one entry per agent-and-backend combination.
+       This was two pickers — an agent picker and, before that, a backend
+       picker — and splitting them made the user do the cross product in their
+       head. Worse, it got the answer wrong on screen: the bar said "Claude
+       Code" while the model list was DeepSeek's, because the backend was
+       chosen on a different page entirely. Two names for one decision, and
+       neither of them complete.
+       So: `Claude Code` and `OpenRouter` are two buttons in one list, picking
+       one sets both halves, and the model picker follows. An agent that is not
+       installed is not in the list at all — it is not something you can run on.
+       The last entry still opens the settings page, which is where backends are
+       added and edited. */
+    bar.append(picker('agent', '🤖 ' + agentName(), (s.composer.agents || []).map((a) => ({
+      value: a.key,
+      label: a.label,
+      meta: a.detail,
     })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }])))
     /* HOW EAGERLY this card should break its work into subtasks.
        Per card, beside the model, because it is a judgement about THIS piece of
@@ -1499,21 +1523,66 @@
    *  thinking, but not for a BOOLEAN field offered as on/off options: comparing
    *  `true` to `'on'` is never equal, so the menu would open with nothing
    *  ticked and no way to tell which way the switch is set. */
+  /** Past this many options a menu gets a filter box. Below it, a filter is
+   *  one more thing to look at; above it, the list is unreadable without one. */
+  const FILTER_AT = 12
+  /** And past this many MATCHES, the rest wait behind a narrower search. 431
+   *  rows is a menu that scrolls for a page and a half. */
+  const SHOW_AT_MOST = 50
+
   function picker(key, label, options, forKey, note, selected) {
     const chosen = selected === undefined ? s.composer[key] : selected
+    const id = 'composer:' + key
     const wrap = el('span', 'picker-wrap')
     const b = el('button', 'picker', label + ' ▾')
     // The label may be ellipsised on a narrow bar, so the full one is always
     // reachable. A control whose text is cut off and unexplained is the same
     // failure as one that is cut off and wrapped.
     b.title = label
-    b.onclick = (e) => { stop(e); openMenu = openMenu === 'composer:' + key ? null : 'composer:' + key; render() }
+    b.onclick = (e) => { stop(e); openMenu = openMenu === id ? null : id; render() }
     wrap.append(b)
-    if (openMenu === 'composer:' + key) {
-      const menu = el('div', 'menu up')
+    if (openMenu === id) {
+      const menu = el('div', 'menu up' + (options.some((o) => o.meta) ? ' wide' : ''))
       menu.onclick = stop
-      for (const o of options) {
-        const i = el('button', 'menu-item' + (chosen === o.value ? ' on' : ''), o.label)
+
+      const typed = menuFilter[id] || ''
+      const needle = typed.trim().toLowerCase()
+      const matches = !needle ? options : options.filter((o) => (
+        [o.label, o.value, o.meta].filter(Boolean).join(' ').toLowerCase().includes(needle)
+      ))
+      if (options.length > FILTER_AT) {
+        const box = el('input', 'menu-filter')
+        box.type = 'text'
+        box.placeholder = 'Filter ' + options.length + '…'
+        box.value = typed
+        /* Re-rendered on every keystroke, so it announces itself the same way
+           the AskUserQuestion box does: the value lives out here, and
+           `data-focus` is what hands the caret back to the node that replaced
+           this one. Without it the first character typed would move focus to
+           the body and the rest would go nowhere — which is the bug the
+           composer's own restore exists for, in a new place. */
+        const fkey = 'filter::' + id
+        box.setAttribute('data-focus', fkey)
+        if (askFocusKey === fkey) askFocusNode = box
+        box.oninput = (e) => { menuFilter[id] = (e && e.target ? e.target.value : box.value) || ''; render() }
+        box.onkeydown = (e) => { if (e && e.key === 'Escape') { stop(e); openMenu = null; render() } }
+        menu.append(box)
+      }
+
+      /* The rows live in their own scroll container, and it carries
+         `data-scroll` like every other one in this file: the menu is rebuilt on
+         every frame an agent produces, and a list scrolled halfway down would
+         snap back to the top several times a second. */
+      const list = el('div', 'menu-list')
+      list.setAttribute('data-scroll', 'menu:' + id)
+      for (const o of matches.slice(0, SHOW_AT_MOST)) {
+        const i = el('button', 'menu-item' + (chosen === o.value ? ' on' : ''))
+        i.append(el('span', 'menu-item-label', o.label))
+        /* The second line: how much context, and what it costs.
+           A model id on its own is not a choice anybody can make. These two
+           numbers are what the endpoint publishes about it, and the whole
+           reason the picker asks the endpoint rather than the CLI. */
+        if (o.meta) i.append(el('span', 'menu-item-meta', o.meta))
         /* An option may be an ACTION rather than a value — "Configure
            providers…" opens a quick pick host-side. Without this the provider
            picker could only ever choose between profiles that already exist,
@@ -1525,7 +1594,17 @@
               stop(e); openMenu = null
               post('composer', forKey ? { [key]: o.value, id: forKey } : { [key]: o.value })
             }
-        menu.append(i)
+        list.append(i)
+      }
+      menu.append(list)
+      /* What is NOT on screen, said out loud. A list silently cut at 50 is a
+         model that is configured, served, and apparently missing — which is
+         the question this whole file's model plumbing exists to answer. */
+      if (!matches.length) {
+        menu.append(el('div', 'menu-note', 'Nothing matches “' + typed + '”.'))
+      } else if (matches.length > SHOW_AT_MOST) {
+        menu.append(el('div', 'menu-note',
+          'Showing ' + SHOW_AT_MOST + ' of ' + matches.length + ' — type to narrow it.'))
       }
       if (note) menu.append(el('div', 'menu-note', note))
       wrap.append(menu)
@@ -1544,13 +1623,20 @@
      backend beside it. A Codex session gets no second half rather than an
      invented one: it signs in as itself and there is nothing behind it to
      name. */
+  /* The chip names the SELECTED COMBINATION, from the same list the menu is
+     built from — so what is on the bar and what is in the menu can never drift
+     apart. A live run's own answer still wins: `resolvedProvider` is what the
+     CLI reported it is ACTUALLY on, and a managed settings file or an
+     apiKeyHelper outranks anything we put in the environment. */
   function agentName() {
-    const id = s.composer.runtime || 'claude'
-    const r = (s.composer.runtimes || []).find((x) => x.id === id)
-    const label = r ? r.label : id
-    if (r && r.providerProfiles === false) return label
-    const backend = providerName()
-    return backend && backend !== 'Provider' ? label + ' · ' + backend : label
+    const live = selected() && selected().agent
+    const chosen = (s.composer.agents || []).find((a) => a.key === s.composer.agent)
+    const label = chosen ? chosen.label : (s.composer.runtime || 'Agent')
+    if (live && (live.providerLabel || live.resolvedProvider)) {
+      const actual = live.providerLabel || live.resolvedProvider
+      return chosen && chosen.detail.indexOf(actual) >= 0 ? label : label + ' · ' + actual
+    }
+    return label
   }
 
   function providerName() {
@@ -1571,7 +1657,15 @@
     /* The inherit profile makes no claim about the backend, so its chip must
        not make one either: it says where the answer comes FROM rather than
        naming a provider we have not been told about. */
-    return p.id === 'inherit' ? 'Inherited' : p.label
+    if (p.id === 'inherit') return 'Inherited'
+    /* A CUSTOM ENDPOINT is named by its HOST, not by the label somebody typed.
+       The label is free text and drifts from the URL the moment a preset is
+       edited: a profile still called "OpenRouter" pointed at api.deepseek.com
+       reads as a bug in the model list — "why is Claude Code offering me
+       DeepSeek models?" — when the answer is simply that it is talking to
+       DeepSeek. The host is the thing that decides which models exist, and it
+       is the one string here that cannot be out of date. */
+    return p.support === 'gateway' && p.detail ? p.detail : p.label
   }
   /* The level's own label. Falls back to the raw key rather than to a guess:
      a build that stored a level this one does not serve should say so, not
@@ -1590,12 +1684,20 @@
      that is the only case with a question attached: "why is the model I use in
      Claude Code missing from this picker?" is unanswerable unless you can see
      that we fell back. */
+  /* One short line. It answers "where did this list come from?", which is the
+     question a menu full of unfamiliar model names provokes — and it names the
+     HOST, because "served by api.deepseek.com" is the whole explanation for why
+     a Claude Code session is offering DeepSeek models. Anything longer belongs
+     on the settings page, where the fix is. */
   function modelSourceNote() {
     const src = s.composer.modelSource
-    if (!src || src === 'cli') return undefined
-    if (src === 'profile') return 'Models listed by this provider profile'
-    return 'Built-in list' + (s.composer.modelNote ? ' — ' + s.composer.modelNote : '') +
-      '. Refresh from the provider menu.'
+    const note = s.composer.modelNote
+    const p = (s.composer.providers || []).find((x) => x.id === s.composer.provider)
+    const host = p && p.support === 'gateway' && p.detail ? p.detail : ''
+    if (src === 'endpoint') return note || ('Served by ' + (host || 'this endpoint'))
+    if (src === 'profile') return note || (host ? 'Your list · ' + host : 'Your list')
+    if (src === 'builtin') return 'Built-in list' + (note ? ' · ' + note : '')
+    return note || undefined
   }
   function effortLabel() {
     const e = s.composer.efforts.find((x) => x.key === s.composer.effort)

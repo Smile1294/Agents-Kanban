@@ -53,13 +53,20 @@ export function makeNode(tag) {
     // stub's incompleteness is meant to catch APIs that do not EXIST, not to
     // pick a house style for two files that are both correct.
     appendChild(n) { this.append(n); return n },
-    // Click handlers are real state: a button whose handler was never attached
-    // is a button that does nothing, and that is only visible if the stub
+    // Event handlers are real state: a control whose handler was never attached
+    // is a control that does nothing, and that is only visible if the stub
     // remembers them. `onclick` and `addEventListener('click')` are two
     // spellings of one thing, so they land in the same place — board.js uses
     // the first, settings.js the second, and a test should not have to know
     // which.
-    addEventListener(type, fn) { if (type === 'click') this.onclick = fn },
+    //
+    // EVERY type, not just click, and that is not generosity. This used to be
+    // `if (type === 'click')`, so a `change` listener on a checkbox and an
+    // `input` listener on a filter box were dropped in SILENCE — the stub could
+    // not tell a control that was wired up from one that was not, which is
+    // exactly the failure it exists to catch. Its incompleteness is meant to
+    // reject APIs that do not exist, never to swallow ones that do.
+    addEventListener(type, fn) { this['on' + type] = fn },
     removeEventListener() {},
     // Scroll offsets are real state too. render() rebuilds every scroll
     // container, so whether the new one is put back where the old one was is a

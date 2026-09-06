@@ -8,7 +8,7 @@
 import {
   mainWindowOf,
   CACHE_READ, CACHE_WRITE_1H, CACHE_WRITE_5M, MODEL_RATES, MODEL_WINDOWS,
-  contextOfUsage, costOfUsage, normaliseModel, summariseUsage,
+  contextOfUsage, costOfUsage, normaliseModel, rateFor, summariseUsage, windowFor,
   type UsageMessage,
 } from '../usage.ts'
 
@@ -270,6 +270,51 @@ ok(noUsage.responses === 0, 'an assistant frame without usage is skipped rather 
   ] as never)
   ok(trailing.contextTokens === 0,
      `a compaction with no response after it empties the meter rather than sticking (${trailing.contextTokens})`)
+}
+
+// --- a model the built-in tables have never heard of -------------------------
+//
+// `MODEL_RATES` and `MODEL_WINDOWS` are keyed by Anthropic's ids and no other
+// vendor uses them, so every session on a custom endpoint reported `≥ $0.00`
+// against a meter with no denominator — honest, and useless. The endpoint
+// publishes both; `ModelBook` is where they arrive.
+{
+  const book = {
+    'deepseek/deepseek-chat-v3.1': { rate: { input: 0.55, output: 1.65 }, contextWindow: 161_000 },
+  }
+  const oneMillionOut = { output_tokens: 1_000_000 }
+  ok(costOfUsage('deepseek/deepseek-chat-v3.1', oneMillionOut) === undefined,
+     'without the book a router model is unpriced — which is what `≥ $0.00` on every card meant')
+  ok(costOfUsage('deepseek/deepseek-chat-v3.1', oneMillionOut, book) === 1.65,
+     'with it, the endpoint\u2019s own published price is what a million output tokens costs')
+
+  // Exact id first. `normaliseModel` strips Anthropic's provider decorations,
+  // and a router slug is not a decorated Anthropic id — running one through it
+  // would be inventing a relationship between two strings that have none.
+  ok(windowFor('deepseek/deepseek-chat-v3.1', book) === 161_000, 'and the window comes from the same place')
+  ok(windowFor('claude-opus-5', book) === 1_000_000, 'a model the table knows is unaffected by the book')
+  ok(rateFor('claude-opus-5', book)?.input === MODEL_RATES['claude-opus-5']!.input,
+     'and keeps its published rate')
+
+  // A gateway serving Claude under a normalisable id should still match, so the
+  // lookup falls through to the normalised form rather than stopping at exact.
+  ok(rateFor('us.anthropic.claude-opus-5-v1:0', { 'claude-opus-5': { rate: { input: 9, output: 9 } } })?.input === 9,
+     'the book is consulted through normaliseModel too — most specific first, then the general form')
+
+  // And it reaches the session total, not just the single-message helper.
+  const totals = summariseUsage([{
+    type: 'assistant', parent_tool_use_id: null,
+    message: { id: 'r1', model: 'deepseek/deepseek-chat-v3.1', usage: { input_tokens: 1_000_000, output_tokens: 0 } },
+  }], book)
+  ok(totals.priced && Math.abs(totals.costUsd - 0.55) < 1e-9,
+     'a session on a router totals to a real figure rather than a floor')
+  ok(totals.contextWindow === 161_000, 'and its context meter has a denominator')
+  const unpriced = summariseUsage([{
+    type: 'assistant', parent_tool_use_id: null,
+    message: { id: 'r1', model: 'deepseek/deepseek-chat-v3.1', usage: { input_tokens: 1_000_000 } },
+  }])
+  ok(!unpriced.priced && unpriced.unpriced[0] === 'deepseek/deepseek-chat-v3.1',
+     'while an unknown model still reports itself as unpriced — the book adds knowledge, it never invents it')
 }
 
 console.log(fails ? `\n${fails} FAILED` : '\nall usage tests passed')

@@ -16,7 +16,7 @@ import {
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
-import { MODEL_WINDOWS, normaliseModel } from './sessions/usage.ts'
+import { MODEL_WINDOWS, normaliseModel, type ModelBook, type ModelFacts } from './sessions/usage.ts'
 import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
@@ -32,11 +32,14 @@ import {
 } from './run/recipe.ts'
 import {
   INHERIT_PROFILE, PROVIDER_KINDS, PROVIDER_PRESETS, activeProfile, credentialKey,
-  describeProfile, envForProfile, kindDef, parseProfiles, profileLabel,
-  reconcileProvider, resolvedLabel, validateProfile,
+  describeProfile, envForProfile, hostOf, kindDef, parseProfiles, profileLabel,
+  reconcileProvider, resolvedLabel, usesRuntimeLogin, validateProfile,
   type ProviderEnv, type ProviderProfile,
 } from './agent/providers.ts'
 import { probeProvider } from './agent/probe.ts'
+import {
+  fetchEndpointModels, parseEndpointModels, type EndpointModel,
+} from './agent/endpoint.ts'
 import {
   collectRuntimeStatus, SettingsPanel,
   type SettingsHost, type SettingsMessage, type SettingsState,
@@ -51,7 +54,7 @@ import {
 } from './agent/runtime.ts'
 import {
   ALL_EFFORTS, catalogueFor, discoverModels, effortsFor, fastModeFor, parseCachedChoices,
-  thinkingFor, ultracodeFor,
+  priceLabel, thinkingFor, ultracodeFor,
   type ModelCatalogue, type ModelChoice,
 } from './agent/models.ts'
 
@@ -226,11 +229,113 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const cachedChoices = (id: string): ModelChoice[] =>
     parseCachedChoices(context.globalState.get(catalogueKey(id)))
 
+  /**
+   * Where a CUSTOM ENDPOINT's own catalogue is cached.
+   *
+   * Not keyed by runtime, unlike `catalogueKey`: this is what the endpoint at a
+   * URL serves, and that answer does not change depending on which agent
+   * program is asking. Not in `settings.json` either — OpenRouter reports 431
+   * models with a paragraph each, which is not something a person should find
+   * in a file they hand-edit and sync between machines. `profile.models` stays
+   * the small, human list of what to OFFER; this is the big machine list of
+   * what EXISTS.
+   */
+  const endpointKey = (id: string) => `endpointModels:${id}`
+  const cachedEndpoint = (id: string): EndpointModel[] =>
+    parseEndpointModels(context.globalState.get(endpointKey(id)))
+
+  /** What the active profile's endpoint says it serves, and what to call it.
+   *  Only a `gateway` has one: no other kind's endpoint is ours to ask. */
+  function endpointFor(p: ProviderProfile): { models: EndpointModel[]; host?: string } | undefined {
+    if (p.kind !== 'gateway' || !p.baseUrl?.trim()) return undefined
+    return { models: cachedEndpoint(p.id), host: hostOf(p.baseUrl) }
+  }
+
+  /**
+   * What every configured endpoint said its models cost and how big their
+   * windows are, in one map.
+   *
+   * Handed to BOTH meters — `SessionStore`, which totals a session from its
+   * transcript, and `AgentManager`, which prices a run as it happens — because
+   * a figure that changes when a run ends is the failure this project has a
+   * rule about. Without it, `MODEL_RATES` knows Anthropic's models and nobody
+   * else's, so every session on a custom endpoint reads `≥ $0.00` against a
+   * meter with no denominator.
+   *
+   * Built from EVERY profile, not just the active one, because a card is
+   * priced long after the run that produced it: the board shows finished
+   * sessions from several backends at once, and "the provider selected right
+   * now" is not the one that billed them. Two profiles serving the same id at
+   * different prices is possible and the last one wins — an ambiguity worth
+   * having, because the alternative is no price at all.
+   */
+  function modelBook(): ModelBook {
+    const out: Record<string, ModelFacts> = {}
+    for (const p of providers) {
+      if (p.kind !== 'gateway') continue
+      for (const m of cachedEndpoint(p.id)) {
+        if (!m.rate && !m.contextWindow) continue
+        out[m.id] = {
+          ...(m.rate ? { rate: m.rate } : {}),
+          ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
+        }
+      }
+    }
+    return out
+  }
+
+  /** Push the book at both meters. Called wherever a catalogue can change. */
+  function applyModelBook(): void {
+    const book = modelBook()
+    ws?.store.setModelBook(book)
+    ws?.manager?.setModelBook(book)
+  }
+
   function recomputeCatalogue(discovered?: readonly ModelChoice[], problem?: string): void {
     const p = currentProvider()
     const cached = discovered ?? cachedChoices(p.id)
     catalogue = catalogueFor(p, cached, builtinChoices(),
-      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, problem)
+      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, problem, endpointFor(p))
+  }
+
+  /**
+   * Ask a custom endpoint what it serves, and remember the answer.
+   *
+   * Separate from `refreshModels` because it asks a different program a
+   * different question: `refreshModels` asks the CLI what CLAUDE CODE can run,
+   * which is the wrong question the moment `ANTHROPIC_BASE_URL` points
+   * somewhere else. It is a plain HTTP GET, so it costs no CLI process and no
+   * token.
+   *
+   * Never rejects, and never clears a good list on a bad answer: an endpoint
+   * that is briefly down must not empty a picker that was working a minute ago.
+   */
+  async function refreshEndpointModels(p: ProviderProfile, force = false): Promise<string | undefined> {
+    if (p.kind !== 'gateway' || !p.baseUrl?.trim()) return undefined
+    if (!force && cachedEndpoint(p.id).length) return undefined
+    const secret = p.hasCredential
+      ? await context.secrets.get(credentialKey(p.id)).then((v) => v ?? undefined, () => undefined)
+      : undefined
+    const env = envForProfile(p, secret, process.env)
+    // The credential goes in whichever header `envForProfile` chose, read back
+    // out of the patch rather than decided again here — one place decides, or
+    // this check comes to disagree with the sessions it is checking.
+    const headers: Record<string, string> = {}
+    if (env.set.ANTHROPIC_AUTH_TOKEN) headers.authorization = `Bearer ${env.set.ANTHROPIC_AUTH_TOKEN}`
+    if (env.set.ANTHROPIC_API_KEY) headers['x-api-key'] = env.set.ANTHROPIC_API_KEY
+    const { models, url, problem } = await fetchEndpointModels(p.baseUrl.trim(), headers)
+    if (models.length) {
+      await context.globalState.update(endpointKey(p.id), models)
+      endpointNotes.delete(p.id)
+      // The prices arrived with the list. Both meters learn them here, or the
+      // number on every card stays a floor.
+      applyModelBook()
+      log.info(`${hostOf(p.baseUrl)} serves ${models.length} models (read from ${url}).`)
+      return undefined
+    }
+    log.warn(`Could not read the model list from ${hostOf(p.baseUrl)}: ${problem}`)
+    if (problem) endpointNotes.set(p.id, problem)
+    return problem
   }
 
   /**
@@ -324,6 +429,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (runtime !== 'claude') { await refreshRuntimeModels(force); return }
     if (cfg().get<boolean>('discoverModels') === false) { recomputeCatalogue(); return }
     const p = currentProvider()
+    /* A CUSTOM ENDPOINT ANSWERS FOR ITSELF, and it is asked first.
+       `supportedModels()` below reports what CLAUDE CODE can run, and it keeps
+       reporting exactly that — `sonnet`, `haiku`, `opus[1m]` — however
+       `ANTHROPIC_BASE_URL` is pointed, because it is assembled from the CLI's
+       `initialize` response before any request leaves the machine. Asking it
+       about DeepSeek and saving the answer is what left a user with six Claude
+       aliases in the picker and no way to select the one model their endpoint
+       actually serves.
+       A plain GET, so it costs no CLI process and no token; and when it
+       answers, the CLI is not asked at all, because its answer could only rank
+       below this one. */
+    const endpointProblem = await refreshEndpointModels(p, force)
+    if (p.kind === 'gateway' && cachedEndpoint(p.id).length) {
+      recomputeCatalogue()
+      alignModelToProvider()
+      return
+    }
     // The runtime is captured for exactly the same reason as the profile: this
     // spends ~400ms in the CLI, and a switch inside that window would file one
     // agent's models under the other's key. `catalogueKey`'s own doc says what
@@ -365,7 +487,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         )
         return
       }
-      recomputeCatalogue(choices, problem)
+      /* An endpoint that would not list its models is the reason a picker can
+         still be showing Claude ids against a DeepSeek URL, so its complaint
+         outranks the CLI's. Without this the fallback is silent, and a silent
+         fallback is how "why is my model missing?" becomes unanswerable — the
+         same rule `problem` exists for on the CLI path. */
+      recomputeCatalogue(choices, endpointProblem ?? problem)
       alignModelToProvider()
     })().finally(() => { discovering = undefined })
     return discovering
@@ -485,7 +612,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await cfg().update('providers', out, vscode.ConfigurationTarget.Global)
     providers = parseProfiles(out)
     await refreshProviderEnv()
+    /* Rebuilt BEFORE the model is re-checked against it, and that order is the
+       whole point of doing it here.
+       A saved profile can change which models are on offer — that is what
+       `profile.models` IS — and `alignModelToProvider()` decides whether the
+       current selection still exists. Run against the catalogue built from the
+       PREVIOUS profile it answers about a list nobody is on any more: ticking
+       a model in settings left the composer on the old one, and unticking the
+       selected one left it selected. One place recomputes, and it is the place
+       that just changed the input. */
+    recomputeCatalogue()
     alignModelToProvider()
+    applyModelBook()
     refreshAll()
   }
 
@@ -655,10 +793,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }),
     )
     log.info(`Provider test — ${profileLabel(profile)}: ${result.message}`)
-    // A probe that found the models is worth keeping: it is the only
-    // authoritative list for a backend whose ids we cannot know, and it turns
-    // the model picker from a guess into something the endpoint confirmed.
-    if (result.ok && result.models?.length && profile.kind !== 'inherit' && !profile.models?.length) {
+
+    /* A catalogue the ENDPOINT gave us is kept, and kept in extension storage
+       rather than in `settings.json`.
+       This used to write `result.models` onto the profile, and `result.models`
+       came from `Query.supportedModels()` — Claude Code's own list, which is
+       about Claude Code no matter where the base URL points. A DeepSeek profile
+       therefore ended up declaring `sonnet`, `haiku` and `opus[1m]`, and since
+       a profile's declared list outranks everything else, the composer offered
+       exactly those and nothing that endpoint serves. That is the bug this
+       whole path exists to have fixed. `catalogue` is the endpoint's answer;
+       `models` on a gateway result is now derived from it. */
+    if (result.catalogue?.length) {
+      await context.globalState.update(endpointKey(profile.id), result.catalogue)
+      applyModelBook()
+      recomputeCatalogue()
+      alignModelToProvider()
+      refreshAll()
+      const priced = result.catalogue.filter((m) => m.rate).length
+      const choice = await vscode.window.showInformationMessage(
+        `${result.message} ${priced ? `${priced} of them come with a published price.` : ''}`.trim(),
+        'Choose which to offer…',
+      )
+      if (choice === 'Choose which to offer…') openSettings()
+      return
+    }
+    // Everything that is NOT a custom endpoint: the CLI is the right thing to
+    // have asked, because the backend serves Claude's models and the CLI
+    // resolves the ids for it — `us.anthropic.claude-opus-5` on Bedrock.
+    if (result.ok && result.models?.length && profile.kind !== 'inherit'
+        && profile.kind !== 'gateway' && !profile.models?.length) {
       const choice = await vscode.window.showInformationMessage(
         `${result.message} Use these ${result.models.length} models in the picker?`,
         'Use them', 'No thanks',
@@ -699,6 +863,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     for (const r of allRuntimes()) {
       await context.globalState.update(catalogueKey(profile.id, r.id), undefined)
     }
+    // And what its endpoint said it served. Same reason, same reused ids: an
+    // "openrouter" profile removed and re-added against a different URL would
+    // otherwise come back offering the old host's 431 models.
+    await context.globalState.update(endpointKey(profile.id), undefined)
     await saveProfiles(providers.filter((p) => p.id !== profile.id))
     if (providerId === profile.id) await setActiveProvider(INHERIT_PROFILE.id)
     refreshAll()
@@ -717,6 +885,83 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // repaint.
 
   let runtimeStatuses: RuntimeStatus[] = []
+  /**
+   * Which agent programs are actually on this machine.
+   *
+   * Kept apart from `runtimeStatuses` because it is answered by a much cheaper
+   * question: `detect()` looks for an executable, where `login()` starts the
+   * CLI and asks it who it is. The composer only needs the first, and it needs
+   * it at activation — an agent that is not installed must not be offered as
+   * something to run a session on, because every session started on it fails at
+   * its first step.
+   *
+   * Absent means NOT CHECKED, and is rendered as available. Hiding something we
+   * have not looked for is the same mistake as showing a state we did not read.
+   */
+  const installedRuntimes = new Map<RuntimeId, boolean>()
+
+  /** Look for each agent's executable. Backgrounded at activation, never
+   *  awaited: it shells out to `which` and, for Codex, a `--version`. */
+  async function detectRuntimes(): Promise<void> {
+    await Promise.all(allRuntimes().map(async (rt) => {
+      try {
+        installedRuntimes.set(rt.id, !!(await rt.detect(configuredPathFor(rt.id))))
+      } catch {
+        // Could not look. Left ABSENT rather than recorded as false: "the
+        // lookup failed" is not "you do not have it".
+        installedRuntimes.delete(rt.id)
+      }
+    }))
+    for (const rt of allRuntimes()) {
+      if (installedRuntimes.get(rt.id) === false) log.info(`${rt.label} is not installed; not offered on the composer.`)
+    }
+  }
+
+  /**
+   * Every (agent × backend) pair this machine can actually run, as one list.
+   *
+   * The composer used to offer these as two separate pickers, which made the
+   * user do the cross product in their head — and got the answer wrong on
+   * screen: the bar said "Claude Code" while the model list came from DeepSeek,
+   * because the backend lived on a different page. One list, one click, and the
+   * model picker follows.
+   *
+   * A runtime with no backend concept contributes ONE entry, not one per
+   * profile: Codex signs in as itself, and pairing it with a gateway would
+   * offer a combination that cannot exist.
+   */
+  const agentKey = (rt: RuntimeId, profileId: string): string =>
+    `${rt}|${getRuntime(rt)?.capabilities.providerProfiles ? profileId : ''}`
+
+  function agentChoices(): { key: string; label: string; detail: string; runtime: string; provider: string }[] {
+    const out: { key: string; label: string; detail: string; runtime: string; provider: string }[] = []
+    for (const rt of allRuntimes()) {
+      // Not offered when we KNOW it is missing; offered when we have not looked.
+      if (installedRuntimes.get(rt.id) === false) continue
+      if (!rt.capabilities.providerProfiles) {
+        out.push({ key: agentKey(rt.id, ''), label: rt.label, detail: rt.vendor, runtime: rt.id, provider: '' })
+        continue
+      }
+      for (const p of providers) {
+        const inherit = p.id === INHERIT_PROFILE.id
+        out.push({
+          key: agentKey(rt.id, p.id),
+          // The BACKEND is what distinguishes two entries on the same runtime,
+          // so it is the name; the inherit profile makes no claim about a
+          // backend, so that entry is named by the agent instead.
+          label: inherit ? rt.label : profileLabel(p),
+          detail: inherit ? `${rt.vendor} · default backend` : `${rt.label} · ${describeProfile(p)}`,
+          runtime: rt.id,
+          provider: p.id,
+        })
+      }
+    }
+    return out
+  }
+  /** Why a backend's endpoint would not list its models, keyed by profile id.
+   *  Kept so the settings page can say "I asked and this is what happened"
+   *  rather than showing an empty list, which reads as "there are none". */
+  const endpointNotes = new Map<string, string>()
   const runtimeModels = new Map<RuntimeId, { models: { id: string; label: string }[]; source: string; note?: string }>()
   let settingsBusy: string | undefined
 
@@ -731,7 +976,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     try {
       const configured: Partial<Record<RuntimeId, string | undefined>> = {}
       for (const rt of allRuntimes()) configured[rt.id] = configuredPathFor(rt.id)
-      const fresh = await collectRuntimeStatus(configured)
+      // The ACTIVE backend's environment, so `login()` answers about the
+      // sessions this board starts rather than about `claude` on its own.
+      await refreshProviderEnv()
+      const fresh = await collectRuntimeStatus(configured, providerEnv)
       runtimeStatuses = only
         // A single-runtime refresh must not blank the others' readouts — the
         // page would then show "not checked yet" for something it checked a
@@ -739,6 +987,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ? runtimeStatuses.filter((r) => r.id !== only).concat(fresh.filter((r) => r.id === only))
         : fresh
       for (const r of runtimeStatuses) {
+        // The full check outranks the cheap one: same question, better answer.
+        installedRuntimes.set(r.id, r.login.kind !== 'notInstalled')
         if (r.login.kind === 'notInstalled') log.info(`${r.label} is not installed.`)
         else if (r.login.kind === 'signedOut') log.warn(`${r.label} is installed but signed out.`)
       }
@@ -749,6 +999,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const settingsHost: SettingsHost = {
     async getState(): Promise<SettingsState> {
+      const active = currentProvider()
       return {
         defaultRuntime: runtime,
         ...(settingsBusy ? { busy: settingsBusy } : {}),
@@ -763,19 +1014,68 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             installHint: rt.installHint,
             providerProfiles: rt.capabilities.providerProfiles,
             ...(status ? { status } : {}),
+            // What a session on this agent would actually talk to. Only where
+            // a backend is a real choice — Codex signs in as itself, and a
+            // backend row over it would be naming something that does not
+            // exist.
+            ...(rt.capabilities.providerProfiles
+              ? {
+                  backend: {
+                    label: profileLabel(active),
+                    detail: describeProfile(active),
+                    usesLogin: usesRuntimeLogin(active),
+                    ...(active.hasCredential
+                      ? { credential: 'key in keychain' }
+                      : active.credentialFromEnv
+                        ? { credential: `$${active.credentialFromEnv}` }
+                        : {}),
+                  },
+                }
+              : {}),
             ...(models ? { models: models.models, modelSource: models.source } : {}),
             ...(models?.note ? { modelNote: models.note } : {}),
           }
         }),
         activeProvider: providerId,
-        providers: providers.map((p) => ({
-          id: p.id,
-          label: profileLabel(p),
-          kind: p.kind,
-          detail: describeProfile(p),
-          active: p.id === providerId,
-          hasCredential: p.hasCredential === true,
-        })),
+        providers: providers.map((p) => {
+          const served = p.kind === 'gateway' ? cachedEndpoint(p.id) : []
+          const offered = new Set(p.models ?? [])
+          return {
+            id: p.id,
+            label: profileLabel(p),
+            kind: p.kind,
+            detail: describeProfile(p),
+            active: p.id === providerId,
+            hasCredential: p.hasCredential === true,
+            ...(p.baseUrl?.trim() ? { endpointHost: hostOf(p.baseUrl) } : {}),
+            ...(served.length
+              ? {
+                  models: served.map((m) => ({
+                    id: m.id,
+                    label: m.label ?? m.id,
+                    context: windowLabel(m.contextWindow ?? p.contextWindow),
+                    ...(priceLabel(m.rate) ? { price: priceLabel(m.rate)! } : {}),
+                    offered: offered.has(m.id),
+                  })),
+                }
+              : {}),
+            // The ids a profile declares that its endpoint does not serve. This
+            // is the state a user was actually left in — six Claude aliases on
+            // a DeepSeek profile — and a settings page that showed the list
+            // without saying that would be the page that hid the bug.
+            ...(served.length && p.models?.length
+              && !p.models.some((id) => served.some((m) => m.id === id))
+              ? {
+                  modelNote:
+                    `Not served here: ${p.models.join(', ')}. ` +
+                    'Those are ignored — tick what you want instead.',
+                }
+              : {}),
+            ...(!served.length && p.kind === 'gateway' && p.baseUrl?.trim()
+              ? { modelNote: endpointNotes.get(p.id) ?? 'Not asked yet.' }
+              : {}),
+          }
+        }),
       }
     },
 
@@ -900,6 +1200,38 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (msg.id !== providerId) await setActiveProvider(msg.id)
           await testProvider()
           return
+        case 'refreshEndpoint': {
+          const p = providers.find((x) => x.id === msg.id)
+          if (!p) return
+          settingsBusy = `Asking ${p.baseUrl ? hostOf(p.baseUrl) : profileLabel(p)} which models it serves…`
+          void SettingsPanel.refreshIfOpen()
+          try {
+            const problem = await refreshEndpointModels(p, true)
+            // Only the ACTIVE profile's list is the one on the composer, so
+            // only that one changes what the board is showing.
+            if (p.id === providerId) { recomputeCatalogue(); alignModelToProvider(); refreshAll() }
+            if (problem) vscode.window.showWarningMessage(`${profileLabel(p)}: ${problem}`)
+          } finally {
+            settingsBusy = undefined
+          }
+          return
+        }
+        case 'setProfileModels': {
+          const p = providers.find((x) => x.id === msg.id)
+          if (!p) return
+          /* An EMPTY list is written as "no list", not as an empty one.
+             `parseProfiles` drops an empty `models` array on the way back in,
+             and `mergeModels` reads "declares nothing" as "offer everything the
+             endpoint serves" — so the two agree only if untick-everything
+             REMOVES the key. Left as `[]` it would round-trip to undefined
+             anyway; writing it explicitly is what makes that intentional rather
+             than incidental. */
+          const next: ProviderProfile = { ...p }
+          if (msg.models.length) next.models = msg.models
+          else delete next.models
+          await saveProfiles(providers.map((x) => (x.id === next.id ? next : x)))
+          return
+        }
         case 'openSetting':
           await vscode.commands.executeCommand('workbench.action.openSettings', msg.key)
           return
@@ -1037,6 +1369,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       store: new SessionStore(root, meta, planning),
       ...(repoRoot ? { repoRoot, worktrees: new WorktreeService(repoRoot, cfg().get<string>('worktreeRoot') || undefined) } : {}),
     }
+    // A NEW store, so a new empty book. Everything the endpoints have already
+    // told us is in `globalState` and costs nothing to read back, and without
+    // this every card reads `≥ $0.00` until something happens to refresh a
+    // catalogue — which for someone who configured their backend last week is
+    // never.
+    applyModelBook()
     commands = await listSlashCommands(root).catch(() => [])
     log.info(
       `Agents Kanban ready. Folder: ${root}  Repo: ${repoRoot ?? '(none)'}  ` +
@@ -1087,6 +1425,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         },
         provider: currentProvider(),
         providerEnv,
+        modelBook: modelBook(),
         // The boundary in CODE for fanning one card out into N billed agents.
         //
         // `split_task` is excluded from the auto-allow list, and that exclusion
@@ -1346,7 +1685,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const composer = {
         model, effort, thinking,
         models: catalogue.choices.map((m) => ({
-          id: m.id, label: m.label, context: m.context, ...(m.detail ? { detail: m.detail } : {}),
+          id: m.id, label: m.label, context: m.context,
+          ...(m.detail ? { detail: m.detail } : {}),
+          ...(m.contextTokens ? { contextTokens: m.contextTokens } : {}),
+          // Formatted once, here, so the composer and the settings page cannot
+          // disagree about how a price reads. Absent when nothing published
+          // one — a blank is "not stated", `$0.00` would be "free".
+          ...(priceLabel(m.rate) ? { price: priceLabel(m.rate)! } : {}),
         })),
         // Ultracode owns effort — it IS xhigh — so the effort picker steps aside
         // rather than showing a level that is being overridden.
@@ -1357,6 +1702,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         fastModeSupported: fastModeFor(catalogue.choices, model),
         modelSource: catalogue.source,
         ...(catalogue.problem ? { modelNote: catalogue.problem } : {}),
+        agent: agentKey(runtime, active.id),
+        agents: agentChoices(),
         runtime,
         runtimes: allRuntimes().map((rt) => ({
           id: rt.id,
@@ -1667,7 +2014,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ws?.manager?.setPermissionMode(permissionMode, patch.forKey)
           .catch((e) => log.warn(`Could not change permission mode: ${String(e)}`))
       }
-      if (patch.provider && patch.provider !== providerId && providers.some((p) => p.id === patch.provider)) {
+      /*
+       * BOTH HALVES AT ONCE, from the composer's single agent picker.
+       *
+       * Handled before the individual `provider` and `runtime` branches, and
+       * instead of them, because those two each kick off their own model
+       * refresh — and a refresh started against the old runtime while the new
+       * provider is being applied files one backend's models under the other's
+       * name. `catalogueKey` has the postmortem for what that costs. One switch,
+       * one refresh, in that order.
+       */
+      const combined = typeof patch.agent === 'string' ? patch.agent.split('|') : undefined
+      if (combined) {
+        const rt = parseRuntimeId(combined[0])
+        const wanted = combined[1] ?? ''
+        const profile = providers.find((p) => p.id === wanted)
+        if (rt) {
+          const runtimeChanged = rt !== runtime
+          if (runtimeChanged) {
+            runtime = rt
+            void state.update('runtime', runtime)
+            ws?.manager?.setDefaults({ runtime })
+          }
+          // `setActiveProvider` already refreshes the catalogue, so a runtime
+          // change rides along with it rather than firing a second one.
+          if (profile && profile.id !== providerId) {
+            setActiveProvider(profile.id)
+              .then(() => refreshAll())
+              .catch((e: unknown) => log.error(`Could not apply the backend: ${String(e)}`))
+          } else if (runtimeChanged) {
+            void refreshModels(true).then(() => refreshAll())
+          }
+          if (runtimeChanged) void SettingsPanel.refreshIfOpen()
+        }
+      }
+      if (!combined && patch.provider && patch.provider !== providerId && providers.some((p) => p.id === patch.provider)) {
         setActiveProvider(patch.provider)
           .then(() => refreshAll())
           .catch((e: unknown) => log.error(`Could not apply the provider: ${String(e)}`))
@@ -1682,7 +2063,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
        * onto a different one. Two cards on two agents, running at once, is the
        * supported thing; one card changing agent mid-run is not.
        */
-      const nextRuntime = parseRuntimeId(patch.runtime)
+      const nextRuntime = combined ? undefined : parseRuntimeId(patch.runtime)
       if (nextRuntime && nextRuntime !== runtime) {
         runtime = nextRuntime
         void state.update('runtime', runtime)
@@ -2459,6 +2840,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => void rebuild()),
     vscode.workspace.onDidChangeConfiguration((e) => {
+      /* An executable path changed, so LOOK AGAIN for the agents.
+         Which agents the composer offers depends on which are installed, and
+         `claudeExecutable`/`codexExecutable` are how someone points at one the
+         search would not find. Without this, correcting a path leaves the agent
+         missing from the picker until the window is reloaded — and the fix
+         reads as not having worked. */
+      if (e.affectsConfiguration('agentsKanban.claudeExecutable')
+          || e.affectsConfiguration('agentsKanban.codexExecutable')) {
+        detectRuntimes()
+          .then(() => refreshAll())
+          .catch((err: unknown) => log.error(`Could not look for the installed agents: ${String(err)}`))
+      }
       // A profile edited by hand in settings.json must take effect without a
       // reload, and the cached environment patch is derived from it — so this
       // re-parses AND re-resolves rather than only re-reading the list.
@@ -2533,6 +2926,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // explicit refresh fills it in.
   recomputeCatalogue()
   alignModelToProvider()
+  /* Except for a CUSTOM ENDPOINT, which is asked here, in the background.
+     A different kind of ask: no CLI process, no token, one HTTP GET — which is
+     why it is safe at activation where `refreshModels()` is not. And it has to
+     happen unasked, because the state it repairs is one nobody knows they are
+     in: a profile whose declared models were written by this extension from
+     the WRONG list, offering ids the endpoint has never served. Waiting for the
+     user to find a Refresh button means waiting for them to work out that the
+     picker is the problem.
+     Only when we have never asked this endpoint, only under the same setting
+     that governs asking the CLI, and never awaited — activation does not wait
+     on a network round trip. */
+  /* Which agents are actually on this machine, in the background.
+     `detect()` only — `login()` starts the CLI, and this runs at activation.
+     The composer must not offer an agent that is not installed: every session
+     started on one fails at its first step, and Codex sat on the bar as a peer
+     of the agent doing all the work on a machine that never had it. */
+  detectRuntimes()
+    .then(() => refreshAll())
+    .catch((e: unknown) => log.error(`Could not look for the installed agents: ${String(e)}`))
+
+  const startupEndpoint = currentProvider()
+  if (cfg().get<boolean>('discoverModels') !== false
+      && startupEndpoint.kind === 'gateway' && !cachedEndpoint(startupEndpoint.id).length) {
+    refreshEndpointModels(startupEndpoint)
+      .then(() => {
+        // Re-checked after the await: a provider switch inside that window
+        // would otherwise apply one backend's catalogue under another's name.
+        if (currentProvider().id !== startupEndpoint.id) return
+        recomputeCatalogue()
+        alignModelToProvider()
+        refreshAll()
+      })
+      // Never a bare void: a rejection here is a picker that silently keeps
+      // offering models the endpoint does not serve.
+      .catch((e: unknown) => log.error(`Could not read the endpoint's model list: ${String(e)}`))
+  }
   const startupProfile = currentProvider()
   log.info(
     `Provider: ${profileLabel(startupProfile)} — ${describeProfile(startupProfile)}` +

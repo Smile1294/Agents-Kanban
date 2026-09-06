@@ -78,6 +78,7 @@ gateway profile straight at them works.
 | Backend | Base URL | Proxy? |
 |---|---|---|
 | **OpenRouter** — 400+ models, one key | `https://openrouter.ai/api` | **no** |
+| **DeepSeek** | `https://api.deepseek.com/anthropic` | **no** |
 | **Ollama** — local | `http://localhost:11434` | **no** |
 | **llama.cpp** (`llama-server`) — local | `http://127.0.0.1:8080` | **no** |
 | **vLLM** — self-hosted | `http://localhost:8000` | **no** |
@@ -100,6 +101,15 @@ by the presets:
   the `anthropic-beta` header is what they are most likely to reject —
   `Unexpected value(s) for the anthropic-beta header` is the commonest way one
   of them looks broken.
+
+And one that decides whether it *keeps* working: **the model ids are theirs, not
+Anthropic's.** DeepSeek serves `deepseek-chat` and `deepseek-reasoner`;
+OpenRouter serves `deepseek/deepseek-chat-v3.1` and `openai/gpt-5.1`. Nothing
+named sonnet, opus or haiku exists on either. You do not have to type them — the
+endpoint is asked, and its answer is what the picker shows — but if you set
+`models` by hand, set it to ids that endpoint actually serves. Setting
+`smallModel` matters for the same reason: see
+[the model Claude Code uses for its own errands](#the-model-claude-code-uses-for-its-own-errands).
 
 Set the profile's **model ids** to what your endpoint actually serves —
 OpenRouter slugs like `anthropic/claude-sonnet-4.5` or `openai/gpt-5.1`, or your
@@ -211,8 +221,15 @@ It reports three useful things:
 - **where the credential came from**, as the CLI sees it. This is how "my key is
   being ignored because I am still logged in" becomes visible instead of
   puzzling.
-- **the models this backend offers**, which it will offer to put in the picker.
-  That is the only authoritative list for a backend whose ids we cannot know.
+- **the models this backend offers** — for a cloud or first-party profile,
+  where the backend serves Claude's models and the CLI resolves the ids for it.
+
+  **Not** for a gateway. That claim was wrong and it was expensive: the CLI's
+  list describes the CLI, so a gateway's models come from the gateway
+  (`GET <baseUrl>/v1/models`), asked at the same moment because that is when the
+  credential is known to work. If the endpoint will not list them, the test says
+  so — an unanswered question is a real answer, and the ids then have to be typed
+  in by hand.
 
 **But that half alone overclaims.** Pointed at `http://127.0.0.1:1`, where
 nothing is listening, the CLI initialises happily and reports `firstParty` — it
@@ -222,7 +239,7 @@ have failed. A check that cannot come back bad is exactly what this project
 forbids.
 
 So a **gateway** profile — the only kind whose endpoint is ours to test — is
-checked for real, in two steps chosen because they have *different fixes*:
+checked for real, in steps chosen because they have *different fixes*:
 
 | Result | What it means | Cost |
 |---|---|---|
@@ -316,9 +333,66 @@ exactly this kind of work off the per-token path.
 
 ## The model list
 
-The picker asks the CLI. `Query.supportedModels()` returns exactly what `/model`
-shows, for whatever provider is active, and it arrives with the `initialize`
-response — so it costs nothing beyond the ~460ms connection described above.
+The picker asks the backend — and **which program that is depends on the kind.**
+
+For a **custom endpoint** (`kind: gateway`) it is the endpoint itself, over
+`GET <baseUrl>/v1/models`. For everything else it is the CLI:
+`Query.supportedModels()` returns exactly what `/model` shows, for whatever
+provider is active, and it arrives with the `initialize` response — so it costs
+nothing beyond the ~460ms connection described above.
+
+That split is not a refinement, it is the fix for a bug that shipped. **The
+CLI's list is about the CLI**, however `ANTHROPIC_BASE_URL` is pointed: it is
+assembled from `initialize`, before a single API request leaves the machine. Ask
+it while pointed at DeepSeek and it answers `sonnet`, `haiku`, `opus[1m]` — and
+the provider test used to offer to save exactly that onto the profile, where a
+declared list outranks everything. One user ended up with six Anthropic aliases
+declared against DeepSeek and no way to select `deepseek-chat` at all. See
+[DECISIONS.md](DECISIONS.md#the-model-picker-offered-six-claude-models-to-a-deepseek-endpoint).
+
+So the ranking is: **the endpoint's own answer → the CLI's → the built-in
+table**, and the picker names which one it is showing (`Listed by the endpoint
+itself` / nothing for the CLI / `Built-in list`), because *"Claude Code's list"*
+and *"this endpoint's list"* are different claims.
+
+### What an endpoint tells you about its models
+
+Three paths are tried, in order, all on the host the profile named —
+`<base>/v1/models`, `<base>/models`, `<host>/v1/models` — and the first that
+parses wins. Two response shapes cover everything people point this at
+(`{data:[…]}` and Ollama's `{models:[…]}`), and the richer ones carry what the
+board otherwise has to render as `?`:
+
+| Endpoint | ids | names | context window | price |
+|---|---|---|---|---|
+| OpenRouter | ✓ | ✓ | ✓ | ✓, per model, per token |
+| Anthropic | ✓ | ✓ | | |
+| DeepSeek, vLLM, Ollama | ✓ | | | |
+| LiteLLM | ✓ | | ✓ | ✓ |
+
+Where a price exists it is shown in the picker beside the window
+(`161K context · $0.55/$1.65 per Mtok`) **and used by the meters** — see
+[Model ids, cost and the context meter](#model-ids-cost-and-the-context-meter).
+A free model reads `Free`; a model nobody published a price for shows nothing at
+all, because a blank means "not stated" and `$0.00` would mean "free".
+
+### Choosing which models the composer offers
+
+Two lists, and they are deliberately different things:
+
+- **What the endpoint serves.** Cached in extension storage, hundreds of entries
+  on a router. Read it on the settings page, under the backend.
+- **What the composer offers.** `profile.models`, in `settings.json`, as few as
+  you like. Tick them on the settings page.
+
+With nothing ticked, everything the endpoint serves is offered — which for
+OpenRouter is over four hundred, so the composer's menu has a filter box and
+says how many it is not showing. Tick a few to pin them.
+
+An id you declare that the endpoint does **not** serve is reported rather than
+silently honoured, and if *none* of them are served the endpoint's own list
+takes over with a note saying which were ignored. That last rule exists because
+this extension used to write the wrong ids into that field itself.
 
 That replaced a hardcoded table which was wrong in three ways at once, none of
 them visible from inside the extension:
@@ -381,7 +455,23 @@ Press **Refresh the model list** and read what it says:
 | `N models: …` naming what you expect | Working — the list is the CLI's |
 | `Using the built-in model list: …` | Discovery failed, and the reason follows |
 | The menu footer says **Built-in list** | Same, seen from the picker |
-| The menu footer says **Models listed by this provider profile** | Your profile declares its own `models`, which outranks discovery — clear that field to fall back to the CLI |
+| The menu footer says **Served by `<host>`** | Working — the list came from `GET <baseUrl>/v1/models` |
+| The menu footer says **Your list · `<host>`** | Your profile declares its own `models`, which outranks discovery — untick them on the settings page to get the whole catalogue back |
+| The footer says `<host>` **does not serve** some ids | Those were declared by the profile and cannot work; untick them |
+| The footer says `<host>` **serves none of** them | Every id the profile declares is dead, so the endpoint's own list is shown instead |
+
+The footer is one line on purpose — the long version, with the ids and the ticks
+that fix them, is on the settings page.
+
+**The agent chip names the endpoint's HOST, not the profile's label.** A label is
+free text and drifts from its URL the moment a preset is edited: a profile still
+called *OpenRouter* pointed at `api.deepseek.com` makes its own model list look
+like a bug — *"why is Claude Code offering me DeepSeek models?"* — when the
+answer is that it is talking to DeepSeek. `Claude Code · api.deepseek.com` says
+which agent program and which endpoint, and neither half can go stale.
+
+For a custom endpoint, **Refresh from the endpoint** on the settings page asks
+it again — a plain HTTP GET, no CLI process and no tokens.
 
 ### Ultracode and fast mode
 
@@ -464,6 +554,44 @@ inference profile still reads as `Haiku 4.5` at `200K` — the existing rule tha
 "a label that disagrees with the meter beside it is not expressible",
 extended to ids we did not write. Only a genuinely unknown model falls back to
 its raw id and the profile's declared window.
+
+### A custom endpoint prices its own models
+
+None of the above helps `deepseek/deepseek-chat-v3.1`: it is not an Anthropic id
+with decoration on it, so `normaliseModel` has nothing to say about it, and
+every session on one read `≥ $0.00` against a context meter with no denominator.
+
+But the endpoint publishes both. OpenRouter states an exact per-token price and
+a context length for all 431 of its models, including separate cache-read and
+cache-write rates. Those travel in a `ModelBook` — an id keyed at its exact
+spelling, since a router slug must never be normalised — which is handed to
+**both** meters:
+
+- `AgentSession`, which prices each turn as it happens, and
+- `SessionStore`, which totals a finished session from its transcript.
+
+Same book, same `costOfUsage()`, so the figure does not change when a run ends —
+the rule the live and stored paths already shared for Anthropic's models,
+extended to everybody else's. Anthropic's cache rates are fixed multiples of the
+input rate and stay derived; a rate the endpoint states explicitly wins, because
+one router's cache discount is not another's.
+
+What is still honest about it: a model whose endpoint published no price stays
+`priced: false` and reads `≥`. The book adds knowledge; it never invents it.
+
+### The model Claude Code uses for its own errands
+
+The CLI runs small background jobs — naming a session, and others it never shows
+you — on a haiku-class model that it names by **Anthropic's** id. On a backend
+that does not serve Claude's models, every one of those 404s for the life of
+every session, silently, while the conversation you are watching works
+perfectly.
+
+`smallModel` on a gateway profile is the fix. It sets **both**
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL` — which of the
+two a given CLI reads is not something this extension can know, and writing one
+is a fix that silently does nothing on half of them. The DeepSeek preset sets
+it; leave it empty on anything that serves Claude's models.
 
 ---
 

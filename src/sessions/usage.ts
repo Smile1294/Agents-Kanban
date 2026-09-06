@@ -47,7 +47,35 @@ export interface TokenUsage {
 export interface ModelRate {
   input: number
   output: number
+  /** Absolute per-million cache rates, when the vendor publishes them instead
+   *  of Anthropic's fixed multiples. Anthropic's are derived (see
+   *  `CACHE_READ`); OpenRouter states them per model, and one router's cache
+   *  discount is not another's. Absent means "derive them". */
+  cacheRead?: number
+  cacheWrite?: number
 }
+
+/**
+ * What a model costs and how big its window is, for models these tables cannot
+ * know about.
+ *
+ * `MODEL_RATES` and `MODEL_WINDOWS` are keyed by Anthropic's ids and no other
+ * vendor uses them, so every session on a custom endpoint reported `≥ $0.00`
+ * against a meter with no denominator — honest, because `priced: false` IS
+ * "unknown model", and useless. The endpoint itself publishes both: OpenRouter
+ * states an exact per-token price and a context length for all 431 of its
+ * models. `agent/endpoint.ts` reads them; this is where they arrive.
+ *
+ * Keyed by the id EXACTLY as the endpoint spells it. `normaliseModel` exists to
+ * strip Anthropic's provider decorations, and `deepseek/deepseek-chat-v3.1` is
+ * not a decorated Anthropic id — running it through would be inventing a
+ * relationship between two strings that have none.
+ */
+export interface ModelFacts {
+  rate?: ModelRate
+  contextWindow?: number
+}
+export type ModelBook = Readonly<Record<string, ModelFacts>>
 
 /**
  * USD per million tokens, base rates only.
@@ -160,10 +188,33 @@ export function normaliseModel(model: string): string {
     .replace(/-\d{8}$/, '')
 }
 
+/**
+ * The rate for a model: what its own endpoint published, else the built-in table.
+ *
+ * The book is consulted by EXACT id first and only then through
+ * `normaliseModel`, and the order is load-bearing. An endpoint id
+ * (`deepseek/deepseek-chat-v3.1`) is not an Anthropic id with decoration on it,
+ * so normalising it can only produce a string that means nothing; but a
+ * gateway serving Claude under a normalisable id should still match. Exact,
+ * then normalised, then the table — most specific first.
+ */
+export function rateFor(model: string, book?: ModelBook): ModelRate | undefined {
+  return book?.[model]?.rate ?? book?.[normaliseModel(model)]?.rate ?? MODEL_RATES[normaliseModel(model)]
+}
+
+/** The context window for a model, from the same three sources in the same
+ *  order. The denominator the meter measures against when no live run has
+ *  reported one. */
+export function windowFor(model: string, book?: ModelBook): number | undefined {
+  return book?.[model]?.contextWindow
+    ?? book?.[normaliseModel(model)]?.contextWindow
+    ?? MODEL_WINDOWS[normaliseModel(model)]
+}
+
 /** What one assistant message cost, or `undefined` if the model has no rate. */
-export function costOfUsage(model: string, usage: TokenUsage): number | undefined {
+export function costOfUsage(model: string, usage: TokenUsage, book?: ModelBook): number | undefined {
   if (model === SYNTHETIC_MODEL) return 0
-  const rate = MODEL_RATES[normaliseModel(model)]
+  const rate = rateFor(model, book)
   if (!rate) return undefined
   // The split is authoritative when present. When it is not, the flat total is
   // charged at the 5-minute rate, which is the CLI's default TTL — and the
@@ -173,12 +224,20 @@ export function costOfUsage(model: string, usage: TokenUsage): number | undefine
   const write5m = split
     ? (split.ephemeral_5m_input_tokens ?? 0)
     : (usage.cache_creation_input_tokens ?? 0)
+  /* Anthropic's cache rates are fixed MULTIPLES of the input rate, so they are
+     derived; another vendor's are whatever that vendor says, so an explicit one
+     wins. OpenRouter, for instance, prices a cache read at a tenth on some
+     models and at the full input rate on others — deriving there would be
+     making the number up. */
+  const readRate = rate.cacheRead ?? rate.input * CACHE_READ
+  const write5mRate = rate.cacheWrite ?? rate.input * CACHE_WRITE_5M
+  const write1hRate = rate.cacheWrite ?? rate.input * CACHE_WRITE_1H
   const dollars =
     (usage.input_tokens ?? 0) * rate.input +
     (usage.output_tokens ?? 0) * rate.output +
-    (usage.cache_read_input_tokens ?? 0) * rate.input * CACHE_READ +
-    write5m * rate.input * CACHE_WRITE_5M +
-    write1h * rate.input * CACHE_WRITE_1H
+    (usage.cache_read_input_tokens ?? 0) * readRate +
+    write5m * write5mRate +
+    write1h * write1hRate
   return dollars / 1_000_000
 }
 
@@ -286,7 +345,7 @@ export function emptyTotals(): UsageTotals {
  * tokens are billed like any others — but never in the context fill, because a
  * subagent's context is its own and the meter is about the main thread's.
  */
-export function summariseUsage(messages: readonly UsageMessage[]): UsageTotals {
+export function summariseUsage(messages: readonly UsageMessage[], book?: ModelBook): UsageTotals {
   /** The last frame seen for each response id, main thread or subagent. */
   const responses = new Map<string, { model: string; usage: TokenUsage; main: boolean; seq: number }>()
   let seq = 0
@@ -326,7 +385,7 @@ export function summariseUsage(messages: readonly UsageMessage[]): UsageTotals {
     totals.output += r.usage.output_tokens ?? 0
     totals.cacheWrite += r.usage.cache_creation_input_tokens ?? 0
     totals.cacheRead += r.usage.cache_read_input_tokens ?? 0
-    const cost = costOfUsage(r.model, r.usage)
+    const cost = costOfUsage(r.model, r.usage, book)
     if (cost === undefined) unpriced.add(r.model || 'unknown')
     else totals.costUsd += cost
     if (r.main && (!lastMain || r.seq > lastMain.seq)) lastMain = r
@@ -336,7 +395,7 @@ export function summariseUsage(messages: readonly UsageMessage[]): UsageTotals {
     totals.contextTokens = contextOfUsage(lastMain.usage)
     if (lastMain.model) {
       totals.model = lastMain.model
-      const window = MODEL_WINDOWS[normaliseModel(lastMain.model)]
+      const window = windowFor(lastMain.model, book)
       if (window) totals.contextWindow = window
     }
   }

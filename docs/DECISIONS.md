@@ -1801,6 +1801,201 @@ Two things worth keeping from this:
   `fetch` and the TCP connect injected, because those states cannot be
   reproduced on demand.
 
+### The model picker offered six Claude models to a DeepSeek endpoint
+
+A user set up DeepSeek through the custom-endpoint kind, and reported:
+
+> I literally dont have access to it in my options I only still have OpenAI or
+> Claude
+
+Their `settings.json`:
+
+```json
+{
+  "id": "openrouter", "kind": "gateway", "label": "OpenRouter",
+  "baseUrl": "https://api.deepseek.com/anthropic",
+  "hasCredential": true,
+  "models": ["default", "opus[1m]", "claude-fable-5-1[1m]", "sonnet", "sonnet[1m]", "haiku"]
+}
+```
+
+Six Anthropic aliases declared against DeepSeek. Nobody typed them. They were
+written by this extension, and the path is three defensible steps that compose
+into nonsense:
+
+1. `probeProvider()` read the model list from `Query.supportedModels()`.
+2. `testProvider()` offered *"Use these 6 models in the picker?"* and saved the
+   answer onto the profile.
+3. `mergeModels()` gives a profile's declared list top priority — correctly,
+   because someone who wrote a list has said something more specific than any
+   discovery could.
+
+The bad step is the first, and it is bad for a reason that is invisible from
+inside the module. **`supportedModels()` answers for Claude Code, not for the
+endpoint Claude Code is pointed at.** It comes out of the CLI's `initialize`
+response, which is assembled before a single API request is made — the same
+property that makes the provider probe nearly free is what makes its model list
+worthless off first-party. Ask it while `ANTHROPIC_BASE_URL` points at DeepSeek
+and it says `sonnet`, `haiku`, `opus[1m]`, because that is what *it* can run.
+
+So the picker offered six models that endpoint has never served, every one of
+which fails at the first request with a message from somebody else's system, and
+there was no way to select `deepseek-chat` at all. The profile's own list is the
+highest-priority source in the system, and this extension had filled it with
+the wrong thing.
+
+**The fix is to ask the only program that knows.** Every Anthropic-compatible
+endpoint people actually point this at also serves a model list —
+`GET <baseUrl>/v1/models`, in one of two shapes — and the richer ones carry
+exactly what the board otherwise has to render as `?`:
+
+| | ids | names | context window | price |
+|---|---|---|---|---|
+| OpenRouter | ✓ | ✓ | ✓ | ✓ per model, per token |
+| Anthropic | ✓ | ✓ | | |
+| DeepSeek, vLLM, Ollama | ✓ | | | |
+| LiteLLM | ✓ | | ✓ | ✓ |
+
+`agent/endpoint.ts` reads it, `catalogueFor()` ranks it **above** the CLI's
+answer, and the source is reported as `endpoint` rather than `cli` — because
+"Claude Code's list" and "this endpoint's list" are different claims and
+collapsing them is what caused this.
+
+Four things are worth keeping:
+
+- **A declared list that matches NOTHING the endpoint serves is not honoured.**
+  Normally the profile wins; that rule stands. But a filter that selects nothing
+  is not a filter, and honouring this one would be honouring a list this
+  extension wrote by mistake. So the endpoint's own catalogue takes over — and
+  the picker *says so*, naming the ignored ids, because a setting overruled in
+  silence is the next surprise. A partly-served list is still honoured, with the
+  dead entries named: pinning two models out of OpenRouter's 431 is a real thing
+  to want.
+- **Zero is a price and `-1` is not.** OpenRouter serves 22 free models at
+  `"0"`, and its auto-router publishes `"-1"` for "depends where this routes".
+  Read naively, the first renders as "unknown" and the second as
+  `$-1000000/Mtok` that *subtracts* from the session total. Both are now
+  explicit cases, and `priceLabel()` renders a real zero as `Free`, an absent
+  price as nothing at all, and a price too small to write as `<$0.0001` rather
+  than rounding it to `$0` — which would make it indistinguishable from free.
+- **The prices go to the meters, not just the menu.** `MODEL_RATES` is keyed by
+  Anthropic's ids and knows nobody else's, so every session on a custom endpoint
+  read `≥ $0.00` against a context meter with no denominator. A `ModelBook`
+  carries the endpoint's own figures into `costOfUsage()` and into
+  `summariseUsage()`, and both meters — the live one in `AgentSession` and the
+  one totalled from the transcript in `SessionStore` — get the same book, so the
+  number does not change when a run ends.
+- **431 models is a different UI problem from 3.** The composer's menu grew a
+  filter box and a bound, and it says how many it is not showing; the settings
+  page grew the catalogue with a tick per model, which is what writes
+  `profile.models`. Two lists, kept distinct on purpose: what the endpoint
+  *serves* (cached, hundreds) and what the composer *offers* (on the profile, as
+  few as you like).
+
+One more thing came out of it, unprompted by the report and worse than what was
+reported: Claude Code runs its own background errands — naming a session, and
+others it never shows you — on a haiku-class model it names by **Anthropic's**
+id. Against DeepSeek those requests 404 for the life of every session, silently,
+while the conversation itself works perfectly. `smallModel` on a gateway profile
+sets `ANTHROPIC_DEFAULT_HAIKU_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL` (both
+spellings — which one a given CLI reads is not something this extension can
+know, and writing one is a fix that silently does nothing on half of them), and
+the DeepSeek preset sets it.
+
+The general lesson is the same one as ["Test connection" said
+Connected](#test-connection-said-connected-to-a-port-with-nothing-on-it), from a
+new direction. `accountInfo()` and `supportedModels()` come back from the same
+cheap `initialize` round trip, and both describe **the CLI's configuration**
+rather than anything that has been asked of a server. The first was overclaimed
+as connectivity; the second was overclaimed as a catalogue. When a question is
+about somebody else's service, the answer has to come from that service.
+
+### The settings page showed a subscription that paid for nothing
+
+Follow-up to the DeepSeek picker, and the sharper version of the same mistake.
+With the fix above in place the page read:
+
+```
+Claude Code · Anthropic
+● Signed in as david@prduct.com (subscription) · firstParty
+```
+
+and, a section below, an active backend pointed at `api.deepseek.com` with a key
+in the keychain. Both statements were true. Together they were a lie: nothing
+that session did would ever touch that subscription.
+
+The cause is one line. `claudeRuntime.login()` called `query()` with **no
+provider environment**, so `accountInfo()` reported what `claude` resolves *on
+its own* — never what a session this board starts resolves. It is
+`accountInfo()` overclaimed for the third time in this file: as connectivity,
+then as a catalogue, now as the account that pays.
+
+Three fixes, and the third is the one worth remembering:
+
+- `login()` takes the active `ProviderEnv`, so it answers about the sessions the
+  board will actually start.
+- The card names the backend on its own row — `Backend: OpenRouter ·
+  api.deepseek.com · key in keychain` — above the login. The reported symptom
+  was *"why is Claude Code offering me DeepSeek models?"*, and the honest answer
+  is one line the page was not saying.
+- **`usesRuntimeLogin()` reconciles the two.** Where the backend does not spend
+  the login, the login row goes grey and says `· not used by this backend`. A
+  green tick over a credential nothing spends is the same failure as a spinner
+  over a wedged process, and it is worse here, because the thing it reassures
+  you about is money.
+
+`firstParty` was on screen for the same underlying reason: `apiProvider` was
+being reported in `LoginState.plan`. It is not a plan, it is somebody else's
+word for a backend.
+
+**And an agent you do not have is not a peer of one you do.** Codex had a full
+card — blurb, login row, model list, and a *Use for new sessions* button that
+would have made every session fail at its first step — on a machine where it was
+never installed, directly above the backend that was running everything. It is
+now one line at the end of the list with the install command on it. Still
+listed, because dropping it would make the board's second agent undiscoverable;
+not presented as something you can pick.
+
+### "There should be two buttons"
+
+The last of the DeepSeek thread, and the one that made the other two look like
+bugs. The composer had an AGENT picker; the settings page owned the BACKEND.
+Choosing what a session runs on was a cross product the user had to compute, and
+the bar showed one half of it — `Claude Code` next to a model list from DeepSeek.
+
+> there should be two fucking buttons, one of them saying Claude code Antropic,
+> and the other one should be saying deepseek, the URL, and open router […] the
+> open router should be showing the deepseek model, and the Claude code should
+> be showing the Claude code models
+
+That is the right design and it was never argued against — it just fell out of
+the two axes being modelled honestly (a runtime is not a provider) and then
+rendered as two controls. The model is still right; the UI was a leak of it.
+
+`composer.agents` is now one flat list of runnable combinations, keyed
+`<runtime>|<profile>`:
+
+```
+Claude Code        Anthropic · default backend
+OpenRouter         Claude Code · api.deepseek.com
+⚙ Agents, backends and logins…
+```
+
+Three things are load-bearing:
+
+- **Both halves switch in ONE branch.** `provider` and `runtime` each kicked off
+  their own model refresh, and a refresh started against the old runtime while
+  the new provider is applied files one backend's models under the other's name
+  — `catalogueKey` already has the postmortem for what that costs.
+- **A runtime that is not installed is ABSENT, not disabled.** Codex sat on the
+  bar as a peer of the agent doing all the work, on a machine that never had it,
+  and picking it would have failed at the first step. `detect()` runs in the
+  background at activation — the executable lookup only, never `login()`, which
+  starts the CLI.
+- **Not checked yet still shows.** Hiding something we have not looked for is
+  the same mistake as asserting a state we did not read, which is the rule this
+  whole thread kept breaking.
+
 ## Still open
 
 - **`verify` tests before it builds, and one test reads the build.**

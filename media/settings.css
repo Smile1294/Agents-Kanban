@@ -149,6 +149,10 @@ body.settings {
 .dot.ok { background: var(--vscode-testing-iconPassed, #3fb950); }
 .dot.bad { background: var(--vscode-testing-iconFailed, #f85149); }
 .dot.unknown { background: var(--vscode-editorWarning-foreground, #d29922); }
+/* A login that is real, correct, and simply not what this backend spends.
+   Amber would read as "something is wrong with your subscription"; grey says
+   "not in play", which is what it is. */
+.dot.idle { background: var(--vscode-descriptionForeground); opacity: 0.6; }
 
 .fix,
 .where code {
@@ -306,3 +310,61 @@ button.primary:hover { background: var(--vscode-button-hoverBackground); }
    claim is then "this is what it said", not "this is how it is". */
 .small { font-size: 0.88em; }
 .stale { font-style: italic; opacity: 0.8; }
+
+/* --- what a backend serves, and what the composer offers --------------------
+ *
+ * Two different lists on one row, and the styling keeps them different: the
+ * catalogue is a long scrolling thing you search, the ticks are a short list
+ * you curate. See `providerModels()` in settings.js for why they are not the
+ * same list.
+ */
+/* Appended as a SIBLING of its `.row`, inside the flex column that holds them,
+   so it is indented to read as belonging to the row above rather than as
+   another backend. */
+.row-models {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 0 0 10px 10px; padding: 2px 0 0;
+  border-left: 1px solid var(--line); padding-left: 12px;
+  min-width: 0;
+}
+.row-models-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+.model-filter {
+  padding: 5px 8px; font: inherit; font-size: 0.9em; min-width: 0;
+  color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 4px;
+}
+.model-filter:focus { outline: 1px solid var(--vscode-focusBorder); }
+
+/* Bounded, because the catalogue is 431 rows on OpenRouter and a settings page
+   the length of a phone book is a settings page nobody scrolls to the end of. */
+.model-rows {
+  display: flex; flex-direction: column;
+  max-height: 320px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.model-row {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 6px 9px; border-bottom: 1px solid var(--line); cursor: pointer;
+  min-width: 0;
+}
+.model-row:last-child { border-bottom: none; }
+.model-row:hover { background: var(--vscode-list-hoverBackground); }
+.model-row.on { background: var(--vscode-list-inactiveSelectionBackground); }
+.model-tick { margin-top: 2px; flex: none; }
+/* `min-width: 0` for the reason it is always needed here: a flex item defaults
+   to `min-width: auto`, and a long model id would push the row wider than the
+   panel rather than ellipsising inside it. */
+.model-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.model-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* An agent this machine does not have. One line at the end of the list rather
+   than a card at the top of it: it is a thing you could install, not a thing
+   you can use, and it used to sit above the backend that was running
+   everything. */
+.agent-missing {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; margin-top: 6px;
+  border: 1px dashed var(--line); border-radius: 6px;
+  font-size: 12.5px; color: var(--muted);
+}

@@ -255,7 +255,21 @@ export interface UiState {
     model: string
     effort: string
     thinking: string
-    models: { id: string; label: string; context: string; detail?: string }[]
+    /**
+     * The models to offer, with the two facts that make a list of ids a
+     * CHOICE: how much context each one has, and what it costs.
+     *
+     * `context` is the label (`1M`, `128K`, `?`) and `price` is the shorthand
+     * (`$0.28/$0.42 per Mtok`, `Free`). Both are formatted host-side, in
+     * `models.ts`, so the two surfaces that show them cannot round money
+     * differently — and so `board.js` does no arithmetic on a price at all.
+     * `price` is ABSENT rather than "unknown" when nothing published one: a
+     * blank says "not stated", where `$0.00` would say "free".
+     */
+    models: {
+      id: string; label: string; context: string; detail?: string
+      contextTokens?: number; price?: string
+    }[]
     /** The effort levels THIS model accepts. Empty means it accepts none, and
      *  the control must disappear: Haiku 4.5 was being shown a five-level
      *  picker it ignores, which is a control that cannot say "no". */
@@ -271,10 +285,12 @@ export interface UiState {
     ultracodeSupported?: boolean
     fastMode?: boolean
     fastModeSupported?: boolean
-    /** Where the model list came from — `cli` (asked), `profile` (declared in
-     *  settings), or `builtin` (the fallback). Shown in the picker, because
-     *  "why is Fable missing?" is only answerable if you can see whether we
-     *  managed to ask. */
+    /** Where the model list came from — `endpoint` (the custom endpoint's own
+     *  answer), `cli` (Claude Code's), `profile` (declared in settings), or
+     *  `builtin` (the fallback). Shown in the picker, because "why is Fable
+     *  missing?" is only answerable if you can see whether we managed to ask —
+     *  and because `cli` against a custom endpoint is a list about Claude Code
+     *  rather than about that endpoint. */
     modelSource?: string
     /** Why the CLI's list is not in use, when it is not. */
     modelNote?: string
@@ -301,6 +317,23 @@ export interface UiState {
     permissionMode: string
     permissionModes: { key: string; label: string; detail: string }[]
     /** Which agent program the NEXT session runs on. */
+    /**
+     * The (agent program × backend) combination the next session runs on, as
+     * one key — `claude|openrouter`.
+     *
+     * ONE picker, not two, and that is the point. The two were a cross product
+     * the user had to do in their head: the bar said "Claude Code" while the
+     * model list was DeepSeek's, because the backend was chosen on a different
+     * screen. Reported as *"how the fuck does that make sense"*, and fairly.
+     * Now every runnable combination is one entry, and picking it sets both.
+     */
+    agent: string
+    /** Every combination available on this machine. A runtime that is not
+     *  installed is ABSENT rather than disabled: it is not a thing you can run
+     *  on, and a session started on it fails at its first step. */
+    agents: {
+      key: string; label: string; detail: string; runtime: string; provider: string
+    }[]
     runtime: string
     /** Every agent program this build can drive. `providerProfiles` is carried
      *  so the chip can name a backend only where one is a real choice — a Codex
@@ -371,6 +404,9 @@ export interface BoardHost {
   setComposer(patch: {
     model?: string; effort?: string; thinking?: string; permissionMode?: string
     provider?: string; runtime?: string; orchestration?: string; ultracode?: string; fastMode?: string; forKey?: string
+    /** `<runtime>|<providerId>` — both halves at once, so the two switches
+     *  cannot race each other's model refresh. */
+    agent?: string
   }): void
   toggleArchived(): void
   /** Give the board the whole window, or hand it back. */
@@ -440,6 +476,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
             ...(msg.permissionMode ? { permissionMode: String(msg.permissionMode) } : {}),
             ...(msg.provider ? { provider: String(msg.provider) } : {}),
             ...(msg.runtime ? { runtime: String(msg.runtime) } : {}),
+            ...(msg.agent ? { agent: String(msg.agent) } : {}),
             ...(msg.orchestration ? { orchestration: String(msg.orchestration) } : {}),
             ...(msg.ultracode ? { ultracode: String(msg.ultracode) } : {}),
             ...(msg.fastMode ? { fastMode: String(msg.fastMode) } : {}),

@@ -182,5 +182,149 @@ const state = (over = {}) => ({
   ok(old.text().includes('Signed in'), 'while still reporting what it read')
 }
 
+// --- WHAT A BACKEND SERVES, and which of it the composer offers -------------
+//
+// This section is the bug this page failed to show. A gateway profile whose
+// declared models were Claude Code's own aliases — saved there by the provider
+// test, which asked the CLI instead of the endpoint — left the composer
+// offering `sonnet` and `haiku` against DeepSeek. The page showed nothing about
+// it, so there was nowhere to see it and nowhere to fix it.
+{
+  const CATALOGUE = [
+    { id: 'deepseek-chat', label: 'DeepSeek Chat', context: '128K', price: '$0.28/$0.42 per Mtok', offered: true },
+    { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner', context: '128K', price: '$0.55/$2.19 per Mtok', offered: false },
+  ]
+  const withCatalogue = (over = {}) => state({
+    providers: [{
+      id: 'ds', label: 'DeepSeek', kind: 'gateway', detail: 'api.deepseek.com',
+      active: true, hasCredential: true, endpointHost: 'api.deepseek.com',
+      models: CATALOGUE, ...over,
+    }],
+  })
+
+  const v = await renderSettings(withCatalogue())
+  ok(v.text().includes('2 models available'), 'the page says how many models the endpoint serves')
+  ok(v.text().includes('1 offered in the composer'), 'and how many of them the composer is offering')
+
+  // Collapsed by default: a catalogue is 431 rows on OpenRouter.
+  ok(!v.text().includes('DeepSeek Reasoner'), 'the catalogue starts collapsed rather than filling the page')
+  const open = findButton(v.root, 'models available')
+  ok(!!open, 'there is a control to open it')
+  // Clicked on THIS view, which re-renders itself. A second `renderSettings`
+  // would be a fresh module with a fresh set of expanded rows — the state under
+  // test lives at module level precisely because render() would destroy it.
+  open.onclick()
+  const opened = v
+  ok(opened.text().includes('DeepSeek Reasoner'), 'opening it lists the models')
+  ok(opened.text().includes('$0.28/$0.42 per Mtok'), 'with the price the endpoint published')
+  ok(opened.text().includes('128K context'), 'and the context window')
+
+  // The tick is the small human list — what to OFFER — as opposed to the big
+  // machine list of what exists.
+  const ticks = opened.root.querySelectorAll('.model-tick')
+  ok(ticks.length === 2, 'every model is tickable')
+  ok(ticks[0].checked === true && ticks[1].checked === false, 'and the ticks reflect what is offered')
+  ticks[1].onchange()
+  const posted = opened.posted.filter((m) => m.type === 'setProfileModels')
+  ok(posted.length === 1, 'ticking one posts the new list to the host')
+  ok(JSON.stringify(posted[0].models) === JSON.stringify(['deepseek-chat', 'deepseek-reasoner']),
+     'as the ids to offer, added to the ones already there')
+
+  // Asking costs an HTTP GET, so it is a button rather than something that
+  // happens on every repaint.
+  ok(!!findButton(opened.root, 'Refresh from the endpoint'), 'and the list can be re-read from the endpoint')
+
+  // The state the user was actually left in. A page that showed the list
+  // without saying this would be the page that hid the bug.
+  const stale = await renderSettings(withCatalogue({
+    modelNote: 'None of the 6 models this profile lists are served here, so they are ignored.',
+  }))
+  ok(stale.text().includes('None of the 6 models'), 'a declared list the endpoint does not serve is called out')
+
+  // Never asked is not the same as "serves nothing".
+  const unasked = await renderSettings(state({
+    providers: [{ id: 'ds', label: 'DeepSeek', kind: 'gateway', detail: 'api.deepseek.com', active: true, hasCredential: false, modelNote: 'Not asked yet.' }],
+  }))
+  ok(unasked.text().includes('Not asked yet.'),
+     '"I have not asked" is rendered as itself, never as an endpoint with no models')
+  ok(!!findButton(unasked.root, 'Ask what it serves'), 'with the way to ask right there')
+
+  // A cloud backend has no endpoint of ours to ask, so it gets no control that
+  // cannot do anything — the same rule that hides the backend picker on Codex.
+  const cloud = await renderSettings(state({
+    providers: [{ id: 'br', label: 'Bedrock', kind: 'bedrock', detail: 'us-east-1', active: true, hasCredential: false }],
+  }))
+  ok(!findButton(cloud.root, 'Ask what it serves'), 'a cloud backend is offered no endpoint to interrogate')
+}
+
+// --- the agent card must not contradict the backend under it ---------------
+//
+// The report this section comes from: "it renders the DeepSeek as Claude Code,
+// that makes no sense — I am logged in to a Claude subscription separately and
+// the OpenRouter is separate from that one."
+//
+// Both halves of the page were true and they were saying opposite things. The
+// Claude Code card read "Signed in as david@… (subscription) · firstParty",
+// which is what `claude` resolves ON ITS OWN; the active backend sent every
+// session to api.deepseek.com with a key from the keychain. The subscription
+// was real and paid for nothing.
+{
+  const withBackend = (backend) => state({
+    runtimes: [{
+      ...CLAUDE,
+      status: {
+        id: 'claude', label: 'Claude Code', at: Date.now(),
+        login: { kind: 'signedIn', via: 'subscription', account: 'david@prduct.com' },
+      },
+      backend,
+    }],
+  })
+
+  const gateway = await renderSettings(withBackend({
+    label: 'OpenRouter', detail: 'api.deepseek.com', usesLogin: false, credential: 'key in keychain',
+  }))
+  ok(gateway.text().includes('Backend: OpenRouter'), 'the agent card names the backend a session would use')
+  ok(gateway.text().includes('api.deepseek.com'),
+     'and where that is — which is the whole explanation for the model list')
+  ok(gateway.text().includes('not used by this backend'),
+     'and says the subscription is not what pays, instead of showing it as a green tick')
+  ok(!gateway.root.querySelectorAll('.dot.ok').length
+     || [...gateway.root.querySelectorAll('.status-row')].some((r) => r.textContent.includes('Backend')),
+     'the only green dot left belongs to the thing that is actually in use')
+
+  // The ordinary case must not be made to look wrong by the fix.
+  const inherit = await renderSettings(withBackend({
+    label: 'Inherit from environment', detail: 'Inherit from environment', usesLogin: true,
+  }))
+  ok(!inherit.text().includes('not used by this backend'),
+     'a backend that DOES use the login says nothing extra about it')
+
+  // `firstParty` is somebody else's vocabulary and was being printed raw.
+  ok(!gateway.text().includes('firstParty') && !inherit.text().includes('firstParty'),
+     'no raw provider jargon reaches the page')
+
+  // Codex has no backend to name, so it is offered none.
+  const codex = await renderSettings(state({ runtimes: [{ ...CODEX, status: { id: 'codex', label: 'Codex', at: Date.now(), login: { kind: 'signedIn', via: 'subscription' } } }] }))
+  ok(!codex.text().includes('Backend:'), 'an agent that signs in as itself gets no backend row it cannot honour')
+}
+
+// --- an agent you do not have is not a peer of one you do -------------------
+{
+  const v = await renderSettings(state({
+    runtimes: [
+      { ...CLAUDE, status: { id: 'claude', label: 'Claude Code', at: Date.now(), login: { kind: 'signedIn', via: 'subscription' } } },
+      { ...CODEX, status: { id: 'codex', label: 'Codex', at: Date.now(), login: { kind: 'notInstalled', fix: 'npm install -g @openai/codex' } } },
+    ],
+  }))
+  ok(v.text().includes('Not installed:') && v.text().includes('Codex'),
+     'an agent that is not on the machine is still listed — dropping it would make it undiscoverable')
+  ok(!v.root.querySelectorAll('.agent-card').length
+     || [...v.root.querySelectorAll('.agent-card')].every((c) => !c.textContent.includes('Codex')),
+     'but as a line, not as a card beside the agent that is actually running things')
+  ok(!findButton(v.root, 'Use for new sessions'),
+     'and it is never offered as the default — pressing that would make every session fail at the first step')
+  ok(!!findButton(v.root, 'Check again'), 'while still offering the way to re-check it')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

@@ -505,6 +505,72 @@ try {
   ok(ask.sendVisible, 'the Send button is on screen — it is the point of the whole picker')
   await askPage.close()
 
+  /* --- the model menu, measured, because it is now hundreds of rows ---------
+   *
+   * The list used to be three Claude models with a five-word label each. It is
+   * now whatever the endpoint serves — 431 entries on OpenRouter, each with an
+   * id, a context window, a price and a sentence of description. Every text
+   * assertion about that menu can pass while it draws off the side of the
+   * panel or a mile down the page, which is exactly the class of failure this
+   * file exists for.
+   */
+  const menuPage = await browser.newPage({ viewport: { width: 1400, height: 900 } })
+  const many = [{
+    id: 'deepseek/deepseek-chat-v3.1', label: 'DeepSeek: DeepSeek V3.1 ' + 'z'.repeat(60),
+    context: '161K', price: '$0.55/$1.65 per Mtok',
+    detail: 'A large hybrid reasoning model. ' + 'y'.repeat(200),
+  }]
+  for (let i = 0; i < 80; i++) {
+    many.push({ id: `vendor/model-${i}`, label: `Model ${i}`, context: '128K', price: '$1.00/$2.00 per Mtok' })
+  }
+  await menuPage.setContent(page$({
+    ...chatState,
+    composer: { ...chatState.composer, model: many[0].id, models: many, modelSource: 'endpoint' },
+  }))
+  await menuPage.waitForSelector('.composer-bar', { timeout: 5000 })
+  await menuPage.evaluate(() => {
+    const b = [...document.querySelectorAll('.picker')].find((x) => /DeepSeek/.test(x.textContent))
+    b.click()
+  })
+  await menuPage.waitForSelector('.menu-list', { timeout: 5000 })
+  const menu = await menuPage.evaluate(() => {
+    const menu = document.querySelector('.menu')
+    const list = document.querySelector('.menu-list')
+    const item = document.querySelector('.menu-item')
+    const mb = menu.getBoundingClientRect()
+    const ib = item.getBoundingClientRect()
+    return {
+      menuOverflow: Math.round(menu.scrollWidth - menu.clientWidth),
+      // A menu wider than the window is a menu whose right-hand half — where
+      // the price is — cannot be read.
+      widerThanWindow: Math.round(mb.width - window.innerWidth),
+      offRight: Math.round(mb.right - window.innerWidth),
+      offLeft: Math.round(0 - mb.left),
+      // It has to be BOUNDED and scrollable, or 81 rows run off the bottom of
+      // a screen with no way back.
+      listHeight: Math.round(list.getBoundingClientRect().height),
+      scrolls: list.scrollHeight > list.clientHeight + 1,
+      itemOverflow: Math.round(item.scrollWidth - item.clientWidth),
+      itemEscapes: Math.round(ib.right - mb.right),
+      // Two lines: the name, then the id/window/price. A row that has grown to
+      // the height of a paragraph is a menu you scroll rather than read.
+      itemHeight: Math.round(ib.height),
+      filterInside: Math.round(document.querySelector('.menu-filter').getBoundingClientRect().right - mb.right),
+    }
+  })
+  ok(menu.menuOverflow <= 1, `the model menu does not scroll horizontally (${menu.menuOverflow}px)`)
+  ok(menu.widerThanWindow < 0, `and is narrower than the window (${menu.widerThanWindow}px)`)
+  ok(menu.offRight <= 1, `it does not run off the right of the window (${menu.offRight}px)`)
+  ok(menu.offLeft <= 1, `nor off the left (${menu.offLeft}px)`)
+  ok(menu.listHeight <= 340, `the list is bounded rather than as tall as the catalogue (${menu.listHeight}px)`)
+  ok(menu.scrolls, 'and scrolls inside itself, so the rows below the fold are reachable')
+  ok(menu.itemOverflow <= 1, `a row with a 60-character name does not overflow it (${menu.itemOverflow}px)`)
+  ok(menu.itemEscapes <= 1, `nor escape the menu (${menu.itemEscapes}px past the edge)`)
+  ok(menu.itemHeight > 24 && menu.itemHeight < 90,
+     `a row is two lines of information, not one and not a paragraph (${menu.itemHeight}px)`)
+  ok(menu.filterInside <= 1, `the filter box stays inside the menu (${menu.filterInside}px past the edge)`)
+  await menuPage.close()
+
 } finally {
   await browser.close()
 }

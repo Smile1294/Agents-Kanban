@@ -36,6 +36,7 @@
  */
 import * as vscode from 'vscode'
 import { allRuntimes, type LoginState, type RuntimeId, type RuntimeStatus } from '../agent/runtime.ts'
+import type { ProviderEnv } from '../agent/providers.ts'
 
 /** What the page renders. Everything is a snapshot with a timestamp on it, so a
  *  readout can be shown as stale rather than as current. */
@@ -60,6 +61,19 @@ export interface RuntimeAgentCard {
    *  the provider section must not offer settings that cannot take effect. */
   providerProfiles: boolean
   status?: RuntimeStatus
+  /**
+   * The backend a session on this agent would ACTUALLY use.
+   *
+   * Here because the page let two facts contradict each other: the Claude Code
+   * card said *"Signed in as david@… (subscription)"* while the active profile
+   * sent every request to `api.deepseek.com` with a key from the keychain. Both
+   * statements were true; together they were a lie, and the visible symptom was
+   * "why is Claude Code offering me DeepSeek models?".
+   *
+   * `usesLogin` is the reconciliation: false means the account above is real
+   * and is not what pays for anything.
+   */
+  backend?: { label: string; detail: string; usesLogin: boolean; credential?: string }
   /** The models this runtime reports, with where the list came from. Absent
    *  until asked, because asking spawns a process. */
   models?: { id: string; label: string }[]
@@ -74,6 +88,37 @@ export interface ProviderCard {
   detail?: string
   active: boolean
   hasCredential: boolean
+  /**
+   * What this backend's own endpoint says it serves.
+   *
+   * Only a `gateway` has one — no other kind's endpoint is ours to ask — and it
+   * is the answer to the question this page kept getting wrong. Claude Code's
+   * `supportedModels()` describes Claude Code however `ANTHROPIC_BASE_URL` is
+   * pointed, so a DeepSeek profile was told it served `sonnet` and `haiku`.
+   *
+   * Descriptions are deliberately NOT carried: OpenRouter lists 431 models with
+   * a paragraph each, and this crosses a postMessage boundary on every refresh.
+   */
+  models?: ProviderModelChoice[]
+  /** The host these came from, so a claim about them can name its source. */
+  endpointHost?: string
+  /** Why there is no list, when there is none. A page that silently shows
+   *  nothing is a page that cannot say "I could not ask". */
+  modelNote?: string
+}
+
+/** One model a backend serves, as the settings page shows it. */
+export interface ProviderModelChoice {
+  id: string
+  label: string
+  /** `1M`, `128K`, `?`. */
+  context: string
+  /** `$0.28/$0.42 per Mtok`, `Free`, or ABSENT when nobody published a price.
+   *  Absent is not zero, and must not render as zero. */
+  price?: string
+  /** True when this id is in the profile's own list — the small human list of
+   *  what to OFFER, as opposed to the big machine list of what EXISTS. */
+  offered: boolean
 }
 
 /** Messages the page sends the host. Parsed on arrival, never trusted: a
@@ -91,6 +136,14 @@ export type SettingsMessage =
   | { type: 'removeProvider'; id: string }
   | { type: 'testProvider'; id: string }
   | { type: 'openSetting'; key: string }
+  /** Ask the endpoint itself what it serves. A plain HTTP GET — no CLI, no
+   *  token — so it is cheap enough to be a button. */
+  | { type: 'refreshEndpoint'; id: string }
+  /** Which of those models the composer should offer. An EMPTY list means
+   *  "offer everything the endpoint serves", which is why it is a distinct
+   *  message rather than an edit to the profile: `[]` and `undefined` have to
+   *  survive the round trip as the same answer. */
+  | { type: 'setProfileModels'; id: string; models: string[] }
 
 export interface SettingsHost {
   getState: () => Promise<SettingsState>
@@ -109,6 +162,10 @@ export interface SettingsHost {
  */
 export async function collectRuntimeStatus(
   configured: Partial<Record<RuntimeId, string | undefined>> = {},
+  /** The active backend's environment patch. Passed to `login()` so the answer
+   *  is about the sessions this board starts, not about the CLI on its own —
+   *  see `AgentRuntime.login`. */
+  providerEnv?: ProviderEnv,
 ): Promise<RuntimeStatus[]> {
   return Promise.all(allRuntimes().map(async (rt): Promise<RuntimeStatus> => {
     const at = Date.now()
@@ -120,7 +177,13 @@ export async function collectRuntimeStatus(
           login: { kind: 'notInstalled', fix: rt.installHint },
         }
       }
-      const login: LoginState = await rt.login(location)
+      const login: LoginState = await rt.login(
+        location,
+        // Only where a provider profile can take effect. Handing one to a
+        // runtime that signs in as itself would be configuring something that
+        // cannot apply.
+        rt.capabilities.providerProfiles ? providerEnv : undefined,
+      )
       return { id: rt.id, label: rt.label, at, location, login }
     } catch (e) {
       return {
@@ -249,7 +312,18 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
     case 'editProvider':
     case 'removeProvider':
     case 'testProvider':
+    case 'refreshEndpoint':
       return id ? ({ type, id } as SettingsMessage) : undefined
+    case 'setProfileModels': {
+      // Model ids from a webview reach a `query()` call, so they are filtered
+      // rather than cast — the same treatment `parseProfiles` gives
+      // `settings.json`. A junk entry is dropped, not rendered blank.
+      if (!id || !Array.isArray(m.models)) return undefined
+      const models = m.models
+        .filter((v): v is string => typeof v === 'string' && !!v.trim())
+        .map((v) => v.trim())
+      return { type, id, models }
+    }
     case 'openSetting':
       return typeof m.key === 'string' && m.key ? { type, key: m.key } : undefined
     default:

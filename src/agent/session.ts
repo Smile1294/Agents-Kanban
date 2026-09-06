@@ -12,7 +12,10 @@
  *     parallel agents safe.
  */
 import { loadSdk, resolveClaudeExecutable, type Options, type PermissionResult, type Query, type SDKMessage, type SDKUserMessage } from './sdk.ts'
-import { contextOfUsage, costOfUsage, mainWindowOf, SYNTHETIC_MODEL, type TokenUsage } from '../sessions/usage.ts'
+import {
+  contextOfUsage, costOfUsage, mainWindowOf, windowFor, SYNTHETIC_MODEL,
+  type ModelBook, type TokenUsage,
+} from '../sessions/usage.ts'
 import { describeImages, userContent, type AttachedImage } from './images.ts'
 import { EventEmitter } from 'node:events'
 import type { EffortLevel, ThinkingMode } from '../sessions/meta.ts'
@@ -256,6 +259,15 @@ export interface AgentSessionOptions {
    *  the CLI actually resolved against what we asked for. Not used to configure
    *  anything — `env`/`envClear` already carry that. */
   provider?: ProviderProfile
+  /**
+   * What a custom endpoint's models cost and how big their windows are.
+   *
+   * The live path has to use the SAME arithmetic as the transcript path or the
+   * figure changes when a run ends — the rule this project already has a
+   * postmortem about. `SessionStore` gets the identical book; both go through
+   * `costOfUsage`.
+   */
+  modelBook?: ModelBook
   model?: string
   effort?: EffortLevel
   /** 'enabled' means OMIT the option and keep the model's adaptive default. */
@@ -639,7 +651,14 @@ export class AgentSession extends EventEmitter implements AgentRun {
         // Haiku's 200K. The window is the MAIN model's or nothing; on nothing,
         // the previous value stands and downstream falls back to the sidecar
         // and the table, which are at least about the right model.
-        const window = mainWindowOf(r.modelUsage, this.lastMainModel ?? this.opts.model)
+        const main = this.lastMainModel ?? this.opts.model
+        /* The run's own report first, then what the model's endpoint published.
+           Off first-party there was no second source at all: `MODEL_WINDOWS` is
+           keyed by Anthropic's ids, so a session on a custom endpoint whose CLI
+           did not report a window drew no meter — a fill with no denominator,
+           which the view correctly renders as nothing. */
+        const window = mainWindowOf(r.modelUsage, main)
+          ?? (main ? windowFor(main, this.opts.modelBook) : undefined)
         if (window) this.contextWindow = window
         this.emit('usage', this.lastContextTokens, this.contextWindow)
         // The turn is over: its cost can no longer change, whether it ended by
@@ -691,7 +710,7 @@ export class AgentSession extends EventEmitter implements AgentRun {
    * TEXT is kept apart; their tokens are not.
    */
   private recordSpend(id: string | undefined, model: string | undefined, usage: TokenUsage): void {
-    const cost = costOfUsage(model ?? '', usage)
+    const cost = costOfUsage(model ?? '', usage, this.opts.modelBook)
     if (cost === undefined) this.unpricedModels.add(model || 'unknown')
     // No id means nothing to deduplicate against, so it is counted once under
     // a key of its own rather than overwriting the previous response.

@@ -19,10 +19,11 @@
  * how the manager knows which to build, rather than knowing about either
  * runtime by name.
  */
-import { AgentSession } from '../session.ts'
+import { AgentSession, agentEnv } from '../session.ts'
 import { loadSdk, resolveClaudeExecutable, type Options } from '../sdk.ts'
 import { MODELS } from '../../sessions/meta.ts'
 import { MODEL_WINDOWS } from '../../sessions/usage.ts'
+import type { ProviderEnv } from '../providers.ts'
 import {
   type AgentRun,
   type AgentRuntime,
@@ -86,13 +87,21 @@ export const claudeRuntime: AgentRuntime = {
    * separate endpoint check, and why this returns `unknown` rather than
    * `signedOut` when it cannot ask.
    */
-  async login(loc: RuntimeLocation): Promise<LoginState> {
+  async login(loc: RuntimeLocation, provider?: ProviderEnv): Promise<LoginState> {
     try {
       const { query } = await loadSdk()
       const q = query({
         // A prompt that never yields: the handshake completes, we ask, we abort.
         prompt: (async function* () { await new Promise(() => {}) })(),
-        options: { pathToClaudeCodeExecutable: loc.command, cwd: process.cwd() },
+        options: {
+          pathToClaudeCodeExecutable: loc.command,
+          cwd: process.cwd(),
+          // THE ACTIVE BACKEND'S environment, so this answers about the sessions
+          // the board will start rather than about `claude` on its own. Without
+          // it the page reported a first-party subscription while every session
+          // went to a gateway.
+          ...(provider ? { env: agentEnv(process.env, provider.set, provider.clear) } : {}),
+        },
       })
       try {
         const info = await q.accountInfo()
@@ -107,7 +116,10 @@ export const claudeRuntime: AgentRuntime = {
           // different thing to tell the user about.
           via: provider && provider !== 'firstParty' ? 'cloud' : 'subscription',
           ...(email ? { account: email } : {}),
-          ...(provider ? { plan: provider } : {}),
+          /* `apiProvider` used to be reported as the PLAN, which is how the raw
+             string `firstParty` came to be printed on the settings page next to
+             an email address. It is not a plan, it is somebody else's word for a
+             backend — and the backend is named properly on its own row now. */
         }
       } finally {
         await q.interrupt().catch(() => {})
@@ -156,6 +168,10 @@ export const claudeRuntime: AgentRuntime = {
       ...(spec.resume ? { resume: spec.resume } : {}),
       ...(spec.log ? { log: spec.log } : {}),
       ...(spec.provider ? { provider: spec.provider } : {}),
+      // What a custom endpoint said its models cost. Without this the session
+      // prices Anthropic's models and nothing else, and every run on a gateway
+      // reads `≥ $0.00`.
+      ...(spec.modelBook ? { modelBook: spec.modelBook } : {}),
       ...(spec.env ? { env: spec.env } : {}),
       ...(spec.envClear ? { envClear: spec.envClear } : {}),
       ...(spec.model ? { model: spec.model } : {}),

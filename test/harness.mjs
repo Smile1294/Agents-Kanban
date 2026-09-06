@@ -92,6 +92,10 @@ export function makeVscodeStub(ctl) {
   const posted = []
   /** The host's inbound message handlers, one per webview surface. */
   const handlers = []
+  /** `onDidChangeConfiguration` listeners, so a test can edit a setting the way
+   *  a person does. Stubbed to nothing, every path that re-derives state from a
+   *  settings change was unreachable from a test. */
+  const configListeners = []
   const infos = []
   const errors = []
   const folders = [{ uri: { fsPath: ctl.repo ?? '' }, name: 'proj', index: 0 }]
@@ -122,6 +126,50 @@ export function makeVscodeStub(ctl) {
         calls.push('createWebviewPanel:' + id)
         const viewStateListeners = []
         const disposeListeners = []
+        /* The SETTINGS tab is not the board, and conflating them made the
+           harness lie about the window.
+           Every panel used to set `boardPanelOpen` and claim
+           `setBoardPanelVisible`, so opening settings told the focus rules a
+           board had appeared and handed the "hide the board" control to a
+           different tab. It also had a quieter cost: the settings page's own
+           message handler was unreachable, so everything it can do — including
+           choosing which of a backend's models the composer offers — was
+           testable only by reading the code. */
+        if (id === 'agentsKanban.settings') {
+          /* Its own handlers and its own outbox.
+             The page registers its handler AFTER this function returns, so it
+             cannot be picked out of the shared list by position — it has to be
+             captured as it arrives. And its `postMessage` payload is
+             `{type:'state', state}`, the same shape the BOARD posts, so sharing
+             one outbox would let a settings refresh answer a question asked
+             about the board. Two surfaces, two mailboxes. */
+          const own = []
+          const outbox = []
+          const base = makeWebview()
+          const webview = {
+            ...base,
+            onDidReceiveMessage: (fn) => { own.push(fn); return disposable },
+            postMessage: async (m) => { outbox.push(m); return true },
+          }
+          const panel = {
+            webview,
+            reveal() { calls.push('reveal:' + id) },
+            dispose() { calls.push('disposePanel:' + id) },
+            visible: true,
+            onDidChangeViewState: (fn) => { viewStateListeners.push(fn); return disposable },
+            onDidDispose: (fn) => { disposeListeners.push(fn); return disposable },
+            iconPath: undefined,
+          }
+          ctl.settings = {
+            panel,
+            posted: outbox,
+            /** Speak to the page's host exactly as the real webview does. */
+            send: async (msg) => { for (const fn of own) await fn(msg) },
+            /** The most recent state it was handed. */
+            state: () => [...outbox].reverse().find((m) => m?.type === 'state')?.state,
+          }
+          return panel
+        }
         ctl.boardPanelOpen = true
         const panel = {
           webview: makeWebview(),
@@ -242,7 +290,11 @@ export function makeVscodeStub(ctl) {
     workspace: {
       get workspaceFolders() { return ctl.noFolder ? undefined : folders },
       onDidChangeWorkspaceFolders: () => disposable,
-      onDidChangeConfiguration: () => disposable,
+      /* A REAL event, because a settings change is a real code path: the
+         extension re-derives which agents are installed and which backend is
+         active when one fires. Stubbed to nothing, all of that was unreachable
+         from a test. `ctl.changeConfig` is how a test edits a setting. */
+      onDidChangeConfiguration: (fn) => { configListeners.push(fn); return disposable },
       getConfiguration: () => ({
         get: (k) => (ctl.config ?? {})[k],
         // Writes go back into the same object a test reads, so "saved the
@@ -284,6 +336,14 @@ export function makeVscodeStub(ctl) {
    *  board's webview is no longer visible, and it hears about it. */
   function takesTheActiveGroup() {
     if (ctl.boardPanelOpen && ctl.setBoardPanelVisible) ctl.setBoardPanelVisible(false)
+  }
+
+  /** Edit a setting and tell the extension, as VS Code would. */
+  ctl.changeConfig = async (patch) => {
+    Object.assign(ctl.config, patch)
+    const keys = Object.keys(patch)
+    const event = { affectsConfiguration: (k) => keys.some((n) => `agentsKanban.${n}` === k || k === 'agentsKanban') }
+    for (const fn of configListeners) await fn(event)
   }
 
   return { vscode, calls, cmds, posted, handlers, infos, errors, folders, makeWebview, layout }

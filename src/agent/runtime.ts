@@ -43,8 +43,9 @@
 import type { EventEmitter } from 'node:events'
 import type { AgentState } from '../board/config.ts'
 import type { AttachedImage } from './images.ts'
+import type { ModelBook } from '../sessions/usage.ts'
 import type { EffortLevel, ThinkingMode } from '../sessions/meta.ts'
-import type { ProviderProfile } from './providers.ts'
+import type { ProviderEnv, ProviderProfile } from './providers.ts'
 
 /** Runtimes the board knows how to drive.
  *
@@ -473,6 +474,21 @@ export interface RunSpec {
   /** The provider profile this run was started under, for the reconciliation
    *  readout. Only meaningful when `capabilities.providerProfiles`. */
   provider?: ProviderProfile
+  /**
+   * What a custom endpoint's models cost and how big their windows are.
+   *
+   * Runtime-neutral because the QUESTION is — "what did this model cost?" — even
+   * though only the runtimes that report token usage in dollars can answer it.
+   * A runtime that meters differently (Codex reports how full a plan window is,
+   * not a bill) ignores it, which is the same thing it does with `thinking`.
+   *
+   * It is on this interface rather than tucked inside the provider block for a
+   * reason worth remembering: an object SPREAD into a typed argument does not
+   * get excess-property checking, so a field that is not declared here is
+   * dropped silently and compiles. That is how a price book can be threaded all
+   * the way from settings to a session and price nothing.
+   */
+  modelBook?: ModelBook
   /** The board tools, as a runtime-neutral description. Claude gets them as an
    *  in-process SDK MCP server; Codex gets the same definitions over stdio.
    *  See `board-mcp.ts`. */
@@ -527,9 +543,20 @@ export interface AgentRuntime {
    *  never `node_modules`. Undefined means not installed. */
   detect(configured?: string): Promise<RuntimeLocation | undefined>
 
-  /** Ask the runtime who it thinks it is. Must be able to say "signed out" and
-   *  must be able to say "I could not tell". */
-  login(loc: RuntimeLocation): Promise<LoginState>
+  /**
+   * Ask the runtime who it thinks it is, IN THE ENVIRONMENT A SESSION WOULD GET.
+   *
+   * `env` is the active provider's patch, and passing it is the difference
+   * between a true answer and a misleading one. Asked without it, Claude Code
+   * reports the login it would use on its own — which the settings page showed
+   * as *"Signed in as david@… (subscription)"* while every session the board
+   * started was going to `api.deepseek.com` with a key from the keychain. The
+   * subscription was real and entirely unused.
+   *
+   * A runtime with no provider concept ignores it. Must be able to say "signed
+   * out" and must be able to say "I could not tell".
+   */
+  login(loc: RuntimeLocation, env?: ProviderEnv): Promise<LoginState>
 
   /** What this runtime can run right now. Cached by the caller, never called on
    *  the render or activation path. */

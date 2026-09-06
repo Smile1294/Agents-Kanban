@@ -17,9 +17,10 @@
  * rather than setting them false).
  */
 import {
-  ALL_EFFORTS, catalogueFor, effortsFor, fastModeFor, mergeModels, thinkingFor, toChoices,
-  ultracodeFor, type SdkModelInfo,
+  ALL_EFFORTS, catalogueFor, effortsFor, fastModeFor, mergeModels, parseCachedChoices,
+  priceLabel, thinkingFor, toChoices, ultracodeFor, type SdkModelInfo,
 } from '../models.ts'
+import type { EndpointModel } from '../endpoint.ts'
 import type { ProviderProfile } from '../providers.ts'
 import { ultracodeWarning } from '../session.ts'
 import { MODEL_RATES, MODEL_WINDOWS, normaliseModel } from '../../sessions/usage.ts'
@@ -331,6 +332,136 @@ const by = (id: string) => choices.find((c) => c.id === id)
   ok(ultracodeWarning(true, 'not an array') === undefined, 'and neither does a malformed one')
   ok(ultracodeWarning(true, []) !== undefined,
      'but an EMPTY list is a real answer: there is no Workflow tool in it')
+}
+
+// --- THE CUSTOM ENDPOINT, which is where the picker was wrong -----------------
+//
+// This section is a bug report with assertions on it. A real profile, verbatim
+// from a real `settings.json`:
+//
+//     { id: "openrouter", kind: "gateway", baseUrl: "https://api.deepseek.com/anthropic",
+//       models: ["default","opus[1m]","claude-fable-5-1[1m]","sonnet","sonnet[1m]","haiku"] }
+//
+// Six Claude aliases declared against DeepSeek. Nobody typed them: the provider
+// test read `Query.supportedModels()` — Claude Code's own list, which answers
+// for Claude Code however `ANTHROPIC_BASE_URL` is pointed — offered to "use
+// these models in the picker", and saved them. A declared list outranks
+// everything, so the composer offered those six and nothing else, and every one
+// of them fails at the first request. The owner's words: "I literally don't
+// have access to it in my options."
+{
+  const DEEPSEEK: EndpointModel[] = [
+    { id: 'deepseek-chat', label: 'DeepSeek Chat', contextWindow: 128_000, rate: { input: 0.28, output: 0.42 } },
+    { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner', contextWindow: 128_000, rate: { input: 0.55, output: 2.19 } },
+  ]
+  const deps = { normaliseModel, windows: MODEL_WINDOWS, windowLabel }
+  const builtin = MODELS.map((m) => ({ ...m, efforts: [...ALL_EFFORTS], thinking: true, ultracode: false, fastMode: false }))
+  const broken = {
+    models: ['default', 'opus[1m]', 'claude-fable-5-1[1m]', 'sonnet', 'sonnet[1m]', 'haiku'],
+  }
+
+  // Before: nothing to check the declared list against, so it stands.
+  const blind = catalogueFor(broken, [], builtin, deps)
+  ok(blind.source === 'profile' && blind.choices.length === 6,
+     'with no endpoint answer a declared list still wins — that rule is not what was wrong')
+
+  // After: the endpoint has been asked, and it serves none of them.
+  const healed = catalogueFor(broken, [], builtin, deps, undefined,
+                              { models: DEEPSEEK, host: 'api.deepseek.com' })
+  ok(healed.source === 'endpoint', 'a declared list that names NOTHING the endpoint serves is not honoured')
+  ok(healed.choices.map((c) => c.id).join() === 'deepseek-chat,deepseek-reasoner',
+     'the models the endpoint actually serves are offered instead')
+  ok(!!healed.problem && healed.problem.includes('api.deepseek.com') && healed.problem.includes('6'),
+     'and it SAYS so, naming the host and the count — a setting overruled in silence is the next surprise')
+  // A menu footer, not a report. The long version — which ids, and where to fix
+  // them — belongs on the settings page, where the ticks are.
+  ok((healed.problem ?? '').length < 90, `and says it in one line (${(healed.problem ?? '').length} chars)`)
+
+  // A list that selects SOME of what is served is a filter, and a filter is a
+  // legitimate thing to want: nobody picks from 431 models on every message.
+  const filtered = catalogueFor({ models: ['deepseek-chat'] }, [], builtin, deps, undefined,
+                                { models: DEEPSEEK, host: 'api.deepseek.com' })
+  ok(filtered.source === 'profile' && filtered.choices.length === 1,
+     'a declared list the endpoint DOES serve is still honoured — it is how you pin two models out of 431')
+  ok(!filtered.problem, 'and there is nothing to warn about')
+  ok(filtered.choices[0]?.context === '128K' && filtered.choices[0]?.contextTokens === 128_000,
+     "a pinned model still gets the endpoint's window — the label and the meter's denominator agree")
+  ok(priceLabel(filtered.choices[0]?.rate) === '$0.28/$0.42 per Mtok',
+     'and its published price, which is the whole reason the endpoint was asked')
+
+  // Partly served: honoured, but the dead entries are called out. Silence here
+  // would be a picker with a model in it that cannot work.
+  const partly = catalogueFor({ models: ['deepseek-chat', 'sonnet'] }, [], builtin, deps, undefined,
+                              { models: DEEPSEEK, host: 'api.deepseek.com' })
+  ok(partly.source === 'profile' && !!partly.problem && partly.problem.includes('sonnet'),
+     'a list that is only partly served keeps its entries and names the ones that will fail')
+
+  // ...but names a FEW of them. A footer that lists four hundred dead ids is a
+  // footer nobody reads, and the count is the part that matters.
+  const manyDead = catalogueFor(
+    { models: ['deepseek-chat', 'a', 'b', 'c', 'd', 'e'] }, [], builtin, deps, undefined,
+    { models: DEEPSEEK, host: 'api.deepseek.com' },
+  )
+  ok(/\+2 more/.test(manyDead.problem ?? ''),
+     `a long list of dead ids is summarised rather than printed (${manyDead.problem})`)
+
+  // Nothing declared: the endpoint IS the list.
+  const open = catalogueFor({}, [], builtin, deps, undefined, { models: DEEPSEEK, host: 'api.deepseek.com' })
+  ok(open.source === 'endpoint' && open.choices.length === 2,
+     'with nothing declared the endpoint\u2019s own list is what the picker shows')
+
+  // And the ordering that is the actual fix.
+  const cli = toChoices(REAL, normaliseModel, MODEL_WINDOWS, windowLabel)
+  const both = catalogueFor({}, cli, builtin, deps, undefined, { models: DEEPSEEK, host: 'api.deepseek.com' })
+  ok(both.source === 'endpoint',
+     'the ENDPOINT outranks the CLI: `supportedModels()` describes Claude Code, not the endpoint it is pointed at')
+  ok(!both.choices.some((c) => c.id === 'sonnet'),
+     'so no Claude alias reaches a picker in front of a DeepSeek endpoint')
+
+  // The floor is unchanged. An empty picker reads as a broken extension.
+  ok(catalogueFor({}, [], builtin, deps, 'offline', { models: [], host: 'x' }).source === 'builtin',
+     'an endpoint that answered with nothing falls through to the CLI and then the built-in list')
+}
+
+// --- what the picker SHOWS about a model ------------------------------------
+//
+// A list of ids is not a choice anybody can make. These two numbers are what
+// turn it into one, and both are absent from the built-in tables for every
+// model this extension has never heard of.
+{
+  ok(priceLabel(undefined) === undefined, 'no price is ABSENT — a blank says "not stated"')
+  ok(priceLabel({ input: 0, output: 0 }) === 'Free',
+     'while a genuine zero says Free — $0.00 for an unknown price is the mistake this avoids')
+  ok(priceLabel({ input: 0.0000005, output: 10 })?.startsWith('<$0.0001') === true,
+     'a price too small to write does not round to $0, which would read as free')
+  ok(priceLabel({ input: 3, output: 15 }) === '$3.00/$15 per Mtok', 'and an ordinary one reads plainly')
+
+  const one = toChoices([{ value: 'claude-opus-5' }], normaliseModel, MODEL_WINDOWS, windowLabel)[0]!
+  ok(one.context === '1M' && one.contextTokens === 1_000_000,
+     'the window is carried as a NUMBER as well as a label — a label cannot be measured against anything')
+}
+
+// --- the cache, which outlives the build that wrote it ----------------------
+{
+  const rich = [{
+    id: 'deepseek-chat', label: 'DeepSeek Chat', context: '128K', contextTokens: 128_000,
+    rate: { input: 0.28, output: 0.42 }, efforts: ['high'], thinking: true, ultracode: false, fastMode: false,
+  }]
+  const back = parseCachedChoices(JSON.parse(JSON.stringify(rich)))
+  ok(back[0]?.contextTokens === 128_000 && back[0]?.rate?.input === 0.28,
+     'a cached choice keeps its window and price — written on every refresh and lost on every read is the bug this repeats otherwise')
+
+  // Written by a build before those fields existed. Not a rejection: this cache
+  // is re-asked on a miss, and discarding every entry for a MISSING optional
+  // would re-spawn a CLI on every launch.
+  const old = parseCachedChoices([{
+    id: 'claude-opus-5', label: 'Opus 5', context: '1M',
+    efforts: ['high'], thinking: true, ultracode: false, fastMode: false,
+  }])
+  ok(old.length === 1 && old[0]?.rate === undefined,
+     'an entry from an older build still reads, with the new fields simply absent')
+  ok(parseCachedChoices([{ id: 'x', label: 'x', context: '1M', efforts: [], thinking: true, ultracode: false, fastMode: false, rate: { input: 1 } }])[0]?.rate === undefined,
+     'but a half-written rate is dropped rather than half-applied')
 }
 
 console.log(fails ? `\n${fails} model test(s) failed` : '\nall model tests passed')

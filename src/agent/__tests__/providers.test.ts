@@ -462,7 +462,7 @@ const SAMPLE: Record<string, ProviderProfile> = {
        `preset "${preset.id}" is structurally sound`)
   }
 
-  const direct = ['openrouter', 'ollama', 'llamacpp', 'vllm']
+  const direct = ['openrouter', 'deepseek', 'ollama', 'llamacpp', 'vllm']
   for (const id of direct) {
     const preset = PROVIDER_PRESETS.find((x) => x.id === id)
     ok(!!preset, `there is a preset for ${id}`)
@@ -488,6 +488,49 @@ const SAMPLE: Record<string, ProviderProfile> = {
   // segment is a 404 that reads as "OpenRouter is down".
   ok(env.set.ANTHROPIC_BASE_URL === 'https://openrouter.ai/api',
      `the base URL does not double the version segment (${env.set.ANTHROPIC_BASE_URL})`)
+}
+
+// --- the model Claude Code reaches for on its OWN ---------------------------
+//
+// The failure this guards is invisible while the thing you are watching works.
+// The CLI runs small errands — naming a session, and other things it never
+// shows you — on a haiku-class model it names by ANTHROPIC's id. Against a
+// backend serving `deepseek-chat` those requests 404 for the life of every
+// session, silently, while the conversation itself is fine.
+{
+  const env = envForProfile(
+    { id: 'ds', kind: 'gateway', baseUrl: 'https://api.deepseek.com/anthropic', smallModel: 'deepseek-chat' },
+    'sk-test',
+  )
+  ok(env.set.ANTHROPIC_DEFAULT_HAIKU_MODEL === 'deepseek-chat', 'the background model is set')
+  ok(env.set.ANTHROPIC_SMALL_FAST_MODEL === 'deepseek-chat',
+     'under BOTH names — which one a given CLI reads is not something this extension can know, and writing one is a fix that silently does nothing on half of them')
+  ok(PROVIDER_VARS.includes('ANTHROPIC_DEFAULT_HAIKU_MODEL') && PROVIDER_VARS.includes('ANTHROPIC_SMALL_FAST_MODEL'),
+     'and both are cleared by a profile that does not set them — left over from another backend they point at a model this one does not serve')
+
+  const plain = envForProfile({ id: 'g', kind: 'gateway', baseUrl: 'https://example.test' })
+  ok(plain.set.ANTHROPIC_DEFAULT_HAIKU_MODEL === undefined,
+     'a gateway serving Claude\u2019s own models sets neither — the CLI\u2019s default is right there')
+  ok(plain.clear.includes('ANTHROPIC_SMALL_FAST_MODEL'), 'it drops them instead')
+
+  const parsed = parseProfiles([{ id: 'ds', kind: 'gateway', baseUrl: 'https://x.test', smallModel: ' deepseek-chat ' }])
+  ok(parsed.find((p) => p.id === 'ds')?.smallModel === 'deepseek-chat',
+     'and it survives the round trip through settings.json — a field written and not parsed back is not persisted')
+}
+
+// --- DeepSeek, because guessing at one is how the broken profile happened ----
+{
+  const preset = PROVIDER_PRESETS.find((p) => p.id === 'deepseek')
+  ok(!!preset, 'there is a DeepSeek preset')
+  ok(preset?.profile.baseUrl === 'https://api.deepseek.com/anthropic',
+     'pointed at the Anthropic-compatible path, not the OpenAI one')
+  ok(preset?.profile.authStyle === 'bearer',
+     'with Bearer auth — the same key in x-api-key is a correct key that 401s')
+  ok(!!preset?.profile.smallModel, 'and a background model, or its errands 404 forever in silence')
+  ok(!/via proxy/i.test(preset?.needs ?? '') && /no proxy/i.test(preset?.needs ?? ''),
+     'and it says NO PROXY explicitly — DeepSeek serves /v1/messages itself, and the old advice is all over the internet')
+  ok(/deepseek-chat/.test(preset?.needs ?? ''),
+     'and it names the real model ids, because the ones people expect — sonnet, opus — are the ids that broke this')
 }
 
 console.log(fails ? `\n${fails} provider test(s) failed` : '\nall provider tests passed')

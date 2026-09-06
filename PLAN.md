@@ -86,6 +86,12 @@ src/
     board-bridge.ts     The board's tools over a socket, for a runtime that
                         spawns MCP servers rather than taking one in-process
     sdk.ts              Lazy ESM loader; resolves the `claude` binary
+    providers.ts        WHICH BACKEND: a profile -> an environment patch
+    endpoint.ts         What a custom endpoint says it serves, asked of the
+                        endpoint — ids, windows and prices. Never the CLI's list
+    models.ts           Which models the picker offers, and where the list came
+                        from (endpoint -> CLI -> built-in)
+    probe.ts            Is this backend there, and will it have us?
     tools.ts            In-process MCP tools the agent uses on its own card
     session.ts          One query() run: streaming, permissions, usage, interrupt
     manager.ts          N concurrent agents, one worktree each
@@ -269,7 +275,7 @@ forgiving moment for two of them to overlap.
 ---
 ## 8. Current state
 
-`npm run verify` — typecheck, 20 test files, build, launch gates.
+`npm run verify` — typecheck, 31 test files, build, launch gates.
 `npm run verify:package` — packages a `.vsix` and checks what is inside it.
 
 Every task goes through `scripts/with-node.sh`, which finds a Node 22.6+ before
@@ -322,7 +328,15 @@ Working:
   `retainContextWhenHidden`, because the quick pick it replaced closed on a
   misclick and took the half-typed gateway URL with it. Whether each agent is
   installed and signed in comes from ASKING it, and "could not tell" is never
-  shown as "signed out"
+  shown as "signed out". A custom endpoint's own catalogue is browsable there,
+  with a tick per model deciding what the composer offers
+- **A custom endpoint's models come from the endpoint.**
+  `GET <baseUrl>/v1/models`, ranked above `Query.supportedModels()` — which
+  answers for Claude Code however `ANTHROPIC_BASE_URL` is pointed, and had been
+  saved onto a DeepSeek profile as though DeepSeek served `sonnet` and `haiku`.
+  The context window and per-token price it publishes reach the picker AND both
+  spend meters, so a session on a router shows a real figure instead of
+  `≥ $0.00`. See [`src/agent/endpoint.ts`](src/agent/endpoint.ts)
 - Archive (soft, reversible) and permanent delete
 - Permission prompts inline on the card
 - Multiple tags per session

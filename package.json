@@ -302,7 +302,11 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "Model ids to offer in the picker instead of the built-in Claude ones. Needed off first-party: Bedrock wants us.anthropic.claude-opus-5, and a router serving another model needs its own id."
+                "description": "Model ids to OFFER in the composer, out of what the backend serves. Leave it out and every model the endpoint reports is offered; set it to pin a few out of a long catalogue \u2014 OpenRouter serves over four hundred. Off first-party it is also how you name ids we cannot derive: Bedrock wants us.anthropic.claude-opus-5. Ids the endpoint does not serve are reported rather than silently honoured, because this extension used to write the WRONG ones here \u2014 Claude Code's own aliases, saved onto a profile pointed at something else."
+              },
+              "smallModel": {
+                "type": "string",
+                "description": "The model Claude Code should use for its OWN background work \u2014 naming a session, and other errands it never shows you. On a backend that does not serve Claude's models those requests name a model that does not exist and fail silently for the life of every session. Sets both ANTHROPIC_DEFAULT_HAIKU_MODEL and ANTHROPIC_SMALL_FAST_MODEL. Leave empty on a backend that serves Claude's models."
               },
               "contextWindow": {
                 "type": "number",
@@ -322,7 +326,7 @@
         "agentsKanban.discoverModels": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Ask the `claude` CLI which models it can actually run, instead of using a built-in list. This is what puts newly released models \u2014 and the ones your provider serves \u2014 in the picker without waiting for an extension update, and it is where the per-model effort levels and extended-thinking support come from. The answer is cached per provider; refresh it with **Agents Kanban: Refresh Model List**. Turn this off to use the built-in list only."
+          "markdownDescription": "Ask the backend which models it can actually run, instead of using a built-in list. For a custom endpoint (`kind: gateway`) that means the ENDPOINT itself, over `GET <baseUrl>/v1/models` \u2014 not the `claude` CLI, whose answer is about Claude Code however `ANTHROPIC_BASE_URL` is pointed, which is how a DeepSeek profile came to offer `sonnet` and `haiku`. It is also where the context window and per-token price shown beside each model come from, and so where the spend figure on a non-Anthropic session comes from. For every other backend it is the `claude` CLI. This is what puts newly released models \u2014 and the ones your provider serves \u2014 in the picker without waiting for an extension update, and it is where the per-model effort levels and extended-thinking support come from. The answer is cached per provider; refresh it with **Agents Kanban: Refresh Model List**. Turn this off to use the built-in list only."
         },
         "agentsKanban.runtime": {
           "type": "string",

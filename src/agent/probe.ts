@@ -36,15 +36,25 @@
  *     the Messages API at that path. Costs a single token, and only when the
  *     credential is accepted.
  *
+ *  3. **What does it actually serve?** `GET <base>/v1/models`, asked here
+ *     because this is the moment the credential is known to work. Emphatically
+ *     NOT `Query.supportedModels()`, which answers for Claude Code however
+ *     `ANTHROPIC_BASE_URL` is pointed — this probe used to report that list as
+ *     the gateway's, `testProvider()` saved it onto the profile, and a DeepSeek
+ *     endpoint ended up declaring `sonnet` and `haiku`. See `endpoint.ts`.
+ *
  * For the cloud kinds the endpoint belongs to the provider and authentication
  * runs through their SDK chain, so the probe confirms which backend was
  * SELECTED and says so in exactly those words — it does not claim the
- * credential works, because it has not asked.
+ * credential works, because it has not asked. Their model list IS the CLI's,
+ * legitimately: the backend serves Claude's models and the CLI resolves the ids
+ * for it.
  *
  * It reports rather than throws. "Could not reach it" is the answer to the
  * question being asked, not an exceptional condition.
  */
 import { withSilentQuery, ConnectError, type ConnectOptions } from './connect.ts'
+import { fetchEndpointModels, type EndpointModel } from './endpoint.ts'
 import { reconcileProvider, resolvedLabel, type ProviderProfile, type ProviderEnv } from './providers.ts'
 
 export interface ProbeResult {
@@ -56,9 +66,26 @@ export interface ProbeResult {
   /** Where the credential came from, as the CLI sees it. Worth showing: it is
    *  how "my key is ignored because I am still logged in" becomes visible. */
   apiKeySource?: string
-  /** Model ids this backend offers, if it said. The honest source for a picker
-   *  on a provider whose ids we cannot know. */
+  /**
+   * Model ids this backend offers, if it said.
+   *
+   * For a CLOUD or first-party profile this is Claude Code's own list, which is
+   * the right answer there: the backend serves Claude's models and the CLI
+   * resolves the ids for it.
+   *
+   * For a `gateway` it is emphatically NOT the CLI's list, and that distinction
+   * is the bug this field carries a warning about. `supportedModels()` is
+   * assembled from the CLI's `initialize` response before any API request is
+   * made, so it answers `sonnet, haiku, opus[1m]` no matter where
+   * `ANTHROPIC_BASE_URL` points — and those ids were being saved onto a
+   * DeepSeek profile as though DeepSeek served them. A gateway's list comes
+   * from the gateway, in `catalogue`.
+   */
   models?: string[]
+  /** What the endpoint itself reported, with windows and prices where it
+   *  publishes them. Gateway profiles only — nobody else's endpoint is ours to
+   *  ask. */
+  catalogue?: EndpointModel[]
   /** True when the CLI answered but on a different backend than asked for. */
   mismatch?: boolean
   /** HTTP status from the endpoint check, when one ran. */
@@ -238,8 +265,14 @@ export async function probeProvider(
     // it has made no API request, so it cannot know whether the endpoint exists.
     // A gateway is therefore checked for real before anything is claimed.
     let endpoint: EndpointCheck | undefined
+    /** The gateway's OWN model list. Asked for here rather than by a separate
+     *  button because this is the moment the credential is known to work, and a
+     *  picker full of the wrong ids is the failure the whole test is for. */
+    let catalogue: EndpointModel[] | undefined
+    let catalogueProblem: string | undefined
     if (profile.kind === 'gateway' && profile.baseUrl?.trim()) {
-      endpoint = await checkEndpoint(profile.baseUrl.trim(), credentialHeaders(env.set), {
+      const headers = credentialHeaders(env.set)
+      endpoint = await checkEndpoint(profile.baseUrl.trim(), headers, {
         timeoutMs: Math.min(timeoutMs, 8_000),
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
         ...(opts.connect ? { connect: opts.connect } : {}),
@@ -252,11 +285,25 @@ export async function probeProvider(
           ...(endpoint.status ? { status: endpoint.status } : {}),
         }
       }
+      const list = await fetchEndpointModels(profile.baseUrl.trim(), headers, {
+        timeoutMs: Math.min(timeoutMs, 10_000),
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      })
+      if (list.models.length) catalogue = list.models
+      else catalogueProblem = list.problem
     }
 
     const credential = info?.apiKeySource && info.apiKeySource !== 'none'
       ? ` Credential: ${info.apiKeySource}.` : ''
-    const modelNote = ids?.length ? ` ${ids.length} models available.` : ''
+    /* A gateway is described by ITS list, never by the CLI's. Saying "6 models
+       available" off `supportedModels()` while pointed at DeepSeek is a
+       sentence about Claude Code dressed up as a sentence about DeepSeek. When
+       the endpoint would not say, the probe says that instead — an unanswered
+       question is a real answer and the user has to type the ids by hand. */
+    const backendIds = profile.kind === 'gateway' ? catalogue?.map((m) => m.id) : ids
+    const modelNote = profile.kind === 'gateway' && !catalogue?.length
+      ? ` ${catalogueProblem ?? 'It did not report a model list, so the model ids have to be typed in by hand.'}`
+      : backendIds?.length ? ` ${backendIds.length} models available.` : ''
 
     if (!resolved) {
       return {
@@ -266,7 +313,8 @@ export async function probeProvider(
           'Claude Code accepted the configuration. This CLI did not report which ' +
           'provider it is on, which older versions do not.' + credential + modelNote,
         ...(info?.apiKeySource ? { apiKeySource: info.apiKeySource } : {}),
-        ...(ids?.length ? { models: ids } : {}),
+        ...(backendIds?.length ? { models: backendIds } : {}),
+        ...(catalogue?.length ? { catalogue } : {}),
         ...(endpoint?.status ? { status: endpoint.status } : {}),
       }
     }
@@ -288,7 +336,8 @@ export async function probeProvider(
             ' The first request will confirm the credentials.',
       resolved,
       ...(info?.apiKeySource ? { apiKeySource: info.apiKeySource } : {}),
-      ...(ids?.length ? { models: ids } : {}),
+      ...(backendIds?.length ? { models: backendIds } : {}),
+      ...(catalogue?.length ? { catalogue } : {}),
       ...(endpoint?.status ? { status: endpoint.status } : {}),
       ...(ok ? {} : { mismatch: true }),
     }

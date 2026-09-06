@@ -16,6 +16,7 @@ import { AgentSession, type PermissionRequest } from './session.ts'
 import type { AttachedImage } from './images.ts'
 import { boardToolNames, createBoardServer, type BoardChange, type BoardNotice, type BoardToolContext } from './tools.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
+import type { ModelBook } from '../sessions/usage.ts'
 import {
   DEFAULT_RUNTIME, getRuntime, parseMeter, type AgentRun, type Meter, type RuntimeId,
 } from './runtime.ts'
@@ -69,6 +70,11 @@ export interface ManagerOptions {
    *  file never touches a credential and `providers.ts` stays the only place
    *  that knows a variable name. */
   providerEnv?: ProviderEnv
+  /** Prices and windows for models the built-in tables cannot know — what a
+   *  custom endpoint published about itself. Handed to every session so the
+   *  live spend figure uses the same arithmetic as the one totalled from the
+   *  transcript after the run ends. */
+  modelBook?: ModelBook
   /**
    * Ask the user before fanning a card out into N billed agents.
    *
@@ -349,6 +355,22 @@ export class AgentManager extends EventEmitter {
     else delete this.opts.provider
     if (env) this.opts.providerEnv = env
     else delete this.opts.providerEnv
+  }
+
+  /**
+   * What a custom endpoint's models cost, for runs started from now on.
+   *
+   * Next run only, like the provider, and for a related reason: the book is
+   * read at session construction and a live run is already pricing its turns
+   * with the one it was given. In practice there is no gap — the book is built
+   * from cached catalogues at activation, before any run can start — and the
+   * one case that remains, refreshing a catalogue while an agent is mid-turn,
+   * settles itself: the card's figure is re-totalled from the transcript when
+   * the run ends, through `SessionStore`, which holds the SAME book. Until then
+   * it reads `≥`, which is what "we cannot price this" is supposed to say.
+   */
+  setModelBook(book: ModelBook): void {
+    this.opts.modelBook = book
   }
 
   /** Find a live run by either key — the UI may hold whichever it saw first. */
@@ -1164,6 +1186,11 @@ export class AgentManager extends EventEmitter {
       ...(boardTools ? { boardTools } : {}),
       ...(this.opts.log ? { log: this.opts.log } : {}),
       ...provider,
+      // Not inside `provider`: a price is arithmetic, not backend selection,
+      // and it is declared on `RunSpec` so the compiler can see it. A field
+      // spread into a typed argument gets no excess-property check, so an
+      // undeclared one compiles and is dropped in silence.
+      ...(this.opts.modelBook ? { modelBook: this.opts.modelBook } : {}),
       ...(this.opts.defaults.model ? { model: this.opts.defaults.model } : {}),
       ...(effort ? { effort } : {}),
       // Only sent when the runtime has the concept. `thinking` is Claude's

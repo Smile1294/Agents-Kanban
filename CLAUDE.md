@@ -225,6 +225,19 @@ run, since each session needs a worktree.
   already counted — so its fill is the turn total. Verified against a real
   rollout: `total_tokens` 14270 == `input_tokens` 14041 + `output_tokens` 229,
   with `cached_input_tokens` 12160 inside the input figure.
+- **One picker for "what does this run on", not two.** The composer offered an
+  AGENT picker and the settings page owned the BACKEND, so choosing what a
+  session runs on was a cross product the user had to do in their head — and the
+  bar showed only half of it: `Claude Code` beside a model list from DeepSeek,
+  because the backend lived on another screen. Reported as "how the fuck does
+  that make sense", and fairly. `composer.agents` is one flat list of runnable
+  combinations keyed `<runtime>|<profile>`, picking one sets BOTH halves in a
+  single `setComposer` branch (two branches meant two model refreshes racing,
+  which files one backend's models under another's name), and a runtime that
+  `detect()` says is missing is ABSENT rather than disabled — a session started
+  on an agent that is not installed fails at its first step. Not checked yet
+  still shows: hiding what we have not looked for is the same mistake as
+  asserting a state we did not read.
 - **Configuration goes on the settings PAGE; per-session choices stay on the
   composer.** A quick pick closes when focus moves and takes a half-typed
   gateway URL with it, which is a control that loses your work. So agents,
@@ -295,6 +308,26 @@ run, since each session needs a worktree.
   people off to regenerate a working key. Cloud kinds say "configured for X, the
   first request will confirm the credentials", never "connected" — they have not
   asked. See [docs/DECISIONS.md](docs/DECISIONS.md).
+- **A custom endpoint's model list comes from the ENDPOINT, and the CLI's list
+  is about the CLI.** `Query.supportedModels()` is assembled from `initialize`
+  before any API request leaves the machine, so it answers `sonnet`, `haiku`,
+  `opus[1m]` however `ANTHROPIC_BASE_URL` is pointed. The probe reported that as
+  the gateway's list, `testProvider()` offered to save it, and a profile's
+  declared list outranks everything — so a real user's DeepSeek profile ended up
+  declaring six Anthropic aliases, the composer offered exactly those, and none
+  of them could work. Every backend people point this at also serves
+  `GET <base>/v1/models` (`agent/endpoint.ts`), and that answer ranks ABOVE the
+  CLI's, is reported as `endpoint` rather than `cli` because they are different
+  claims, and brings the two facts that make a list of ids a choice: the context
+  window and the per-token price. Three things are load-bearing. A declared list
+  that matches NOTHING the endpoint serves is not a filter, it is a filter that
+  selects nothing — the endpoint's list takes over and the picker SAYS which ids
+  were dropped, because this extension wrote them. Zero is a price and `-1` is
+  not: OpenRouter serves 22 free models at `"0"` and publishes `"-1"` for "it
+  depends", so one must render as `Free` and the other as unknown, never as
+  `$0.00`. And the prices reach the METERS through `ModelBook`, given to
+  `AgentSession` and `SessionStore` alike, or a gateway session reads `≥ $0.00`
+  against a meter with no denominator. See [docs/DECISIONS.md](docs/DECISIONS.md).
 - **The model list comes from the CLI, not from a table here.** `MODELS` in
   `sessions/meta.ts` is the FALLBACK; `Query.supportedModels()` is the answer.
   The hardcoded table was wrong three ways at once and none were visible from

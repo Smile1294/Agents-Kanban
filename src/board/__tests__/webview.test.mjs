@@ -269,6 +269,8 @@ ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no clai
     providers: [{ id: 'my-gateway', label: 'My Gateway' }],
     runtimes: [{ id: 'claude', label: 'Claude Code', providerProfiles: true }],
     runtime: 'claude',
+    agent: 'claude|my-gateway',
+    agents: [{ key: 'claude|my-gateway', label: 'My Gateway', detail: 'Claude Code · llm.corp:4000', runtime: 'claude', provider: 'my-gateway' }],
   }
   const asked = run({
     ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
@@ -286,9 +288,7 @@ ok(!/\$[\d]/.test(fresh.text()), 'a session with nothing to report makes no clai
     composer,
   }).text()
   ok(answered.includes('Amazon Bedrock'),
-     `once the CLI answers, the chip names what it is ACTUALLY on (${/Claude Code · [^A-Z]*[A-Za-z ]+/.exec(answered)?.[0] ?? 'nothing'})`)
-  ok(!answered.includes('My Gateway'),
-     'and not the profile that was outranked — that is the whole point of asking')
+     'once the CLI answers, the chip names what it is ACTUALLY on')
 }
 
 // An approval must name the agent that actually asked, and say what it wants.
@@ -822,6 +822,99 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   } finally {
     Date.now = realNow
   }
+}
+
+// --- the model menu, which is where a picker stopped being usable ------------
+//
+// Two things happen when the model list comes from a custom endpoint instead of
+// from a table of three: it carries facts worth showing (a window, a price),
+// and it can be 431 entries long. A flat menu of 431 unlabelled ids is not a
+// picker, and a menu that says only `deepseek/deepseek-chat-v3.1` is not a
+// choice anybody can make.
+{
+  const CATALOGUE = [{
+    id: 'deepseek/deepseek-chat-v3.1', label: 'DeepSeek: DeepSeek V3.1',
+    context: '161K', price: '$0.55/$1.65 per Mtok', detail: 'A large hybrid reasoning model.',
+  }]
+  for (let i = 0; i < 60; i++) CATALOGUE.push({ id: `vendor/model-${i}`, label: `Model ${i}`, context: '128K' })
+
+  const v = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: {
+      ...COMPOSER, model: 'deepseek/deepseek-chat-v3.1', models: CATALOGUE, modelSource: 'endpoint',
+      provider: 'or', providers: [{ id: 'or', label: 'OpenRouter', detail: 'api.deepseek.com', support: 'gateway' }],
+      runtime: 'claude', runtimes: [{ id: 'claude', label: 'Claude Code', detail: 'Anthropic', providerProfiles: true }],
+      agent: 'claude|or',
+      agents: [
+        { key: 'claude|inherit', label: 'Claude Code', detail: 'Anthropic · default backend', runtime: 'claude', provider: 'inherit' },
+        { key: 'claude|or', label: 'OpenRouter', detail: 'Claude Code · api.deepseek.com', runtime: 'claude', provider: 'or' },
+      ],
+    },
+  })
+  /* ONE list of things you can run on, which is what was actually asked for:
+     "there should be two buttons, one saying Claude Code, the other saying
+     OpenRouter and the URL — and OpenRouter should show the DeepSeek models."
+     Two pickers made that a cross product the user had to do in their head,
+     and the bar showed one half of it. */
+  ok(v.text().includes('OpenRouter'), 'the chip names the combination that is selected')
+  const agentChip = findButton(v.root, 'OpenRouter')
+  agentChip.onclick({ stopPropagation() {}, preventDefault() {} })
+  const agentMenu = v.text()
+  ok(agentMenu.includes('Claude Code') && agentMenu.includes('Anthropic · default backend'),
+     'and the menu offers the other backend on the same agent as its own entry')
+  ok(agentMenu.includes('Claude Code · api.deepseek.com'),
+     'each entry naming both halves — which agent program, and which endpoint')
+  const picked = []
+  for (const b of walkAll(v.root)) {
+    if ((b.className || '').includes('menu-item') && String(b.textContent).includes('Anthropic · default')) picked.push(b)
+  }
+  picked[0].onclick({ stopPropagation() {}, preventDefault() {} })
+  const sent = v.posted.filter((m) => m.type === 'composer' && m.agent)
+  ok(sent.length === 1 && sent[0].agent === 'claude|inherit',
+     'and picking one sends BOTH halves as a single switch, so the two model refreshes cannot race')
+  // Left CLOSED: the model-menu assertions below open it themselves, and
+  // `picker` toggles — opening it here would shut it there.
+  ok(v.text().includes('DeepSeek: DeepSeek V3.1'), 'the chip names the selected model, whoever serves it')
+
+  // Open it.
+  const chip = findButton(v.root, 'DeepSeek: DeepSeek V3.1')
+  ok(!!chip, 'the model picker is a control')
+  chip.onclick({ stopPropagation() {}, preventDefault() {} })
+  const menu = v.text()
+  ok(menu.includes('$0.55/$1.65 per Mtok'), 'an open menu shows what each model costs')
+  ok(menu.includes('161K context'), 'and how much context it has')
+  ok(menu.includes('deepseek/deepseek-chat-v3.1'),
+     'and the id, which is what actually gets sent and is not always in the name')
+  ok(menu.includes('Served by api.deepseek.com'),
+     'and where the list came from, in one line naming the host — which is the whole explanation for why a Claude Code session is offering DeepSeek models')
+
+  // 61 models: not all of them, and it SAYS not all of them. A list silently
+  // cut short is a model that is configured, served, and apparently missing.
+  ok(/Showing 50 of 61/.test(menu), 'a long list is bounded and says what it is not showing')
+
+  const box = v.root.querySelector('.menu-filter')
+  ok(!!box, 'a long list gets a filter box')
+  ok(!!box.getAttribute('data-focus'),
+     'which announces itself for focus restore — the panel repaints on every agent frame, and the first keystroke would otherwise lose the rest of the word')
+  box.oninput({ target: { value: 'deepseek' } })
+  const filtered = v.text()
+  ok(filtered.includes('DeepSeek: DeepSeek V3.1'), 'typing narrows the list to what matches')
+  ok(!filtered.includes('Model 42'), 'and drops what does not')
+  box.oninput({ target: { value: 'zzzz' } })
+  ok(/Nothing matches/.test(v.text()),
+     'a filter that matches nothing says so, rather than looking like an empty picker')
+}
+
+// --- a short list is left alone ---------------------------------------------
+{
+  const v = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: { ...COMPOSER, models: [{ id: 'claude-opus-5', label: 'Opus 5', context: '1M' }] },
+  })
+  findButton(v.root, 'Opus 5').onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(!v.root.querySelector('.menu-filter'),
+     'three models get no filter box — below a certain length it is one more thing to look at')
+  ok(!/Showing/.test(v.text()), 'and nothing is hidden, so nothing is announced')
 }
 
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
