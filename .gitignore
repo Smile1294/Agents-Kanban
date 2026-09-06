@@ -11,3 +11,9 @@ dist-test/
 # Agent worktrees, when this extension is pointed at its own repository.
 # Written automatically on first session; kept here so a fresh clone is covered.
 /.agentskanban/
+
+# Local env files and Claude Code project settings can hold credentials
+# (settings.local.json, exported keys) — never track them.
+.env
+.env.*
+.claude/

@@ -4031,20 +4031,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await loadReview(key)
     },
 
-    /** Merge the session's branch back into its base. Confirmed first: it
-     *  writes to the user's own checkout, which nothing else here does. */
-    async mergeWorktree(key) {
+    /** Merge the session's branch back into the repository. Confirmed first:
+     *  it writes to the user's own checkout, which nothing else here does.
+     *  `into` is the review panel's own base; without it the user picks a
+     *  target branch — that is the toolbar Merge button's path. */
+    async mergeWorktree(key, into) {
       const w = requireWs()
       if (!w.worktrees) return
       const wt = await worktreeOf(key)
       if (!wt) { vscode.window.showInformationMessage('This session has no worktree.'); return }
 
-      const ahead = await w.worktrees.aheadOf(wt.dir, wt.base)
+      const current = await w.worktrees.currentBranch().catch(() => '')
+      let target = typeof into === 'string' && into ? into : undefined
+      if (!target) {
+        const branches = (await w.worktrees.branches()).filter((b) => b !== wt.branch)
+        const pick = await vscode.window.showQuickPick(
+          branches
+            .map((b) => ({
+              label: b,
+              description: b === current ? 'current branch' : b === wt.base ? 'what it forked from' : undefined,
+            }))
+            .sort((a, b) => (a.label === current ? -1 : b.label === current ? 1 : a.label.localeCompare(b.label))),
+          { placeHolder: `Merge ${wt.branch} into…`, ignoreFocusOut: true },
+        )
+        if (!pick) return
+        target = pick.label
+      }
+
+      const switches = target !== current
+      const ahead = await w.worktrees.aheadOf(wt.dir, target)
       const choice = await vscode.window.showWarningMessage(
-        `Merge ${wt.branch} into ${wt.base}?`,
+        `Merge ${wt.branch} into ${target}?`,
         {
           modal: true,
           detail: `${ahead} commit${ahead === 1 ? '' : 's'} will be merged into your working tree. ` +
+            (switches ? `Your checkout moves from ${current} to ${target} first. ` : '') +
             'The worktree and its branch are left in place.',
         },
         'Merge',
@@ -4054,14 +4075,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       busy = key
       refreshAll()
       try {
-        const result = await w.worktrees.merge(wt.branch, wt.base)
+        // Checkout before the merge's own clean-tree gate, so a dirty tree is
+        // refused by name rather than carried across branches or clobbered.
+        if (switches) {
+          if (!(await w.worktrees.isClean(w.worktrees.repoRoot))) {
+            vscode.window.showWarningMessage(await w.worktrees.dirtyMessage())
+            return
+          }
+          await w.worktrees.checkout(target)
+        }
+        const result = await w.worktrees.merge(wt.branch, target)
         if (result.ok) {
-          vscode.window.showInformationMessage(`Merged ${wt.branch} into ${wt.base}.`)
+          vscode.window.showInformationMessage(`Merged ${wt.branch} into ${target}.`)
         } else if (result.reason === 'conflict') {
           // Left in progress on purpose: the editor is the right place to
           // resolve it, and silently aborting would throw the work away.
           const pick = await vscode.window.showWarningMessage(
-            `${wt.base} has conflicts with ${wt.branch}.`,
+            `${target} has conflicts with ${wt.branch}.`,
             {
               modal: true,
               detail: result.files.length

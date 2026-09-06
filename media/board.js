@@ -1640,6 +1640,13 @@
         run.title = 'Start this worktree\'s app and open it in your browser'
         run.onclick = () => post('run', { id: c.key })
         head.append(run)
+        // The other half of the review loop, where you can see it: one click,
+        // then pick the branch to merge into. The host asks which branch.
+        const merge = el('button', null, 'Merge')
+        merge.title = 'Merge this branch back into the repository — pick the branch to merge into'
+        merge.disabled = s.busy === c.key
+        merge.onclick = () => post('merge', { id: c.key })
+        head.append(merge)
       }
       const arch = el('button', null, c.archived ? 'Unarchive' : 'Archive')
       arch.onclick = () => post('archive', { id: c.key, archived: !c.archived })
@@ -2076,7 +2083,7 @@
     merge.title = r.ahead
       ? 'Merge this branch into ' + r.base
       : 'Nothing committed to merge yet — commit the worktree first.'
-    merge.onclick = () => post('merge', { id: c.key })
+    merge.onclick = () => post('merge', { id: c.key, into: r.base })
     actions.append(merge)
 
     body.append(actions)

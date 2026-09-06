@@ -302,6 +302,22 @@ export class WorktreeService {
     return git(this.repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])
   }
 
+  /** Every local branch. The merge target picker needs the real list — a
+   *  branch the user can name is one they should be able to pick. */
+  async branches(): Promise<string[]> {
+    const out = await git(this.repoRoot, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'])
+    return out ? out.split('\n').filter(Boolean) : []
+  }
+
+  /** Switch the repository's own checkout to another branch. Callers check
+   *  for a dirty tree first: git refuses to carry changes across, but the
+   *  refusal names nothing, and a merge is the place work can be lost. */
+  async checkout(branch: string): Promise<void> {
+    await withRepoLock(this.repoRoot, async () => {
+      await git(this.repoRoot, ['checkout', branch])
+    })
+  }
+
   /** Parse `git worktree list --porcelain`. The main worktree is excluded. */
   async list(): Promise<WorktreeInfo[]> {
     const out = await git(this.repoRoot, ['worktree', 'list', '--porcelain'])
@@ -348,7 +364,7 @@ export class WorktreeService {
 
       const taken = new Set([
         ...existing.map((w) => path.basename(w.path)),
-        ...(await this.localBranches()).map((b) => b.replace(/^task\//, '')),
+        ...(await this.branches()).map((b) => b.replace(/^task\//, '')),
       ])
       let name = stem
       for (let n = 2; taken.has(name); n++) name = `${stem}-${n}`
@@ -374,11 +390,6 @@ export class WorktreeService {
       const head = await git(dir, ['rev-parse', 'HEAD']).catch(() => '')
       return { path: dir, branch: `task/${name}`, head, base }
     })
-  }
-
-  private async localBranches(): Promise<string[]> {
-    const out = await git(this.repoRoot, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'])
-    return out ? out.split('\n') : []
   }
 
   /** @param base the branch this worktree forked from. Without it the ahead/
@@ -551,7 +562,7 @@ export class WorktreeService {
    * the merge button. Naming the files is the fallback, because a merge refused
    * without saying what is in the way is a dead end either way.
    */
-  private async dirtyMessage(): Promise<string> {
+  async dirtyMessage(): Promise<string> {
     const porcelain = await gitRaw(this.repoRoot, ['status', '--porcelain']).catch(() => '')
     const files = porcelain.split('\n')
       .map(parsePorcelainLine)
