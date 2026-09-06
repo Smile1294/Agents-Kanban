@@ -59,10 +59,18 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
      wide — the chat did not look wrong, it looked EMPTY. */
   min-width: 0;
 }
-.rail-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; }
+.rail-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; flex-wrap: wrap; }
 .rail-title { font-size: 0.78em; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-.rail-head .pill { margin-left: auto; font-size: 0.82em; }
-.search, .composer textarea {
+/* The rail head now holds two pills (mode + search). The FIRST one takes the
+   auto margin that pins the pair to the right edge; the second follows it at
+   the head's own gap. With an auto margin on every pill they split the free
+   space and drift apart mid-head. And the head wraps: at narrow window widths
+   the pills drop to their own line rather than shoving the title into
+   ellipsis — a wrapped chip row reads as deliberate, a truncated title does
+   not. */
+.rail-head .pill { font-size: 0.82em; }
+.rail-head .pill:first-of-type { margin-left: auto; }
+.search, .composer textarea, .ts-input {
   font: inherit;
   color: var(--vscode-input-foreground);
   background: var(--vscode-input-background);
@@ -71,7 +79,7 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
   padding: 5px 9px;
 }
 .search { margin: 0 12px 8px; }
-.search:focus, .composer textarea:focus { outline: 1px solid var(--vscode-focusBorder); border-color: var(--vscode-focusBorder); }
+.search:focus, .composer textarea:focus, .ts-input:focus { outline: 1px solid var(--vscode-focusBorder); border-color: var(--vscode-focusBorder); }
 .new-session { margin: 0 12px 10px; }
 .rail-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
 .rail-group {
@@ -560,6 +568,23 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 .attach { flex: none; }
 /* What a sent message carried. The bytes are not kept, so this is a note. */
 .prompt-images { color: var(--faint); font-size: 0.85em; margin-top: 4px; }
+.prompt-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+/* "Try again from here": a quiet ghost under the prompt bubble, so it reads as
+   part of the row rather than a board control. Inherits the `button` base
+   (border + secondary background), so the transparent overrides below are what
+   keep it quiet — without them every prompt row carries a full button. */
+.prompt-retry {
+  font-size: 0.76em; padding: 1px 8px; color: var(--faint);
+  background: transparent; border-color: transparent;
+}
+.prompt-retry:hover {
+  color: var(--run);
+  border-color: color-mix(in srgb, var(--run) 40%, transparent);
+  background: color-mix(in srgb, var(--run) 8%, transparent);
+}
+.prompt-retry:focus-visible {
+  color: var(--run); border-color: var(--vscode-focusBorder, var(--run));
+}
 .ctx-meter {
   width: 68px; height: 4px; border-radius: 2px; overflow: hidden;
   background: color-mix(in srgb, var(--vscode-foreground) 14%, transparent);
@@ -876,6 +901,50 @@ details.thinking summary::-webkit-details-marker { display: none; }
 .slash-scope { font-size: 0.86em; color: var(--faint); }
 .slash-hint { padding: 5px 10px; font-size: 0.74em; color: var(--faint); border-top: 1px solid var(--line); }
 
+/* --- the composer's dictation mic and its note ------------------------------ */
+
+/* `button` resets the cursor to default, which is wrong for a control. */
+.mic { flex: none; font-size: 1.05em; line-height: 1; padding: 5px 8px; cursor: pointer; }
+/* Recording: a solid stop glyph on a red mic, pulsing — a live capture that
+   silently ended is shown as such by state, not by this pulse alone. */
+.mic.live {
+  color: #fff; background: var(--vscode-errorForeground, #f14c4c);
+  border-color: transparent; border-radius: 50%;
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+/* Whisper or ffmpeg is missing: still clickable, because it opens the settings
+   page that says how to install them — a button that goes to the fix is not a
+   dead control. */
+.mic.missing { opacity: 0.45; cursor: pointer; }
+.voice-note {
+  margin: 0 14px 8px; font-size: 0.78em; color: var(--warn, #f0ad4e);
+  padding: 4px 10px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel);
+}
+
+/* --- the composer's @-mention picker ---------------------------------------- */
+
+.mention-menu {
+  display: flex; flex-direction: column;
+  margin: 0 14px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); overflow: hidden; max-height: 260px; overflow-y: auto;
+}
+.mention-item {
+  display: flex; align-items: baseline; gap: 10px; width: 100%;
+  padding: 6px 10px; border: none; border-bottom: 1px solid var(--line);
+  background: none; color: var(--vscode-foreground); text-align: left;
+  font-family: var(--vscode-editor-font-family); font-size: 0.84em; cursor: pointer;
+}
+.mention-item:last-of-type { border-bottom: none; }
+.mention-item:hover, .mention-item.on { background: var(--vscode-list-hoverBackground); }
+.mention-item.on { box-shadow: inset 2px 0 0 var(--vscode-focusBorder); }
+.mention-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-dir { font-size: 0.86em; color: var(--faint); }
+
 /* --- taking the window ----------------------------------------------------- */
 
 .focus-btn {
@@ -926,3 +995,50 @@ details.thinking summary::-webkit-details-marker { display: none; }
 .decomp { margin-top: 6px; font-size: 0.78em; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
 .decomp.refused { color: var(--faint); }
 .decomp-said { font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ----------------------------------------------------- transcript search */
+
+.search-main { min-width: 0; }
+.search-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px 18px 8px; }
+.search-line { display: flex; gap: 8px; }
+.search-line .ts-input { flex: 1; }
+.search-note { margin-top: 6px; font-size: 0.8em; color: var(--faint); }
+
+.search-list { flex: 1; overflow-y: auto; margin-top: 12px; padding-right: 6px;
+  display: flex; flex-direction: column; gap: 9px; }
+.search-idle, .search-empty { padding: 26px 14px; color: var(--faint); font-size: 0.92em;
+  text-align: center; border: 1px dashed var(--line); border-radius: var(--radius); }
+.search-empty { color: var(--muted); }
+.search-empty-sub { margin-top: 5px; font-size: 0.86em; color: var(--faint); }
+.search-meta { font-size: 0.78em; color: var(--faint); font-variant-numeric: tabular-nums; }
+.search-more { margin-left: 8px; font-style: italic; }
+
+.srow {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 8px 12px; cursor: pointer;
+  background: color-mix(in srgb, var(--vscode-foreground) 2%, transparent);
+}
+.srow:hover { border-color: var(--vscode-focusBorder); background: var(--vscode-list-hoverBackground); }
+.srow-top { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.srow-title { font-weight: 600; font-size: 0.95em; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex: 1; min-width: 0; }
+.srow-when { font-size: 0.74em; color: var(--faint); font-variant-numeric: tabular-nums; flex: none; }
+.srow-kind { font-size: 0.7em; color: var(--faint); letter-spacing: 0.04em; }
+.srow-snip { margin-top: 4px; font-size: 0.88em; line-height: 1.45; color: var(--muted);
+  word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.srow-lead { color: var(--faint); }
+mark.hl {
+  background: color-mix(in srgb, var(--run) 26%, transparent);
+  color: var(--vscode-foreground);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* The transcript row a search hit jumped to: a ring that fades out over two
+   seconds. A box-shadow ring changes no layout — the row it wraps is a prompt
+   or an answer block of its own height — so the flash cannot push anything. */
+.hit-jump { animation: hitflash 2s ease-out; border-radius: 6px; }
+@keyframes hitflash {
+  0% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--run) 75%, transparent); }
+  100% { box-shadow: 0 0 0 2px transparent; }
+}

@@ -51,6 +51,90 @@ export interface SettingsState {
   /** Set while a check is in flight, so the page can say so rather than
    *  appearing to have answered instantly. */
   busy?: string
+  /**
+   * The composer's voice pipeline, checked.
+   *
+   * Absent until "Check" is pressed: checking spawns whisper-cli and ffmpeg,
+   * which is never something a page paint does. `at` rides along so the page
+   * can say how stale a green row is.
+   */
+  voice?: { at: number; rows: VoiceRowState[] }
+  /**
+   * Scheduled runs, with the derived facts the page must not compute itself.
+   * `canRun` is false when no git repo is open — the runs would not fire, and
+   * the page says so instead of showing a countdown that can never reach zero.
+   */
+  schedules?: { rows: ScheduleRowState[]; canRun: boolean; problem?: string }
+  /**
+   * Remote Control: the board streamed to a relay site so it can be watched
+   * from anywhere. Always present. `hasCode` says a pairing code is in the
+   * keychain — the host reads it once at activation, so this is a cached
+   * boolean, and the code itself never crosses the postMessage boundary in
+   * either direction.
+   */
+  remote?: RemoteState
+}
+
+/**
+ * Remote Control, as the settings page shows it. `status` is the relay's last
+ * answer — success AND failure both, so a page cannot show a green tick that
+ * no attempt ever produced. Absent before the first attempt, which the page
+ * renders as "not asked yet", not as "fine".
+ */
+export interface RemoteState {
+  enabled: boolean
+  /** The relay site origin, "" when never set. */
+  url: string
+  /** True when a pairing code is in the keychain. The code never renders. */
+  hasCode: boolean
+  status?: { at: number; ok: boolean; note?: string; error?: string }
+}
+
+/** What the page sends to change Remote Control. A `saveRemote` with no code
+ *  keeps the stored code — the input is a change-only field. */
+export type RemoteMessage =
+  | { type: 'setRemote'; enabled: boolean }
+  | { type: 'saveRemote'; url: string; code?: string }
+  | { type: 'clearRemoteCode' }
+
+/** One scheduled run as the page shows it. The schedule itself, plus the
+ *  derived facts: `when` ("Mon–Fri at 09:00") and `nextAt`, both host-computed,
+ *  so the page needs no clock of its own for WHEN — only for how long ago a
+ *  run was, which `since()` needs anyway. */
+export interface ScheduleRowState {
+  id: string
+  title: string
+  prompt: string
+  hour: number
+  minute: number
+  days: number[]
+  enabled: boolean
+  /** "Daily at 09:00" — the one-line shape of the schedule. */
+  when: string
+  /** When it will next fire, host-computed. Absent when no days are picked. */
+  nextAt?: number
+  lastRun?: { at: number; ok: boolean; note?: string }
+}
+
+/** What the page sends to add or change a schedule. */
+export interface ScheduleDraft {
+  /** Present on an edit, absent on a new one. */
+  id?: string
+  title: string
+  prompt: string
+  hour: number
+  minute: number
+  days: number[]
+  enabled: boolean
+}
+
+/** One piece of the dictation pipeline, as the settings page shows it. */
+export interface VoiceRowState {
+  key: string
+  label: string
+  ok: boolean
+  /** Where it was found, or the fix for THIS piece when it was not. */
+  detail: string
 }
 
 export interface RuntimeAgentCard {
@@ -146,6 +230,18 @@ export type SettingsMessage =
    *  message rather than an edit to the profile: `[]` and `undefined` have to
    *  survive the round trip as the same answer. */
   | { type: 'setProfileModels'; id: string; models: string[] }
+  /** Run the voice-pipeline probe now, cache or no cache — a Check button is a
+   *  check. Fills `state.voice`. */
+  | { type: 'checkVoice' }
+  /** Add or change a schedule. The webview validates before sending, but a
+   *  message from a webview is model-written input all the same — this parses
+   *  every field a fire depends on. `runSchedule` and `toggleSchedule` can
+   *  START a billed session, so they parse too rather than cast. */
+  | { type: 'saveSchedule'; draft: ScheduleDraft }
+  | { type: 'removeSchedule'; id: string }
+  | { type: 'toggleSchedule'; id: string }
+  | { type: 'runSchedule'; id: string }
+  | RemoteMessage
 
 export interface SettingsHost {
   getState: () => Promise<SettingsState>
@@ -258,6 +354,7 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
   switch (type) {
     case 'ready':
     case 'addProvider':
+    case 'checkVoice':
       return { type } as SettingsMessage
     case 'refresh':
       return known.has(runtime) ? { type, runtime: runtime as RuntimeId } : { type }
@@ -284,6 +381,55 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
     }
     case 'openSetting':
       return typeof m.key === 'string' && m.key ? { type, key: m.key } : undefined
+    case 'removeSchedule':
+    case 'toggleSchedule':
+    case 'runSchedule':
+      return id ? ({ type, id } as SettingsMessage) : undefined
+    case 'setRemote':
+      return typeof m.enabled === 'boolean' ? { type, enabled: m.enabled } : undefined
+    case 'clearRemoteCode':
+      return { type }
+    case 'saveRemote': {
+      // The URL is validated host-side too (relayBase) — this keeps the shape
+      // check here: non-empty strings with sane lengths, nothing more.
+      const url = typeof m.url === 'string' ? m.url.trim().slice(0, 2000) : ''
+      if (!url) return undefined
+      // A blank or absent code field means "keep the stored one" — the code is
+      // a change-only field, and emptying it must not wipe the keychain entry
+      // (there is a dedicated message for that, `clearRemoteCode`).
+      const code = typeof m.code === 'string' ? m.code.trim().slice(0, 500) : undefined
+      return code ? { type, url, code } : { type, url }
+    }
+    case 'saveSchedule': {
+      const d = m.draft as Record<string, unknown> | undefined
+      if (!d || typeof d !== 'object') return undefined
+      const did = typeof d.id === 'string' && d.id ? d.id.slice(0, 200) : undefined
+      const title = typeof d.title === 'string' ? d.title.trim() : ''
+      const prompt = typeof d.prompt === 'string' ? d.prompt : ''
+      const hour = typeof d.hour === 'number' && Number.isInteger(d.hour) && d.hour >= 0 && d.hour <= 23
+        ? d.hour : -1
+      const minute = typeof d.minute === 'number' && Number.isInteger(d.minute) && d.minute >= 0 && d.minute <= 59
+        ? d.minute : -1
+      const days = Array.isArray(d.days)
+        ? [...new Set(d.days.filter((v): v is number =>
+            typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 6))]
+        : []
+      // A draft that cannot fire (no title, no prompt, bad time) is refused
+      // wholesale, like every other malformed message on this page.
+      if (!title || !prompt || !prompt.trim() || hour === -1 || minute === -1) return undefined
+      return {
+        type,
+        draft: {
+          ...(did ? { id: did } : {}),
+          title,
+          prompt,
+          hour,
+          minute,
+          days,
+          enabled: d.enabled !== false,
+        },
+      } as SettingsMessage
+    }
     default:
       return undefined
   }

@@ -360,6 +360,26 @@
           ],
           "default": "balanced",
           "markdownDescription": "How eagerly a session should break its work into subtasks with `split_task`. This is the DEFAULT for new sessions; each card carries its own, chosen on the composer bar beside the model. It biases the agent rather than dictating a number: a small task stays one agent at **Maximum**, and a genuinely unrelated pair still splits at **Minimal**. The limit of four subtasks, one level deep, is unchanged."
+        },
+        "agentsKanban.whisperPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to `whisper-cli` (a whisper.cpp build). Leave empty to find it on your PATH. This is what makes the composer's microphone button dictate, and dictation is **fully local** — the audio never leaves your machine. Install whisper.cpp with: `brew install whisper-cpp` (macOS) or `sudo apt install whisper-cpp` (Debian/Ubuntu), then download a model with `whisper-cli -m models/ggml-base.en.bin -f nothing.wav` — or set `#agentsKanban.whisperModel#` to a model file you already have."
+        },
+        "agentsKanban.whisperModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a whisper ggml model file (`ggml-*.bin`), e.g. `/models/ggml-base.en.bin`. Download one from the whisper.cpp releases: `ggml-base.en.bin` is a good first model (English, ~150 MB). The settings page shows where to put it."
+        },
+        "agentsKanban.ffmpegPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to `ffmpeg`. Leave empty to find it on your PATH. ffmpeg captures the microphone (16 kHz mono WAV) for local transcription; install it with `brew install ffmpeg` or `sudo apt install ffmpeg`."
+        },
+        "agentsKanban.recordDevice": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The microphone ffmpeg records from. Empty means the platform default: `default` (ALSA) on Linux, `:0` on macOS. **Windows cannot guess** — set a device NAME here (list them with `ffmpeg -f dshow -list_devices true -i dummy`) or the mic reports that it cannot record."
         }
       }
     },

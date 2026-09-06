@@ -1,0 +1,7 @@
+# The remote board relay. Netlify installs the dependencies from
+# package.json during the build and discovers the function automatically.
+[functions]
+  directory = "functions"
+
+[build]
+  publish = "public"
