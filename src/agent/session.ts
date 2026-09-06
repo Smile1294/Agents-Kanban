@@ -381,6 +381,14 @@ export class AgentSession extends EventEmitter implements AgentRun {
       // the board can show. Every frame it produces carries `parent_tool_use_id`
       // and handle() routes on that, so none of it lands in the main thread.
       forwardSubagentText: true,
+      // File checkpoints are what make "try again from here" possible: the CLI
+      // snapshots the tracked files before each user turn, into its own
+      // file-history store, so the board can put the worktree back to the
+      // state any past message was sent into. Local bookkeeping on the CLI's
+      // side of the fence — nothing is written to the user's repository. A
+      // session run before this flag existed simply has no checkpoints, and
+      // the rewind affordance says so instead of pretending.
+      enableFileCheckpointing: true,
       ...(this.opts.model ? { model: this.opts.model } : {}),
       ...(this.opts.effort ? { effort: this.opts.effort } : {}),
       // 'enabled' deliberately sends nothing: omitting the option is what keeps

@@ -21,6 +21,37 @@
   let stick = true
   let openMenu = null
   /**
+   * Transcript search — a third screen, over every session's actual
+   * conversation, shown from either mode.
+   *
+   * It must survive repaints for the same reason `draft` does: render()
+   * replaces the whole tree several times a second while an agent streams, so
+   * the open query, the busy flag and the last answer all live here, never in
+   * the DOM. The answer travels on its own message channel (`searchResults`),
+   * like `mentions` and `voice`, because the host reads every session's
+   * transcript to produce it — never something a repaint does. `searchRows`
+   * is `null` until an answer lands, which is also "the box is empty": no
+   * answer yet is not the same thing as "no matches".
+   */
+  let searching = false
+  let searchQ = ''
+  let searchBusy = false
+  let searchRows = null // { key, entryIndex, at, kind, snippet, lead }[] | null
+  let searchMore = 0
+  let searchTimer = null
+  /** The query the outstanding search was posted with — answers must echo it
+   *  back or they are for a query the box no longer holds. */
+  let searchAsked = null
+  /** A hit the user clicked, waiting for the chat to show its session:
+   *  `{ key, idx, at }`. Kept here because the select lands a refresh or two
+   *  later, and the entry it names must flash when it finally renders — not
+   *  on whichever session happens to be on screen when the click was made. */
+  let jump = null
+  /** How long a jump may wait for its session to appear before it is dropped.
+   *  A vanished or archived-hidden session would otherwise flash the row on
+   *  some LATER visit to the same session — wrong, and only visible then. */
+  const JUMP_TTL = 15000
+  /**
    * What has been typed into an open menu's filter box, keyed by menu id.
    *
    * Module-level for the reason everything else here is: render() replaces the
@@ -32,8 +63,31 @@
   let menuFilter = {}
   /** Index into the slash-command suggestions, or -1 when the list is closed. */
   let slashPick = -1
-  /** The live composer textarea, so a repaint can hand focus back to it. */
-  let composerInput = null
+  /**
+   * Files the @-mention picker can suggest, workspace-relative.
+   *
+   * `null` means "not fetched yet". Fetching is the one thing on this panel
+   * that crosses to the DISK (the host answers with `findFiles`), so it happens
+   * once, lazily, the first time the user types an @ — never on a repaint.
+   */
+  let mentionFiles = null
+  let mentionFetching = false
+  /** Index into the mention suggestions, or -1 when the list is closed. */
+  let mentionPick = -1
+  /** Where the transcript of the dictation in progress will be inserted, or -1
+   *  when none is in flight. Captured when the mic is pressed, because between
+   *  then and the transcript arriving the textarea can be rebuilt by a repaint
+   *  and lose its caret — the position must survive in here, not in the DOM. */
+  let dictateAt = -1
+  /** The last place the user's caret sat in the composer, captured from the
+   *  live textarea on every input/click/keyup. The mic button steals focus when
+   *  pressed, so the caret has to be remembered, not read. */
+  let caretAt = -1
+  /** A one-line message under the composer — a dictation error, or "nothing
+   *  recognised". Stamped, because repaints happen several times a second and
+   *  without a timestamp a note posted from the host would vanish on the next
+   *  frame; with one it fades after a few seconds of its own accord. */
+  let voiceNote = null // { text: string, at: number }
   /**
    * Images attached to the message being composed.
    *
@@ -98,8 +152,9 @@
   let catalogue = []
 
   window.addEventListener('message', (e) => {
-    if (e.data.type === 'state') {
-      s = e.data.state
+    const d = e.data
+    if (d.type === 'state') {
+      s = d.state
       // Carried over when the host omitted it. Never the other way round: an
       // empty list arriving would be indistinguishable from "unchanged", so the
       // host omits the FIELD rather than sending `[]`.
@@ -110,6 +165,42 @@
         for (const k in s.disclosures || {}) disclosed[k] = !!s.disclosures[k]
       }
       render()
+    } else if (d.type === 'mentions') {
+      // The @-mention file list, fetched once on first use. Repaints do not
+      // clear it — it is module-level — and arriving late merely fills the
+      // picker the next time the user types @.
+      if (Array.isArray(d.files)) {
+        mentionFiles = d.files
+        mentionFetching = false
+        if (mentionAt(draft)) render()
+      }
+    } else if (d.type === 'searchResults') {
+      // The answer to a transcript search. The host echoes the query it
+      // actually answered, and the view compares it against both what it
+      // asked and what is in the box NOW: a result for a query the user has
+      // already edited away is dropped, and a screen the user closed gets no
+      // results either. Typing can outrun the search — that is what the
+      // debounce is for — so a stale answer must never paint over a newer
+      // one.
+      if (searching && typeof d.q === 'string' && d.q === searchQ.trim() && d.q === searchAsked) {
+        searchRows = Array.isArray(d.matches) ? d.matches : []
+        searchMore = Number.isFinite(d.more) ? d.more : 0
+        searchBusy = false
+        render()
+      }
+    } else if (d.type === 'voice') {
+      // Replies to voiceStart/voiceStop. The recording STATE rides the normal
+      // repaint (composer.voice.recording); these carry what a repaint cannot:
+      // the transcript, and the error when the pipeline refused to start.
+      if (d.started) {
+        if (voiceNote) { voiceNote = null; render() }
+      } else if (typeof d.text === 'string') {
+        insertDictation(d.text)
+      } else {
+        voiceNote = { text: d.error || 'Dictation is unavailable', at: Date.now() }
+        dictateAt = -1
+        render()
+      }
     }
   })
   document.addEventListener('click', () => { if (openMenu) { openMenu = null; render() } })
@@ -183,7 +274,7 @@
 
     const shell = el('div', 'shell')
     shell.append(renderRail())
-    shell.append(s.mode === 'chat' ? renderChat() : renderKanban())
+    shell.append(searching ? renderSearch() : (s.mode === 'chat' ? renderChat() : renderKanban()))
     root.append(shell)
 
     forEachScroll((n) => { const k = n.getAttribute('data-scroll'); if (scrolled[k]) n.scrollTop = scrolled[k] })
@@ -193,6 +284,21 @@
     if (sc2 && stick) sc2.scrollTop = sc2.scrollHeight
     if (askFocusKey && askFocusNode && askFocusNode.focus) restoreFocus(askFocusNode, caret)
     if (hadFocus && composerInput && composerInput.focus) restoreFocus(composerInput, caret)
+    // A search hit the user clicked finally rendered: its row carries
+    // `hit-jump`, and this scrolls it into the middle of the transcript and
+    // forgets the request. A jump waits only JUMP_TTL for its session — the
+    // select lands a refresh or two later, and a session that never appears
+    // (deleted, or the run id never resolved) must not flash a row on some
+    // future visit to a different session that happens to share the key.
+    if (jump) {
+      const hit = root.querySelector('.hit-jump')
+      if (hit) {
+        if (hit.scrollIntoView) { try { hit.scrollIntoView({ block: 'center' }) } catch (e) { /* stub DOM */ } }
+        jump = null
+      } else if (Date.now() - jump.at > JUMP_TTL) {
+        jump = null
+      }
+    }
   }
 
   /* Give a rebuilt input its focus AND its caret back.
@@ -340,8 +446,23 @@
     const head = el('div', 'rail-head')
     head.append(el('div', 'rail-title', 'Agent Sessions'))
     const t = el('button', 'pill' + (s.mode === 'kanban' ? ' on' : ''), '▤ Kanban')
-    t.onclick = () => post('setMode', { mode: s.mode === 'kanban' ? 'chat' : 'kanban' })
+    t.onclick = () => { closeSearch(); post('setMode', { mode: s.mode === 'kanban' ? 'chat' : 'kanban' }) }
     head.append(t)
+    // Transcript search — its screen replaces the main area, whichever mode it
+    // was opened from, so the toggle has to live in the rail, the one thing
+    // both modes keep.
+    const ts = el('button', 'pill' + (searching ? ' on' : ''), '⌕ Search')
+    ts.title = 'Search what was actually said — prompts and answers, no tool calls'
+    ts.onclick = () => {
+      if (searching) { closeSearch(); render() }
+      else {
+        searching = true
+        render()
+        const inp = root.querySelector('[data-focus="ts-search"]')
+        if (inp && inp.focus) inp.focus()
+      }
+    }
+    head.append(ts)
     rail.append(head)
 
     const search = el('input', 'search')
@@ -358,7 +479,7 @@
     rail.append(search)
 
     const nw = el('button', 'primary new-session', '+ New session')
-    nw.onclick = () => { post('select', { id: '' }); post('setMode', { mode: 'chat' }) }
+    nw.onclick = () => { closeSearch(); post('select', { id: '' }); post('setMode', { mode: 'chat' }) }
     rail.append(nw)
 
     const list = el('div', 'rail-list')
@@ -446,7 +567,7 @@
 
   function renderRailItem(c) {
     const row = el('div', 'rail-item' + (c.key === s.selectedKey ? ' active' : '') + (c.archived ? ' archived' : ''))
-    row.onclick = () => { post('select', { id: c.key }); post('setMode', { mode: 'chat' }) }
+    row.onclick = () => { closeSearch(); post('select', { id: c.key }); post('setMode', { mode: 'chat' }) }
     const top = el('div', 'rail-item-top')
     top.append(el('span', 'ai', '✦'))
     top.append(el('span', 'nm', c.title))
@@ -1066,7 +1187,18 @@
     scroll.setAttribute('data-scroll', 'transcript')
     if (!c) scroll.append(renderNewSessionHint())
     else if (!s.transcript || !s.transcript.length) scroll.append(el('div', 'empty', 'No transcript yet.'))
-    else for (const e of s.transcript) scroll.append(renderEntry(e, c))
+    else {
+      // The row a search hit pointed at, when this session finally rendered —
+      // marked here (the entry index IS the row the search read, by contract
+      // between the host's two transcript paths and this loop) and scrolled to
+      // at the end of render(), which is where the scroll restore has finished.
+      const want = jump && jump.key === c.key ? jump.idx : -1
+      for (let i = 0; i < s.transcript.length; i++) {
+        const node = renderEntry(s.transcript[i], c)
+        if (i === want) node.classList.add('hit-jump')
+        scroll.append(node)
+      }
+    }
     if (s.streaming) scroll.append(renderStreaming(s.streaming))
     // The running indicator belongs HERE, at the foot of the transcript, where
     // new output appears and where the eye already is. It used to exist only on
@@ -1079,6 +1211,169 @@
 
     main.append(renderComposer(c))
     return main
+  }
+
+  // ----------------------------------------------------------- transcript search
+
+  /** Closing the search screen. Navigation (a rail click, a mode flip) closes
+   *  it too, and the state frame those posts produce repaints — so this only
+   *  ever touches module state, never the DOM. */
+  function closeSearch() {
+    if (!searching) return
+    searching = false
+    searchQ = ''
+    searchBusy = false
+    searchRows = null
+    searchMore = 0
+    searchAsked = null
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+    jump = null
+  }
+
+  /** Post the search that is in the box. The host answers on its own channel,
+   *  never through the repaint — see the `searchResults` branch — so the busy
+   *  flag set here needs its own repaint, which the caller provides. */
+  function doSearch() {
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+    const q = searchQ.trim().slice(0, 200)
+    if (!q) { searchRows = null; searchMore = 0; searchBusy = false; searchAsked = null; return }
+    searchBusy = true
+    searchAsked = q
+    post('search', { q })
+  }
+
+  function renderSearch() {
+    const main = el('main', 'main search-main')
+    const head = el('div', 'chat-head')
+    head.append(el('div', 'chat-title', 'Search transcripts'))
+    head.append(el('div', 'spacer'))
+    const close = el('button', 'pill', '✕ Close')
+    close.onclick = () => { closeSearch(); render() }
+    head.append(close)
+    main.append(head)
+
+    const pane = el('div', 'search-pane')
+    const row = el('div', 'search-line')
+    const inp = el('input', 'ts-input')
+    inp.setAttribute('data-focus', 'ts-search')
+    inp.placeholder = 'e.g. jira, a file name, “the build broke”…'
+    inp.value = searchQ
+    inp.oninput = (e) => {
+      searchQ = e.target.value
+      if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+      if (!searchQ.trim()) {
+        // The box was emptied: the old answer no longer answers anything, and
+        // whatever was in flight answers it even less. Back to the idle state.
+        searchRows = null
+        searchMore = 0
+        searchBusy = false
+        searchAsked = null
+        render()
+        return
+      }
+      // Debounce: a keystroke sets a timer, and a later keystroke replaces it.
+      // Enter skips the wait. (The timer is real only in the browser; the test
+      // DOM holds setTimeout and never fires it, so tests drive Enter.)
+      searchTimer = setTimeout(() => { searchTimer = null; doSearch(); render() }, 250)
+    }
+    inp.onkeydown = (e) => {
+      if (e.key === 'Enter') { doSearch(); render() }
+      else if (e.key === 'Escape') { closeSearch(); render() }
+    }
+    row.append(inp)
+    pane.append(row)
+
+    pane.append(el('div', 'search-note',
+      'Prompts and agent answers only — tool calls, thinking and subagent chatter are not searched.'))
+
+    const list = el('div', 'search-list')
+    list.setAttribute('data-scroll', 'search')
+    if (searchBusy && searchQ.trim()) {
+      // An answer is on its way. What is on screen is the LAST answer — the
+      // busy line is above it, and the box the user typed into keeps its text.
+      if (searchRows && searchRows.length) list.append(searchFooter(searchRows.length, true))
+      else list.append(el('div', 'search-idle', 'Searching…'))
+    } else if (searchRows && searchRows.length) {
+      list.append(searchFooter(searchRows.length, false))
+      for (const r of searchRows) list.append(searchRow(r))
+    } else if (searchRows && searchRows.length === 0) {
+      list.append(el('div', 'search-empty', 'No matches for “' + searchQ.trim() + '”.'))
+      list.append(el('div', 'search-empty-sub', 'Remember the filter — a word that only appears in a tool call is not in here.'))
+    } else {
+      list.append(el('div', 'search-idle',
+        'Every prompt you sent and every answer the agent gave, across every session — archived ones too.'))
+    }
+    pane.append(list)
+    main.append(pane)
+    return main
+  }
+
+  function searchFooter(n, busy) {
+    const f = el('div', 'search-meta')
+    f.append(el('span', null, n + (n === 1 ? ' match' : ' matches')))
+    if (busy) f.append(el('span', 'search-more', 'searching…'))
+    else if (searchMore) f.append(el('span', 'search-more', 'and ' + searchMore + ' more — narrow the query'))
+    return f
+  }
+
+  /** One hit: where it lives, what it was, and the text that matched. Clicking
+   *  jumps to the session with the row set to flash — the entry index was
+   *  measured against exactly the array the chat renders, so the flash lands
+   *  on the row the snippet came from, not on "somewhere in this session". */
+  function searchRow(r) {
+    const c = card(r.key)
+    const row = el('div', 'srow')
+    row.onclick = () => {
+      // Close first — closeSearch() clears any leftover jump — then announce
+      // the jump THIS click means, so the flash cannot be stolen by an older
+      // pending one.
+      closeSearch()
+      jump = { key: r.key, idx: r.entryIndex, at: Date.now() }
+      // An archived session that the rail is hiding has no card to open. The
+      // search covers archived sessions by design (that is where the old work
+      // is), so jumping to one first reveals it — same tap count as any other
+      // hit, and honest: the chat opens on the session, not on a blank.
+      if (!c && !s.showArchived) post('toggleArchived')
+      post('select', { id: r.key })
+      post('setMode', { mode: 'chat' })
+    }
+    const top = el('div', 'srow-top')
+    top.append(el('span', 'srow-title', (c && c.title) || r.title || r.key))
+    if (c) top.append(phaseChip(c.phase))
+    top.append(el('span', 'srow-when', whenLabel(r.at)))
+    row.append(top)
+    const who = el('span', 'srow-kind', r.kind === 'prompt' ? 'you asked' : 'agent answered')
+    const text = el('div', 'srow-snip')
+    if (r.lead) text.append(el('span', 'srow-lead', '…'))
+    text.append(snipWithMark(r.snippet, searchQ))
+    row.append(who, text)
+    return row
+  }
+
+  /** A snippet with the occurrence marked. Text nodes only — the snippet is
+   *  another program's output and this file never builds HTML from it, so the
+   *  mark is a `<mark>` whose textContent is set, never an innerHTML
+   *  substitution. Whitespace is flattened first: the snippet can span
+   *  paragraphs, and a preview is one line, not the row's layout. */
+  function snipWithMark(text, q) {
+    const out = el('span')
+    const flat = text.replace(/\s+/g, ' ')
+    const ql = (q || '').trim().toLowerCase()
+    const i = ql ? flat.toLowerCase().indexOf(ql) : -1
+    if (i < 0) { out.append(flat); return out }
+    const mark = el('mark', 'hl')
+    mark.textContent = flat.slice(i, i + ql.length)
+    out.append(flat.slice(0, i), mark, flat.slice(i + ql.length))
+    return out
+  }
+
+  /** When a hit happened: the day when it was not today, the time always —
+   *  the transcript's own rows show the time alone, and a hit from Tuesday
+   *  would read as one from this afternoon without the day. */
+  function whenLabel(at) {
+    const time = new Date(at).toLocaleTimeString()
+    const day = dayLabel(at)
+    return day === 'Today' ? time : day + ' · ' + time
   }
 
   /** How to test what the agent built.
@@ -1425,6 +1720,11 @@
     // nobody knew they were there.
     const matches = slashMatches(draft)
     if (matches.length) wrap.append(renderSlashMenu(matches))
+    // `@path` names a file IN THE REPO — the agent reads it itself, so the
+    // prompt never has to quote it. One menu at a time: a draft starts with
+    // either, and the two lists never both match.
+    const mentions = mentionMatches(draft)
+    if (!matches.length && mentions.length) wrap.append(renderMentionMenu(mentions))
 
     const row = el('div', 'composer')
     const ta = el('textarea')
@@ -1432,16 +1732,41 @@
     ta.placeholder = c ? 'Reply… (Enter to send, Shift+Enter for a new line)' : 'What should the agent do? (Enter to start)'
     ta.value = draft
     ta.rows = 1
+    const rememberCaret = () => {
+      if (typeof ta.selectionStart === 'number') caretAt = ta.selectionStart
+    }
+    // A repaint destroys this textarea; clicks and keystrokes land on a new
+    // one each time. Caret position is per-node, so it is copied out on every
+    // interaction — the mic steals focus when pressed, and the transcript has
+    // to come back where the caret was, not at the end.
+    ta.onfocus = rememberCaret
+    ta.onclick = rememberCaret
+    ta.onkeyup = rememberCaret
     ta.oninput = (e) => {
       const had = slashKey(draft)
+      const hadMent = mentionQuery(draft)
       draft = e.target.value
       e.target.style.height = 'auto'
       e.target.style.height = Math.min(160, e.target.scrollHeight) + 'px'
+      rememberCaret()
       const now = slashKey(draft)
+      const nowMent = mentionQuery(draft)
       // Compare the actual match SET, not its size. Comparing counts left the
       // menu showing the old commands whenever a different query happened to
       // match the same number — and clicking a row inserted the stale one.
-      if (had !== now) { slashPick = now ? 0 : -1; render() }
+      const menuChanged = had !== now || hadMent !== nowMent
+      if (had !== now) slashPick = now ? 0 : -1
+      if (hadMent !== nowMent) mentionPick = nowMent !== null ? 0 : -1
+      // The first @ of the panel's life: go get the file list. One fetch per
+      // panel — it is the list of files in the workspace, and it does not
+      // change faster than that. Deliberately not inside the repaint branch:
+      // the very first @ changes the menu state AND must fire the fetch, and
+      // an early return for the one would starve the other.
+      if (mentionAt(draft) && !mentionFiles && !mentionFetching) {
+        mentionFetching = true
+        post('mentionFiles')
+      }
+      if (menuChanged) render()
     }
     ta.onkeydown = (e) => {
       const list = slashMatches(draft)
@@ -1458,6 +1783,21 @@
           return
         }
         if (e.key === 'Escape') { e.preventDefault(); slashPick = -1; draft = draft + ' '; render(); return }
+      }
+      const ments = mentionMatches(draft)
+      if (ments.length) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault()
+          mentionPick = (mentionPick + (e.key === 'ArrowDown' ? 1 : ments.length - 1)) % ments.length
+          render()
+          return
+        }
+        if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+          e.preventDefault()
+          chooseMention(ments[Math.max(0, mentionPick)].value)
+          return
+        }
+        if (e.key === 'Escape') { e.preventDefault(); mentionPick = -1; draft = draft + ' '; render(); return }
       }
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
     }
@@ -1499,6 +1839,38 @@
       picker.click()
     }
 
+    /* The mic: dictation into the draft, recorded and transcribed on THIS
+       machine by ffmpeg + whisper — the audio never leaves it. Shown only
+       when the host's probe of both binaries answered, because a mic that
+       cannot record is a control that cannot take effect; when the probe says
+       what is missing, the mic still shows, dimmed, and opens the settings
+       page that says how to install it — a button that takes you to the fix
+       is not a dead control. Absent (probe not finished) it is not drawn. */
+    const voice = s.composer.voice
+    let mic = null
+    if (voice && voice.available) {
+      mic = el('button', 'mic' + (voice.recording ? ' live' : ''), voice.recording ? '⏺' : '🎤')
+      mic.title = voice.recording
+        ? 'Stop dictating — the recording is transcribed locally'
+        : 'Dictate… (recorded on this machine, transcribed by whisper-cli)'
+      mic.onclick = () => {
+        if (voice.recording) {
+          dictateAt = -1
+          post('voiceStop')
+        } else {
+          // Where the transcript lands: the last place the caret sat. Read now,
+          // because a repaint between stop and transcript will rebuild the
+          // textarea, and a rebuilt textarea does not remember where you were.
+          dictateAt = caretAt >= 0 ? Math.min(caretAt, draft.length) : draft.length
+          post('voiceStart')
+        }
+      }
+    } else if (voice && voice.why) {
+      mic = el('button', 'mic missing', '🎤')
+      mic.title = voice.why + '\n\nClick to open the settings page, which says how to install each piece.'
+      mic.onclick = () => { dictateAt = -1; post('openSettings') }
+    }
+
     const send = el('button', 'primary send', '➤')
     send.title = c ? 'Send' : 'Start session'
     send.onclick = submit
@@ -1514,10 +1886,101 @@
       else post('newSession', { text, images })
       render()
     }
-    row.append(ta, clip, send)
+    row.append(ta, clip)
+    if (mic) row.append(mic)
+    row.append(send)
     if (attachments.length) wrap.append(renderAttachments())
     wrap.append(row)
+    // A dictation error or an empty transcript, shown where the mic is, and
+    // only for a few seconds — repaints do not repaint it away instantly
+    // because it carries a timestamp, and nothing here pretends it is news
+    // after eight seconds.
+    if (voiceNote && Date.now() - voiceNote.at < 8000) {
+      const note = el('div', 'voice-note', voiceNote.text)
+      wrap.append(note)
+    } else if (voiceNote) {
+      voiceNote = null
+    }
     return wrap
+  }
+
+  /* —— @-mentions: naming a file in the repo, so the agent reads it itself. — */
+
+  /** The @-mention being typed, if the caret is in one.
+   *
+   *  An @ that starts a token — after whitespace or the start of the draft —
+   *  and that has only filename-ish characters after it. An email address in
+   *  prose must not open the picker on every keystroke. */
+  function mentionAt(text) {
+    const m = /(^|\s)@([\w./~-]*)$/.exec(text)
+    if (!m) return null
+    return { at: m.index + m[1].length, query: m[2].toLowerCase() }
+  }
+
+  /** The query of the mention being typed, or null when none — the identity of
+   *  the current suggestion set, for deciding whether to repaint. Deliberately
+   *  independent of whether the file list has arrived: the FIRST @ must change
+   *  the menu state even though there is nothing to match yet, or the lazy
+   *  fetch below would never fire. */
+  function mentionQuery(text) {
+    const m = mentionAt(text)
+    return m ? m.query : null
+  }
+
+  /** Suggestions for the @ the user is part-way through typing. No matches
+   *  until the file list has been fetched — there is nothing honest to offer
+   *  before the host answered. */
+  function mentionMatches(text) {
+    const m = mentionAt(text)
+    if (!m || !mentionFiles || !mentionFiles.length) return []
+    const hits = []
+    for (const f of mentionFiles) {
+      if (m.query && f.toLowerCase().indexOf(m.query) === -1) continue
+      hits.push(f)
+      if (hits.length >= 8) break
+    }
+    return hits.map((f) => ({ value: f, label: f, meta: f.slice(0, f.lastIndexOf('/')) }))
+  }
+
+  function renderMentionMenu(list) {
+    const box = el('div', 'mention-menu')
+    list.forEach((f, i) => {
+      const row = el('button', 'mention-item' + (i === Math.max(0, mentionPick) ? ' on' : ''))
+      row.append(el('span', 'mention-name', '@' + f.label))
+      row.append(el('span', 'mention-dir', f.meta || ''))
+      row.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); chooseMention(f.value) }
+      box.append(row)
+    })
+    return box
+  }
+
+  /** Replace the half-typed @query with the chosen path (and a trailing space,
+   *  so the next word does not stick to it). */
+  function chooseMention(file) {
+    const m = /(^|\s)@([\w./~-]*)$/.exec(draft)
+    if (!m) return
+    draft = draft.slice(0, m.index + m[1].length) + '@' + file + ' '
+    mentionPick = -1
+    render()
+  }
+
+  /** Drop the transcript of a finished dictation into the draft. */
+  function insertDictation(text) {
+    const t = String(text || '').trim()
+    if (!t) {
+      voiceNote = { text: 'Nothing recognised — is the microphone live?', at: Date.now() }
+      dictateAt = -1
+      render()
+      return
+    }
+    const at = dictateAt >= 0 ? dictateAt : caretAt >= 0 ? Math.min(caretAt, draft.length) : draft.length
+    // A space unless the text before the caret already ends in one, so two
+    // dictations in a row do not weld themselves together.
+    const piece = (at > 0 && !/\s$/.test(draft.slice(0, at)) ? ' ' : '') + t + ' '
+    draft = draft.slice(0, at) + piece + draft.slice(at)
+    dictateAt = -1
+    caretAt = at + piece.length
+    render()
   }
 
   /** Suggestions for the `/` the user is part-way through typing. */
@@ -2261,14 +2724,30 @@
         // The bytes are not kept in the board's state — see Entry.images — so
         // the row says how many went with the message rather than showing them.
         // Without this an images-only message renders as an empty bubble.
+        const head = el('div', 'prompt-wrap')
         if (e.images) {
           const note = el('div', 'prompt-images',
             '🖼 ' + e.images + (e.images === 1 ? ' image' : ' images') + ' attached')
-          const wrap2 = el('div', 'prompt-wrap')
-          wrap2.append(body, note)
-          return block('You', e.at, wrap2)
+          head.append(body, note)
+        } else {
+          head.append(body)
         }
-        return block('You', e.at, body)
+        // "Try again from here": fork the session at this message and restore
+        // the files to how they were when it was sent. The row can anchor a
+        // fork only when it names the transcript uuid that the fork cuts at —
+        // Codex transcripts and rows written before the id was kept have none,
+        // so offering the button there would fork at nothing. Same gate, host
+        // and view; the host still validates, because a row that loses its id
+        // between the click and the handler must refuse, not guess.
+        if (e.id && c && c.runtime !== 'codex') {
+          const retry = el('button', 'prompt-retry', '↶ Try again from here')
+          retry.onclick = (ev) => {
+            ev.stopPropagation()
+            post('forkAt', { id: c.key, messageId: e.id })
+          }
+          head.append(retry)
+        }
+        return block('You', e.at, head)
       }
       case 'text': return block(speakerName(e.model), e.at, renderMarkdown(e.text))
       case 'thinking': {

@@ -13,12 +13,38 @@ import * as vscode from 'vscode'
 import type { RunningAgent } from '../agent/manager.ts'
 import type { WorktreeReview } from '../git/worktree.ts'
 import type { Entry } from '../sessions/store.ts'
+import type { TranscriptHit } from '../sessions/search.ts'
 import type { AttachedImage } from '../agent/images.ts'
 import type { TestPlan } from '../sessions/meta.ts'
 import type { Meter } from '../agent/runtime.ts'
 import type { SlashCommand } from '../sessions/commands.ts'
 import type { ColumnDef } from './config.ts'
 import { parseAskQuestions, type AskQuestion } from './questions.ts'
+
+/** One transcript search hit, joined to the session it lives in. */
+export interface SearchRow extends TranscriptHit {
+  /** The session's key — the same key the board's cards carry, so the view
+   *  can name the hit with the card's current title and phase. */
+  key: string
+  /** The session's title as the SEARCH saw it. The view prefers the card's
+   *  current title and falls back to this — the card is not on the board when
+   *  the rail is hiding archived sessions, and a hit that names itself with a
+   *  raw session id reads as broken. */
+  title?: string
+}
+
+/** The answer to a search. Not board state: it arrives on its own channel and
+ *  `q` echoes the request, so a slow answer to an old query is dropped rather
+ *  than painted over a newer one. */
+export interface SearchAnswer {
+  /** The query this answer is for. */
+  q: string
+  /** Matches across every session, most recent first. */
+  matches: SearchRow[]
+  /** How many further matches were cut by the cap. Zero when the list is
+   *  complete; the view says "narrow the search" rather than pretending. */
+  more: number
+}
 
 export type Mode = 'kanban' | 'chat'
 
@@ -139,6 +165,11 @@ export interface UiCard {
   /** sessionId when Claude Code has assigned one, else the local run id. */
   key: string
   sessionId?: string
+  /** Which agent program this runs on. Undefined on a card written before the
+   *  board had more than one, which is Claude Code. The view gates the fork
+   *  affordance on this: Claude Code's fork works on its own transcripts, and
+   *  a control that cannot take effect must not be offered. */
+  runtime?: string
   title: string
   phase: string
   tags: string[]
@@ -369,6 +400,27 @@ export interface UiState {
     runtimes: { id: string; label: string; detail?: string; providerProfiles: boolean }[]
     /** The provider profile the NEXT session will run on. */
     provider: string
+    /**
+     * Whether the composer's mic can dictate.
+     *
+     * Not a capability guess: the host has ASKED each binary. Absent until the
+     * first check completes (the board is usable long before a lazy probe
+     * finishes), and `why` — present only when unavailable — names the missing
+     * piece and the setting that fixes it, which is what the mic's tooltip and
+     * the settings page render. `recording` is live state on the same object
+     * because the mic is a single control: it flips back on the next repaint
+     * when the capture dies on its own, so a recording that stopped must not
+     * keep pulsing.
+     */
+    voice?: {
+      /** Whether the two binaries answered. */
+      available: boolean
+      /** Present only when unavailable — names the missing piece and the
+       *  setting that fixes it. */
+      why?: string
+      /** A capture is live right now. */
+      recording?: boolean
+    }
     /** Everything selectable. `support` is carried so the view can mark a
      *  community setup as one, rather than listing it beside Bedrock as though
      *  Anthropic supported it. */
@@ -402,6 +454,11 @@ export interface BoardHost {
   interrupt(key: string): Promise<void>
   /** Pick a session back up after its run was killed by a host restart. */
   resume(key: string): Promise<void>
+  /** "Try again from here": fork the session at the user message `messageId`,
+   *  restore the files to the state it was sent into, and re-key the card to
+   *  the fork. Confirms with the user first; never throws — every refusal and
+   *  caveat is shown host-side, the way `remove` and `cleanup` speak. */
+  forkAt(key: string, messageId: string): Promise<void>
   /** Accept that a killed run is not coming back, and clear its banner. */
   dismissInterrupted(key: string): Promise<void>
   clearQueue(key: string): Promise<void>
@@ -451,6 +508,26 @@ export interface BoardHost {
    *  that could only choose between profiles that already exist would leave the
    *  feature reachable only from the command palette. */
   selectProvider(): Promise<void>
+  /** Workspace-relative, forward-slash file paths for the composer's
+   *  @-mention picker. Asked lazily — the file list is the one payload that is
+   *  too big to ride the state channel on every repaint. */
+  mentionFiles(): Promise<string[]>
+  /**
+   * Search every session's transcript for what the conversation actually was.
+   *
+   * Answered with a post rather than through `refresh`, like `mentionFiles`:
+   * the matches are not board state and must not ride the repaint channel,
+   * which would recompute them ten times a second. The request echoes its own
+   * query back (`q`) so the view can drop an answer to a superseded search.
+   */
+  searchTranscript(q: string): Promise<SearchAnswer>
+  /** Begin a dictation: the host records the microphone with ffmpeg. Fails
+   *  with a named reason when a piece of the local whisper pipeline is missing
+   *  or the device refuses. */
+  voiceStart(): Promise<{ ok: true } | { ok: false; error: string }>
+  /** Stop the recording and transcribe it locally. `text` may be empty — the
+   *  composer says "nothing recognised" rather than appending silence. */
+  voiceStop(): Promise<{ ok: true; text: string } | { ok: false; error: string }>
   /** Open the settings tab: agents, backends and logins. Synchronous because
    *  showing a panel is not something to await — the page fills itself in. */
   openSettings(): void
@@ -486,6 +563,10 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'stop': await host.stop(id()); break
         case 'interrupt': await host.interrupt(id()); await refresh(); break
         case 'resume': await host.resume(id()); await refresh(); break
+        case 'forkAt':
+          await host.forkAt(id(), String(msg.messageId ?? ''))
+          await refresh()
+          break
         case 'dismissInterrupted': await host.dismissInterrupted(id()); await refresh(); break
         case 'clearQueue': await host.clearQueue(id()); await refresh(); break
         case 'openWorktree': await host.openWorktree(id()); break
@@ -531,6 +612,39 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'permission':
           host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))
           break
+        case 'mentionFiles': {
+          // One round trip, answered with a post rather than through `refresh`:
+          // the file list is not board state and must not ride the repaint
+          // channel, which would ship it ten times a second.
+          const files = await host.mentionFiles()
+          void webview.postMessage({ type: 'mentions', files })
+          break
+        }
+        case 'search': {
+          // Same one-round-trip rule as mentionFiles: transcript search parses
+          // every session, which is never something a repaint does.
+          const answer = await host.searchTranscript(String(msg.q ?? ''))
+          void webview.postMessage({ type: 'searchResults', ...answer })
+          break
+        }
+        case 'voiceStart': {
+          const r = await host.voiceStart()
+          void webview.postMessage(
+            r.ok
+              ? { type: 'voice', started: true }
+              : { type: 'voice', started: false, error: r.error },
+          )
+          break
+        }
+        case 'voiceStop': {
+          const r = await host.voiceStop()
+          void webview.postMessage(
+            r.ok
+              ? { type: 'voice', started: false, text: r.text }
+              : { type: 'voice', started: false, error: r.error },
+          )
+          break
+        }
       }
     } catch (e) {
       vscode.window.showErrorMessage(`Agents Kanban: ${e instanceof Error ? e.message : String(e)}`)
