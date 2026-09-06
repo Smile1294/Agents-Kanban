@@ -109,6 +109,12 @@ export function makeVscodeStub(ctl) {
   })
 
   const vscode = {
+    // The version the built-in dictation gate compares against. A real API;
+    // the stub's job is to exist so a wrong spelling fails here instead of at
+    // activation. Below the gate's floor on purpose: the smoke test must
+    // exercise the whisper path, and a stub that opened the built-in branch
+    // would hide a regression in the fallback.
+    version: '1.130.0',
     Uri: {
       file: (p) => ({ fsPath: p, scheme: 'file', toString: () => `file://${p}` }),
       joinPath: (u, ...p) => ({ fsPath: path.join(u.fsPath, ...p), scheme: 'file', toString: () => `file://${path.join(u.fsPath, ...p)}` }),

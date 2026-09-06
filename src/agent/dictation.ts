@@ -109,6 +109,78 @@ export function whisperArgs(model: string, wavPath: string, outBase: string): st
   return ['-m', model, '-f', wavPath, '-otxt', '-of', outBase, '-nt']
 }
 
+/* ——— VS Code's OWN built-in dictation: the zero-install front path ———————
+ *
+ * VS Code 1.131 (July 2026) shipped experimental built-in dictation — an
+ * offline on-device model, no Speech extension, nothing to install. It types
+ * into whichever control has focus (which includes webview inputs in
+ * principle — the claim the mic's howToTest must verify by hand), driven by
+ * `workbench.action.editorDictation.*` commands. Those commands are INTERNAL
+ * and undocumented; there is no public API, which is why the mic still shows
+ * the keybinding (Ctrl+Alt+V / ⌥⌘V) in its tooltip and every call is guarded.
+ *
+ * What DOES exist to gate on is a version, a setting and a platform, and the
+ * function below is exactly that gate, kept pure so a test can hold it up
+ * against the platform matrix the research produced:
+ *
+ *   - Windows x64 / Arm64, macOS on Apple Silicon, Linux x64 / Arm64
+ *     (Linux also needs glibc >= 2.34 — not checkable from Node, not checked)
+ *   - NOT VS Code for the Web, Intel Macs, 32-bit
+ *
+ * When the gate opens, the mic triggers VS Code's dictation and the whisper
+ * pipeline is left for every other case: it stays the explicit fallback,
+ * unchanged. */
+
+export const VSCODE_DICTATION_START = 'workbench.action.editorDictation.start'
+export const VSCODE_DICTATION_STOP = 'workbench.action.editorDictation.stop'
+
+/** The smallest VS Code version whose release notes promise built-in dictation. */
+export const DICTATION_MIN_VERSION = [1, 131, 0]
+
+export interface BuiltinGate {
+  /** `vscode.version`, e.g. '1.131.0' — may carry an `-insider` suffix. */
+  version: string
+  platform: string
+  arch: string
+  /** The `dictation.enabled` setting, whatever it says. */
+  enabled: unknown
+}
+
+/** `version >= want`, tolerating an `-insider`/`-dev` suffix. A whole semver
+ *  parser is more than a three-field compare needs. */
+export function atLeast(version: string, want: number[]): boolean {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version))
+  if (!m) return false
+  const have = [Number(m[1]), Number(m[2]), Number(m[3])]
+  for (let i = 0; i < want.length; i++) {
+    if ((have[i] ?? 0) !== (want[i] ?? 0)) return (have[i] ?? 0) > (want[i] ?? 0)
+  }
+  return true
+}
+
+export function builtinDictationAvailable(g: BuiltinGate): VoiceStatus {
+  if (g.enabled !== true) {
+    return {
+      ok: false,
+      why: 'VS Code built-in dictation is off — enable "Dictation: Enabled" (experimental, VS Code 1.131+)',
+    }
+  }
+  if (!atLeast(g.version, DICTATION_MIN_VERSION)) {
+    return { ok: false, why: 'Built-in dictation needs VS Code 1.131+' }
+  }
+  const supported =
+    (g.platform === 'win32' && (g.arch === 'x64' || g.arch === 'arm64')) ||
+    (g.platform === 'darwin' && g.arch === 'arm64') ||
+    (g.platform === 'linux' && (g.arch === 'x64' || g.arch === 'arm64'))
+  if (!supported) {
+    return {
+      ok: false,
+      why: 'Built-in dictation does not support this platform — it covers Windows x64/Arm64, macOS on Apple Silicon and Linux x64/Arm64',
+    }
+  }
+  return { ok: true }
+}
+
 /** Ask the three pieces where they are. Spawns each binary once with --version;
  *  spawnSync returns an error object rather than throwing when the binary is
  *  not on PATH, and every spawn is bounded by a timeout so a broken binary

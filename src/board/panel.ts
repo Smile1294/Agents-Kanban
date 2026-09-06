@@ -260,6 +260,15 @@ export interface UiState {
   cards: UiCard[]
   /** Only for the selected session — sending every transcript would be wasteful. */
   transcript?: Entry[]
+  /** True when the loaded window is shorter than the session's whole history,
+   *  so the view can offer to load OLDER messages. Absent (false) while the
+   *  session is running — history is fixed at launch, so "more above" cannot
+   *  become true mid-run — and for runtimes whose transcripts have no limit. */
+  transcriptMore?: boolean
+  /** How many messages sit ABOVE the rendered window (total minus window).
+   *  Search hits carry an index into the FULL transcript; subtracting this
+   *  from it is how the view lands the flash on the row actually drawn. */
+  transcriptHead?: number
   /** The block currently streaming in, appended after `transcript`. */
   streaming?: string
   /** What the selected session changed in its worktree. Computed on demand, not
@@ -340,6 +349,14 @@ export interface UiState {
     modelSource?: string
     /** Why the CLI's list is not in use, when it is not. */
     modelNote?: string
+    /** Shown beside the model picker when the selected session HAS a
+     *  conversation and the picker's model differs from the one that
+     *  conversation was on: switching re-reads it all at the new model's
+     *  input price. Built HOST-side — the view does no arithmetic on money —
+     *  with the context fill as the token estimate and `rateFor` as the
+     *  price. Absent when there is nothing to warn about, including when the
+     *  old model or the new price cannot be read honestly. */
+    modelSwitchNote?: string
     contextTokens: number
     contextWindow?: number
     /**
@@ -403,17 +420,21 @@ export interface UiState {
     /**
      * Whether the composer's mic can dictate.
      *
-     * Not a capability guess: the host has ASKED each binary. Absent until the
-     * first check completes (the board is usable long before a lazy probe
-     * finishes), and `why` — present only when unavailable — names the missing
-     * piece and the setting that fixes it, which is what the mic's tooltip and
-     * the settings page render. `recording` is live state on the same object
-     * because the mic is a single control: it flips back on the next repaint
-     * when the capture dies on its own, so a recording that stopped must not
-     * keep pulsing.
+     * Not a capability guess: the host has ASKED. `mode` names the path —
+     * `builtin` is VS Code's own dictation (1.131+, nothing installed, typed
+     * into the focused control by VS Code itself), `whisper` is the local
+     * ffmpeg + whisper-cli pipeline. Absent until some path answered (the
+     * board is usable long before a lazy probe finishes), and `why` — present
+     * only when unavailable — names the missing piece and the setting that
+     * fixes it, which is what the mic's tooltip and the settings page render.
+     * `recording` is live state on the same object because the mic is a
+     * single control: it flips back on the next repaint when the capture dies
+     * on its own, so a recording that stopped must not keep pulsing.
      */
     voice?: {
-      /** Whether the two binaries answered. */
+      /** Which path the mic will take. */
+      mode: 'builtin' | 'whisper'
+      /** Whether that path answered. */
       available: boolean
       /** Present only when unavailable — names the missing piece and the
        *  setting that fixes it. */
@@ -521,13 +542,24 @@ export interface BoardHost {
    * query back (`q`) so the view can drop an answer to a superseded search.
    */
   searchTranscript(q: string): Promise<SearchAnswer>
-  /** Begin a dictation: the host records the microphone with ffmpeg. Fails
-   *  with a named reason when a piece of the local whisper pipeline is missing
-   *  or the device refuses. */
-  voiceStart(): Promise<{ ok: true } | { ok: false; error: string }>
+  /** Widen the selected session's transcript window by one slice, so the view
+   *  can show OLDER messages above the loaded tail. Called from the "load
+   *  earlier" pill; the host owns the window and re-reads on demand. */
+  loadOlderTranscript(key: string): Promise<void>
+  /** Open a search hit: select the session and widen its transcript window to
+   *  INCLUDE the full-transcript index the hit points at, so the chat can
+   *  render the row the snippet came from. */
+  openHit(key: string, entryIndex: number): Promise<void>
+  /** Begin a dictation. On the whisper path the host records the microphone
+   *  with ffmpeg; on the built-in path it just triggers VS Code's own
+   *  dictation (`builtin: true`), which types into the focused composer.
+   *  Fails with a named reason when the path is missing a piece. */
+  voiceStart(): Promise<{ ok: true; builtin?: true } | { ok: false; error: string }>
   /** Stop the recording and transcribe it locally. `text` may be empty — the
-   *  composer says "nothing recognised" rather than appending silence. */
-  voiceStop(): Promise<{ ok: true; text: string } | { ok: false; error: string }>
+   *  composer says "nothing recognised" rather than appending silence. On the
+   *  built-in path (`builtin: true`) there is no transcript to return: VS Code
+   *  typed it into the composer itself. */
+  voiceStop(): Promise<{ ok: true; text: string; builtin?: true } | { ok: false; error: string }>
   /** Open the settings tab: agents, backends and logins. Synchronous because
    *  showing a panel is not something to await — the page fills itself in. */
   openSettings(): void
@@ -627,20 +659,35 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
           void webview.postMessage({ type: 'searchResults', ...answer })
           break
         }
+        case 'moreTranscript': await host.loadOlderTranscript(id()); await refresh(); break
+        case 'openHit': {
+          // The index is a number the VIEW is echoing back from a search hit,
+          // so it is trusted — except in shape: a NaN would widen the window
+          // to NaN and blank the chat, so the host clamps it and moves on.
+          const idx = Number(msg.idx)
+          await host.openHit(id(), Number.isFinite(idx) ? idx : 0)
+          await refresh()
+          break
+        }
         case 'voiceStart': {
           const r = await host.voiceStart()
           void webview.postMessage(
             r.ok
-              ? { type: 'voice', started: true }
+              ? { type: 'voice', started: true, ...(r.builtin ? { builtin: true } : {}) }
               : { type: 'voice', started: false, error: r.error },
           )
           break
         }
         case 'voiceStop': {
           const r = await host.voiceStop()
+          // The built-in path carries no transcript — `builtin: true` tells
+          // the view the dictation typed itself, so it must not run the
+          // "nothing recognised" note on the empty text.
           void webview.postMessage(
             r.ok
-              ? { type: 'voice', started: false, text: r.text }
+              ? r.builtin
+                ? { type: 'voice', started: false, builtin: true }
+                : { type: 'voice', started: false, text: r.text }
               : { type: 'voice', started: false, error: r.error },
           )
           break

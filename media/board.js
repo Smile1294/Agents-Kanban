@@ -45,7 +45,11 @@
   /** A hit the user clicked, waiting for the chat to show its session:
    *  `{ key, idx, at }`. Kept here because the select lands a refresh or two
    *  later, and the entry it names must flash when it finally renders — not
-   *  on whichever session happens to be on screen when the click was made. */
+   *  on whichever session happens to be on screen when the click was made.
+   *  `idx` is an index into the FULL transcript: the chat draws a window of
+   *  the tail, so renderChat subtracts `transcriptHead` from it to find the
+   *  row actually drawn — which also makes a jump immune to a "load earlier"
+   *  prepend between the click and the render. */
   let jump = null
   /** How long a jump may wait for its session to appear before it is dropped.
    *  A vanished or archived-hidden session would otherwise flash the row on
@@ -74,11 +78,21 @@
   let mentionFetching = false
   /** Index into the mention suggestions, or -1 when the list is closed. */
   let mentionPick = -1
+  /** The textarea render() most recently built. Every repaint destroys the old
+   *  node, so the one being typed into — and the one a post-rebuild height fit
+   *  measures — must be reachable from module state. */
+  let composerInput = null
   /** Where the transcript of the dictation in progress will be inserted, or -1
    *  when none is in flight. Captured when the mic is pressed, because between
    *  then and the transcript arriving the textarea can be rebuilt by a repaint
    *  and lose its caret — the position must survive in here, not in the DOM. */
   let dictateAt = -1
+  /** Whether the mic's BUILT-IN mode is on. That path has no host-side
+   *  recording state to read — VS Code types straight into the focused
+   *  control — so the toggle lives here, exactly like `draft`: the host posts
+   *  "started"/"stopped" once, and repaints must not wash the ⏺ away between
+   *  them. */
+  let builtinMicOn = false
   /** The last place the user's caret sat in the composer, captured from the
    *  live textarea on every input/click/keyup. The mic button steals focus when
    *  pressed, so the caret has to be remembered, not read. */
@@ -88,6 +102,15 @@
    *  without a timestamp a note posted from the host would vanish on the next
    *  frame; with one it fades after a few seconds of its own accord. */
   let voiceNote = null // { text: string, at: number }
+  /** The height the textarea grew to for the current draft, in px. The user
+   *  types a long message and the box grows; render() then rebuilds the
+   *  composer on the next frame (an agent at work produces several a second)
+   *  and the rebuilt box started at one row — the message shrank to a slit
+   *  every time anything on the board moved. Like `draft`, the size survives
+   *  in here, not in the DOM. `null` means "measure when the node is back in
+   *  the tree" — the stub DOM has no layout, and a real browser answers
+   *  scrollHeight only after the rebuild has been attached. */
+  let composerH = null
   /**
    * Images attached to the message being composed.
    *
@@ -151,10 +174,63 @@
    */
   let catalogue = []
 
+  /* ——— The streaming fast path (ask 1: "doesn't let me scroll while it
+     streams"). render() replaces the whole tree, and an agent at work
+     produces a state frame several times a second — so the transcript's
+     scroll container was destroyed and recreated several times a second. A
+     destroyed node cannot be scrolled: the drag the user was in the middle of
+     has no target any more, and a wheel gesture lands on a fresh container at
+     a restored offset. Harvest-and-restore cannot fix that — restoring the
+     NUMBER after the node is gone does not bring the gesture back.
+     So a frame whose chrome is unchanged no longer rebuilds. The chat
+     transcript GROWS — appended rows while a run is live (the host fixes
+     history at run start and live entries only grow), or rows PREPENDED when
+     the user asks for older messages — so the existing nodes are patched in
+     place: new rows are appended, or spliced in above when the tail still
+     matches the rows on screen (that match is the proof the growth is
+     pagination, not a session change); the streaming block's text is
+     re-rendered into the SAME node, a tool row that settled gets fresh
+     content, and the trailers are moved back to the end. The refs below are
+     what the fast path patches; they are captured by renderChat/renderComposer
+     on every full render and are only ever used when `chromeSig()` says the
+     chrome around them is the same as the state that built them. —————— */
+  let syncRows = [] // { node, sig } — transcript entry rows, in DOM order
+  let syncStreamNode = null
+  let syncActivityNode = null
+  let syncQueuedNode = null
+  let syncAskNode = null
+  let syncEmptyNode = null // the 'No transcript yet.' placeholder
+  let syncHintNode = null // the new-session hint, when no card is selected
+  let syncReadoutsNode = null // the composer bar's context/spend readouts
+  let syncBarNode = null // the composer bar itself, to append a first readouts
+  /** chromeSig() of the state the last full render drew. A frame with the
+   *  same signature goes down the fast path; anything else rebuilds. */
+  let lastChrome = null
+  /** A "load earlier" round trip is in flight. Debounces the pill: its click
+   *  posts once, the widened state arrives as a normal frame (and prepends via
+   *  the fast path), and the flag is cleared by whichever frame comes next.
+   *  Held out of the DOM for the usual reason — the pill would be rebuilt by
+   *  the next full render and lose it. */
+  let moreFetching = false
+  /** The selected session's key for the rows `syncRows` currently draws. Set by
+   *  every full render and every fast-path apply — it is how the handler tells
+   *  a widened transcript (same key, more rows) from a session change. */
+  let syncKey = null
+
   window.addEventListener('message', (e) => {
     const d = e.data
     if (d.type === 'state') {
       s = d.state
+      // A "load earlier" request is consumed by the frame whose transcript is
+      // LONGER than what is on screen — the widened window — or by a frame for
+      // a different session. Clearing on every frame would defeat the debounce:
+      // a repaint from another agent mid-round-trip would re-arm the pill and
+      // a second click would double-widen. `syncRows` is the previous frame's
+      // drawn rows, so the comparison runs against what was up when the click
+      // happened.
+      if (moreFetching && ((s.transcript || []).length > syncRows.length || syncKey !== s.selectedKey)) {
+        moreFetching = false
+      }
       // Carried over when the host omitted it. Never the other way round: an
       // empty list arriving would be indistinguishable from "unchanged", so the
       // host omits the FIELD rather than sending `[]`.
@@ -164,7 +240,16 @@
         disclosuresSeeded = true
         for (const k in s.disclosures || {}) disclosed[k] = !!s.disclosures[k]
       }
+      // The streaming fast path (ask 1): a frame whose CHROME is unchanged and
+      // whose only news is transcript content — the block being streamed, the
+      // last row growing, a tool call settling — patches the existing nodes in
+      // place instead of rebuilding the tree. Rebuilding destroyed the scroll
+      // container several times a second, which cancelled every scrollbar drag
+      // and mouse-wheel gesture mid-flight: that is the freeze this fixes.
+      const sig = chromeSig()
+      if (sig === lastChrome && syncApply()) return
       render()
+      lastChrome = sig
     } else if (d.type === 'mentions') {
       // The @-mention file list, fetched once on first use. Repaints do not
       // clear it — it is module-level — and arriving late merely fills the
@@ -194,11 +279,24 @@
       // the transcript, and the error when the pipeline refused to start.
       if (d.started) {
         if (voiceNote) { voiceNote = null; render() }
+        else if (d.builtin) {
+          // The built-in path types into the FOCUSED control — and the mic
+          // button stole focus to be clicked. The composer takes it back
+          // before VS Code's dictation starts writing.
+          builtinMicOn = true
+          if (composerInput && composerInput.focus) composerInput.focus()
+          render()
+        }
+      } else if (d.builtin) {
+        // The built-in path returns no transcript: VS Code typed it itself.
+        builtinMicOn = false
+        render()
       } else if (typeof d.text === 'string') {
         insertDictation(d.text)
       } else {
         voiceNote = { text: d.error || 'Dictation is unavailable', at: Date.now() }
         dictateAt = -1
+        builtinMicOn = false
         render()
       }
     }
@@ -282,6 +380,7 @@
     // tail. That wins over "where you were", because where you were was the end.
     const sc2 = root.querySelector('.transcript-scroll')
     if (sc2 && stick) sc2.scrollTop = sc2.scrollHeight
+    fitComposer()
     if (askFocusKey && askFocusNode && askFocusNode.focus) restoreFocus(askFocusNode, caret)
     if (hadFocus && composerInput && composerInput.focus) restoreFocus(composerInput, caret)
     // A search hit the user clicked finally rendered: its row carries
@@ -301,6 +400,250 @@
     }
   }
 
+  /** Everything that decides what the chat view LOOKS like, except the bits
+   *  the fast path patches in place. Two states with the same signature must
+   *  produce an identical shell, panels, composer controls and row SET — only
+   *  the volatile transcript content below may differ:
+   *
+   *    - `transcript` and `streaming` (top-level, patched per row / per node)
+   *    - agent.tool / subagent / lastEventAt / contextTokens (the activity
+   *      line and the kanban strip's liveness readouts)
+   *    - composer.contextTokens / contextWindow / meter (the readouts)
+   *
+   *  Everything else is structural. A field is DELETED from the signature, not
+   *  left out by accident — the clones above are how a field gets listed, and
+   *  a future field that changes per frame will arrive unlisted and therefore
+   *  force a full rebuild, which is correct-but-slow, never wrong.
+   *
+   *  The signature is a stringify of the whole state minus those fields. That
+   *  is O(state) per frame, but it runs in the WEBVIEW — a separate process
+   *  from the event loop that drains the CLI — and it replaces an O(rows)
+   *  DOM rebuild with markdown, so the frame cost strictly shrinks. The model
+   *  catalogue is never in here: the view keeps it once, out of `s`. */
+  function chromeSig() {
+    const cards = (s.cards || []).map((c) => {
+      if (!c.agent) return c
+      const a = { ...c.agent }
+      delete a.tool
+      delete a.subagent
+      delete a.lastEventAt
+      delete a.contextTokens
+      return { ...c, agent: a }
+    })
+    const composer = { ...(s.composer || {}) }
+    delete composer.models
+    delete composer.contextTokens
+    delete composer.contextWindow
+    delete composer.meter
+    return JSON.stringify([
+      s.mode, s.selectedKey || '', !!s.ready, !!s.noWorkspace, !!s.noRepo,
+      !!s.focused, !!s.boardOpen, !!s.showArchived, s.busy || '',
+      !!searching, !!control, s.running || 0, s.waiting || 0,
+      !!s.transcriptMore,
+      cards, composer, s.columns || [], s.commands || [],
+      s.disclosures || {}, s.review || null,
+    ])
+  }
+
+  /** A transcript row's identity for the fast path: everything that makes it
+   *  render differently, EXCEPT the volatile bits the fast path patches
+   *  (a text/thinking row's length grows; a tool row's status settles, which
+   *  is exactly the moment its duration appears). Text uses its LENGTH rather
+   *  than its content because live rows only ever grow, and length changes
+   *  exactly when content does. */
+  function rowSig(e) {
+    if (!e) return '?'
+    switch (e.kind) {
+      case 'prompt': return 'p:' + (e.id || '') + ':' + (e.text || '').length + ':' + (e.images || 0)
+      case 'text': return 't:' + (e.model || '') + ':' + (e.text || '').length
+      case 'thinking': return 'h:' + (e.text || '').length
+      case 'tool': return 'o:' + (e.id || '') + ':' + (e.name || '') + ':' + (e.summary || '') + ':' + (e.status || '') + ':' + (e.children ? e.children.length : 0)
+      case 'phase': return 'f:' + (e.from || '') + ':' + (e.to || '') + ':' + (e.note || '')
+      case 'result': return 'r:' + (e.durationMs || '') + ':' + (e.costUsd || '')
+      case 'notice': return 'n:' + (e.urgency || '') + ':' + (e.message || '')
+      case 'error': return 'x:' + (e.message || '')
+      default: return '?' + JSON.stringify(e)
+    }
+  }
+
+  /** Handle a state frame whose chromeSig matched the last full render, by
+   *  patching the transcript in place. Returns true when it did; false means
+   *  "something does not line up, do a full render instead" — the guards
+   *  here are the fast path's safety net, and a full render is always a
+   *  correct (if slower) fallback. */
+  function syncApply() {
+    if (control || searching || s.mode !== 'chat' || !s.selectedKey || !s.ready || s.noWorkspace) return false
+    const c = selected()
+    const sc = root.querySelector('.transcript-scroll')
+    if (!c || !sc) return false
+    syncKey = c.key
+    const rows = s.transcript || []
+    // A live transcript never shrinks — a shorter list means the session
+    // changed under this DOM, which is what the full render is for.
+    if (rows.length < syncRows.length) return false
+    // First rows arrived: the placeholder under them has to go.
+    if (rows.length && (syncEmptyNode || syncHintNode)) {
+      if (syncEmptyNode) { syncEmptyNode.remove(); syncEmptyNode = null }
+      if (syncHintNode) { syncHintNode.remove(); syncHintNode = null }
+    }
+    const delta = rows.length - syncRows.length
+    if (delta > 0) {
+      // Growth is normally at the TAIL — a live run appending. Growth at the
+      // HEAD is upward pagination: the user asked for older messages and the
+      // widened window arrived. Which one, by matching the tail: if the last
+      // `syncRows.length` rows of the new array are exactly what is on screen,
+      // the new rows sit ABOVE them. (Only a finished session can paginate,
+      // and its rows are immutable, so the match is exact.) When it does not
+      // match, the rows are genuinely new tail content — or a session change
+      // the guards missed — and the fallback below stays correct.
+      let headGrew = syncRows.length > 0
+      if (headGrew) {
+        for (let i = 0; i < syncRows.length; i++) {
+          if (rowSig(rows[delta + i]) !== syncRows[i].sig) { headGrew = false; break }
+        }
+      }
+      if (headGrew) {
+        // Splice the older rows in ABOVE what is on screen. `append` re-parents
+        // an attached node, so re-appending the existing rows after the new
+        // head is a MOVE, not a copy — every row node (open panels, hover
+        // state) keeps its identity, and the reader keeps their place via the
+        // height arithmetic below.
+        const heightBefore = sc.scrollHeight
+        const topBefore = sc.scrollTop
+        const head = []
+        for (let i = 0; i < delta; i++) {
+          const e = rows[i]
+          const node = renderEntry(e, c)
+          head.push({ node, sig: rowSig(e) })
+          sc.append(node)
+        }
+        for (const r of syncRows) sc.append(r.node)
+        syncRows = head.concat(syncRows)
+        // No jump adjustment here: `jump.idx` is an index into the FULL
+        // transcript, and renderChat subtracts `transcriptHead` (total minus
+        // drawn rows) to find the row on screen — a number this prepend does
+        // not change. Shifting `idx` by `delta` would land the flash on the
+        // wrong row the moment a search jump and a load-earlier overlap.
+        // Anchoring: the content above grew, so the paragraph the reader was
+        // on now sits exactly `added` pixels further down. Reading
+        // scrollHeight forces a real layout in a real DOM — this is the one
+        // place the fast path may pay for it, and only on a pagination click.
+        sc.scrollTop = topBefore + (sc.scrollHeight - heightBefore)
+        // The pill node survived the fast path; drop the busy look the click
+        // gave it, now that the round trip has visibly landed.
+        const pill = root.querySelector('.load-earlier')
+        if (pill) pill.classList.remove('busy')
+      } else {
+        for (let i = syncRows.length; i < rows.length; i++) {
+          const e = rows[i]
+          const node = renderEntry(e, c)
+          sc.append(node)
+          syncRows.push({ node, sig: rowSig(e) })
+        }
+      }
+    }
+    // Rows whose volatile bits changed — the last text/thinking entry grew, a
+    // tool call settled. Patched INTO the existing node, so the scroll
+    // container and every row around it keep their identity (which is the
+    // whole point: a node that is never destroyed never cancels a drag).
+    let patching = false
+    for (let i = 0; i < syncRows.length; i++) {
+      if (rowSig(rows[i]) !== syncRows[i].sig) { patching = true; break }
+    }
+    if (patching) {
+      // A rebuilt row forgets the user's open/closed state unless it is read
+      // off the live node first — the same harvest render() does, run once
+      // ahead of the rebuilds that need it.
+      forEachDisclosure((n) => { disclosed[n.getAttribute('data-open')] = !!n.open })
+      for (let i = 0; i < syncRows.length; i++) {
+        const e = rows[i]
+        const sig = rowSig(e)
+        if (sig !== syncRows[i].sig) {
+          syncRow(syncRows[i].node, e, c)
+          syncRows[i].sig = sig
+        }
+      }
+    }
+    // The block being written. Re-rendered INTO the same node, so the stream
+    // updates without touching anything above it.
+    if (s.streaming) {
+      if (syncStreamNode) {
+        const fresh = renderStreaming(s.streaming)
+        syncStreamNode.replaceChildren(...fresh.children)
+      } else {
+        syncStreamNode = renderStreaming(s.streaming)
+        sc.append(syncStreamNode)
+      }
+    } else if (syncStreamNode) {
+      syncStreamNode.remove()
+      syncStreamNode = null
+    }
+    // "Is it still going?" — its tool name and age are volatile, and it must
+    // not sit stale while everything else on screen is live.
+    if (c.agent) {
+      const fresh = renderActivity(c.agent)
+      if (syncActivityNode) syncActivityNode.replaceChildren(...fresh.children)
+      else { syncActivityNode = fresh; sc.append(syncActivityNode) }
+    } else if (syncActivityNode) {
+      syncActivityNode.remove()
+      syncActivityNode = null
+    }
+    // Appends and the streaming block land at the end of the container; the
+    // trailers must come back after them. append() MOVES an existing child,
+    // so this is the whole "insert before the trailers" this view needs.
+    orderTrailers(sc)
+    // The composer's context/spend readouts are volatile too.
+    syncReadouts()
+    // Follow the tail, judged from the LIVE node. The user may have scrolled
+    // up since the last full render — `stick` cannot be carried over from it,
+    // which is what made a rebuilt container snap back to the bottom.
+    stick = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 60
+    if (stick) sc.scrollTop = sc.scrollHeight
+    return true
+  }
+
+  /** Refresh one row's content inside its existing node. */
+  function syncRow(node, e, c) {
+    // A thinking block streams into a row the user may have OPEN. Patching
+    // its body text in place is the cheap path — a full row rebuild would
+    // re-render the (potentially huge) block every frame, which is the very
+    // cost this fast path exists to avoid. Collapsed, there is no body to
+    // update: disclosure() only builds it for an open panel.
+    if (e.kind === 'thinking') {
+      const body = node.querySelector ? node.querySelector('.thinking-body') : null
+      if (body) body.textContent = e.text || ''
+      return
+    }
+    const fresh = renderEntry(e, c)
+    // The wrapper's own class is row state too — a settling tool call must
+    // stop saying status-running on the row itself, not only in its children.
+    node.className = fresh.className
+    node.replaceChildren(...fresh.children)
+  }
+
+  /** Put the trailers back after the rows. */
+  function orderTrailers(sc) {
+    for (const n of [syncStreamNode, syncActivityNode, syncQueuedNode, syncAskNode]) {
+      if (n) sc.append(n)
+    }
+  }
+
+  /** The composer bar's context/spend readouts change per frame while a turn
+   *  runs; rebuild just that group in place, remove it when the new state has
+   *  nothing to show, and CREATE it when the first usage figure arrives after
+   *  a full render that had none to draw. The readouts sit at the end of the
+   *  bar, so appending a fresh one lands where it belongs. */
+  function syncReadouts() {
+    const fresh = buildReadouts()
+    if (syncReadoutsNode) {
+      if (fresh) syncReadoutsNode.replaceChildren(...fresh.children)
+      else { syncReadoutsNode.remove(); syncReadoutsNode = null }
+    } else if (fresh && syncBarNode) {
+      syncReadoutsNode = fresh
+      syncBarNode.append(fresh)
+    }
+  }
+
   /* Give a rebuilt input its focus AND its caret back.
      Clamped to the current value, because the draft can legitimately be shorter
      than it was — the host can replace it, and a selection that ran past the
@@ -314,6 +657,31 @@
     const end = caret && Number.isFinite(caret.end) ? Math.min(caret.end, n) : start
     try { node.setSelectionRange(start, end) } catch (e) { /* not a real input */ }
   }
+
+  /** Measure the rebuilt composer box once it is back in the tree. `composerH`
+   *  was cleared by a change that happened without an input event — a pasted
+   *  mention, a dictation landing — so the rebuilt textarea is one row tall and
+   *  the draft spills out of sight. Reading scrollHeight on an attached node
+   *  forces the one layout the answer needs. Skipped when a size is already
+   *  known: this runs on every repaint, and repaints happen several times a
+   *  second. The stub DOM reports scrollHeight 0 — no layout exists to force —
+   *  so the box stays at its CSS size there, and the view tests assert the
+   *  recorded height, not the measured one. */
+  function fitComposer() {
+    if (!composerInput || composerH || !draft) return
+    const sh = composerInput.scrollHeight
+    if (typeof sh !== 'number' || !sh) return
+    composerH = Math.min(160, sh)
+    composerInput.style.height = composerH + 'px'
+  }
+
+  /** The height that fit the old window width may not fit the new one. Forget
+   *  it and re-measure. No-op in the stub: its window swallows every listener
+   *  that is not `message`. */
+  window.addEventListener('resize', () => {
+    composerH = null
+    fitComposer()
+  })
 
   /** Every scroll container currently on screen. They announce themselves with
    *  `data-scroll="<key>"`; anything that scrolls and is rebuilt by render()
@@ -452,7 +820,7 @@
     // was opened from, so the toggle has to live in the rail, the one thing
     // both modes keep.
     const ts = el('button', 'pill' + (searching ? ' on' : ''), '⌕ Search')
-    ts.title = 'Search what was actually said — prompts and answers, no tool calls'
+    ts.title = 'Search every transcript in full — answers, prompts, thinking, tool calls'
     ts.onclick = () => {
       if (searching) { closeSearch(); render() }
       else {
@@ -1183,34 +1551,113 @@
     if (c && c.testPlan) main.append(renderTestPlan(c))
     if (c && c.worktree) main.append(renderReview(c))
 
+    syncKey = c ? c.key : null
     const scroll = el('div', 'transcript-scroll')
     scroll.setAttribute('data-scroll', 'transcript')
-    if (!c) scroll.append(renderNewSessionHint())
-    else if (!s.transcript || !s.transcript.length) scroll.append(el('div', 'empty', 'No transcript yet.'))
-    else {
+    // The fast path's refs (see the block at module top). Every full render
+    // refreshes them; a streaming frame then patches exactly these nodes.
+    syncRows = []
+    syncStreamNode = null
+    syncActivityNode = null
+    syncQueuedNode = null
+    syncAskNode = null
+    syncEmptyNode = null
+    syncHintNode = null
+    if (!c) {
+      syncHintNode = renderNewSessionHint()
+      scroll.append(syncHintNode)
+    } else if (!s.transcript || !s.transcript.length) {
+      syncEmptyNode = el('div', 'empty', 'No transcript yet.')
+      scroll.append(syncEmptyNode)
+    } else {
       // The row a search hit pointed at, when this session finally rendered —
-      // marked here (the entry index IS the row the search read, by contract
-      // between the host's two transcript paths and this loop) and scrolled to
-      // at the end of render(), which is where the scroll restore has finished.
-      const want = jump && jump.key === c.key ? jump.idx : -1
+      // marked here and scrolled to at the end of render(), which is where the
+      // scroll restore has finished. `jump.idx` is an index into the FULL
+      // transcript, but the chat draws a tail window of it: `transcriptHead`
+      // (total minus drawn rows, sent by the host) translates it to the row
+      // actually on screen. Using that offset instead of shifting `jump.idx`
+      // when a load-earlier prepends is what keeps a jump immune to a window
+      // widening between the click and the render.
+      const want = jump && jump.key === c.key ? jump.idx - (s.transcriptHead || 0) : -1
       for (let i = 0; i < s.transcript.length; i++) {
-        const node = renderEntry(s.transcript[i], c)
+        const e = s.transcript[i]
+        const node = renderEntry(e, c)
         if (i === want) node.classList.add('hit-jump')
+        syncRows.push({ node, sig: rowSig(e) })
         scroll.append(node)
       }
     }
-    if (s.streaming) scroll.append(renderStreaming(s.streaming))
+    if (s.streaming) {
+      syncStreamNode = renderStreaming(s.streaming)
+      scroll.append(syncStreamNode)
+    }
     // The running indicator belongs HERE, at the foot of the transcript, where
     // new output appears and where the eye already is. It used to exist only on
     // the kanban cards — so the chat view, which is where you actually sit and
     // watch, showed nothing at all between tool calls and looked stopped.
-    if (c && c.agent) scroll.append(renderActivity(c.agent))
-    if (c && c.queued && c.queued.length) scroll.append(renderQueued(c))
-    if (c && c.agent && c.agent.pendingPermission) scroll.append(renderAsk(c, c.agent))
-    main.append(scroll)
+    if (c && c.agent) {
+      syncActivityNode = renderActivity(c.agent)
+      scroll.append(syncActivityNode)
+    }
+    if (c && c.queued && c.queued.length) {
+      syncQueuedNode = renderQueued(c)
+      scroll.append(syncQueuedNode)
+    }
+    if (c && c.agent && c.agent.pendingPermission) {
+      syncAskNode = renderAsk(c, c.agent)
+      scroll.append(syncAskNode)
+    }
+    // The wrap exists so the pagination and jump controls can overlay the
+    // scroll area without taking flow space from the transcript. The scroll
+    // node itself keeps `data-scroll` — the repaint restore finds it there,
+    // and the fast path finds it by class, both unchanged by the wrapper.
+    const wrap = el('div', 'transcript-wrap')
+    wrap.append(scroll)
+    if (s.transcriptMore) wrap.append(renderLoadEarlier())
+    if (c && s.transcript && s.transcript.length > 1) wrap.append(renderJumps())
+    main.append(wrap)
 
     main.append(renderComposer(c))
     return main
+  }
+
+  /** The pill at the top of the transcript: "there is more above". Clicking it
+   *  posts once (debounced by `moreFetching`) and the host answers with the
+   *  widened window on the normal state channel — the fast path splices the
+   *  older rows in above what is on screen, without rebuilding. */
+  function renderLoadEarlier() {
+    const pill = el('button', 'load-earlier' + (moreFetching ? ' busy' : ''), '↑ Load earlier messages')
+    pill.title = 'Load the next older slice of this conversation'
+    pill.onclick = () => {
+      if (moreFetching) return
+      moreFetching = true
+      post('moreTranscript', { id: s.selectedKey })
+      // The click consumed the frame budget; re-render locally so the busy
+      // state is visible without waiting for the round trip.
+      render()
+    }
+    return pill
+  }
+
+  /** Jump to the oldest loaded message, or back to the newest and follow the
+   *  tail. Overlaid on the transcript's edge, out of the text flow. */
+  function renderJumps() {
+    const cluster = el('div', 'jump-cluster')
+    const top = el('button', null, '⤒ Top')
+    top.title = 'Jump to the oldest loaded message'
+    top.onclick = () => {
+      const sc = root.querySelector('.transcript-scroll')
+      if (sc) sc.scrollTop = 0
+    }
+    const latest = el('button', null, '⤓ Latest')
+    latest.title = 'Jump to the newest message and follow the tail'
+    latest.onclick = () => {
+      stick = true
+      const sc = root.querySelector('.transcript-scroll')
+      if (sc) sc.scrollTop = sc.scrollHeight
+    }
+    cluster.append(top, latest)
+    return cluster
   }
 
   // ----------------------------------------------------------- transcript search
@@ -1284,7 +1731,7 @@
     pane.append(row)
 
     pane.append(el('div', 'search-note',
-      'Prompts and agent answers only — tool calls, thinking and subagent chatter are not searched.'))
+      'Every word the transcript shows — prompts, answers, thinking, tool calls, board moves — across the whole conversation, not just what is loaded.'))
 
     const list = el('div', 'search-list')
     list.setAttribute('data-scroll', 'search')
@@ -1298,10 +1745,10 @@
       for (const r of searchRows) list.append(searchRow(r))
     } else if (searchRows && searchRows.length === 0) {
       list.append(el('div', 'search-empty', 'No matches for “' + searchQ.trim() + '”.'))
-      list.append(el('div', 'search-empty-sub', 'Remember the filter — a word that only appears in a tool call is not in here.'))
+      list.append(el('div', 'search-empty-sub', 'Only what the transcript shows is searched — a word that never appears on screen is not in here.'))
     } else {
       list.append(el('div', 'search-idle',
-        'Every prompt you sent and every answer the agent gave, across every session — archived ones too.'))
+        'Every word any transcript shows, across every session — the full history of each, archived ones too.'))
     }
     pane.append(list)
     main.append(pane)
@@ -1320,6 +1767,35 @@
    *  jumps to the session with the row set to flash — the entry index was
    *  measured against exactly the array the chat renders, so the flash lands
    *  on the row the snippet came from, not on "somewhere in this session". */
+  /** What a search hit's row is, in words. Every kind the widened search can
+   *  match gets one — the old prompt/answer pair would call a tool row's
+   *  match "agent answered". A `nested` hit sits inside a subagent transcript
+   *  under a Task row, and the label says so: that is why the jump lands on
+   *  the Task rather than on the words themselves. */
+  function kindLabel(r) {
+    const base = {
+      prompt: 'you asked',
+      text: 'agent answered',
+      thinking: "the agent's thinking",
+      tool: 'a tool call',
+      phase: 'a board move',
+      result: 'a turn summary',
+      notice: 'a notice',
+      error: 'an error',
+    }[r.kind] || r.kind
+    if (!r.nested) return base
+    return {
+      prompt: 'a subagent was asked',
+      text: "a subagent's answer",
+      thinking: "a subagent's thinking",
+      tool: "a subagent's tool call",
+      phase: 'a subagent board move',
+      result: "a subagent's summary",
+      notice: 'a subagent notice',
+      error: 'a subagent error',
+    }[r.kind] || `in a subagent — ${base}`
+  }
+
   function searchRow(r) {
     const c = card(r.key)
     const row = el('div', 'srow')
@@ -1334,7 +1810,11 @@
       // is), so jumping to one first reveals it — same tap count as any other
       // hit, and honest: the chat opens on the session, not on a blank.
       if (!c && !s.showArchived) post('toggleArchived')
-      post('select', { id: r.key })
+      // `openHit`, not `select`: the index is into the FULL transcript, and
+      // the host widens the chat's window to include it — otherwise the flash
+      // would land on "somewhere in the tail", not on the row the snippet
+      // came from.
+      post('openHit', { id: r.key, idx: r.entryIndex })
       post('setMode', { mode: 'chat' })
     }
     const top = el('div', 'srow-top')
@@ -1342,7 +1822,7 @@
     if (c) top.append(phaseChip(c.phase))
     top.append(el('span', 'srow-when', whenLabel(r.at)))
     row.append(top)
-    const who = el('span', 'srow-kind', r.kind === 'prompt' ? 'you asked' : 'agent answered')
+    const who = el('span', 'srow-kind', kindLabel(r))
     const text = el('div', 'srow-snip')
     if (r.lead) text.append(el('span', 'srow-lead', '…'))
     text.append(snipWithMark(r.snippet, searchQ))
@@ -1539,10 +2019,51 @@
     return b
   }
 
+  /** The composer bar's context/spend readouts, as one group. Returns null
+   *  when there is nothing to show. Extracted so the fast path can rebuild
+   *  this group in place while the rest of the composer stands still. */
+  function buildReadouts() {
+    /* One GROUP, so the two readouts cannot be separated. The bar is
+       `flex-wrap: wrap`, and appending the spend figure as a sibling put it at
+       the far LEFT of a second row the moment the pickers filled the first —
+       the opposite of "next to the context", with its separator rule dangling
+       at the start of a line. Grouped, they wrap together or not at all. */
+    const readouts = el('div', 'readouts')
+    // Counted rather than read back off the node: the stub DOM the view tests
+    // run against has no `childNodes`, and that is the point of it — a view
+    // that only works against a real browser cannot be unit-tested at all.
+    let readoutCount = 0
+    if (s.composer.contextWindow) {
+      const meter = el('span', 'ctx-meter')
+      const fill = el('span', 'ctx-fill')
+      const ratio = Math.min(1, s.composer.contextTokens / s.composer.contextWindow)
+      fill.style.width = (ratio * 100).toFixed(1) + '%'
+      if (ratio > 0.85) fill.classList.add('hot')
+      meter.append(fill)
+      readouts.append(meter)
+      const ctx = el('span', 'ctx', pct(s.composer.contextTokens, s.composer.contextWindow))
+      ctx.title = 'Context used by the last response, of this session’s window'
+      readouts.append(ctx)
+      readoutCount += 2
+    } else if (s.composer.contextTokens) {
+      // Tokens without a window. Showing the count alone beats showing nothing:
+      // it is the number the percentage would have been derived from.
+      const ctx = el('span', 'ctx', fmtTokens(s.composer.contextTokens))
+      ctx.title = 'Context used by the last response. The window this session ran with is unknown.'
+      readouts.append(ctx)
+      readoutCount++
+    }
+    const spend = renderMeter(s.composer.meter)
+    if (spend) { readouts.append(spend); readoutCount++ }
+    return readoutCount ? readouts : null
+  }
+
   function renderComposer(c) {
     const wrap = el('div', 'composer-wrap')
 
     const bar = el('div', 'composer-bar')
+    // The fast path appends the readouts here when they appear mid-turn.
+    syncBarNode = bar
     bar.append(el('span', 'agent-badge', 'AGENT'))
     /* The menu carries the CLI's own one-liner for each model. That is what
        makes "Default (recommended) — Opus 5 with 1M context" a choice rather
@@ -1564,6 +2085,16 @@
         m.detail || '',
       ].filter(Boolean).join(' · '),
     })), s.selectedKey, modelSourceNote()))
+    /* The model-switch warning, built HOST-side (this file does no arithmetic
+       on money): the selected session has a conversation, and the picker's
+       model differs from the one it was on — the next turn re-reads it all
+       at the new model's input price. Rendered beside the picker that
+       triggered it, in the same amber used for the provider note. */
+    if (s.composer.modelSwitchNote) {
+      const sw = el('span', 'provider-note', '⚠ ' + s.composer.modelSwitchNote)
+      sw.title = s.composer.modelSwitchNote
+      bar.append(sw)
+    }
     /* WHAT THIS SESSION RUNS ON: one entry per agent-and-backend combination.
        This was two pickers — an agent picker and, before that, a backend
        picker — and splitting them made the user do the cross product in their
@@ -1680,39 +2211,10 @@
        as "nobody is counting". They are now totalled from the transcript when
        nothing is running, so what is drawn here does not depend on whether the
        agent happens to be alive. */
-    /* One GROUP, so the two readouts cannot be separated. The bar is
-       `flex-wrap: wrap`, and appending the spend figure as a sibling put it at
-       the far LEFT of a second row the moment the pickers filled the first —
-       the opposite of "next to the context", with its separator rule dangling
-       at the start of a line. Grouped, they wrap together or not at all. */
-    const readouts = el('div', 'readouts')
-    // Counted rather than read back off the node: the stub DOM the view tests
-    // run against has no `childNodes`, and that is the point of it — a view
-    // that only works against a real browser cannot be unit-tested at all.
-    let readoutCount = 0
-    if (s.composer.contextWindow) {
-      const meter = el('span', 'ctx-meter')
-      const fill = el('span', 'ctx-fill')
-      const ratio = Math.min(1, s.composer.contextTokens / s.composer.contextWindow)
-      fill.style.width = (ratio * 100).toFixed(1) + '%'
-      if (ratio > 0.85) fill.classList.add('hot')
-      meter.append(fill)
-      readouts.append(meter)
-      const ctx = el('span', 'ctx', pct(s.composer.contextTokens, s.composer.contextWindow))
-      ctx.title = 'Context used by the last response, of this session’s window'
-      readouts.append(ctx)
-      readoutCount += 2
-    } else if (s.composer.contextTokens) {
-      // Tokens without a window. Showing the count alone beats showing nothing:
-      // it is the number the percentage would have been derived from.
-      const ctx = el('span', 'ctx', fmtTokens(s.composer.contextTokens))
-      ctx.title = 'Context used by the last response. The window this session ran with is unknown.'
-      readouts.append(ctx)
-      readoutCount++
-    }
-    const spend = renderMeter(s.composer.meter)
-    if (spend) { readouts.append(spend); readoutCount++ }
-    if (readoutCount) bar.append(readouts)
+    const readouts = buildReadouts()
+    // The one piece of the composer that changes per streamed frame, and the
+    // ref the fast path patches between full renders.
+    if (readouts) { bar.append(readouts); syncReadoutsNode = readouts } else syncReadoutsNode = null
     wrap.append(bar)
 
     // `/name args` is executed by the Agent SDK as the matching
@@ -1732,6 +2234,7 @@
     ta.placeholder = c ? 'Reply… (Enter to send, Shift+Enter for a new line)' : 'What should the agent do? (Enter to start)'
     ta.value = draft
     ta.rows = 1
+    if (composerH) ta.style.height = composerH + 'px'
     const rememberCaret = () => {
       if (typeof ta.selectionStart === 'number') caretAt = ta.selectionStart
     }
@@ -1746,8 +2249,12 @@
       const had = slashKey(draft)
       const hadMent = mentionQuery(draft)
       draft = e.target.value
+      // Grow with the content and RECORD the size: the next repaint rebuilds
+      // this node and must come back at the same height, not at one row.
       e.target.style.height = 'auto'
-      e.target.style.height = Math.min(160, e.target.scrollHeight) + 'px'
+      const sh = typeof e.target.scrollHeight === 'number' ? e.target.scrollHeight : 0
+      composerH = sh ? Math.min(160, sh) : null
+      e.target.style.height = sh ? composerH + 'px' : 'auto'
       rememberCaret()
       const now = slashKey(draft)
       const nowMent = mentionQuery(draft)
@@ -1839,24 +2346,39 @@
       picker.click()
     }
 
-    /* The mic: dictation into the draft, recorded and transcribed on THIS
-       machine by ffmpeg + whisper — the audio never leaves it. Shown only
-       when the host's probe of both binaries answered, because a mic that
-       cannot record is a control that cannot take effect; when the probe says
-       what is missing, the mic still shows, dimmed, and opens the settings
-       page that says how to install it — a button that takes you to the fix
-       is not a dead control. Absent (probe not finished) it is not drawn. */
+    /* The mic: dictation into the draft. TWO paths, named by `voice.mode`.
+       `builtin` is the default when it exists — VS Code 1.131+ ships its own
+       offline dictation, nothing installed, which types into the focused
+       control; the click only triggers it and puts focus back on the
+       composer. `whisper` is the explicit fallback, recorded and transcribed
+       on THIS machine by ffmpeg + whisper — the audio never leaves it.
+       Shown only when the host's gate answered (a mic that cannot record is
+       a control that cannot take effect); when the gate says what is
+       missing, the mic still shows, dimmed, and opens the settings page that
+       says how to install each piece — a button that takes you to the fix is
+       not a dead control. Absent (no answer yet) it is not drawn. */
     const voice = s.composer.voice
     let mic = null
     if (voice && voice.available) {
-      mic = el('button', 'mic' + (voice.recording ? ' live' : ''), voice.recording ? '⏺' : '🎤')
-      mic.title = voice.recording
-        ? 'Stop dictating — the recording is transcribed locally'
-        : 'Dictate… (recorded on this machine, transcribed by whisper-cli)'
+      const on = voice.recording || builtinMicOn
+      const builtin = voice.mode === 'builtin'
+      mic = el('button', 'mic' + (on ? ' live' : ''), on ? '⏺' : '🎤')
+      mic.title = on
+        ? 'Stop dictating'
+        : builtin
+          ? "Dictate with VS Code's built-in speech recognition — offline, nothing to install. Types into the message box; the keybinding is Ctrl+Alt+V (⌥⌘V on macOS)."
+          : 'Dictate… (recorded on this machine, transcribed by whisper-cli)'
       mic.onclick = () => {
-        if (voice.recording) {
+        if (on) {
           dictateAt = -1
+          builtinMicOn = false
           post('voiceStop')
+        } else if (builtin) {
+          // The built-in dictation types into the FOCUSED control, and the
+          // button click just moved focus here — the composer must take it
+          // back before the trigger fires.
+          if (composerInput && composerInput.focus) composerInput.focus()
+          post('voiceStart')
         } else {
           // Where the transcript lands: the last place the caret sat. Read now,
           // because a repaint between stop and transcript will rebuild the
@@ -1867,7 +2389,9 @@
       }
     } else if (voice && voice.why) {
       mic = el('button', 'mic missing', '🎤')
-      mic.title = voice.why + '\n\nClick to open the settings page, which says how to install each piece.'
+      mic.title = voice.why
+        + '\n\nOr enable VS Code built-in dictation — "Dictation: Enabled" (experimental, VS Code 1.131+), then hold Ctrl+Alt+V (⌥⌘V on macOS) with the message focused.'
+        + '\n\nClick to open the settings page, which says how to install each piece.'
       mic.onclick = () => { dictateAt = -1; post('openSettings') }
     }
 
@@ -1880,7 +2404,7 @@
       // point of attaching a screenshot.
       if (!text && !attachments.length) return
       const images = attachments.map((a) => ({ name: a.name, mediaType: a.mediaType, data: a.data }))
-      draft = ''; ta.value = ''; ta.style.height = 'auto'; stick = true
+      draft = ''; ta.value = ''; composerH = null; stick = true
       attachments = []
       if (c) post('send', { id: c.key, text, images })
       else post('newSession', { text, images })
@@ -1961,6 +2485,7 @@
     if (!m) return
     draft = draft.slice(0, m.index + m[1].length) + '@' + file + ' '
     mentionPick = -1
+    composerH = null // the draft grew without an input event; measure the rebuilt box
     render()
   }
 
@@ -1980,6 +2505,7 @@
     draft = draft.slice(0, at) + piece + draft.slice(at)
     dictateAt = -1
     caretAt = at + piece.length
+    composerH = null // the draft grew without an input event; measure the rebuilt box
     render()
   }
 
@@ -2001,6 +2527,7 @@
     // would fire the bare command before the user typed them.
     draft = '/' + cmd.name + ' '
     slashPick = -1
+    composerH = null // the draft grew without an input event; measure the rebuilt box
     render()
   }
 
@@ -2143,34 +2670,6 @@
     return label
   }
 
-  function providerName() {
-    /* The RUNNING agent's answer wins over the profile we asked for.
-       `resolvedProvider` and `providerLabel` are what the CLI reported it is
-       ACTUALLY on — a managed settings file, an `apiKeyHelper` or an env block
-       in `~/.claude/settings.json` all outrank our request. The host has
-       computed both onto every card since the feature was written and the view
-       read neither, so the chip could only ever repeat our own configuration
-       back, which is the decorative readout the rule about this names. */
-    const live = selected() && selected().agent
-    if (live && (live.providerLabel || live.resolvedProvider)) {
-      return live.providerLabel || live.resolvedProvider
-    }
-    const id = s.composer.provider
-    const p = (s.composer.providers || []).find((x) => x.id === id)
-    if (!p) return 'Provider'
-    /* The inherit profile makes no claim about the backend, so its chip must
-       not make one either: it says where the answer comes FROM rather than
-       naming a provider we have not been told about. */
-    if (p.id === 'inherit') return 'Inherited'
-    /* A CUSTOM ENDPOINT is named by its HOST, not by the label somebody typed.
-       The label is free text and drifts from the URL the moment a preset is
-       edited: a profile still called "OpenRouter" pointed at api.deepseek.com
-       reads as a bug in the model list — "why is Claude Code offering me
-       DeepSeek models?" — when the answer is simply that it is talking to
-       DeepSeek. The host is the thing that decides which models exist, and it
-       is the one string here that cannot be out of date. */
-    return p.support === 'gateway' && p.detail ? p.detail : p.label
-  }
   /* The level's own label. Falls back to the raw key rather than to a guess:
      a build that stored a level this one does not serve should say so, not
      silently show "Balanced". */

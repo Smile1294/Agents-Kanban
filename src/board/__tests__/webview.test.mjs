@@ -134,6 +134,17 @@ ok(ct.includes('82k/1M (8%)'), `composer shows context usage: ${/\d+k\/\d+\w? \(
 // state in which a session that has run has no context fill and no cost.
 ok(ct.includes('$1.23'), 'composer shows what the session has spent')
 
+// 5b. The model-switch warning: built host-side (this file does no arithmetic
+// on money), rendered beside the picker that triggered it.
+{
+  const note = "This conversation last ran on Opus 5. Switching to Haiku re-reads it all — ~223k tokens ≈ $0.67 at Haiku's input price."
+  const warned = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, modelSwitchNote: note } })
+  ok(warned.text().includes('re-reads it all'), 'the model-switch warning is on the composer bar')
+  ok(warned.text().includes('$0.67'), 'the cost estimate arrives as text, not as money arithmetic done here')
+  ok(!run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER } }).text().includes('re-reads it all'),
+    'absent when the host sent no note')
+}
+
 const stored = run({
   ...base, mode: 'chat', selectedKey: 'abc-123',
   // No `agent` on the card: nothing is running, exactly as after a restart.
@@ -578,6 +589,34 @@ ok(typed.text().includes('/release') && !typed.text().includes('/review'),
 const gone = type(typed, 'not a command')
 ok(!typed.text().includes('/release'), 'the menu closes once the text is no longer a slash command')
 ok(typed.document.activeElement === gone, 'and focus is still in the composer')
+
+// 10b. A long draft keeps its size across repaints. The composer grew with the
+// message; render() then rebuilt the textarea at one row, so the draft shrank
+// to a slit every time any card on the board moved. The size must live in
+// module state, not in the DOM.
+const grown = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] })
+const ta1 = findByTag(grown.root, 'textarea')
+ta1.focus()
+ta1.value = 'one long line '.repeat(60)
+ta1.scrollHeight = 300 // real browsers answer this; the stub has no layout
+ta1.oninput({ target: ta1 })
+ok(ta1.style.height === '160px', `typing a long draft grows the box to the cap: ${ta1.style.height}`)
+// A frame with nothing new does NOT rebuild the composer any more — the
+// streaming fast path keeps the node the user is typing into alive (the
+// scroll-freeze fix). Rebuilding it per frame was the old behaviour, and it
+// is exactly what threw the textarea away mid-sentence.
+for (const fn of grown.listeners) fn({ data: { type: 'state', state: { ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] } } })
+ok(findByTag(grown.root, 'textarea') === ta1, 'a frame with nothing new keeps the composer node')
+// A frame with a real chrome change (the model picker moved) rebuilds it…
+for (const fn of grown.listeners) fn({ data: { type: 'state', state: { ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, model: 'claude-haiku-4-5-20251001' } } } })
+const ta2 = findByTag(grown.root, 'textarea')
+ok(ta2 !== ta1, 'a chrome-changing frame rebuilt the composer')
+ok(ta2.value === ta1.value && ta2.style.height === '160px', 'and the draft came back at the same height, not one row')
+// Sending clears the recorded size along with the draft, so the next message
+// starts from a one-row box instead of inheriting the old one.
+findButton(grown.root, '➤').onclick()
+const ta3 = findByTag(grown.root, 'textarea')
+ok(ta3.value === '' && !ta3.style.height, 'sending clears the draft and its recorded height')
 
 // 11. Taking the window. The board is five columns and a rail; squeezed beside a
 // file explorer there is not enough room to read a card, so this has to be one
@@ -1080,6 +1119,38 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   ok(ta3.value === 'fix the parser and rerun it ', 'two dictations do not weld together')
 }
 
+// 18b. The mic's BUILT-IN mode: VS Code's own dictation, nothing installed. ---
+// The click only triggers it and hands focus back to the composer — the
+// built-in dictation types into the FOCUSED control, and the button click just
+// stole focus. There is no transcript message either: VS Code typed it itself,
+// so a stop reply must not run the "nothing recognised" note.
+{
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { mode: 'builtin', available: true, recording: false } } })
+  const ta = findByTag(v.root, 'textarea')
+  const mic = findButton(v.root, '🎤')
+  ok(!!mic, 'the built-in gate draws the mic like any other')
+  ta.focus()
+  mic.onclick()
+  ok(v.document.activeElement === ta, 'pressing the built-in mic puts focus back on the composer — the dictation types there')
+  ok(v.posted.some((m) => m.type === 'voiceStart'), 'and asks the host to trigger VS Code dictation')
+
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: true, builtin: true } })
+  const stop = findButton(v.root, '⏺')
+  ok(!!stop, 'the built-in mic becomes a stop control once the trigger fired')
+  ok(v.document.activeElement.tagName === 'textarea', 'focus is in the composer while VS Code dictates')
+
+  stop.onclick()
+  ok(v.posted.some((m) => m.type === 'voiceStop'), 'pressing again asks the host to stop VS Code dictation')
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: false, builtin: true } })
+  ok(!!findButton(v.root, '🎤'), 'and the mic comes back')
+  ok(!v.text().includes('Nothing recognised'), 'a built-in stop carries no transcript, and is NOT read as "nothing recognised"')
+
+  // The ⏺ survives repaints — module state, like the draft, not DOM state.
+  for (const fn of v.listeners) fn({ data: { type: 'voice', started: true, builtin: true } })
+  for (const fn of v.listeners) fn({ data: { type: 'state', state: { ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], composer: { ...COMPOSER, voice: { mode: 'builtin', available: true, recording: false } } } } })
+  ok(!!findButton(v.root, '⏺'), 'the built-in ⏺ survives a repaint between start and stop')
+}
+
 {
   // Whisper or ffmpeg missing: no dead mic. The mic shows, dimmed, and goes to
   // the settings page — the place that says how to install each piece.
@@ -1160,7 +1231,7 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   pill.onclick({})
   ok(v.text().includes('Search transcripts'), 'clicking it opens the search screen')
   ok(!v.root.querySelector('.board'), 'the kanban board stands down while searching')
-  ok(v.text().includes('Every prompt you sent'), 'the idle hint says what the search covers')
+  ok(v.text().includes('Every word any transcript shows'), 'the idle hint says what the search covers')
   const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
   ok(!!box && box.placeholder.includes('jira'), 'the screen leads with a search box')
 
@@ -1230,7 +1301,8 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   // The right query's answer, zero matches: an honest no, not a blank.
   for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches: [], more: 0 } })
   ok(v.text().includes('No matches for “jira”'), 'a real miss says so, naming the query')
-  ok(v.text().includes('tool call'), 'and reminds why — the filter is the point')
+  ok(v.text().includes('Only what the transcript shows is searched'),
+    'and states the boundary — text that never renders is not searched')
 }
 
 // Clicking a hit jumps to the session and flashes the exact row the snippet
@@ -1249,7 +1321,8 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   const row = walkAll(v.root).find((n) => n.className === 'srow')
   ok(!!row, 'the hit is drawn as a row')
   row.onclick({})
-  ok(v.posted.some((m) => m.type === 'select' && m.id === 'abc-123'), 'clicking a hit selects its session')
+  const oh = v.posted.find((m) => m.type === 'openHit' && m.id === 'abc-123')
+  ok(!!oh && oh.idx === 1, 'clicking a hit posts openHit with the FULL-transcript index, not select')
   ok(v.posted.some((m) => m.type === 'setMode' && m.mode === 'chat'), 'and asks for the chat view')
   ok(!v.posted.some((m) => m.type === 'toggleArchived'), 'a session already on the board jumps without revealing anything')
 
@@ -1275,8 +1348,75 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
       { kind: 'text', at: Date.now(), text: 'the answer that mentions jira' },
     ],
   })
-  ok(!walkAll(v.root).some((n) => (n.className || '').includes('hit-jump')),
-    'the flash is one-shot — a later frame does not repeat it')
+  // The flash is one-shot: a later frame must not RE-CREATE the marked row —
+  // re-creating the element is the only way a CSS animation restarts. The
+  // streaming fast path keeps the node, so the class may still be ON it; that
+  // is harmless, and the next full render rebuilds the row without it.
+  const again = walkAll(v.root).find((n) => (n.className || '').includes('hit-jump'))
+  ok(!again || again === flash, 'the flash is one-shot — a later frame does not repeat it')
+}
+
+// A hit's index is into the FULL transcript, but the chat draws a tail window
+// of it — `transcriptHead` (total minus drawn rows) translates it. The
+// translation must hold when the window later widens: the pending jump keeps
+// its full index, and the flash lands on the same row's new position.
+{
+  const v = run(base)
+  findButton(v.root, 'Search').onclick({})
+  const box = findByTag(v.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box.value = 'jira'
+  box.oninput({ target: box })
+  box.onkeydown({ key: 'Enter' })
+  const matches = [{ key: 'abc-123', entryIndex: 6, at: Date.now(), kind: 'tool', snippet: 'grep jira src/', lead: false }]
+  for (const fn of v.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches, more: 0 } })
+  const row = walkAll(v.root).find((n) => n.className === 'srow')
+  ok(v.text().includes('a tool call'), 'a tool hit says what it is, not "agent answered"')
+  row.onclick({})
+
+  // The chat draws the LAST four rows of a ten-row transcript: head = 6. The
+  // hit at full index 6 is the FIRST drawn row.
+  const tail = []
+  for (let i = 0; i < 4; i++) tail.push({ kind: 'text', at: Date.now(), text: `row ${i}` })
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'abc-123', transcriptHead: 6, transcript: tail })
+  const flash = walkAll(v.root).find((n) => (n.className || '').includes('hit-jump'))
+  ok(!!flash && flash.textContent.includes('row 0'),
+    'transcriptHead translates the full index to the drawn window (6 - 6 = row 0)')
+
+  // The window widens (load earlier): head 6 → 2, four older rows prepend on
+  // the fast path. The jump is NOT shifted by the prepend — the translation
+  // alone re-lands it: full index 6 minus head 2 is drawn row 4, the same
+  // 'row 0' node, which the prepend MOVED rather than rebuilt.
+  const older = []
+  for (let i = 0; i < 4; i++) older.push({ kind: 'text', at: Date.now(), text: `older ${i}` })
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'abc-123', transcriptHead: 2, transcript: [...older, ...tail] })
+  const flash2 = walkAll(v.root).find((n) => (n.className || '').includes('hit-jump'))
+  ok(flash2 === flash && flash.textContent.includes('row 0'),
+    'a real load-earlier prepend keeps the flash on the SAME row node, re-landed by the translation')
+
+  // And a hit the window does not include flashes nothing — honest, no
+  // pointing at a row the snippet did not come from.
+  const v2 = run(base)
+  v2.deliver({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcriptHead: 8,
+    transcript: [{ kind: 'text', at: Date.now(), text: 'the tail end' }],
+  })
+  // An out-of-window jump arrives as a search click; simulate its effect by
+  // posting a hit whose full index (0) is above the drawn window (head 8).
+  findButton(v2.root, 'Search').onclick({})
+  const box2 = findByTag(v2.root, 'input', (n) => n.getAttribute('data-focus') === 'ts-search')
+  box2.value = 'jira'
+  box2.oninput({ target: box2 })
+  box2.onkeydown({ key: 'Enter' })
+  const outside = [{ key: 'abc-123', entryIndex: 0, at: Date.now(), kind: 'prompt', snippet: 'jira at the very top', lead: false }]
+  for (const fn of v2.listeners) fn({ data: { type: 'searchResults', q: 'jira', matches: outside, more: 0 } })
+  const r2 = walkAll(v2.root).find((n) => n.className === 'srow')
+  r2.onclick({})
+  v2.deliver({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcriptHead: 8,
+    transcript: [{ kind: 'text', at: Date.now(), text: 'the tail end' }],
+  })
+  ok(!walkAll(v2.root).some((n) => (n.className || '').includes('hit-jump')),
+    'a hit outside the drawn window flashes nothing — the host widens the window first')
 }
 
 // Archived sessions are searched too (that is where the old work is); a hit
@@ -1295,8 +1435,173 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   const row = walkAll(v.root).find((n) => n.className === 'srow')
   row.onclick({})
   const ti = v.posted.findIndex((m) => m.type === 'toggleArchived')
-  const si = v.posted.findIndex((m) => m.type === 'select' && m.id === 'old-9')
-  ok(ti !== -1 && si !== -1 && ti < si, 'jumping reveals the archived session before selecting it')
+  const si = v.posted.findIndex((m) => m.type === 'openHit' && m.id === 'old-9')
+  ok(ti !== -1 && si !== -1 && ti < si, 'jumping reveals the archived session before opening the hit')
+}
+
+// 19. The streaming fast path (the scroll freeze). A frame whose chrome is
+// unchanged patches the transcript in place instead of rebuilding the tree.
+// The scroll container is a node the user may be dragging RIGHT NOW — the old
+// render-per-frame destroyed it several times a second, which cancelled every
+// scrollbar drag and wheel gesture mid-flight. The freeze IS the recreated
+// node, so the gate is node identity.
+{
+  const mk = (extra = {}) => ({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+      { kind: 'text', at: Date.now(), text: 'working on it' },
+    ],
+    streaming: 'Hel',
+    ...extra,
+  })
+  const v = run(mk())
+  const scroll1 = v.root.querySelector('.transcript-scroll')
+  ok(!!scroll1 && scroll1.textContent.includes('Hel'), 'a streaming chat renders the live block')
+
+  // A frame whose only change is more streaming text: same node, new text.
+  v.deliver(mk({ streaming: 'Hello world' }))
+  const scroll2 = v.root.querySelector('.transcript-scroll')
+  ok(scroll2 === scroll1, 'a streaming frame keeps the transcript scroll node (no rebuild)')
+  ok(scroll2.textContent.includes('Hello world'), 'and the live block updated in place')
+
+  // A new tool row lands while streaming: appended to the SAME container,
+  // with the streaming block still ahead of the activity line.
+  const streamNode = walkAll(v.root).find((n) => n.className === 'block streaming')
+  v.deliver(mk({
+    streaming: 'Hello world',
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+      { kind: 'text', at: Date.now(), text: 'working on it' },
+      { kind: 'tool', at: Date.now(), id: '2', name: 'Bash', summary: 'git status', status: 'running', runningSince: Date.now() },
+    ],
+  }))
+  const scroll3 = v.root.querySelector('.transcript-scroll')
+  ok(scroll3 === scroll1, 'a frame that APPENDS a tool row still keeps the scroll node')
+  const kids3 = scroll3.children
+  const toolKid = kids3.find((n) => (n.className || '').startsWith('tool status-running'))
+  const streamKid = kids3.indexOf(streamNode)
+  const actKid = kids3.findIndex((n) => n.className === 'activity')
+  ok(!!toolKid, 'the new tool row is in the tree')
+  ok(streamKid > kids3.indexOf(toolKid) && actKid > streamKid,
+    'and it sits between the rows and the streaming block')
+
+  // The tool settles: patched into its OWN node — the row is never recreated
+  // (a recreated row is a recreated scroll container's sibling bug).
+  v.deliver(mk({
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+      { kind: 'text', at: Date.now(), text: 'working on it' },
+      { kind: 'tool', at: Date.now(), id: '2', name: 'Bash', summary: 'git status', status: 'ok', durationMs: 4200 },
+    ],
+  }))
+  ok(v.root.querySelector('.transcript-scroll') === scroll1, 'a settling tool call still keeps the scroll node')
+  ok(walkAll(v.root).find((n) => (n.className || '').startsWith('tool status-ok')) === toolKid,
+    'the settled tool row is the SAME node, patched in place')
+  ok(toolKid.textContent.includes('4s'), 'and its duration is on the row')
+
+  // The turn ends: the streaming block goes away, the settled text stays.
+  const full = [
+    { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+    { kind: 'text', at: Date.now(), text: 'working on it' },
+    { kind: 'tool', at: Date.now(), id: '2', name: 'Bash', summary: 'git status', status: 'ok', durationMs: 4200 },
+    { kind: 'text', at: Date.now(), text: 'all done now' },
+  ]
+  v.deliver(mk({ streaming: undefined, transcript: full }))
+  ok(v.root.querySelector('.transcript-scroll') === scroll1, 'the turn ending still keeps the scroll node')
+  ok(!walkAll(v.root).some((n) => n.className === 'block streaming'), 'the streaming block is gone')
+  ok(v.text().includes('all done now'), 'and the settled answer is a row')
+
+  // Every frame from here must carry the FULL transcript — a shorter one is a
+  // session change, which is correctly a full rebuild, not a sync frame.
+  const fullFrame = (extra = {}) => mk({ transcript: full, ...extra })
+
+  // Scrolled up, a streaming frame must NOT snap back — that is the bug in one
+  // assertion. The stub's scroll offsets are real state, so a follow-the-tail
+  // that overrides a scrolled-up reader is visible here.
+  scroll1.scrollHeight = 500
+  scroll1.clientHeight = 100
+  scroll1.scrollTop = 120 // reading the middle
+  v.deliver(fullFrame({ streaming: 'more text' }))
+  ok(v.root.querySelector('.transcript-scroll') === scroll1 && scroll1.scrollTop === 120,
+    'a streaming frame does not move a scrolled-up reader')
+  // And at the bottom it still follows the tail.
+  scroll1.scrollTop = 420
+  v.deliver(fullFrame({ streaming: 'more text again' }))
+  ok(scroll1.scrollTop === scroll1.scrollHeight, 'at the bottom it still follows the tail')
+
+  // The activity line — fed by the agent's volatile tool/age fields — patches
+  // in place too, so the transcript does not have to rebuild to update it.
+  ok(walkAll(v.root).some((n) => n.className === 'activity' && n.textContent.includes('Bash')),
+    'the activity line names the running tool')
+  v.deliver(fullFrame({ streaming: 'x', cards: [{ ...CARD, agent: { ...CARD.agent, tool: 'Edit' } }] }))
+  ok(v.root.querySelector('.transcript-scroll') === scroll1, 'a tool change on the agent still keeps the scroll node')
+  ok(walkAll(v.root).some((n) => n.className === 'activity' && n.textContent.includes('Edit')),
+    'and the activity line names the new tool in place')
+
+  // The composer's context/spend readouts patch in place — the textarea the
+  // user may be typing in is untouched (rebuilding it per frame was the other
+  // half of the typing-while-streaming fight).
+  const ta1 = findByTag(v.root, 'textarea')
+  v.deliver(fullFrame({ streaming: 'x', composer: { ...COMPOSER, contextTokens: 910000 } }))
+  ok(findByTag(v.root, 'textarea') === ta1, 'a usage frame keeps the composer textarea node')
+  ok(v.root.querySelector('.readouts').textContent.includes('91%'),
+    'and the context readout moved in place')
+
+  // A REAL chrome change still rebuilds — the fast path must not eat it.
+  v.deliver(fullFrame({ streaming: 'x', cards: [{ ...CARD, title: 'Fix login harder' }] }))
+  ok(v.root.querySelector('.transcript-scroll') !== scroll1, 'a chrome change (title) still rebuilds the transcript')
+  ok(v.text().includes('Fix login harder'), 'and the new chrome rendered')
+}
+
+// 19b. Upward pagination rides the SAME fast path: the widened window's tail
+// matches what is on screen, so the older rows prepend into the SAME scroll
+// container and every existing row node keeps its identity. The tail match is
+// what makes the detection self-healing — growth that does not match (a live
+// run appending) goes down the ordinary append path, never a splice.
+{
+  const OLD = Array.from({ length: 5 }, (_, i) => ({ kind: 'text', at: Date.now(), text: 'older row ' + i }))
+  const TAIL = [
+    { kind: 'prompt', at: Date.now(), text: 'do the thing' },
+    { kind: 'text', at: Date.now(), text: 'working on it' },
+    { kind: 'tool', at: Date.now(), id: '9', name: 'Bash', summary: 'git status', status: 'ok', durationMs: 3200 },
+  ]
+  const page = (extra = {}) => ({ ...base, mode: 'chat', selectedKey: 'abc-123', transcriptMore: true, transcript: TAIL, ...extra })
+  // Rows as the fast path sees them: transcript entries (text/prompt rows are
+  // `block`, tool rows are `tool status-*`), EXCLUDING the trailers.
+  const rows = (sc) => sc.children.filter((n) => {
+    const c = n.className || ''
+    return c.includes('block') || c.startsWith('tool ')
+  })
+  const w = run(page())
+  const wsc1 = w.root.querySelector('.transcript-scroll')
+  ok(!!wsc1 && !!w.root.querySelector('.load-earlier'), 'a truncated transcript shows the load-earlier pill')
+  const pre = rows(wsc1)
+  ok(pre.length === TAIL.length, `the window draws its rows (${pre.length})`)
+  // The host answers with the widened window — chrome otherwise unchanged.
+  w.deliver(page({ transcript: [...OLD, ...TAIL] }))
+  const wsc2 = w.root.querySelector('.transcript-scroll')
+  ok(wsc2 === wsc1, 'the widened window keeps the scroll node (no rebuild)')
+  const post = rows(wsc2)
+  ok(post.length === OLD.length + TAIL.length, `all rows are drawn (${post.length})`)
+  ok(post[0].textContent.includes('older row 0'), 'the older rows prepend ABOVE')
+  ok(post[post.length - 1] === pre[pre.length - 1], 'the rows that were on screen keep their nodes')
+  ok(post[OLD.length] === pre[0], 'and their order — the old head follows the new head')
+  // The last slice flips transcriptMore off: a chrome change, full render,
+  // pill gone.
+  w.deliver(page({ transcript: [...OLD, ...TAIL], transcriptMore: false }))
+  ok(!w.root.querySelector('.load-earlier'), 'the pill disappears once the whole history is loaded')
+  ok(w.root.querySelector('.transcript-scroll') !== wsc2, 'and the chrome change correctly rebuilds')
+  // Growth that does NOT tail-match is append content, never a prepend —
+  // the guard that stops a session change being spliced as pagination.
+  const widened = page({ transcript: [...OLD, ...TAIL], transcriptMore: true })
+  const w2 = run(widened)
+  const wsc3 = w2.root.querySelector('.transcript-scroll')
+  w2.deliver(widened /* identical frame: sync, nothing to do */)
+  w2.deliver(page({ transcript: [...OLD, ...TAIL, { kind: 'text', at: Date.now(), text: 'a new tail row' }] }))
+  const post2 = rows(wsc3)
+  ok(post2.length === OLD.length + TAIL.length + 1, 'tail growth still appends')
+  ok(post2[post2.length - 1].textContent.includes('a new tail row'), 'and lands last')
 }
 
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)

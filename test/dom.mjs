@@ -45,9 +45,37 @@ export function makeNode(tag) {
       // container before filling it reads it as blank — which is a stub that
       // makes a WORKING view look broken.
       this._text = null
-      for (const n of ns) this.children.push(typeof n === 'string' ? { textContent: n, children: [], className: '' } : n)
+      for (const n of ns) {
+        if (typeof n === 'string') {
+          this.children.push({ textContent: n, children: [], className: '' })
+          continue
+        }
+        // A real appendChild MOVES a child that is already in the tree;
+        // push() would duplicate it. board.js's streaming fast path re-appends
+        // its trailer nodes every frame to keep them after the new rows, so a
+        // stub that duplicates here grows phantom streaming/activity columns
+        // and fails every assertion about the live transcript.
+        const i = this.children.indexOf(n)
+        if (i >= 0) this.children.splice(i, 1)
+        // Parent pointers, real state for one reason: the fast path re-appends
+        // existing trailer nodes to move them to the end, and `remove()`
+        // detaches a node when its stream ended. Both are invisible to a test
+        // that cannot follow the tree — and a remove() that did nothing would
+        // leave phantom rows in every assertion about the live transcript.
+        n._parent = this
+        this.children.push(n)
+      }
     },
     replaceChildren(...ns) { this.children = []; this.append(...ns) },
+    // Detach from the parent — a real DOM API the streaming fast path uses to
+    // drop the streaming block and the placeholders when rows arrive.
+    remove() {
+      const p = this._parent
+      if (!p) return
+      const i = p.children.indexOf(this)
+      if (i >= 0) p.children.splice(i, 1)
+      this._parent = null
+    },
     // The older spelling of `append`, and a real DOM API. settings.js uses it
     // throughout; board.js uses `append`. Both are in the stub because the
     // stub's incompleteness is meant to catch APIs that do not EXIST, not to

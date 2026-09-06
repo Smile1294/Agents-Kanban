@@ -131,8 +131,6 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 }
 .card:hover { border-color: var(--vscode-focusBorder); }
 .card.dragging { opacity: 0.4; }
-.card.p-high { border-left-color: var(--vscode-charts-orange, #d18616); }
-.card.p-critical { border-left-color: var(--bad); }
 .card.running { border-left-color: var(--run); }
 .card.needs-input { border-left-color: var(--warn); }
 .card.failed { border-left-color: var(--bad); }
@@ -159,8 +157,6 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
   background: color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
   color: var(--muted);
 }
-.label.added { background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
-.label.removed { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); text-decoration: line-through; }
 
 .chip { font-size: 0.72em; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .chip.cat-backlog { border-color: var(--faint); }
@@ -280,6 +276,38 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 .chat-titles .labels { margin-top: 4px; }
 
 .transcript-scroll { flex: 1; overflow-y: auto; padding: 16px 18px 8px; display: flex; flex-direction: column; gap: 12px; }
+
+/* The wrapper the pagination and jump controls overlay. Takes the flex role
+   the scroll container used to hold directly under .main, so the scroll box
+   itself keeps exactly the box it had before the wrapper existed. */
+.transcript-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.transcript-wrap .transcript-scroll { flex: 1; }
+
+/* "Load earlier messages" — upward pagination. Floats over the top edge of
+   the transcript so it takes no flow space; a solid backdrop keeps it legible
+   over whichever row it covers. */
+.load-earlier {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 2;
+  border-radius: 999px; padding: 4px 14px; font-size: 0.85em;
+  background: var(--vscode-button-background, var(--vscode-button-secondaryBackground));
+  color: var(--vscode-button-foreground, var(--vscode-foreground));
+  border-color: transparent; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+.load-earlier.busy { opacity: 0.6; pointer-events: none; }
+
+/* Jump-to-top / jump-to-latest. Bottom-right of the transcript, offset right
+   to stay clear of the scrollbar. The buttons carry their own background and
+   shadow because they OVERLAY the transcript: the last row's text runs
+   beneath them when the chat is scrolled to the bottom, and transparent
+   buttons over text are illegible. Same treatment as the load-earlier pill,
+   so the two overlays read as one family. */
+.jump-cluster { position: absolute; right: 20px; bottom: 10px; display: flex; gap: 6px; z-index: 2; }
+.jump-cluster button {
+  font-size: 0.82em; padding: 2px 9px; opacity: 0.85;
+  background: var(--vscode-editor-background, var(--vscode-sideBar-background, #1e1e1e));
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+.jump-cluster button:hover { opacity: 1; }
 
 .block { display: flex; flex-direction: column; gap: 5px; }
 .block-head { display: flex; align-items: baseline; gap: 8px; }
@@ -401,28 +429,6 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 /* min-width: 0, or a long subtask title widens the card instead of ellipsing —
    the same flex trap as `.tool-text` and `.rail`. */
 .subtask-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.commit {
-  border: 1px solid color-mix(in srgb, var(--ok) 55%, transparent);
-  border-radius: var(--radius); overflow: hidden;
-  background: color-mix(in srgb, var(--ok) 7%, transparent);
-}
-.commit-head { display: flex; align-items: center; padding: 9px 12px; }
-.commit-title { font-weight: 600; color: var(--ok); }
-.sha {
-  margin-left: auto; font-family: var(--vscode-editor-font-family); font-size: 0.8em;
-  padding: 1px 7px; border-radius: 4px; color: var(--ok);
-  background: color-mix(in srgb, var(--ok) 16%, transparent);
-}
-.commit-date { padding: 0 12px; font-size: 0.76em; color: var(--faint); }
-.commit-msg {
-  margin: 6px 0 0; padding: 0 12px 10px;
-  font-family: var(--vscode-editor-font-family); font-size: 0.84em; line-height: 1.5;
-  white-space: pre-wrap; word-break: break-word;
-}
-.commit-files { border-top: 1px solid color-mix(in srgb, var(--ok) 30%, transparent); padding: 8px 12px; }
-.commit-files-h { font-size: 0.7em; letter-spacing: 0.08em; color: var(--faint); margin-bottom: 4px; }
-.commit-files .file { font-family: var(--vscode-editor-font-family); font-size: 0.82em; color: var(--run); }
 
 .session-meta { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
 .session-meta-h { padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 0.76em; font-weight: 700; letter-spacing: 0.07em; color: var(--muted); }
@@ -905,6 +911,15 @@ details.thinking summary::-webkit-details-marker { display: none; }
 
 /* `button` resets the cursor to default, which is wrong for a control. */
 .mic { flex: none; font-size: 1.05em; line-height: 1; padding: 5px 8px; cursor: pointer; }
+/* The input row's three buttons sit beside a textarea whose first line is
+   35px tall, and measured in real Chromium they came out at 27, 29 and 33px —
+   three heights in one row, bottoms flush, tops ragged. One shared height,
+   contents centred. It must be a FIXED height: `align-self: stretch` would
+   make them grow with a multi-line draft and turn the row into towers. */
+.composer .attach, .composer .mic, .composer .send {
+  height: 33px; box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center;
+}
 /* Recording: a solid stop glyph on a red mic, pulsing — a live capture that
    silently ended is shown as such by state, not by this pulse alone. */
 .mic.live {
