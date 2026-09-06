@@ -132,8 +132,15 @@ export type Entry =
  */
 const SCAN_TTL_MS = 1000
 
-/** How many of a session's most recent messages the chat view renders. */
-const TRANSCRIPT_LIMIT = 400
+/**
+ * How many of a session's most recent messages the chat view renders.
+ *
+ * Exported (not just the store's business) for one reason: the host owns the
+ * per-session WINDOW for upward pagination — `loadOlderTranscript()` widens it
+ * in slices — and the first slice must be this number, or the store's default
+ * and the host's window would drift apart on day one.
+ */
+export const TRANSCRIPT_LIMIT = 400
 
 /**
  * How long an untouched session's parse is kept.
@@ -173,7 +180,7 @@ export class SessionStore {
    */
   private readonly transcripts = new Map<
     string,
-    { at: number; key: string; limit: number; entries: Entry[]; usage: UsageTotals }
+    { at: number; key: string; limit: number; total: number; entries: Entry[]; usage: UsageTotals }
   >()
 
   /**
@@ -445,6 +452,41 @@ export class SessionStore {
   }
 
   /**
+   * How many messages the session's file holds in TOTAL, whatever window
+   * `transcript()` renders. This is the "is there more above?" answer for
+   * upward pagination: a loaded window shorter than this has older entries.
+   *
+   * Free once the transcript has been read — it comes off the same parse
+   * cache, and the total is a property of the FILE, not of the window, so any
+   * fresh cache entry answers it whatever limit it was parsed for.
+   */
+  async transcriptTotal(id: string): Promise<number> {
+    const rt = await this.runtimeOf(id)
+    if (rt) return (await rt.transcript(id)).length
+    const now = Date.now()
+    const key = await this.fileKey(id)
+    const hit = this.transcripts.get(id)
+    const fresh = hit && (key ? hit.key === key : now - hit.at < SCAN_TTL_MS)
+    if (fresh) return hit.total
+    return (await this.parse(id, TRANSCRIPT_LIMIT)).total
+  }
+
+  /**
+   * The WHOLE transcript, for search — which is explicitly over the full
+   * conversation, not the loaded tail. Deliberately NOT cached: `parse`'s
+   * cache holds one window per session, and a search that replaced the
+   * selected session's render-window parse with a full one would make every
+   * repaint re-read a file nobody wrote to (the cache keys on the limit).
+   * Searching every session is an on-demand action whose cost is reading
+   * every session's file once; that cost must not tax the render path.
+   */
+  async fullTranscript(id: string): Promise<Entry[]> {
+    const rt = await this.runtimeOf(id)
+    if (rt) return (await rt.transcript(id)) as Entry[]
+    return (await this.readTranscript(id, Number.POSITIVE_INFINITY)).entries
+  }
+
+  /**
    * The history reader for a session that is NOT Claude Code's, or undefined.
    *
    * Routed on the session's own recorded runtime rather than on which store
@@ -505,7 +547,7 @@ export class SessionStore {
   private async parse(
     id: string,
     limit: number,
-  ): Promise<{ entries: Entry[]; usage: UsageTotals }> {
+  ): Promise<{ total: number; entries: Entry[]; usage: UsageTotals }> {
     const now = Date.now()
     const key = await this.fileKey(id)
     const hit = this.transcripts.get(id)
@@ -541,7 +583,7 @@ export class SessionStore {
   private async readTranscript(
     id: string,
     limit: number,
-  ): Promise<{ entries: Entry[]; usage: UsageTotals }> {
+  ): Promise<{ total: number; entries: Entry[]; usage: UsageTotals }> {
     const { getSessionMessages } = await loadSdk()
     let all: Awaited<ReturnType<typeof getSessionMessages>>
     try {
@@ -561,7 +603,7 @@ export class SessionStore {
       // could not even observe it.
       all = await getSessionMessages(id, { includeSystemMessages: true })
     } catch {
-      return { entries: [], usage: emptyTotals() }
+      return { total: 0, entries: [], usage: emptyTotals() }
     }
     // Spend and context fill are totalled over the WHOLE session, including the
     // messages too old to render.
@@ -654,7 +696,10 @@ export class SessionStore {
         if (kids?.length) e.children = kids
       }
     }
-    return { entries, usage }
+    // The total is the whole file's message count — older than the rendered
+    // window — and is the pagination answer: more can be loaded when the window
+    // is shorter than this. It costs nothing extra; `all` is in hand.
+    return { total: all.length, entries, usage }
   }
 
   async setPhase(id: string, phase: string): Promise<void> {

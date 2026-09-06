@@ -22,8 +22,8 @@ import {
 } from './board/panel.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type ThinkingMode } from './sessions/meta.ts'
-import { MODEL_WINDOWS, normaliseModel, type ModelBook, type ModelFacts } from './sessions/usage.ts'
-import { SessionStore, interruptedSessions, type Entry } from './sessions/store.ts'
+import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts } from './sessions/usage.ts'
+import { SessionStore, TRANSCRIPT_LIMIT, interruptedSessions, type Entry } from './sessions/store.ts'
 import { searchEntries } from './sessions/search.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
@@ -57,7 +57,8 @@ import {
   type Schedule,
 } from './board/schedules.ts'
 import {
-  checkVoice, rowsFromChecks, startCapture, verdict,
+  builtinDictationAvailable, checkVoice, rowsFromChecks, startCapture, verdict,
+  VSCODE_DICTATION_START, VSCODE_DICTATION_STOP,
   type Capture, type VoiceChecks, type VoiceConfig,
 } from './agent/dictation.ts'
 import { RemoteFeed, type TailSource } from './remote/feed.ts'
@@ -85,6 +86,19 @@ type AgentPermissionMode = AgentOptions['permissionMode']
 const REPAINT_INTERVAL_MS = 100
 
 let log: vscode.LogOutputChannel
+
+/**
+ * Per-session transcript windows for upward pagination.
+ *
+ * Absent means the store's own default (`TRANSCRIPT_LIMIT`); an entry is only
+ * ever written when the user asks for OLDER messages, and it is never sent to
+ * the webview — the view sees the widened `transcript` plus `transcriptMore`.
+ * Holding it in the host (not extension storage) is deliberate: it is a VIEW
+ * position, like scroll state, not a fact about the session — a reopened
+ * board starting at the latest 400 messages is the right behaviour, and
+ * persisting it would be writing a cache nobody needs after a reload.
+ */
+const transcriptWindows = new Map<string, number>()
 
 /** Everything that depends on having a folder open. Rebuilt when folders change. */
 interface Workspace {
@@ -1097,13 +1111,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return voiceChecking
   }
 
-  /** The composer's mic facts from the last check. Runs on every repaint, so
-   *  it is pure — the check it summarises never does. */
-  const voiceState = (r: VoiceResult) => {
-    const v = verdict(r.checks)
+  /* VS Code's OWN built-in dictation (1.131+, experimental, offline). When it
+   * is available it is the mic's whole story: no whisper, no ffmpeg, nothing
+   * to install. Its gate is three facts read once per config change — the
+   * version, the `dictation.enabled` setting and the platform — never on the
+   * render path, and it spawns nothing. `undefined` in the memo slot means
+   * "not asked yet"; `{ ok: false, why }` means "asked, and no". */
+  let builtinVoice: { ok: boolean; why?: string } | undefined
+  const builtinVoiceGate = (): { ok: boolean; why?: string } => {
+    if (builtinVoice) return builtinVoice
+    const v = builtinDictationAvailable({
+      version: vscode.version,
+      platform: process.platform,
+      arch: process.arch,
+      enabled: vscode.workspace.getConfiguration('dictation').get('enabled'),
+    })
+    builtinVoice = v.ok ? { ok: true } : { ok: false, why: v.why }
+    return builtinVoice
+  }
+
+  /** The composer's mic facts. Runs on every repaint, so it is pure — the
+   *  gate and the check it summarises never run here. Absent when no path has
+   *  an answer yet: the whisper probe has not finished and the built-in gate
+   *  said no, so the mic must not be drawn at all (a mic that cannot record
+   *  is a control that cannot take effect). */
+  const voiceState = () => {
+    const builtin = builtinVoiceGate()
+    if (builtin.ok) {
+      return { voice: { available: true, mode: 'builtin' as const, recording: !!liveCapture } }
+    }
+    if (!voiceResult) return {}
+    const v = verdict(voiceResult.checks)
     return {
       voice: {
         available: v.ok,
+        mode: 'whisper' as const,
         ...(v.why ? { why: v.why } : {}),
         recording: !!liveCapture,
       },
@@ -2356,9 +2398,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
            missing. */
         orchestrationLevels: undefined as { key: string; label: string; detail: string }[] | undefined,
         orchestrationNote: undefined as string | undefined,
-        // The mic's gate: absent until the lazy probe answered, so the first
-        // paint of the board never waits on two `--version` spawns.
-        ...(voiceResult ? voiceState(voiceResult) : {}),
+        // Filled in below when the selected session has a conversation and the
+        // picker moved off the model that conversation was on.
+        modelSwitchNote: undefined as string | undefined,
+        // The mic's gate: absent until some path answered — the built-in
+        // gate, or the lazy whisper probe. The first paint of the board never
+        // waits on two `--version` spawns.
+        ...(voiceState()),
       }
       if (!ws) {
         composer.models = sendModels(catalogue, active.id)
@@ -2445,6 +2491,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       )
 
       let transcript: Entry[] | undefined
+      let transcriptMore: boolean | undefined
+      let transcriptHead: number | undefined
       let streaming: string | undefined
       if (selectedKey) {
         const a = ws.manager?.byKey(selectedKey)
@@ -2476,7 +2524,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // path a restart lands on, and the reason the context meter and the
           // spend readout are still there afterwards: they used to exist only
           // inside the live run, and died with the extension host.
-          transcript = await ws.store.transcript(selectedKey)
+          //
+          // The window is the user's upward-pagination state: `undefined` lets
+          // the store's own default stand, and `loadOlderTranscript` widens it.
+          // `transcriptMore` says whether older messages exist beyond it. It is
+          // ABSENT (not false) while the session is running — history is
+          // captured at launch, so "more above" cannot become true mid-run —
+          // and for runtimes whose transcript has no limit the comparison is
+          // equal and it reads false on its own.
+          transcript = await ws.store.transcript(selectedKey, transcriptWindows.get(selectedKey))
+          const total = await ws.store.transcriptTotal(selectedKey)
+          transcriptMore = transcript.length < total
+          // Messages above the rendered window. A search hit carries an index
+          // into the FULL transcript; the view subtracts this from it to land
+          // the flash on the row actually drawn.
+          transcriptHead = Math.max(0, total - transcript.length)
           const totals = await ws.store.usage(selectedKey)
           composer.contextTokens = totals.contextTokens
           composer.contextWindow = metas[selectedKey]?.contextWindow ?? totals.contextWindow
@@ -2555,6 +2617,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         composer.fastModeSupported = fastModeFor(cat.choices, composer.model)
       }
 
+      /* THE MODEL-SWITCH WARNING.
+       *
+       * Switching a session's model makes the NEXT turn re-read the whole
+       * conversation at the new model's input price — nothing for a fresh
+       * card, real money for a long one, and nothing else in the bar says so.
+       * The view does no arithmetic on money (board.js rule), so the note is
+       * built HERE, host-side: the token count is the context fill the bar
+       * already shows, and the price is the same `rateFor` the meters use.
+       *
+       * "Different" is judged against the model the conversation was actually
+       * ON, which is NOT `sessionMeta.model` — the picker writes its own
+       * choice straight back to that field, so it could never disagree with
+       * itself and no warning would ever appear. The live run knows the model
+       * it started on; a finished transcript names the model on each answer
+       * block, so the last answer's writer is what a switch actually moves
+       * away from. When neither can be read, no claim is made: a warning that
+       * could be wrong is worse than none, and a fresh session has nothing to
+       * re-read anyway. */
+      if (selectedKey && transcript?.length) {
+        const ranModel = (() => {
+          for (let i = transcript.length - 1; i >= 0; i--) {
+            const e = transcript[i]
+            if (!e || e.kind !== 'text') continue
+            if (e.model) return e.model
+          }
+          return undefined
+        })()
+        if (ranModel && composer.model && ranModel !== composer.model) {
+          const newModel = composer.model
+          const labelOf = (id: string) => effectiveCatalogue.choices.find((c) => c.id === id)?.label ?? id
+          const choice = effectiveCatalogue.choices.find((c) => c.id === newModel)
+          const rate = choice?.rate ?? rateFor(newModel, modelBook())
+          const costNote = (() => {
+            if (!(composer.contextTokens > 0)) return undefined
+            const count = `~${composer.contextTokens >= 1000
+              ? `${Math.round(composer.contextTokens / 1000)}k`
+              : String(composer.contextTokens)} tokens`
+            if (!rate) {
+              return `${count}; no input price is published for ${labelOf(newModel)}, so the cost cannot be estimated`
+            }
+            const cost = (composer.contextTokens * rate.input) / 1e6
+            const costStr = cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`
+            return `${count} ≈ ${costStr} at ${labelOf(newModel)}'s input price`
+          })()
+          composer.modelSwitchNote =
+            `This conversation last ran on ${labelOf(ranModel)}. ` +
+            `Switching to ${labelOf(newModel)} re-reads it all` +
+            (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
+        }
+      }
+
       if (ws.repoRoot) {
         composer.orchestrationLevels = ORCHESTRATION_CHOICES.map((c) => ({ ...c }))
         const meta = sessionMeta
@@ -2576,6 +2689,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(ws.repoRoot ? {} : { noRepo: true }),
         ...(selectedKey ? { selectedKey } : {}),
         ...(transcript ? { transcript } : {}),
+        ...(transcriptMore ? { transcriptMore } : {}),
+        ...(transcriptHead ? { transcriptHead } : {}),
         ...(streaming ? { streaming } : {}),
         ...(commands.length ? { commands } : {}),
         ...(Object.keys(disclosures).length ? { disclosures } : {}),
@@ -2664,16 +2779,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
 
-    /** Search what the conversations actually were.
+    /** Search what the conversations actually were — every visible word of
+     *  them, over the FULL transcript, not just the loaded tail.
      *
      * Answered on its own channel, never through `refresh`: it reads every
      * session's transcript, which is never something a repaint does. The
-     * filter is deliberate and tested elsewhere — prompts and agent answers
-     * only; no tool rows, no thinking, no subagent frames. And each session
-     * is searched through the SAME array its chat view renders — a live
-     * run's own history plus its streaming tail, a finished one's store
-     * parse — so a hit's `entryIndex` is the row the chat will show when
-     * the hit is opened, not an index into a differently-cut file.
+     * match rules live in `sessions/search.ts` (prompts, answers, thinking,
+     * tool rows, phase moves, results, notices, errors, nested subagent
+     * frames). A hit's `entryIndex` is an index into the FULL transcript;
+     * `openHit` widens the chat's window to include it when the hit is
+     * opened, so the flash lands on the row the snippet came from, not on
+     * an index into a differently-cut file. A live run is searched through
+     * its own history plus streaming tail — that IS its full transcript.
      */
     async searchTranscript(qRaw: string): Promise<SearchAnswer> {
       const q = qRaw.trim().slice(0, 200)
@@ -2697,10 +2814,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       for (const s of stored) {
         if (liveKeys.has(s.id)) continue
         try {
-          // The store's parse cache (keyed on the file's identity) makes this
-          // cheap once each session has been read; the entry indices line up
-          // with the chat because both are the store's own tail parse.
-          push(s.id, s.title, await ws.store.transcript(s.id))
+          // The FULL transcript, not the render window — the whole point of
+          // the widened search is finding what is older than the loaded
+          // tail. `fullTranscript` deliberately bypasses the parse cache
+          // (see store.ts); a search is one on-demand read per session.
+          push(s.id, s.title, await ws.store.fullTranscript(s.id))
         } catch {
           // A session whose file vanished mid-search contributes nothing.
           // `transcript()` already returns [] for a read failure; this guard
@@ -2712,11 +2830,74 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return { q, matches: rows.slice(0, cap), more: Math.max(0, rows.length - cap) }
     },
 
+    /**
+     * Widen one session's transcript window by one slice and repaint, so the
+     * view can splice the OLDER messages in above what it has. Host-side by
+     * design: the window is not view state (two board windows share it), and
+     * the read — the store re-parses with the larger limit, or answers from
+     * its cache — happens on demand, never on the per-token render path.
+     *
+     * The window is capped at the file's true total, so a stale request can
+     * never overshoot — the store slices at the tail either way, but the
+     * cap keeps `transcriptMore` honest when the very last slice lands.
+     */
+    async loadOlderTranscript(key: string): Promise<void> {
+      if (!ws || !key) return
+      if (ws.manager?.byKey(key)) return // running: history is fixed at launch
+      const win = transcriptWindows.get(key) ?? TRANSCRIPT_LIMIT
+      const total = await ws.store.transcriptTotal(key)
+      transcriptWindows.set(key, Math.min(win + TRANSCRIPT_LIMIT, total))
+    },
+
+    /**
+     * Open a search hit. Selecting is the ordinary part; the search-specific
+     * part is the window: a hit's index is into the FULL transcript, and the
+     * chat renders a window of the tail, so the window is widened to include
+     * the hit — then the view's flash (full index minus `transcriptHead`)
+     * lands on the row the snippet came from. A hit in the last 400 messages
+     * needs no widening at all, which is the common case.
+     *
+     * A live session is left alone: it renders its full history+live tail,
+     * which is the array the search read, so its indices already line up.
+     */
+    async openHit(key: string, entryIndex: number): Promise<void> {
+      selectedKey = key
+      if (!ws) return
+      const a = ws.manager?.byKey(key)
+      if (a) return
+      const total = await ws.store.transcriptTotal(key)
+      // Full index F is inside a tail window of `win` messages iff
+      // F >= total - win; a stale index clamps rather than overshoots.
+      const win = Math.min(
+        total,
+        Math.max(transcriptWindows.get(key) ?? TRANSCRIPT_LIMIT, total - entryIndex),
+      )
+      transcriptWindows.set(key, win)
+    },
+
     /** Start dictating: check the pipeline, then record the microphone.
      *  Idempotent — a second press while recording is a no-op that returns ok.
      */
-    async voiceStart(): Promise<{ ok: true } | { ok: false; error: string }> {
+    async voiceStart(): Promise<{ ok: true; builtin?: true } | { ok: false; error: string }> {
       if (liveCapture) return { ok: true }
+      /* The zero-install path: VS Code's own built-in dictation. We cannot
+         capture its transcript — it types into whichever control has focus,
+         which is the composer, because the view refocuses it before asking —
+         so `voiceStart` here is only a trigger. The command is internal and
+         undocumented, hence the guard: a future VS Code that renames it falls
+         through to an error that names the keybinding, not to silence. */
+      if (builtinVoiceGate().ok) {
+        try {
+          await vscode.commands.executeCommand(VSCODE_DICTATION_START)
+          return { ok: true, builtin: true }
+        } catch (e) {
+          return {
+            ok: false,
+            error: `VS Code's built-in dictation did not start (${e instanceof Error ? e.message : String(e)}). ` +
+              'Hold Ctrl+Alt+V (⌥⌘V on macOS) with the message focused, or install whisper-cli from the settings page.',
+          }
+        }
+      }
       const r = await voiceCheckNow()
       const v = verdict(r.checks)
       if (!v.ok) return { ok: false, error: v.why ?? 'Dictation is unavailable' }
@@ -2742,7 +2923,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
 
     /** Stop dictating and transcribe what was captured, locally. */
-    async voiceStop(): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+    async voiceStop(): Promise<{ ok: true; text: string; builtin?: true } | { ok: false; error: string }> {
+      // The built-in path carries no transcript back: VS Code typed it into
+      // the composer itself. `builtin: true` tells the view not to expect one.
+      if (builtinVoiceGate().ok) {
+        try {
+          await vscode.commands.executeCommand(VSCODE_DICTATION_STOP)
+        } catch {
+          // Not running is the ordinary case here — the user stopped it with
+          // the keybinding, or it never started. Saying ok closes the mic.
+        }
+        return { ok: true, text: '', builtin: true }
+      }
       const cap = liveCapture
       if (!cap) return { ok: false, error: 'Not recording' }
       liveCapture = undefined
@@ -3908,6 +4100,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         voiceCheckNow()
           .then(() => { refreshAll(); void SettingsPanel.refreshIfOpen() })
           .catch((err: unknown) => log.error(`Could not re-check the dictation pipeline: ${String(err)}`))
+      }
+      // VS Code's own dictation switch: the mic's front path flips on this
+      // setting, so flipping it while the window is open must flip the mic.
+      if (e.affectsConfiguration('dictation.enabled')) {
+        builtinVoice = undefined
+        refreshAll()
       }
     }),
     { dispose: () => ws?.manager?.stopAll() },

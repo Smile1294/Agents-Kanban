@@ -86,6 +86,9 @@ const COMPOSER = {
   // screenshot with an empty corner there documents the bug, not the feature.
   contextTokens: 223_000, contextWindow: 1_000_000,
   meter: { kind: 'usd', spentUsd: 8.11, priced: true },
+  // The host's dictation gate answered: built-in available. The mic is drawn,
+  // and a screenshot without it would document an absent feature.
+  voice: { available: true, mode: 'builtin', recording: false },
 }
 const now = Date.now()
 const mins = (n) => now - n * 60_000
@@ -255,8 +258,31 @@ const SHOTS = [
 // Playwright resolves. Never download one — the sandbox blocks it.
 async function launch() {
   const { promises: fsp } = await import('node:fs')
+  const { homedir } = await import('node:os')
+  // The same cache scan layout.test.mjs uses: playwright's own cache may hold
+  // a NEWER Chromium than the version this checkout's playwright wants, and
+  // refusing to use it would mean `npm run screenshots` fails until a fresh
+  // ~170MB download — when any Chromium can take a screenshot.
+  const cacheRoots = [
+    ...(process.env.PLAYWRIGHT_BROWSERS_PATH ? [process.env.PLAYWRIGHT_BROWSERS_PATH] : []),
+    path.join(homedir(), '.cache', 'ms-playwright'),
+  ]
+  const cached = []
+  for (const cache of cacheRoots) {
+    const dirs = await fsp.readdir(cache).catch(() => [])
+    const builds = dirs
+      .filter((d) => /^chromium(_headless_shell)?-\d+$/.test(d))
+      .sort((a, b) => Number(b.match(/\d+$/)[0]) - Number(a.match(/\d+$/)[0]))
+    for (const d of builds) {
+      for (const rel of [['chrome-linux', 'headless_shell'], ['chrome-linux', 'chrome'],
+                         ['chrome-linux64', 'chrome']]) {
+        cached.push(path.join(cache, d, ...rel))
+      }
+    }
+  }
   for (const p of [
     process.env.CHROMIUM_PATH,
+    ...cached,
     '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
     '/opt/pw-browsers/chromium/chrome-linux/chrome',
   ].filter(Boolean)) {

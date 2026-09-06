@@ -170,6 +170,23 @@ if (settled.length) {
   console.log('      (no settled session to check the transcript window against)')
 }
 
+// --- how much is above the loaded window? -------------------------------------
+//
+// `transcriptTotal` is the upward-pagination answer: the whole file's message
+// count, whatever window `transcript()` renders. A window shorter than it is
+// how the host decides the "load earlier" pill exists at all.
+if (settled.length) {
+  const id = settled[0]!.id
+  const total = await store.transcriptTotal(id)
+  const fullLen = (await store.transcript(id)).length
+  ok(total === fullLen, `the total matches the whole file (${total} vs ${fullLen})`)
+  const bounded = await store.transcript(id, 3)
+  ok((bounded.length < total) === (fullLen > 3),
+     'a bounded window reports "more above" exactly when older messages exist')
+}
+ok((await store.transcriptTotal('00000000-0000-0000-0000-000000000000')) === 0,
+   'an unknown session totals zero rather than throwing')
+
 // an unknown session must return empty, not throw
 ok((await store.transcript('00000000-0000-0000-0000-000000000000')).length === 0, 'unknown session yields an empty transcript')
 const noUsage = await store.usage('00000000-0000-0000-0000-000000000000')

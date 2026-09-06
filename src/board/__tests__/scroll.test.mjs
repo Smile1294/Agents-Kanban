@@ -7,6 +7,12 @@
    moment the agent produced a frame. The transcript had a "stick to the
    bottom" rule; nothing else had any rule at all.
 
+   Since the streaming fast path, a chat frame whose chrome is unchanged does
+   not rebuild at all — the transcript scroll node is patched in place, which
+   is the fix for the scroll freeze this file's transcript case now asserts.
+   Real chrome changes still rebuild, and the harvest/restore below is what
+   must put every container back where it was.
+
    The DOM stub carries scrollTop as plain state, so this can be asserted
    without a browser. The pixel-true version lives in layout.test.mjs. */
 import { boardSource, renderBoardWith, walk } from '../../../test/dom.mjs'
@@ -66,6 +72,9 @@ ok(rail1 && rail1 !== rail0 && rail1.scrollTop === 80, `the rail keeps its scrol
 // The stick rule follows the tail while you are at the bottom. Away from the
 // bottom it must leave you exactly where you were — a frame arriving while you
 // read something a minute old used to throw you to the top of the transcript.
+// A streaming frame whose chrome is unchanged now goes down the fast path and
+// keeps the SAME node — which is the stronger form of "does not move you":
+// nothing is even rebuilt, so no drag or wheel gesture can be cancelled.
 const chatState = {
   ...state, mode: 'chat', selectedKey: 'k1',
   transcript: Array.from({ length: 30 }, (_, i) => ({ kind: 'text', at: i, text: 'paragraph ' + i })),
@@ -76,7 +85,99 @@ ok(!!t0, 'the transcript is a scroll container')
 t0.scrollHeight = 3000; t0.clientHeight = 600; t0.scrollTop = 900   // well above the bottom
 chat.deliver({ ...chatState, streaming: 'more words arriving' })
 const t1 = byClass(chat.root, 'transcript-scroll')
-ok(t1 && t1 !== t0 && t1.scrollTop === 900, `reading up the transcript, a new frame does not move you (${t1 && t1.scrollTop}px)`)
+ok(t1 === t0 && t1.scrollTop === 900, `reading up the transcript, a streaming frame does not move you (${t1 && t1.scrollTop}px)`)
+// A frame with a REAL chrome change still rebuilds — and the harvest/restore
+// must still put a scrolled-up reader back where they were.
+t1.scrollTop = 900
+chat.deliver({ ...chatState, streaming: 'more words arriving', cards: cards.map((c) => (c.key === 'k1' ? { ...c, title: 'Session 1 renamed' } : c)) })
+const t2 = byClass(chat.root, 'transcript-scroll')
+ok(t2 && t2 !== t1 && t2.scrollTop === 900, `a REBUILD (chrome changed) still restores a scrolled-up reader (${t2 && t2.scrollTop}px)`)
+
+// --- upward pagination: older messages arrive ABOVE, you stay put -------------
+//
+// A long conversation loads as a window of its newest messages. "Load earlier"
+// widens the window; the older rows must splice in ABOVE the ones on screen —
+// not rebuild, which would cancel the scroll mid-gesture exactly like the
+// streaming freeze — and the reader must keep the paragraph they were on.
+{
+  const OLD = Array.from({ length: 8 }, (_, i) => ({ kind: 'text', at: 100 + i, text: 'older ' + i }))
+  const TAIL = Array.from({ length: 6 }, (_, i) => ({ kind: 'text', at: 200 + i, text: 'recent ' + i }))
+  const base = { ...state, mode: 'chat', selectedKey: 'k1', transcript: TAIL, transcriptMore: true }
+  const p = run(base)
+  const pill0 = byClass(p.root, 'load-earlier')
+  ok(!!pill0, 'the load-earlier pill shows when the host says there is more')
+  const rows0 = walk(p.root).filter((n) => (n.className || '').split(' ').includes('block'))
+  ok(rows0.length === TAIL.length, `the initial window draws its rows (${rows0.length})`)
+  const sc0 = byClass(p.root, 'transcript-scroll')
+  sc0.scrollHeight = 600; sc0.clientHeight = 200; sc0.scrollTop = 100
+  // Clicking the pill posts once and shows busy while the round trip runs.
+  pill0.onclick()
+  const more = p.posted.filter((m) => m.type === 'moreTranscript')
+  ok(more.length === 1, 'the pill posts a moreTranscript message')
+  ok(more[0] && more[0].id === 'k1', 'and says which session')
+  // The click re-renders (busy state); the stub gives the rebuilt scroll node
+  // no metrics, so hand it the ones a real layout would keep.
+  const sc1 = byClass(p.root, 'transcript-scroll')
+  sc1.scrollHeight = 600; sc1.clientHeight = 200; sc1.scrollTop = 100
+  ok(!!byClass(p.root, 'busy'), 'and shows busy while in flight')
+  const rowsPre = walk(p.root).filter((n) => (n.className || '').split(' ').includes('block'))
+  // The host's answer: the widened window, same chrome otherwise. This goes
+  // down the fast path — the growth is at the HEAD, so it must prepend, not
+  // rebuild.
+  p.deliver({ ...base, transcript: [...OLD, ...TAIL] })
+  const sc2 = byClass(p.root, 'transcript-scroll')
+  ok(sc2 === sc1, 'the widened window keeps the scroll node — no rebuild')
+  const rows1 = walk(p.root).filter((n) => (n.className || '').split(' ').includes('block'))
+  ok(rows1.length === OLD.length + TAIL.length, `all rows are drawn (${rows1.length})`)
+  ok(rows1[0].textContent.includes('older 0'), 'the older rows sit ABOVE')
+  ok(rows1[rows1.length - 1].textContent.includes('recent 5'), 'and the tail is still last')
+  ok(rows1[rows1.length - 1] === rowsPre[rowsPre.length - 1], 'the rows already on screen keep their nodes')
+  ok(!byClass(p.root, 'busy'), 'and the pill stops saying busy once the window arrived')
+  // The stub has no reflow, so scrollHeight does not grow with the prepend and
+  // the anchor reads as "unchanged". The pixel-true version — the same
+  // paragraph stays at the same viewport offset — is the layout gate's job.
+  ok(sc2.scrollTop === 100, `and you are not thrown around (${sc2.scrollTop}px, wanted 100)`)
+  // The LAST slice flips transcriptMore off, which is a chrome change: full
+  // render, pill gone. (A pill that outlived the history it offered would
+  // re-ask the host for rows that do not exist.)
+  p.deliver({ ...base, transcript: [...OLD, ...TAIL], transcriptMore: false })
+  ok(!byClass(p.root, 'load-earlier'), 'the pill disappears once the whole history is loaded')
+  const rows2 = walk(p.root).filter((n) => (n.className || '').split(' ').includes('block'))
+  ok(rows2.length === OLD.length + TAIL.length, 'and the full history stays on screen')
+
+  // --- the jump buttons ------------------------------------------------------
+  const sc3 = byClass(p.root, 'transcript-scroll')
+  const top = walk(p.root).find((n) => n.tagName === 'button' && /oldest/.test(n.title || ''))
+  const latest = walk(p.root).find((n) => n.tagName === 'button' && /newest/.test(n.title || ''))
+  ok(!!top && !!latest, 'a transcript with rows has jump-to-top and jump-to-latest buttons')
+  sc3.scrollHeight = 900; sc3.scrollTop = 500
+  if (top) top.onclick()
+  ok(sc3.scrollTop === 0, 'Top jumps to the oldest loaded message')
+  if (latest) latest.onclick()
+  ok(sc3.scrollTop === 900, 'Latest jumps to the newest')
+}
+
+// --- a widened transcript from a STALE window never mis-prepends ---------------
+//
+// The tail-match is the proof the growth is pagination. Growth that does NOT
+// match — a live run appending while its last row is still streaming, whose
+// tail therefore differs — must go down the append path, not splice junk
+// above. This is the guard the mutation test breaks.
+{
+  const wide = { ...state, mode: 'chat', selectedKey: 'k2', transcriptMore: false }
+  const grow = (n) => Array.from({ length: n }, (_, i) => ({ kind: 'text', at: i, text: 'row ' + i }))
+  const g = run({ ...wide, transcript: grow(3) })
+  const gsc0 = byClass(g.root, 'transcript-scroll')
+  // A frame that appends one row AND grows the last row (streaming text):
+  // tail-mismatch, so the existing rows keep their order and the new one lands
+  // at the end.
+  g.deliver({ ...wide, transcript: [...grow(3).slice(0, 2), { kind: 'text', at: 2, text: 'row 2 and more words' }, { kind: 'text', at: 3, text: 'row 3' }] })
+  const gsc1 = byClass(g.root, 'transcript-scroll')
+  ok(gsc1 === gsc0, 'appended growth keeps the scroll node too')
+  const grows = walk(g.root).filter((n) => (n.className || '').split(' ').includes('block'))
+  ok(grows[0] && grows[0].textContent.includes('row 0'), 'the head row is still the head row')
+  ok(grows[grows.length - 1] && grows[grows.length - 1].textContent.includes('row 3'), 'and the appended row is last')
+}
 
 // --- a section you closed STAYS closed ---------------------------------------
 //

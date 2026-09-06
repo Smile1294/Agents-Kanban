@@ -2,7 +2,10 @@
  *  controls are gated on. Nothing here spawns a binary — the real capture and
  *  transcription need hardware and two user-installed tools, which no hermetic
  *  test can supply; they are exercised by the real-agent run the card describes. */
-import { captureArgs, whisperArgs, verdict, rowsFromChecks, defaultVoiceConfig } from '../dictation.ts'
+import {
+  captureArgs, whisperArgs, verdict, rowsFromChecks, defaultVoiceConfig,
+  atLeast, builtinDictationAvailable,
+} from '../dictation.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -70,5 +73,23 @@ const rowPath = rowsFromChecks({ ...cfg(), whisperPath: '/opt/whisper/whisper-cl
   whisper: { ok: true }, model: { ok: true }, ffmpeg: { ok: true },
 })
 ok(rowPath[0]!.detail === '/opt/whisper/whisper-cli', 'a configured path is reported, not the PATH fallback')
+
+// 6. The built-in dictation gate: the zero-install front path opens only where
+//    VS Code's own dictation actually exists, and says why everywhere else.
+const gate = (patch: Record<string, unknown>) => builtinDictationAvailable({
+  version: '1.131.0', platform: 'linux', arch: 'x64', enabled: true, ...patch,
+})
+ok(gate({}).ok === true, 'the gate opens on a supported platform with the setting on')
+ok(!gate({ enabled: false }).ok && (gate({ enabled: false }).why ?? '').includes('Dictation: Enabled'),
+  'a disabled setting names the setting, not the platform')
+ok(!gate({ enabled: undefined }).ok, 'an unset setting does not open the gate — built-in dictation is experimental')
+ok(!gate({ version: '1.130.2' }).ok && (gate({ version: '1.130.2' }).why ?? '').includes('1.131'),
+  'a version below the floor names the floor')
+ok(gate({ version: '1.131.0-insider' }).ok === true, 'an insider suffix does not trip the version compare')
+ok(!gate({ platform: 'darwin', arch: 'x64' }).ok, 'Intel macOS is refused — the built-in model covers Apple Silicon only')
+ok(gate({ platform: 'darwin', arch: 'arm64' }).ok === true, 'Apple Silicon is accepted')
+ok(gate({ platform: 'win32', arch: 'arm64' }).ok === true, 'Windows Arm64 is accepted')
+ok(!gate({ platform: 'win32', arch: 'ia32' }).ok, '32-bit is refused')
+ok(!gate({ platform: 'linux', arch: 'x64', version: 'no version here' }).ok, 'an unparseable version is refused, not guessed at')
 
 process.exit(fails ? 1 : 0)

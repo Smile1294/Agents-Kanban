@@ -642,6 +642,101 @@ try {
   ok(search.pillVisible, 'both pills are on screen')
   await searchPage.close()
 
+  /* --- upward pagination, MEASURED: the reader stays on their paragraph ------
+   *
+   * The stub DOM cannot reflow, so the anchor arithmetic — scrollTop += the
+   * height the prepend added — is only verifiable where layout is real. A
+   * reader mid-transcript, the widened window arrives, the fast path prepends
+   * the older rows: the paragraph that was at the top of the viewport must
+   * still be there, pixel for pixel, and the offset must have grown by the
+   * prepended height. A rebuild would pass neither (scroll restore puts back
+   * a NUMBER, and the number would be stale).
+   */
+  const pagRows = Array.from({ length: 40 }, (_, i) => ({ kind: 'text', at: 200 + i, text: 'tail row ' + i }))
+  const oldRows = Array.from({ length: 10 }, (_, i) => ({ kind: 'text', at: 100 + i, text: 'old row ' + i }))
+  const pagPage = await browser.newPage({ viewport: { width: 900, height: 900 } })
+  const pagErrors = []
+  pagPage.on('pageerror', (e) => pagErrors.push(String(e)))
+  await pagPage.setContent(page$({ ...state, mode: 'chat', selectedKey: 'a', transcriptMore: true, transcript: pagRows }))
+  await pagPage.waitForSelector('.transcript-scroll', { timeout: 5000 })
+  const beforeWiden = await pagPage.evaluate(() => {
+    const sc = document.querySelector('.transcript-scroll')
+    sc.scrollTop = Math.floor(sc.scrollHeight / 2) // reading the middle
+    const topEl = document.elementFromPoint(140, 140)
+    return { scrollTop: sc.scrollTop, topText: topEl ? (topEl.textContent || '').slice(0, 20) : '' }
+  })
+  const widenedState = { ...state, mode: 'chat', selectedKey: 'a', transcriptMore: true, transcript: [...oldRows, ...pagRows] }
+  await pagPage.evaluate((st) => {
+    window.dispatchEvent(new MessageEvent('message', { data: { type: 'state', state: st } }))
+  }, widenedState)
+  const afterWiden = await pagPage.evaluate(() => {
+    const sc = document.querySelector('.transcript-scroll')
+    const topEl = document.elementFromPoint(140, 140)
+    return {
+      scrollTop: sc.scrollTop,
+      topText: topEl ? (topEl.textContent || '').slice(0, 20) : '',
+      pill: !!document.querySelector('.load-earlier'),
+    }
+  })
+  ok(pagErrors.length === 0, `the paginated chat renders without throwing (${pagErrors.join('; ') || 'clean'})`)
+  ok(afterWiden.scrollTop > beforeWiden.scrollTop,
+     `the offset grew by the prepended height (${beforeWiden.scrollTop}px -> ${afterWiden.scrollTop}px)`)
+  ok(afterWiden.topText === beforeWiden.topText,
+     `and the same paragraph is at the viewport top (was "${beforeWiden.topText}", now "${afterWiden.topText}")`)
+  ok(afterWiden.pill, 'the load-earlier pill is drawn when more remains')
+  const jumps = await pagPage.evaluate(() => {
+    const j = document.querySelector('.jump-cluster')
+    if (!j) return null
+    const jb = j.getBoundingClientRect()
+    const sb = document.querySelector('.transcript-scroll').getBoundingClientRect()
+    return { inside: jb.right <= sb.right + 1 && jb.bottom <= sb.bottom + 1 }
+  })
+  ok(!!jumps && jumps.inside, 'the jump buttons sit inside the transcript area')
+  await pagPage.close()
+
+  /* --- the composer's input row, MEASURED: one height for its buttons --------
+   *
+   * Attach, mic and send sit in one row beside the textarea. Measured in real
+   * Chromium they came out at 27, 29 and 33px — bottoms flush (flex-end),
+   * tops ragged, and ragged reads as broken. The fix is one shared height;
+   * this gate fails the moment the three drift apart again. The jump buttons
+   * overlay the transcript, so their background is measured too: transparent
+   * buttons over the last row's text are illegible.
+   */
+  const compPage = await browser.newPage({ viewport: { width: 900, height: 900 } })
+  const compErrors = []
+  compPage.on('pageerror', (e) => compErrors.push(String(e)))
+  await compPage.setContent(page$({
+    ...state, mode: 'chat', selectedKey: 'a',
+    composer: { ...state.composer, voice: { available: true, mode: 'builtin', recording: false } },
+    transcript: [
+      { kind: 'prompt', at: 1, text: 'hi' },
+      { kind: 'text', at: 2, text: 'hello' },
+    ],
+  }))
+  await compPage.waitForSelector('.composer .send', { timeout: 5000 })
+  const comp = await compPage.evaluate(() => {
+    const h = (sel) => {
+      const el = document.querySelector(sel)
+      if (!el) return 0
+      return Math.round(el.getBoundingClientRect().height)
+    }
+    const jb = document.querySelector('.jump-cluster button')
+    const bg = jb ? getComputedStyle(jb).backgroundColor : ''
+    const shadow = jb ? getComputedStyle(jb).boxShadow : ''
+    return {
+      attach: h('.composer .attach'), mic: h('.composer .mic'), send: h('.composer .send'),
+      micDrawn: !!document.querySelector('.composer .mic'),
+      jumpBg: bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && shadow !== 'none',
+    }
+  })
+  ok(compErrors.length === 0, `the composer renders without throwing (${compErrors.join('; ') || 'clean'})`)
+  ok(comp.micDrawn, 'the mic renders when the host gate answered')
+  ok(comp.attach === comp.send && comp.mic === comp.send,
+     `attach, mic and send are ONE height (${comp.attach}/${comp.mic}/${comp.send})`)
+  ok(comp.jumpBg, 'the jump buttons carry a background and shadow — they overlay the text')
+  await compPage.close()
+
 } finally {
   await browser.close()
 }
