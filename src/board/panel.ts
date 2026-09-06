@@ -139,6 +139,11 @@ export interface UiCard {
   /** sessionId when Claude Code has assigned one, else the local run id. */
   key: string
   sessionId?: string
+  /** Which agent program this runs on. Undefined on a card written before the
+   *  board had more than one, which is Claude Code. The view gates the fork
+   *  affordance on this: Claude Code's fork works on its own transcripts, and
+   *  a control that cannot take effect must not be offered. */
+  runtime?: string
   title: string
   phase: string
   tags: string[]
@@ -396,6 +401,11 @@ export interface BoardHost {
   interrupt(key: string): Promise<void>
   /** Pick a session back up after its run was killed by a host restart. */
   resume(key: string): Promise<void>
+  /** "Try again from here": fork the session at the user message `messageId`,
+   *  restore the files to the state it was sent into, and re-key the card to
+   *  the fork. Confirms with the user first; never throws — every refusal and
+   *  caveat is shown host-side, the way `remove` and `cleanup` speak. */
+  forkAt(key: string, messageId: string): Promise<void>
   /** Accept that a killed run is not coming back, and clear its banner. */
   dismissInterrupted(key: string): Promise<void>
   clearQueue(key: string): Promise<void>
@@ -482,6 +492,10 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'stop': await host.stop(id()); break
         case 'interrupt': await host.interrupt(id()); await refresh(); break
         case 'resume': await host.resume(id()); await refresh(); break
+        case 'forkAt':
+          await host.forkAt(id(), String(msg.messageId ?? ''))
+          await refresh()
+          break
         case 'dismissInterrupted': await host.dismissInterrupted(id()); await refresh(); break
         case 'clearQueue': await host.clearQueue(id()); await refresh(); break
         case 'openWorktree': await host.openWorktree(id()); break

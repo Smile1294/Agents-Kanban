@@ -555,6 +555,23 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 .attach { flex: none; }
 /* What a sent message carried. The bytes are not kept, so this is a note. */
 .prompt-images { color: var(--faint); font-size: 0.85em; margin-top: 4px; }
+.prompt-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+/* "Try again from here": a quiet ghost under the prompt bubble, so it reads as
+   part of the row rather than a board control. Inherits the `button` base
+   (border + secondary background), so the transparent overrides below are what
+   keep it quiet — without them every prompt row carries a full button. */
+.prompt-retry {
+  font-size: 0.76em; padding: 1px 8px; color: var(--faint);
+  background: transparent; border-color: transparent;
+}
+.prompt-retry:hover {
+  color: var(--run);
+  border-color: color-mix(in srgb, var(--run) 40%, transparent);
+  background: color-mix(in srgb, var(--run) 8%, transparent);
+}
+.prompt-retry:focus-visible {
+  color: var(--run); border-color: var(--vscode-focusBorder, var(--run));
+}
 .ctx-meter {
   width: 68px; height: 4px; border-radius: 2px; overflow: hidden;
   background: color-mix(in srgb, var(--vscode-foreground) 14%, transparent);

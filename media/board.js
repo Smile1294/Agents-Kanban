@@ -2417,14 +2417,30 @@
         // The bytes are not kept in the board's state — see Entry.images — so
         // the row says how many went with the message rather than showing them.
         // Without this an images-only message renders as an empty bubble.
+        const head = el('div', 'prompt-wrap')
         if (e.images) {
           const note = el('div', 'prompt-images',
             '🖼 ' + e.images + (e.images === 1 ? ' image' : ' images') + ' attached')
-          const wrap2 = el('div', 'prompt-wrap')
-          wrap2.append(body, note)
-          return block('You', e.at, wrap2)
+          head.append(body, note)
+        } else {
+          head.append(body)
         }
-        return block('You', e.at, body)
+        // "Try again from here": fork the session at this message and restore
+        // the files to how they were when it was sent. The row can anchor a
+        // fork only when it names the transcript uuid that the fork cuts at —
+        // Codex transcripts and rows written before the id was kept have none,
+        // so offering the button there would fork at nothing. Same gate, host
+        // and view; the host still validates, because a row that loses its id
+        // between the click and the handler must refuse, not guess.
+        if (e.id && c && c.runtime !== 'codex') {
+          const retry = el('button', 'prompt-retry', '↶ Try again from here')
+          retry.onclick = (ev) => {
+            ev.stopPropagation()
+            post('forkAt', { id: c.key, messageId: e.id })
+          }
+          head.append(retry)
+        }
+        return block('You', e.at, head)
       }
       case 'text': return block('Claude Agent', e.at, renderMarkdown(e.text))
       case 'thinking': {

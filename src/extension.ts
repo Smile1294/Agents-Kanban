@@ -6,9 +6,14 @@
  * plain Node and unit-tested without VS Code.
  */
 import * as path from 'node:path'
+import * as fs from 'node:fs/promises'
 import * as vscode from 'vscode'
 import { AgentManager, followKey, type RunningAgent } from './agent/manager.ts'
-import type { Options as AgentOptions } from './agent/sdk.ts'
+import { loadSdk, type Options as AgentOptions } from './agent/sdk.ts'
+import {
+  applyRestore, checkpointMapFor, claudeHome, historyDirFor, planRestore,
+  sessionFileFor, waitForQuiescent, type CheckpointMap,
+} from './sessions/checkpoints.ts'
 import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
   setBoardFocusMode, showSideBarView, toUiAgent,
@@ -1865,6 +1870,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         cards.push({
           key,
           ...(a.sessionId ? { sessionId: a.sessionId } : {}),
+          runtime: m?.runtime ?? a.runtime,
           title: s?.title ?? a.title,
           phase: phase ?? ws.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing',
           tags: s?.tags ?? m?.tags ?? [],
@@ -1885,7 +1891,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       for (const s of stored) {
         if (seen.has(s.id)) continue
         cards.push({
-          key: s.id, sessionId: s.id, title: s.title, phase: s.phase, tags: s.tags,
+          key: s.id, sessionId: s.id,
+          ...(s.runtime ? { runtime: s.runtime } : {}),
+          title: s.title, phase: s.phase, tags: s.tags,
           updated: s.updated, archived: s.archived, pinned: s.pinned,
         ...(() => {
           const d = metas[s.id]?.decomposition
@@ -2397,6 +2405,172 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const n = ws?.manager?.clearQueue(key) ?? 0
       if (n) vscode.window.showInformationMessage(`Discarded ${n} queued message${n === 1 ? '' : 's'}.`)
       refreshAll()
+    },
+
+    /**
+     * "Try again from here": put the card back to one of its messages.
+     *
+     * The worktree files are restored to the state that message was sent into
+     * (from Claude Code's file checkpoints — see checkpoints.ts), the session
+     * is forked at that message so everything after it is gone from the card,
+     * and the sidecar entry is re-keyed to the fork. The user then sends the
+     * corrected instruction, and the card resumes the fork in the same
+     * worktree — nothing is tracked in the user's repository, and the original
+     * session stays in Claude Code's history untouched.
+     *
+     * Every refusal names its reason, and success with a caveat (no checkpoints
+     * at that point, a file that could not be restored) says the caveat — a
+     * "try again" that silently kept the current files is a control that lied.
+     */
+    async forkAt(key, messageId) {
+      const w = requireWs()
+      if (!messageId) {
+        vscode.window.showWarningMessage('Choose a message to start over from first.')
+        return
+      }
+      const card = await w.store.get(key)
+      if (!card) {
+        vscode.window.showWarningMessage(
+          'This session has not been given an id yet, so it cannot be forked. Wait for it to start, then try again.')
+        return
+      }
+      if (card.runtime && card.runtime !== 'claude') {
+        vscode.window.showWarningMessage(
+          'A Codex session cannot be forked — Claude Code\'s fork works on its own transcripts.')
+        return
+      }
+      const children = await w.store.childrenOf(card.id)
+      if (children.length) {
+        vscode.window.showWarningMessage(
+          'Merge or remove its subtasks first — a fork re-keys this card to a new session, ' +
+          'and each subtask remembers its parent by the id that would be left behind.')
+        return
+      }
+      // The anchor must be a real prompt row of this session's transcript. The
+      // view names it from the same parse this reads, so a miss means the
+      // transcript moved under us — say so rather than fork at nothing.
+      const rows = await w.store.transcript(card.id)
+      const prompts = rows.filter((e): e is Entry & { kind: 'prompt'; id: string } =>
+        e.kind === 'prompt' && e.id !== undefined)
+      const anchor = prompts.find((e) => e.id === messageId)
+      if (!anchor) {
+        vscode.window.showWarningMessage(
+          'That message is not in this session\'s transcript any more — refresh and try again.')
+        return
+      }
+      const snippet = anchor.text.replace(/\s+/g, ' ').trim().slice(0, 90) ||
+        '(message with no text)'
+      const later = prompts.length - prompts.indexOf(anchor) - 1
+      const live = w.manager?.byKey(key)
+      const wt = await worktreeOf(key).catch(() => undefined)
+
+      // What the files looked like when that message was sent: the snapshot
+      // marker at that message, from the raw JSONL the SDK does not expose.
+      // When a run is LIVE the file can still gain a snapshot update (the CLI
+      // re-issues the marker when the file set changes mid-turn), so the map
+      // for a live session is only read AFTER the run is stopped below; the
+      // modal then cannot promise a count it does not have yet.
+      const readMap = async (): Promise<CheckpointMap | undefined> => {
+        const loc = await sessionFileFor(claudeHome(), card.id)
+        if (!loc) return undefined
+        const text = await fs.readFile(loc.file, 'utf8').catch(() => '')
+        return checkpointMapFor(text.split('\n'), messageId)
+      }
+      const mapNow = live ? undefined : await readMap()
+
+      const choice = await vscode.window.showWarningMessage(
+        `Start over from "${snippet}"?`,
+        {
+          modal: true,
+          detail: [
+            `This forks the session at that message. Everything after it — its answer and the ` +
+              `${later} later message${later === 1 ? '' : 's'} — is discarded from this card. The original ` +
+              `session stays in Claude Code's history, untouched.`,
+            live ? 'The run in progress is stopped first.' : '',
+            !wt ? 'This session has no worktree, so no files are restored.'
+              : live ? 'The worktree files are restored to how they were when you sent it.'
+              : mapNow === undefined
+                ? 'No file checkpoints exist at this point (this session ran before they were recorded), so the files keep their current state.'
+                : Object.keys(mapNow).length
+                  ? `Files are restored to how they were: ${Object.keys(mapNow).length} tracked file${Object.keys(mapNow).length === 1 ? '' : 's'}.`
+                  : 'No files had been touched by that point, so there is nothing to restore.',
+          ].filter(Boolean).join('\n\n'),
+        },
+        'Try again from here',
+      )
+      if (choice !== 'Try again from here') return
+
+      // The fork reads the transcript file, so a dying CLI — which can flush a
+      // frame or two on the way out — has to be finished before we cut. Only
+      // now is the checkpoint map read for a live session.
+      if (live) {
+        w.manager?.stop(key)
+        const loc = await sessionFileFor(claudeHome(), card.id)
+        const settled = loc
+          ? await waitForQuiescent(loc.file)
+          : await new Promise((r) => setTimeout(r, 1500))
+        if (!settled) {
+          vscode.window.showWarningMessage(
+            'The run is still stopping — wait a moment and try again.')
+          return
+        }
+      }
+      const map = mapNow ?? await readMap()
+
+      // Restore first: the fork shares this worktree, and the redo must start
+      // from the state the anchor message was sent into, not the state the
+      // discarded turns left behind. applyRestore never throws per file; a
+      // missing backup is a note afterwards, not a reason to skip the rest.
+      let restored: string[] = []
+      let failedFiles: { rel: string; reason: string }[] = []
+      if (wt && map) {
+        const plan = planRestore(wt.dir, historyDirFor(claudeHome(), card.id), map)
+        const out = await applyRestore(plan.copies)
+        restored = out.restored
+        failedFiles = out.failed
+      }
+
+      try {
+        const { forkSession } = await loadSdk()
+        const forked = await forkSession(card.id, {
+          upToMessageId: messageId,
+          title: card.title,
+        })
+        const forkId = forked.sessionId
+        // Re-key the card to the fork, keeping phase, tags and the worktree
+        // mapping, and clear the run mark: the fork has never run.
+        await w.store.adoptKey(card.id, forkId)
+        await w.store.patch(forkId, { running: 0 })
+        if (selectedKey === key) selectedKey = forkId
+        log.info(`Forked session ${card.id} at ${messageId} -> ${forkId}; restored ${restored.length} file(s)`)
+        refreshAll()
+
+        const notes: string[] = []
+        if (restored.length) {
+          notes.push(`Restored ${restored.length} tracked file${restored.length === 1 ? '' : 's'} to how they were.`)
+        } else if (wt && map && !Object.keys(map).length) {
+          notes.push('No files had been touched by that point, so nothing needed restoring.')
+        }
+        if (failedFiles.length) {
+          notes.push(`Could not restore: ${failedFiles.slice(0, 3).map((f) => f.rel).join(', ')}` +
+            (failedFiles.length > 3 ? ` and ${failedFiles.length - 3} more` : '') +
+            ` (${failedFiles[0]?.reason ?? 'unknown'}).`)
+        }
+        if (map === undefined && wt) {
+          notes.push('No file checkpoints existed at that point, so the files kept their current state.')
+        }
+        const text = `Forked at "${snippet}". ` + (notes.length ? notes.join(' ') : 'Send the corrected instruction to continue here.')
+        if (notes.length) vscode.window.showWarningMessage(text)
+        else vscode.window.showInformationMessage(text)
+      } catch (e) {
+        // The files are already restored at this point — say so, or the card
+        // looks untouched while the worktree quietly went backwards.
+        vscode.window.showWarningMessage(
+          `Could not fork: ${e instanceof Error ? e.message : String(e)}. ` +
+          (restored.length
+            ? `The files were restored to that message's state; the card still points at the original session.`
+            : 'The card still points at the original session.'))
+      }
     },
 
     /**

@@ -72,6 +72,11 @@ export function interruptedSessions(
 export type Entry =
   | {
       kind: 'prompt'; at: number; text: string
+      /** The message's uuid in Claude Code's transcript. Carried so the view
+       *  can name this row as a fork/rewind anchor ("try again from here").
+       *  Absent on rows from runtimes whose transcripts have no chain uuids
+       *  (Codex), which is exactly the rows that must not offer a fork. */
+      id?: string
       /** How many images went with this message. The COUNT, not the bytes:
        *  this array is serialised to the webview on every repaint, and a few
        *  megabytes of base64 per frame is the per-token cost this board
@@ -592,7 +597,7 @@ export class SessionStore {
         ? blocks.filter((b) => b.type === 'image').length
         : 0
       if (imageCount && m.type === 'user' && !parentId && !blocks.some((b) => b.type === 'text')) {
-        target.push({ kind: 'prompt', at, text: '', images: imageCount })
+        target.push({ kind: 'prompt', at, text: '', id: m.uuid, images: imageCount })
       }
 
       for (const b of blocks) {
@@ -601,7 +606,7 @@ export class SessionStore {
           // the person typed, so it must not render as their prompt.
           target.push(parentId
             ? { kind: 'text', at, text: b.text }
-            : { kind: 'prompt', at, text: b.text, ...(imageCount ? { images: imageCount } : {}) })
+            : { kind: 'prompt', at, text: b.text, id: m.uuid, ...(imageCount ? { images: imageCount } : {}) })
         } else if (m.type === 'user' && b.type === 'tool_result') {
           // Tool ids are unique across the session, so one map serves both the
           // main thread and every subagent.

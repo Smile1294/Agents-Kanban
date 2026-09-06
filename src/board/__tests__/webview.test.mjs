@@ -91,6 +91,35 @@ ok(ct.includes('git status'), 'chat renders tool rows')
 ok(ct.includes('Session Meta') && ct.includes('Planning') && ct.includes('Implementing'), 'chat renders the phase transition')
 ok(ct.includes('37s'), 'chat renders the result duration')
 
+// 4a. "Try again from here" anchors a fork at a prompt row — but only a row
+// that names the transcript uuid a fork cuts at (Codex transcripts and rows
+// written before the id was kept have none), on a session that can fork.
+{
+  const page = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    cards: [{ ...CARD, agent: undefined }],
+    transcript: [
+      { kind: 'prompt', at: Date.now(), text: 'please fix the sort', id: 'uuid-1' },
+      { kind: 'text', at: Date.now(), text: 'on it' },
+      { kind: 'prompt', at: Date.now(), text: 'please fix the sort too' },
+    ],
+  })
+  const count = page.text().split('Try again from here').length - 1
+  ok(count === 1, `only the uuid-carrying prompt row offers the fork (${count} shown)`)
+  const retry = findButton(page.root, 'Try again from here')
+  ok(!!retry, 'the affordance is a real button')
+  retry.onclick({ stopPropagation() {} })
+  ok(page.posted.some((m) => m.type === 'forkAt' && m.id === 'abc-123' && m.messageId === 'uuid-1'),
+    'clicking it asks the host to fork the SELECTED session at THAT message')
+
+  const codex = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    cards: [{ ...CARD, agent: undefined, runtime: 'codex' }],
+    transcript: [{ kind: 'prompt', at: Date.now(), text: 'do the thing', id: 'uuid-9' }],
+  })
+  ok(!codex.text().includes('Try again from here'), 'a Codex card offers no fork even on an id-carrying row')
+}
+
 // 5. The composer carries the controls that were missing entirely.
 ok(ct.includes('Opus 5'), 'composer shows the model picker')
 ok(ct.includes('High'), 'composer shows the effort picker')
