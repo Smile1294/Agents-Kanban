@@ -44,6 +44,16 @@ export class RemoteFeed {
    *  next push. */
   private counts = new Map<string, number>()
 
+  /** The host's write-channel toggle, carried into every index so the remote
+   *  page shows its composer exactly when a command would be acted on. */
+  private writes = false
+
+  /** Set by the host from its own `remote.writes` state — the page's composer
+   *  and the host's gate must agree, and both read this one value. */
+  setWrites(on: boolean): void {
+    this.writes = on
+  }
+
   /** Mark a session as already sent, at `totalEntries` — used after the
    *  enable-time backfill so the first tick does not resend every backfilled
    *  tail. */
@@ -85,7 +95,7 @@ export class RemoteFeed {
       if (tail) out.push(tail)
     }
     return {
-      index: projectIndex(at, columns, cards, (k) => this.tvOf(k)),
+      index: projectIndex(at, columns, cards, (k) => this.tvOf(k), this.writes),
       tails: out,
     }
   }

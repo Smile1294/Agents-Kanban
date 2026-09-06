@@ -2114,7 +2114,10 @@ keychain and the watcher's browser, which keeps only the derived id. The
 relay's POST gate is knowing the id (`x-rc-key`); possession of the id grants
 read and write of the MIRROR only — the real board is never touched by any of
 it. That is the honest price of a server with no secrets, and it is the reason
-the relay page's "login" is a code field and can never be a session.
+the relay page's "login" is a code field and can never be a session. (The
+write channel below splits that single capability into two: the code still
+grants the mirror, and a separate toggle gates anything reaching the real
+board.)
 
 **The lift-out folder is part of the repo.** `remote/` carries its own
 `package.json`, `netlify.toml` and README, is excluded from the .vsix, and its
@@ -2142,6 +2145,99 @@ page's oldest rule.
 **The viewer is a static page with the same hygiene as the webviews.** No
 framework, no build, no innerHTML — the chat rows it renders are another
 program's output. Node and text only.
+
+### Remote Control: prompts back into the board
+
+> I want to be able to, from the remote control, control as well the inputs
+> into the AI model. So if I just have it connected through that remote
+> control, I could basically control the Kanban board and the chats and all
+> that from anywhere.
+
+The mirror is one-way by design, and this request asks for the way back. The
+shape it took, and the decisions that follow from it:
+
+**The pairing code and the write channel are TWO capabilities, and the second
+is opt-in.** The code is a capability for the mirror — anyone holding it can
+read the board and junk the mirror by pushing to it, and that is fine because
+the mirror is disposable. Running prompts on the real machine is different:
+it starts sessions and spends money. So `remote.writes` is a separate toggle
+in the settings page's Remote section, default OFF, persisted, and the
+description on the page names the risk outright (anyone with the code and the
+site can send one). The toggle is drawn only when a relay URL and a pairing
+code are configured — a control that cannot take effect is not drawn. The
+page's composer appears exactly while the index's `writes` flag is true, and
+that flag is the HOST's toggle carried in every push, never something the
+relay asserts.
+
+**The relay queues, the extension gates — boundaries in code, not prose.** The
+relay's job ends at holding commands (bounded: 20, 20 000 chars each, so a
+holder of the id cannot bloat the store). Whether one runs is decided in
+`src/remote/commands.ts`, `acceptCommands()`, host-side, in one place: the
+toggle, the nonce dedup, and a re-check that the named session still exists on
+the live board (the relay validates against its stored index, which is a
+snapshot; the host re-checks against the board itself — a session that is gone
+is dropped, never re-targeted). An accepted command runs through the SAME host
+paths the local webview uses (`sendMessage` / `newSession`) — permission mode,
+model flags, worktree creation, money. Nothing reaches around them, and the
+tool description of none of the board tools matters to any of it.
+
+**Act-then-ack, at-least-once.** The extension runs a command and only then
+acks it; the relay forgets a command only when acked. So a prompt survives the
+relay's queue and runs at least once — a host that dies between running and
+acking may run it once more on the next delivery, and that window is the
+host's own crash (the nonce memory is in-process). The alternative — ack
+first, then act — loses commands silently, which is worse. Re-delivery while
+the host is alive is a nonce no-op.
+
+**Commands sent while the channel is OFF are discarded when it turns ON,
+never run late.** The relay keeps them (capped) because the extension cannot
+ack while off; enabling flushes the queue by acking everything without acting.
+"Only commands sent while the switch is on ever run" is the honest contract —
+a queue that runs at some later moment is a time bomb, not a feature.
+
+**A command is a PROMPT, never a board edit.** There is no remote tool for
+moving a card or touching board state: the write channel composes into an
+existing session's chat or starts a new session with the text. The user's ask
+was to "control the inputs into the AI model", and the inputs are prompts —
+the board's moves follow from what the agent then does, which is the normal,
+watched, permission-gated flow rather than an unobserved remote edit.
+
+**Delivery rides the push loop and one gate.** Commands arrive piggybacked on
+push answers (a busy board picks them up without extra traffic) and on a poll
+every 30s that runs only while the toggle is on — an idle board is exactly
+when a remote prompt arrives, so the poll must not depend on pushes. The
+watcher's draft and focus survive the page's rebuilds the same way the
+settings page's do (module-level drafts, `data-focus` hand-back), and a failed
+send keeps the draft — a page that eats your prompt is a page that makes you
+type it twice.
+
+### Remote Control: any host, not just Netlify
+
+> now it's on Netlify, for example, but I want it to be generic. It doesn't
+> have to be just Netlify. It can be any other repository that can handle the
+> board.
+
+**One API path, one core, adapters only.** Every host serves the relay at
+`<site>/board`: Netlify rewrites it to its function (`netlify.toml`), the
+Cloudflare worker and the plain-Node server route it directly, and the host
+side (`relayBase()`) normalises away `/.netlify/functions/` and a trailing
+`/board`, so a URL pasted from any of them works. All behaviour lives in
+`functions/board-core.mjs` with the store injected; the host files are thin
+wrappers (Netlify Blobs, Workers KV, one JSON file written atomically), and
+the repo's test suite runs the core against a fake Map store — so a gate the
+deployables could not run would be no gate.
+
+**The Node server is the zero-account host, and that matters.** `remote/server.js`
+is dependency-free and runs the whole relay locally — which is what makes the
+whole feature testable end-to-end without deploying anywhere, and what the
+howToTest rides on. The other two hosts are for the public-internet case; the
+local one is for today.
+
+**The KV adapter's only job is the list shape.** Cloudflare's KV `list()`
+returns `keys: [{ name }]`; `board-core` expects `blobs: [{ key }]`. That
+mapping is the entire adapter, and it is pinned by a test because a store
+whose list returns the wrong shape silently breaks the orphan-tail GC, not
+the reads.
 
 ## Still open
 

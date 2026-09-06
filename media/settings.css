@@ -517,3 +517,16 @@ button.link:disabled:hover { text-decoration: none; }
   align-items: center;
   flex-wrap: wrap;
 }
+/* The write-channel opt-in: the same checkbox-row layout the model list uses,
+   with a description that names the risk — the user must knowingly let another
+   device drive this board. */
+.remote-writes {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 8px 0;
+  cursor: pointer;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  margin-top: 8px;
+}

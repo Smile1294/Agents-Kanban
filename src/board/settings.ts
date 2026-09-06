@@ -87,6 +87,11 @@ export interface RemoteState {
   url: string
   /** True when a pairing code is in the keychain. The code never renders. */
   hasCode: boolean
+  /** The write channel: prompts sent from the remote page run on THIS machine
+   *  when true. The host's own toggle, default OFF — and the page renders the
+   *  control only when a relay URL is set, because without one no command
+   *  could ever arrive. */
+  writesEnabled: boolean
   status?: { at: number; ok: boolean; note?: string; error?: string }
 }
 
@@ -96,6 +101,7 @@ export type RemoteMessage =
   | { type: 'setRemote'; enabled: boolean }
   | { type: 'saveRemote'; url: string; code?: string }
   | { type: 'clearRemoteCode' }
+  | { type: 'setRemoteWrites'; enabled: boolean }
 
 /** One scheduled run as the page shows it. The schedule itself, plus the
  *  derived facts: `when` ("Mon–Fri at 09:00") and `nextAt`, both host-computed,
@@ -405,6 +411,7 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
     case 'runSchedule':
       return id ? ({ type, id } as SettingsMessage) : undefined
     case 'setRemote':
+    case 'setRemoteWrites':
       return typeof m.enabled === 'boolean' ? { type, enabled: m.enabled } : undefined
     case 'clearRemoteCode':
       return { type }

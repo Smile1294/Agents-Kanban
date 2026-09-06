@@ -100,6 +100,20 @@ function CARD(updated: number): RemoteCardSource {
   ok(b.tails.length === 1 && b.tails[0]!.entries.length === 6, '…but growth after the backfill sends again')
 }
 
+// --- writes: the host's toggle rides every index ----------------------------
+
+{
+  const feed = new RemoteFeed()
+  const a = feed.build(1000, COLS, [CARD(1000)], [])
+  ok(a.index.writes === false, 'the toggle defaults off — the page shows no composer')
+  feed.setWrites(true)
+  const b = feed.build(2000, COLS, [CARD(2000)], [])
+  ok(b.index.writes === true, 'setWrites(true) rides the next index — the page shows its composer')
+  feed.setWrites(false)
+  const c = feed.build(3000, COLS, [CARD(3000)], [])
+  ok(c.index.writes === false, '…and off again when the host says so')
+}
+
 // --- reset: a new code names a new board -----------------------------------
 
 {

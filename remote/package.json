@@ -2,10 +2,11 @@
   "name": "agents-kanban-remote",
   "version": "1.0.0",
   "private": true,
-  "description": "The Netlify relay that Agents Kanban pushes its board to — lift this folder into its own repository and deploy.",
+  "description": "The relay that Agents Kanban pushes its board to — runs on Netlify, Cloudflare Workers or any Node server. Lift this folder into its own repository and deploy.",
   "type": "module",
   "scripts": {
-    "test": "node --check functions/board.mjs && node --check functions/board-core.mjs && node --check public/board.js"
+    "start": "node server.js",
+    "test": "node --check functions/board.mjs && node --check functions/board-core.mjs && node --check server.js && node --check worker.js && node --check public/board.js"
   },
   "dependencies": {
     "@netlify/blobs": "^11.0.3"

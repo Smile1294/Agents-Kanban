@@ -243,6 +243,37 @@ input.code {
   flex-direction: column;
 }
 
+/* --- the write channel ---------------------------------------------------- */
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.chat .composer { margin-top: 10px; }
+.composer-input {
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  resize: vertical;
+  min-width: 0;
+}
+.composer-input:focus { outline: 1px solid var(--accent); }
+.composer-acts {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.composer-note { overflow-wrap: anywhere; }
+.composer-note.error { color: var(--bad); }
+
 @media (max-width: 720px) {
   .entry .when { display: none; }
 }
