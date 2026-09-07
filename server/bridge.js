@@ -8,26 +8,105 @@
  * dialogs a webview never has to draw (quick picks, input boxes, modal
  * confirmations) are drawn here as overlays.
  *
- * One more job: the pairing code gate. The code lives in sessionStorage —
- * never in the URL after entry — and rides as a header on every request and as
- * a query parameter on the EventSource (which cannot set headers).
+ * One more job: the pairing code gate. The CODE is the long-lived secret and
+ * it is used ONCE — to exchange for a short-lived TOKEN (POST /api/session).
+ * sessionStorage then holds the token (`x-rc-token` on every request; `?token=`
+ * on the EventSource, which cannot set headers) and keeps the code ONLY so a
+ * dead token — expired, revoked, or a server restart — can be re-exchanged
+ * once without asking the user again. When even that fails, the gate returns
+ * with an explanation. Neither the code nor the token is ever printed to the
+ * console or put in the URL bar.
  */
 ;(function () {
   'use strict'
   const surface = document.currentScript.dataset.surface === 'settings' ? 'settings' : 'board'
   const CODE_KEY = 'ak-code'
+  const TOKEN_KEY = 'ak-token'
 
   const code = () => sessionStorage.getItem(CODE_KEY) ?? ''
-  const setCode = (c) => { sessionStorage.setItem(CODE_KEY, c); start() }
-  const clearCode = () => sessionStorage.removeItem(CODE_KEY)
+  const token = () => sessionStorage.getItem(TOKEN_KEY) ?? ''
+  const setToken = (t) => sessionStorage.setItem(TOKEN_KEY, t)
+  const forget = () => { sessionStorage.removeItem(CODE_KEY); sessionStorage.removeItem(TOKEN_KEY) }
 
+  /** Exchange the stored code for a fresh token. Returns the token, or
+   *  { status, body } when the server refused it, or null when there is no
+   *  code to exchange or the board did not answer. */
+  async function exchange() {
+    const c = code()
+    if (!c) return null
+    let res
+    try {
+      res = await fetch('/api/session', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code: c }),
+      })
+    } catch { return null }
+    if (res.status === 200) {
+      let parsed = null
+      try { parsed = await res.json() } catch { /* fall through */ }
+      if (parsed && typeof parsed.token === 'string' && parsed.token) {
+        setToken(parsed.token)
+        return parsed.token
+      }
+      return null
+    }
+    let body = ''
+    try { body = await res.text() } catch { /* keep '' */ }
+    return { status: res.status, body }
+  }
+
+  // The code is kept only to re-exchange — and only ONCE per page life, or a
+  // loop of dead tokens and re-exchanges would chase its own tail.
+  let reexchanged = false
+  let stream = null
+
+  /** One 401 recovery: kill the dead stream, re-exchange the code once, tell
+   *  the caller whether a fresh token is now stored. Shows the gate — with an
+   *  honest note — when the session cannot be recovered. */
+  async function recoverAuth() {
+    if (reexchanged) return false
+    reexchanged = true
+    const expired = !code() // a token died and there is nothing left to re-exchange it with
+    closeStream()
+    const ex = await exchange()
+    if (typeof ex === 'string') return true
+    showGate(noteFor(ex, expired))
+    return false
+  }
+
+  function closeStream() {
+    if (stream) { stream.close(); stream = null }
+  }
+
+  const GATE_DEFAULT = 'This board is locked with a pairing code. The server printed it when it started.'
+  function noteFor(ex, expired) {
+    if (ex === null) {
+      return expired ? 'The session expired — enter the pairing code again.' : 'The board did not answer — is the server still running?'
+    }
+    if (ex.status === 429 || ex.status === 403) return ex.body || 'Too many failed attempts — wait a while, then try again.'
+    return 'That code was not accepted — it may have changed. Check the one the server printed.'
+  }
+
+  /** fetch with the session token. On a 401 — a token the server no longer
+   *  accepts — re-exchange once and retry the request; when that fails the
+   *  gate is up and the response is returned as it stood. */
   async function api(path, body, method) {
-    const res = await fetch(path, {
-      method: method ?? (body ? 'POST' : 'GET'),
-      headers: { 'content-type': 'application/json', 'x-rc-code': code() },
-      body: body ? JSON.stringify(body) : undefined,
-    })
-    if (res.status === 401) console.error('bridge 401 on', path, 'code present:', !!code(), 'stored:', sessionStorage.getItem(CODE_KEY))
+    let res
+    try {
+      res = await fetch(path, {
+        method: method ?? (body ? 'POST' : 'GET'),
+        headers: { 'content-type': 'application/json', 'x-rc-token': token() },
+        body: body ? JSON.stringify(body) : undefined,
+      })
+    } catch (e) {
+      // Network: surface it as a toast so the user knows the board is
+      // unreachable rather than pretending nothing happened, and return a
+      // response that cannot be mistaken for a server answer.
+      toast({ level: 'error', text: 'The board did not answer — is the server still running?' })
+      return { status: 0, ok: false }
+    }
+    if (res.status === 401 && (await recoverAuth())) return api(path, body, method)
     return res
   }
 
@@ -36,10 +115,10 @@
   window.acquireVsCodeApi = () => ({
     postMessage: async (msg) => {
       // The app script posts its boot `ready` the moment it loads — while the
-      // gate is still up and no code exists yet. That message is the very
+      // gate is still up and no token exists yet. That message is the very
       // thing `ready` after the stream connects repeats, so drop it here
       // instead of sending an unauthenticated request (and its wrong-note 401).
-      if (!code()) return true
+      if (!code() && !token()) return true
       let res = await api('/api/msg?surface=' + surface, msg)
       if (res.status === 409) {
         // The surface does not exist yet — the extension creates its panel
@@ -47,7 +126,6 @@
         await api('/api/open', { surface })
         res = await api('/api/msg?surface=' + surface, msg)
       }
-      if (res.status === 401) showGate('The pairing code was not accepted.')
       return true
     },
     getState: () => state,
@@ -87,20 +165,20 @@
     const h = document.createElement('h1')
     h.textContent = 'Agents Kanban'
     const p = document.createElement('p')
-    p.textContent = note ?? 'This board is locked with a pairing code. The server printed it when it started.'
+    p.textContent = note ?? GATE_DEFAULT
     const input = document.createElement('input')
     input.type = 'password'
     input.placeholder = 'Pairing code'
     input.autocomplete = 'off'
     const go = document.createElement('button')
     go.textContent = 'Open board'
-    const enter = () => { if (input.value.trim()) setCode(input.value.trim()) }
+    const enter = () => { if (input.value.trim()) { forget(); sessionStorage.setItem(CODE_KEY, input.value.trim()); reexchanged = false; start() } }
     go.addEventListener('click', enter)
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') enter() })
     const wrong = document.createElement('button')
     wrong.className = 'ak-link'
     wrong.textContent = 'Forget this board'
-    wrong.addEventListener('click', () => { clearCode(); input.value = ''; input.focus() })
+    wrong.addEventListener('click', () => { closeStream(); forget(); gateEl()?.remove(); showGate() })
     box.append(h, p, input, go, wrong)
     div.append(box)
     document.body.append(div)
@@ -214,28 +292,66 @@
     const g = gateEl()
     if (g) g.remove()
     void (async () => {
+      closeStream()
+      // A reload with a live token skips the exchange; the code is only spent
+      // when a token is missing or dead.
+      if (!token()) {
+        const ex = await exchange()
+        if (typeof ex !== 'string') {
+          showGate(noteFor(ex, false))
+          return
+        }
+      }
       // Make sure the surface exists before the stream attaches: the page is
-      // the click that opens the board.
+      // the click that opens the board. A 401 here means the token died
+      // between the exchange and now — api() already recovered or gated.
       const opened = await api('/api/open', { surface })
-      if (opened.status === 401) {
-        clearCode()
-        showGate('That code was not accepted. Check the one the server printed.')
-        return
-      }
-      const events = new EventSource('/api/events?surface=' + surface + '&code=' + encodeURIComponent(code()))
-      events.onopen = () => {
-        // A freshly (re)connected view holds no cached state — exactly the
-        // `ready` the real webview posts on load, which paints the board.
-        window.acquireVsCodeApi().postMessage({ type: 'ready' })
-      }
-      events.onmessage = (e) => {
-        try { onFrame(JSON.parse(e.data)) } catch { /* a frame we cannot read is dropped, not crashed on */ }
-      }
-      events.onerror = () => { /* EventSource reconnects on its own */ }
+      if (opened.status === 401) return
+      connect()
     })()
   }
 
-  // First paint: gate first, so nothing runs without the code.
-  if (!code()) showGate()
+  /** Open the event stream with the CURRENT token — the token is read at
+   *  connect time and cannot change on a live EventSource, so a re-exchange
+   *  always comes back through here with a fresh URL. */
+  function connect() {
+    const t = token()
+    if (!t) { showGate(GATE_DEFAULT); return }
+    closeStream()
+    // The token rides in the query because EventSource cannot set headers.
+    // It is the credential that expires (server/README.md: TLS section), never
+    // the code.
+    const events = new EventSource('/api/events?surface=' + surface + '&token=' + encodeURIComponent(t))
+    stream = events
+    events.onopen = () => {
+      // A freshly (re)connected view holds no cached state — exactly the
+      // `ready` the real webview posts on load, which paints the board.
+      window.acquireVsCodeApi().postMessage({ type: 'ready' })
+    }
+    events.onmessage = (e) => {
+      try { onFrame(JSON.parse(e.data)) } catch { /* a frame we cannot read is dropped, not crashed on */ }
+    }
+    events.onerror = () => {
+      if (events !== stream) return // a replaced stream must not fight its successor
+      void (async () => {
+        // A dead token (401) and a network blip look identical here — the
+        // EventSource retries on its own timer either way. Ask the server
+        // which one it was: /api/ping answers 401 exactly when the token is
+        // gone, and recoverAuth() closes this stream and reconnects with a
+        // fresh token, or shows the gate with the reason.
+        let ping = null
+        try {
+          ping = await fetch('/api/ping', { headers: { 'x-rc-token': token() } })
+        } catch { return } // network down — the EventSource keeps retrying
+        if (ping.status === 401 && (await recoverAuth())) connect()
+      })()
+    }
+  }
+
+  // First paint: gate first, so nothing runs without a credential. A stored
+  // token (this tab logged in before, or the popup sharing its sessionStorage)
+  // goes straight to the board; the code alone is enough to start — start()
+  // exchanges it.
+  if (!code() && !token()) showGate()
   else start()
 })()

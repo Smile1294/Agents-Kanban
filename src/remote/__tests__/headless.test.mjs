@@ -73,18 +73,33 @@ if (!up) {
   process.exit(1)
 }
 console.log('ok: server came up')
+// The default bind says nothing scary at startup: loopback plus a strong
+// supplied code — the exposure warnings are for the network-bound cases only.
+await new Promise((r) => setTimeout(r, 100))
+ok(!/reachable from the network|GENERATED for this run|pairing code you supplied/.test(serverLog), 'a loopback run prints no exposure warnings')
 
 try {
   // --- auth: the code gates everything that could move board state -----------
-  ok((await fetch(`${base}/api/msg`, { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } })).status === 401, 'a message without a code is 401')
-  ok((await fetch(`${base}/api/msg`, { method: 'POST', body: '{}', headers: { 'content-type': 'application/json', 'x-rc-code': 'not-the-code' } })).status === 401, 'a message with a wrong code is 401')
-  ok((await fetch(`${base}/api/events`)).status === 401, 'the event stream without a code is 401')
+  ok((await fetch(`${base}/api/msg`, { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } })).status === 401, 'a message without a token is 401')
+  ok((await fetch(`${base}/api/msg`, { method: 'POST', body: '{}', headers: { 'content-type': 'application/json', 'x-rc-code': CODE } })).status === 401, 'the CODE itself is not accepted on the message route')
+  ok((await fetch(`${base}/api/events`)).status === 401, 'the event stream without a token is 401')
+  ok((await fetch(`${base}/api/events?surface=board&code=${CODE}`)).status === 401, 'the code in the stream URL is not accepted')
   ok((await fetch(`${base}/`)).ok, 'the page itself is public')
 
-  // --- the HTTP round trip: open, ready, state over the event stream ---------
-  ok((await fetch(`${base}/api/open`, { method: 'POST', headers: { 'x-rc-code': CODE } })).ok, 'open creates the surface')
+  // The code is exchanged once for a token, exactly the way the gate page does
+  // it; everything after this rides the token.
+  const session = await fetch(`${base}/api/session`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: CODE }),
+  })
+  ok(session.status === 200, 'the code exchanges for a token')
+  const token = (await session.json()).token
+  ok(typeof token === 'string' && token.length > 20, 'the token is a long random string')
+  const auth = { 'content-type': 'application/json', 'x-rc-token': token }
 
-  const sse = await fetch(`${base}/api/events?surface=board&code=${CODE}`)
+  // --- the HTTP round trip: open, ready, state over the event stream ---------
+  ok((await fetch(`${base}/api/open`, { method: 'POST', headers: auth })).ok, 'open creates the surface')
+
+  const sse = await fetch(`${base}/api/events?surface=board&token=${encodeURIComponent(token)}`)
   if (!sse.ok || !sse.body) { ok(false, 'the event stream opens'); process.exit(1) }
   console.log('ok: the event stream opens')
   const reader = sse.body.getReader()
@@ -103,7 +118,7 @@ try {
 
   await fetch(`${base}/api/msg?surface=board`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-rc-code': CODE },
+    headers: auth,
     body: JSON.stringify({ type: 'ready' }),
   })
   const frame = await nextFrame()

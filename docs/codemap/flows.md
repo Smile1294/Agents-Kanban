@@ -122,5 +122,8 @@ webview.
 Headless: `server/server.mjs` activates the built extension against
 `server/stub.mjs`; the browser gets `server/page.mjs`'s document with
 `media/theme.css` first, `server/bridge.js` supplies `acquireVsCodeApi()`, host
-frames arrive over SSE, `postMessage` becomes `POST /api/msg`, and the pairing
-code gates everything as a header (`x-rc-code`) or `?code=` on the stream.
+frames arrive over SSE, `postMessage` becomes `POST /api/msg`. The pairing code
+is exchanged once for a short-lived token (`POST /api/session`); the token
+gates everything else as an `x-rc-token` header, and `?token=` on the event
+stream alone — the code itself never rides in a URL. See [remote.md](remote.md)
+and `server/README.md`.
