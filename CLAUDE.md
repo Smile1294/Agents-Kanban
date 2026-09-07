@@ -12,7 +12,7 @@ stream reference, current state, and what to build next.
 | Question | File |
 |---|---|
 | How does this work, what's next? | [PLAN.md](PLAN.md) |
-| Where is X in the code, which test covers it, what must I not break? | [docs/CODEMAP.md](docs/CODEMAP.md) — the map, file by file, plus a task → files index. Read it before grepping |
+| Where is X in the code, which test covers it, what must I not break? | [docs/codemap/README.md](docs/codemap/README.md) — the knowledge base: an index plus one file per area, each owning its source files. Read the index, then only the areas your task touches. **You must update the area files for what you change; the review move is refused otherwise** |
 | How does Nimbalyst do X? | [docs/NIMBALYST.md](docs/NIMBALYST.md) — don't re-clone the repo, it's already been analysed |
 | How does Paperclip do X? | [docs/PAPERCLIP.md](docs/PAPERCLIP.md) — same rule, don't re-read it |
 | Should one objective become several agents, and how? | [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) — research; `split_task`, the dial and per-piece routing are built, its §10 says what is not |
@@ -593,6 +593,24 @@ run, since each session needs a worktree.
   in turn is what keeps a subtask an ordinary task branch that the existing
   diff, merge and cleanup paths already handle. It is also the one board tool
   that is not auto-allowed: starting processes that cost money is worth a click.
+- **Knowledge files move with the code, and the review move checks it.**
+  `docs/codemap/` is the knowledge base: an index plus one file per area, each
+  with YAML frontmatter whose `paths:` says which source files the area OWNS.
+  A brief that asks for the update is present for the whole session, and
+  PRESENT is not OUTRANKING (the `/jira-task` postmortem), so `set_phase` into a
+  review column runs `knowledgeCheck()` host-side over the worktree's diff
+  against its base and refuses, naming the files, while an area whose source
+  changed has an untouched file. Three things are load-bearing. It is GENERIC:
+  no codemap in the repository means nothing is required and the brief says
+  nothing about it, because the extension runs on repositories that never heard
+  of the convention. It reads the agent's OWN worktree, so a new source file is
+  claimed by editing an area file in the same branch. And tests and markdown
+  are exempt, or the line becomes a formality. One file per area rather than
+  one map, because a single file edited by every branch is a merge conflict
+  every time; the per-area "Recent changes" list replaces a shared changelog
+  for the same reason. `codemap.test.ts` checks the folder against the tree —
+  every source file owned by exactly one area, every glob alive, every named
+  path existing — so the map cannot rot while the suite stays green.
 - **Verify SDK APIs against the `.d.ts`**, at
   `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts`. See
   [docs/SDK-NOTES.md](docs/SDK-NOTES.md) for cases where the published docs

@@ -69,6 +69,14 @@ ok(brief.includes('task/S1-fix'), 'it tells the agent which branch it is on')
 ok(brief.includes('Fix login'), 'and which card is its own')
 ok(!brief.includes('complete'), 'it does NOT invite the agent to complete its own work')
 ok(brief.includes('set_title'), 'and it tells the agent the card name is a guess it can fix')
+// Knowledge files move with the code — but only where there is a codemap. On
+// any other repository the paragraph would describe a refusal that cannot happen.
+ok(!brief.includes('docs/codemap'), 'a repository without a codemap is told nothing about knowledge files')
+{
+  const mapped = buildBrief(DEFAULT_BOARD, 'Fix login', 'task/S1-fix', undefined, true, undefined, true)
+  ok(mapped.includes('docs/codemap/README.md') && mapped.includes('REFUSED'),
+     'with a codemap, the brief names the map and says the review move is refused without the update')
+}
 
 // The brief LOSES to a slash command unless it says so.
 //
@@ -818,7 +826,7 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
     live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
   }
   const ctx = internals.boardContext(agent)
-  for (const cb of ['onChanged', 'onNotice', 'onRename', 'onSplit']) {
+  for (const cb of ['onChanged', 'onNotice', 'onRename', 'onSplit', 'knowledgeCheck']) {
     ok(typeof ctx[cb] === 'function', `the run's board context wires ${cb}`)
   }
 

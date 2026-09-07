@@ -120,6 +120,20 @@ await exec('git', ['commit', '-m', 'work'], { cwd: wt.path })
 const changed = await svc.changedFiles(wt.path, 'main')
 ok(changed.includes('new.txt'), `changedFiles sees committed work: ${changed.join(',')}`)
 
+// An untracked directory is reported as its FILES. Plain `--porcelain` collapses
+// it to `newdir/`, which no owner glob matches and no diff row can open — the
+// knowledge-file gate refused a branch whose new area files sat in a new folder.
+await fs.mkdir(path.join(wt.path, 'newdir', 'inner'), { recursive: true })
+await fs.writeFile(path.join(wt.path, 'newdir', 'a.ts'), 'export const a = 1\n')
+await fs.writeFile(path.join(wt.path, 'newdir', 'inner', 'b.ts'), 'export const b = 2\n')
+const untracked = await svc.changedFiles(wt.path, 'main')
+ok(untracked.includes('newdir/a.ts') && untracked.includes('newdir/inner/b.ts'),
+   `changedFiles lists each untracked file, not the directory: ${untracked.join(',')}`)
+ok(!untracked.some((p) => p.endsWith('/')), 'and never a bare directory entry')
+const statuses = await svc.fileStatuses(wt.path, 'main')
+ok(statuses.some((f) => f.path === 'newdir/inner/b.ts'), 'fileStatuses has a row per new file too')
+await fs.rm(path.join(wt.path, 'newdir'), { recursive: true, force: true })
+
 // concurrent creates do not corrupt the repo (the reason the lock exists)
 const many = await Promise.all([10, 11, 12, 13].map(i =>
   svc.create({ taskId: `TASK-0${i}`, title: `Parallel ${i}` })))

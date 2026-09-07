@@ -15,9 +15,11 @@ Nimbalyst is an Electron app.
   docs are wrong in several places.**
 - [docs/DECISIONS.md](docs/DECISIONS.md) — why it's built this way, and the bugs
   already fallen into.
-- [docs/CODEMAP.md](docs/CODEMAP.md) — where everything is in the code, file by
-  file, with its test and its trap; a task → files index; the flows. Read it
-  before grepping.
+- [docs/codemap/README.md](docs/codemap/README.md) — the knowledge base: an
+  index plus one file per area, each owning its source files, with exports,
+  tests, traps, change recipes and the flows. Read the index, then only the
+  areas your task touches — and update them for what you change; the review
+  move is refused otherwise.
 - [docs/RUNTIMES.md](docs/RUNTIMES.md) and [docs/PROVIDERS.md](docs/PROVIDERS.md)
   — which agent program runs a session, and which backend sits behind Claude
   Code. Two axes, not one.
@@ -149,7 +151,8 @@ smoke.mjs               The launch gate
 ```
 
 Per-file detail — exports, the test that covers each file, the trap its header
-states, and a task → files index — is in [docs/CODEMAP.md](docs/CODEMAP.md).
+states, change recipes and the flows — is in [docs/codemap/](docs/codemap/README.md),
+one file per area.
 
 Everything outside `extension.ts`, `board/panel.ts` and `board/settings.ts` is
 free of `vscode` imports and unit-tested in plain Node.
@@ -340,7 +343,7 @@ forgiving moment for two of them to overlap.
 ---
 ## 8. Current state
 
-`npm run verify` — typecheck, build, 54 test files, launch gates.
+`npm run verify` — typecheck, build, 55 test files, launch gates.
 `npm run verify:package` — packages a `.vsix` and checks what is inside it.
 
 Every task goes through `scripts/with-node.sh`, which finds a Node 22.6+ before
@@ -539,6 +542,12 @@ Working:
   Anything this board ever touched is always shown, however old; search always
   finds everything (`hideSessionsOlderThanDays`)
 - **Pin a session** to the top of its column, from the card menu
+- **Knowledge files move with the code.** `docs/codemap/` is the knowledge
+  base — an index plus one file per area, each owning source files through the
+  `paths:` in its frontmatter — and `set_phase` into review is refused, naming
+  the files, while an area whose source changed has an untouched file. The
+  check runs host-side over the worktree's diff; a repository without a codemap
+  is asked for nothing. See [docs/codemap/README.md](docs/codemap/README.md)
 - **Repaints are bounded at 10Hz.** `refreshAll()` runs on every event an agent
   produces, streamed tokens included, and it used to do a full `getState()` per
   event, per surface — 105 seconds of extension-host work for every 60 seconds
@@ -603,9 +612,8 @@ Notable tests:
 Checked against the code on 2026-09-07. Items that had shipped since this list
 was first written — scheduled runs, per-session model choice, transcript search,
 the orchestration dial, per-piece routing — were removed rather than struck
-through; §8 describes them. Where a doc file answers "is X done", it is listed
-in [docs/CODEMAP.md](docs/CODEMAP.md), which is also where to look before
-grepping.
+through; §8 describes them. Each area file in [docs/codemap/](docs/codemap/README.md)
+carries its own "Open work" section with the items that land there.
 
 ### Runtimes: what is not done
 

@@ -180,7 +180,7 @@ npm run install-local # package and install into VS Code
 Press <kbd>F5</kbd> for an Extension Development Host.
 
 For the architecture and what is planned next, see **[PLAN.md](PLAN.md)**. For
-where everything is in the code, see **[docs/CODEMAP.md](docs/CODEMAP.md)**. For
+where everything is in the code, see **[docs/codemap/](docs/codemap/README.md)**. For
 why things are built the way they are, see **[docs/DECISIONS.md](docs/DECISIONS.md)**.
 
 ## Credits and licence

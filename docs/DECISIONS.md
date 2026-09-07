@@ -270,6 +270,34 @@ our own, so a conflict resolved by hand is not retitled behind the user's back.
 Committing is disabled outright while files are unresolved — git refuses, so a
 live button would only ever produce an error toast.
 
+### Knowledge files move with the code, and the review move checks it
+
+The single `docs/CODEMAP.md` lasted a day. Every agent that changed anything
+would have edited it, which is one file collecting every branch's merge
+conflict, and it asked to be kept current without anything making that so.
+
+So it is a folder, `docs/codemap/`, in the shape a skills library takes: an
+index that is always worth reading (`README.md`), area files read only when a
+task touches them, YAML frontmatter on each naming the source files it owns
+(`paths:`). Two agents working in different areas edit different files. Each
+area keeps its own "Recent changes" list; there is no shared changelog, for the
+same reason.
+
+And it is enforced. `AgentManager.boardContext()` hands `set_phase` a
+`knowledgeCheck` that diffs the worktree against its base and maps every changed
+source file to its owner through the frontmatter (`src/board/codemap.ts`); an
+owner whose file is not in the diff is a refusal naming it, before anything is
+written. The brief and the tool description state the rule too — but the brief
+is `appendSystemPrompt`, and the `/jira-task` postmortem is the record of what a
+present-but-not-outranking instruction is worth. Three deliberate choices: the
+check is generic (no codemap, no requirement, no paragraph in the brief — the
+extension runs on other people's repositories); it reads the agent's own
+worktree, so claiming a new file is an edit in the same branch; tests and
+markdown are exempt, or the line becomes a formality. `codemap.test.ts` keeps
+the map itself honest — every source file owned by exactly one area, every glob
+matching a tracked file, every path a knowledge file names existing — so the
+map cannot rot while every other test stays green.
+
 ## Postmortems
 
 ### "It says completed but nothing came back, and the second one never launched"

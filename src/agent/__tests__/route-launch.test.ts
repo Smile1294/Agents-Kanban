@@ -29,6 +29,7 @@ import { WorktreeService } from '../../git/worktree.ts'
 import { DEFAULT_BOARD } from '../../board/config.ts'
 import type { SpawnCatalogue } from '../routing.ts'
 import type { ProviderEnv, ProviderProfile } from '../providers.ts'
+import type { KnowledgeVerdict } from '../../board/codemap.ts'
 
 // --- the fake runtimes -------------------------------------------------------
 const specs: RunSpec[] = []
@@ -208,6 +209,62 @@ const recorded = (): string | undefined =>
   (meta.get(parentId)?.decomposition as { rule?: string } | undefined)?.rule
 ok(recorded() === 'spawn-model',
    `and the refusal is on the parent's card (${recorded()})`)
+
+// --- knowledge files move with the code, through the real path --------------
+// The unit tests prove `knowledgeCheck()` and the tool's refusal in isolation.
+// This proves the WIRING: a repository that carries a codemap gets the rule in
+// its brief, the tool context knows it, and the manager's callback reads the
+// agent's own worktree — its diff against the base, and the area files as the
+// agent left them, untracked ones included.
+{
+  ok(!(parentSpec?.appendSystemPrompt ?? '').includes('docs/codemap'),
+     'a repository without a codemap puts nothing about knowledge files in the brief')
+
+  // Give main a codemap, in the shape this repository's own has.
+  await fs.mkdir(path.join(root, 'docs', 'codemap'), { recursive: true })
+  await fs.writeFile(path.join(root, 'docs', 'codemap', 'README.md'), '# map\n')
+  await fs.writeFile(path.join(root, 'docs', 'codemap', 'alpha.md'),
+    '---\nname: alpha\ndescription: the alpha module\npaths:\n  - src/alpha/**\n---\n# Alpha\n\n## Recent changes\n')
+  await sh(root, 'add', '-A')
+  await sh(root, 'commit', '-qm', 'codemap')
+
+  specs.length = 0
+  const id = await mgr.start('Change alpha.')
+  const spec = specs.find((s) => s.taskId === id)
+  const brief = spec?.appendSystemPrompt ?? ''
+  ok(!!spec && brief.includes('docs/codemap/README.md') && brief.includes('REFUSED'),
+     'with a codemap on the base, the brief names the map and says the review move is refused without the update')
+
+  const agent = mgr.byKey(id)!
+  const internals = mgr as unknown as {
+    boardContext: (a: typeof agent) => { knowledgeFiles?: boolean; knowledgeCheck: () => Promise<KnowledgeVerdict> }
+  }
+  const ctx = internals.boardContext(agent)
+  ok(ctx.knowledgeFiles === true, 'and the tool context knows this worktree carries one')
+  const wt = agent.worktreePath
+  ok((await ctx.knowledgeCheck()).ok, 'a clean worktree passes')
+
+  await fs.mkdir(path.join(wt, 'src', 'alpha'), { recursive: true })
+  await fs.writeFile(path.join(wt, 'src', 'alpha', 'x.ts'), 'export const x = 1\n')
+  const refused = await ctx.knowledgeCheck()
+  ok(!refused.ok && refused.missing[0]?.file === 'docs/codemap/alpha.md',
+     'a new, uncommitted source file in an owned area with the area file untouched is REFUSED, naming the file' +
+     (refused.ok ? '' : ` (${refused.missing.map((m) => m.file).join(', ')})`))
+
+  await fs.appendFile(path.join(wt, 'docs', 'codemap', 'alpha.md'), '- 2026-09-07 · test · added x.ts\n')
+  const satisfied = await ctx.knowledgeCheck()
+  ok(satisfied.ok && satisfied.areas.includes('alpha'), 'editing the area file in the same worktree satisfies it')
+
+  // A NEW area file claiming a NEW directory, both untracked: the check reads
+  // the agent's own worktree, file by file, not the base's map.
+  await fs.mkdir(path.join(wt, 'src', 'beta'), { recursive: true })
+  await fs.writeFile(path.join(wt, 'src', 'beta', 'y.ts'), 'export const y = 2\n')
+  await fs.writeFile(path.join(wt, 'docs', 'codemap', 'beta.md'),
+    '---\nname: beta\npaths:\n  - src/beta/**\n---\n# Beta\n')
+  const claimed = await ctx.knowledgeCheck()
+  ok(claimed.ok && claimed.areas.includes('beta'),
+     `an area file added in the worktree claims a new directory (${claimed.ok ? claimed.areas.join(', ') : 'refused'})`)
+}
 
 mgr.stopAll()
 await fs.rm(root, { recursive: true, force: true })

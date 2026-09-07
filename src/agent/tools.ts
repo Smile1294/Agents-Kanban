@@ -25,6 +25,7 @@ import { normaliseTestPlan, normaliseTitle } from '../sessions/meta.ts'
 import { describeWhen, parseScheduleDraft, type Schedule, type ScheduleDraft } from '../board/schedules.ts'
 import { loadSdk } from './sdk.ts'
 import { describeSpawnAgents, type SpawnAgent } from './routing.ts'
+import type { KnowledgeVerdict } from '../board/codemap.ts'
 
 /** The MCP namespace these tools are mounted under; `mcpServers: { board: … }`. */
 export const BOARD_SERVER = 'board'
@@ -150,6 +151,18 @@ export interface BoardToolContext {
    */
   commitWorktree?: (message: string) => Promise<CommitWorktreeOutcome>
   /**
+   * Knowledge files move with the code. Called on the move into a review
+   * column BEFORE anything is written: the host diffs the worktree against its
+   * base and checks that every area of `docs/codemap/` whose source changed had
+   * its own file changed too (`src/board/codemap.ts`). A refusal names the
+   * files. Absent, or a repository with no codemap, means nothing is required —
+   * the extension runs on repositories that never heard of the convention.
+   */
+  knowledgeCheck?: () => Promise<KnowledgeVerdict>
+  /** Whether this worktree carries a codemap, so the description states the
+   *  rule only where it applies. */
+  knowledgeFiles?: boolean
+  /**
    * Rename this session's card.
    *
    * A callback rather than a `store.rename()` from in here, because the title
@@ -204,7 +217,7 @@ type Content = { content: Array<{ type: 'text'; text: string }>; isError?: boole
 const ok = (text: string): Content => ({ content: [{ type: 'text', text }] })
 const err = (text: string): Content => ({ content: [{ type: 'text', text }], isError: true })
 
-function phaseDescription(board: BoardConfig): string {
+function phaseDescription(board: BoardConfig, knowledgeFiles = false): string {
   const movable = board.columns.filter((c) => !c.humanOnly)
   const blocked = board.columns.filter((c) => c.humanOnly)
   const lines = [
@@ -235,6 +248,15 @@ function phaseDescription(board: BoardConfig): string {
       'Merge button"), or one is derived from the card title. The user\'s merge',
       'button merges commits, so uncommitted work would never be mergeable.',
       '',
+      // Stated only where it applies: on a repository without a codemap this
+      // paragraph would describe a refusal that can never happen.
+      ...(knowledgeFiles
+        ? ['Knowledge files move with the code: every area of docs/codemap/ whose source you',
+           'changed must have its own file changed too — fix what is no longer true, append a',
+           'line under "## Recent changes". The move is REFUSED otherwise, and the refusal',
+           'names the files. docs/codemap/README.md has the rule.',
+           '']
+        : []),
       '  howToTest: {',
       '    summary: "One line: what changed and what to look at."',
       '    steps:   ["Numbered, concrete. \'Run npm test\', not \'verify it works\'."]',
@@ -262,7 +284,7 @@ export function buildBoardTools(
 
   const setPhase = tool(
     'set_phase',
-    phaseDescription(board),
+    phaseDescription(board, ctx.knowledgeFiles === true),
     {
       phase: z.string().describe(`The column to move to. One of: ${phases.join(', ')}`),
       note: z.string().optional().describe('A short line saying why, shown on the board.'),
@@ -314,6 +336,15 @@ export function buildBoardTools(
           'the concrete steps to check it, and links to the files you changed and the command that ' +
           'verifies them (kind: "file" | "command" | "url").',
         )
+      }
+      // Knowledge files move with the code. Checked BEFORE anything is written,
+      // so a refusal leaves the card exactly where it was, and host-side, so it
+      // is the same gate over both transports. See `src/board/codemap.ts`.
+      if (isReviewColumn(board, args.phase) && ctx.knowledgeCheck) {
+        const verdict = await ctx.knowledgeCheck()
+        if (!verdict.ok) {
+          return err(`Moving to "${args.phase}" hands this work back, and ${verdict.message}`)
+        }
       }
 
       const current = await ctx.store.card(id)
