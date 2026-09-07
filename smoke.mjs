@@ -333,7 +333,21 @@ ok(stub.calls.includes('createWebviewPanel:agentsKanban.panel'), 'openBoard crea
 ok(stub.handlers.length > 0, 'the panel installs a message handler')
 
 const send = async (msg) => { for (const h of stub.handlers) await h(msg) }
-const latestState = () => [...stub.posted].reverse().find((m) => m.type === 'state')?.state
+// The most recent state, as the VIEW would hold it. The host OMITS
+// `composer.models` from a frame when the list is the one the view already has
+// (`sendModels` in extension.ts — a 431-entry catalogue must not travel ten
+// times a second), and the view keeps the last list it was sent. A coalesced
+// repaint can post more than one frame for a single `ready`, so the LAST frame
+// is not always the one carrying the list; reading it raw failed "the composer
+// offers models" on every run while the real board showed them fine. Fold the
+// list forward exactly as board.js does, and nothing else.
+const latestState = () => {
+  const states = stub.posted.filter((m) => m.type === 'state').map((m) => m.state)
+  const last = states[states.length - 1]
+  if (!last?.composer || last.composer.models !== undefined) return last
+  const carrier = [...states].reverse().find((st) => st.composer?.models !== undefined)
+  return carrier ? { ...last, composer: { ...last.composer, models: carrier.composer.models } } : last
+}
 await send({ type: 'ready' })
 const state = latestState()
 ok(!!state, 'posting `ready` gets a state message back')
@@ -1616,9 +1630,21 @@ console.log('\n— a live card does not restamp itself on every repaint')
 
 // ---------------------------------------------------------------------- teardown
 
-ext.deactivate()
-await fs.rm(claudeHome, { recursive: true, force: true })
-await fs.rm(repo, { recursive: true, force: true })
-await fs.rm(storage, { recursive: true, force: true })
+// The verdict was decided above; teardown must not overturn it. The host is
+// still finishing asynchronous work when `deactivate()` returns — a sidecar
+// patch, a session-index cache, the stop of the queued run the last section
+// started — and a write landing inside a directory `rm` is walking is an
+// ENOTEMPTY thrown out of the gate AFTER every assertion passed. It happened:
+// `npm run verify` read red with nothing wrong. So: retry (Node's own knob for
+// exactly this race), and if a directory still will not go, say so and leave it
+// rather than fail a run whose assertions all held.
+await Promise.resolve(ext.deactivate())
+for (const dir of [claudeHome, repo, storage]) {
+  try {
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+  } catch (e) {
+    console.log(`  warn: could not remove ${dir} (${e?.code ?? e}) — left in place`)
+  }
+}
 console.log(fails === 0 ? '\nPASS — the built extension activates, wires up and renders' : `\n${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

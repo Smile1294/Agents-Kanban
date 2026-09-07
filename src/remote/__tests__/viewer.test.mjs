@@ -16,11 +16,12 @@
  * so a test can drive a second poll without waiting on a real clock.
  */
 import { promises as fs } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import * as path from 'node:path'
 import vm from 'node:vm'
 import { findByTag, makeNode, walk } from '../../../test/dom.mjs'
 
-const HERE = path.dirname(new URL(import.meta.url).pathname)
+const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SRC = await fs.readFile(path.join(HERE, '..', '..', '..', 'remote', 'public', 'board.js'), 'utf8')
 
 let fails = 0
