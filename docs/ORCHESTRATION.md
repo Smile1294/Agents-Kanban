@@ -25,8 +25,18 @@ has to read it again.
 
 ## The answer, on one page
 
-**The feature already exists and is called `split_task`.** What is missing is not
-an orchestrator; it is four things around the one we have:
+> **Status, checked 2026-09-07.** The four items below are built: the dial is
+> `agentsKanban.orchestration` and `src/board/decomposition.ts`; the gate is
+> `ManagerOptions.confirmSplit`, a host-side click; a refused split is recorded
+> on the card (`decompositionLine`); the count is `SessionMeta.fanout`, and a
+> child queued behind the concurrency limit gets a card. Per-piece routing (§4)
+> is built too — `src/agent/routing.ts`, DECISIONS.md *"Per-piece routing"* —
+> and the six bugs in §11 are fixed. What is NOT built is marked in §10 and
+> summarised in [PLAN.md §9](../PLAN.md). The rest of this document is the
+> research as written, kept because the arguments still hold.
+
+**The feature already exists and is called `split_task`.** What was missing was
+not an orchestrator; it was four things around the one we have, all since built:
 
 1. **A dial** — how eagerly should this card break itself up — that biases the
    agent's judgement without ever dictating a count.
@@ -752,11 +762,11 @@ story. New **orchestration strategies** are the honest gap: there is one, it is
 
 ## 10. The staged build
 
-**Stage 0 — prerequisites.** Six existing bugs, each defensible alone, none
+**Stage 0 — prerequisites. DONE.** Six existing bugs, each defensible alone, none
 mentioning orchestration. Every one is a seam the rest sits on. See § *Bugs
 found*.
 
-**Stage 1 — the decision procedure and the fast path.**
+**Stage 1 — the decision procedure and the fast path. BUILT.**
 `src/board/decomposition.ts` (`OrchestrationLevel`, `policyFor`, `aimSentence`,
 `checkProposal`); the level control on the composer bar; `aimSentence` replacing
 the disposition half of `buildBrief`; `split_task` gains `scope`; `split()` gains
@@ -764,15 +774,18 @@ the disposition half of `buildBrief`; `split_task` gains `scope`; `split()` gain
 and the roll-up guard; the roll-up single-flight; `decomposition` and `scope`
 persisted **and read back by a test**; refusals made visible on the card.
 
-**Stage 2 — routing, drift, and validation's honest half.** Nothing here calls a
-model. Per-piece routing captured at enqueue; `permittedFlags()` on the launch
-path in one place; scope drift at merge; `gates.ts` + `check.ts`; `snapshot.ts`
-for staleness computed **on events**; `MeterTotal`; roll-up reconciliation at
-startup; `maxBudgetUsd`.
+**Stage 2 — routing, drift, and validation's honest half. PARTLY BUILT.**
+Nothing here calls a model. Built: per-piece routing captured at enqueue
+(`launchSettings`, `resolveRoute`, `src/agent/routing.ts`) and the session-flag
+gate on the launch path in one place. Not built, as of 2026-09-07: scope drift
+at merge; `gates.ts` + `check.ts`; `snapshot.ts` for staleness computed **on
+events**; `MeterTotal`; a roll-up reconciliation pass at startup (the roll-up
+runs on phase changes only); `maxBudgetUsd`.
 
-**Stage 3 — the plan document, dependencies, validators.** Each item blocked on
-something stage 1–2 builds or measures. The validator is additionally gated on
-measuring its false-positive rate against this repo's own merged history first.
+**Stage 3 — the plan document, dependencies, validators. NOT STARTED.** Each
+item blocked on something stage 1–2 builds or measures. The validator is
+additionally gated on measuring its false-positive rate against this repo's own
+merged history first.
 
 **Declined outright, not deferred:** worker-to-worker dependency as a fork
 relation; any automatic wake of a parent by its children; an `execute()` that
@@ -785,51 +798,28 @@ charts; cron heartbeats.
 
 ## 11. Bugs found in the current code while researching this
 
-All six verified against source, all independent of orchestration.
+All six were verified against source when this was written, and **all six have
+since been fixed**. Kept as a list because the pattern — a contract declared and
+unenforced — is the one to watch for:
 
-1. **The `done`/`Meter` seam will blank the panel on the first real Codex run.**
-   `runtime.ts` declares `done: (summary, meter?: Meter)`. `codex.ts` honours it
-   and emits a `Meter` object; `session.ts` emits `r.total_cost_usd`, a bare
-   number; `manager.ts` types the listener `(summary, costUsd?: number)` and
-   assigns straight into `agent.costUsd`, which `board.js` calls `.toFixed(2)` on
-   — twice. `EventEmitter.on()` is untyped, so tsc sees none of it. **The fix is
-   two-sided**: `session.ts` must emit `{kind: 'usd', spentUsd, priced}` in the
-   same commit, or fixing only the listener breaks the Claude path. Add a gate
-   asserting both runtimes' `done` payloads satisfy the union — the contract is
-   declared and unenforced, which is exactly why it drifted.
-2. **`SessionMeta.runtime` is parsed and never written.** Its own doc comment
-   says *"a field written and never parsed is not persistence"* — this is the
-   mirror image. `store.runtimeOf()` therefore returns `undefined` for every
-   session, so **every finished Codex session's transcript, usage and meter route
-   to the Claude parser**. Write it at the `adoptKey` patch site.
-3. **`store.meter()` has zero callers** anywhere in `src/`, `test/` or
-   `smoke.mjs`. A Codex card shows no spend readout at all. Build the
-   single-session case before any aggregate, or the harder half gets built twice.
-4. **`ASKS_FIRST` is not a boundary.** `boardToolsFor()` returns `autoAllow`;
-   `claude.ts` consumes it and **`codex.ts` never reads it at all** — Codex
-   surfaces approvals only for `execCommandApproval` and `applyPatchApproval`,
-   while MCP calls arrive as a `mcptoolcall` *notification*. On Claude it routes
-   through `canUseTool`, which `tools.ts` already states is skipped under
-   `dontAsk` and `bypassPermissions`. So **`split_task` fans out four billed
-   agents with no click in three configurations a self-driving-board user would
-   actually choose.** Rule 7 is "both, always" — this needs the code half.
-5. **`split_task`'s `reason` is dropped.** The schema promises *"Shown when they
-   approve the split"*; the handler is `ctx.onSplit(args.subtasks ?? [])`. The
-   permission prompt renders the bare string `split_task`, because `summarise()`
-   knows only `command | file_path | path | url`. There is a second, independently
-   maintained summariser in `store.ts` with a seventeen-key list — two functions
-   with two fallback lists, rule 11, unnoticed, inside the function about to be
-   changed.
-6. **The roll-up notification can be false.** `rollUpToParent` reads
-   `childrenOf(parentKey)`, and `start()` pushes past `maxConcurrentAgents` into
-   an **in-memory** queue, returning before `launch()` writes the sidecar entry.
-   `MAX_SUBTASKS` (4) exceeds the default concurrency (3), so a four-way split
-   reliably tells the user **"All 2 subtasks are ready for you to test"** over two
-   agents that never ran.
+1. **The `done`/`Meter` seam.** `session.ts` now emits the `Meter` union and
+   `manager.ts` settles it through one `settleMeter()`; `spend.test.ts` feeds
+   both runtimes' payloads.
+2. **`SessionMeta.runtime` is written** at launch (`durablePatch`) and parsed on
+   the way back, so a finished Codex session's transcript, usage and meter route
+   to Codex's store.
+3. **`store.meter()` has a caller** — `getState()` puts the selected session's
+   meter on the composer, and `unknown` renders as `—`.
+4. **`ASKS_FIRST` is backed by code** — `ManagerOptions.confirmSplit` is a
+   host-side click, so `dontAsk`, `bypassPermissions` and a Codex session cannot
+   fan out four billed agents silently.
+5. **`split_task`'s `reason` reaches the dialog** — `onSplit(subtasks, reason)`.
+6. **The roll-up cannot be false** — `SessionMeta.fanout` is the denominator,
+   and a child queued behind `maxConcurrentAgents` gets a card of its own.
 
-Also: a child inherits the workspace-default runtime rather than the parent's
-(§3), and `move()` refuses a key starting with `run-`, so dragging a card whose
-session id has not yet arrived silently does nothing.
+Also fixed: a child inherits the parent's WHOLE agent, runtime and backend —
+DECISIONS.md *"Per-piece routing"* — and `move()` no longer refuses a `run-`
+key, so a card can be dragged before its session id has arrived.
 
 ---
 

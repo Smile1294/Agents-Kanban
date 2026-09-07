@@ -632,7 +632,9 @@ export class WorktreeService {
     }
 
     // Uncommitted work wins the entry: it is the newer truth about that file.
-    const porcelain = await gitRaw(worktreePath, ['status', '--porcelain']).catch(() => '')
+    // `-uall`: a new directory is its files, each with its own diff row — not
+    // one undiffable entry named `dir/`. Same reason as `changedFiles()`.
+    const porcelain = await gitRaw(worktreePath, ['status', '--porcelain', '-uall']).catch(() => '')
     for (const line of porcelain.split('\n')) {
       const parsed = parsePorcelainLine(line)
       if (parsed) byPath.set(parsed.path, { ...parsed, committed: false })
@@ -871,12 +873,21 @@ export class WorktreeService {
     return gitExact(worktreePath, ['show', `${ref}:${file}`]).catch(() => '')
   }
 
-  /** Files changed in a worktree relative to `base`, for the review view. */
+  /**
+   * Files changed in a worktree relative to `base` — committed, staged, unstaged
+   * and untracked alike. The review view and the knowledge-file gate read it.
+   *
+   * `-uall`, because plain `--porcelain` collapses an untracked directory to
+   * one entry ending in `/`. The gate maps changed PATHS to the area files
+   * that own them, so a new source file inside a new directory was invisible to
+   * it — and so was the new area file an agent wrote to claim it, which made
+   * the gate refuse a branch that had done exactly what it asked.
+   */
   async changedFiles(worktreePath: string, base: string): Promise<string[]> {
     const merge = await git(worktreePath, ['merge-base', 'HEAD', base]).catch(() => '')
     const range = merge ? `${merge}..HEAD` : 'HEAD'
     const committed = await gitRaw(worktreePath, ['diff', '--name-only', range]).catch(() => '')
-    const working = await gitRaw(worktreePath, ['status', '--porcelain']).catch(() => '')
+    const working = await gitRaw(worktreePath, ['status', '--porcelain', '-uall']).catch(() => '')
     const set = new Set<string>()
     for (const f of committed.split('\n')) if (f.trim()) set.add(f.trim())
     for (const l of working.split('\n')) {

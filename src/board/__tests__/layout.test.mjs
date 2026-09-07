@@ -12,10 +12,11 @@
  * Chromium comes from playwright, already a devDependency.
  */
 import { promises as fs } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import * as path from 'node:path'
 import { chromium } from 'playwright'
 
-const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..', '..')
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
 let fails = 0
 const ok = (c, m) => { console.log(c ? '  ok:' : 'FAIL:', m); if (!c) fails++ }

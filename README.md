@@ -34,6 +34,16 @@ part.
   to `settings.json`. See [docs/PROVIDERS.md](docs/PROVIDERS.md).
 - **Interrupt, queue follow-ups, change permissions mid-run.**
 - **Subagents, attached screenshots, ultracode, fast mode.**
+- **One task becomes several.** An agent that finds its brief is really two
+  jobs splits it into up to four subtasks — each its own session, worktree and
+  card, on its own agent and model if you say so — and the parent tells you
+  when the last one is ready to test.
+- **Scheduled runs.** A brief that starts a fresh session at a set time on set
+  days, from the settings page or from an agent.
+- **Search every transcript**, rewind a session to an earlier message with its
+  files restored, and dictate a prompt locally with whisper.cpp.
+- **The headless board.** Run the extension itself on a box and drive the whole
+  board from a browser.
 
 ## How it works
 
@@ -59,20 +69,6 @@ Backlog → Planning → Implementing → Validating → Complete
 
 ## Remote control
 
-Watch the board from anywhere — a phone, another computer — and optionally send
-prompts back to it.
-
-1. Deploy the small relay in [`remote/`](remote/README.md) — the same folder
-   runs on **Netlify, Cloudflare Workers, or any Node server**, and the free
-   tiers cover ordinary use.
-2. In the extension: **settings page → Remote Control**, paste the relay's URL
-   and choose a pairing code.
-3. Open the relay site on any device and enter the same code.
-
----
-
-## Remote control
-
 Two ways to reach the board from somewhere else, one pairing code each.
 
 **The headless board** is the full thing: run it on a VPS, a Mac mini or a
@@ -91,9 +87,12 @@ travels as a header on every request and in the event-stream URL, and nothing
 else is secret. See [server/README.md](server/README.md).
 
 **The relay** mirrors a board running in VS Code to a small site (Netlify,
-Cloudflare Workers, or a plain Node process), so you can watch it from a phone
-without the extension's machine being reachable at all. See
-[remote/README.md](remote/README.md).
+Cloudflare Workers, or a plain Node process — the free tiers cover ordinary
+use), so you can watch it from a phone without the extension's machine being
+reachable at all. Deploy the [`remote/`](remote/README.md) folder, paste its
+URL and a pairing code into **settings page → Remote Control**, then open the
+site on any device and enter the same code. Prompts can be sent back too, behind
+a switch that is off by default.
 
 ---
 
@@ -160,9 +159,16 @@ and let it go.
 | `agentsKanban.worktreeRoot` | Where worktrees go. Default: `.agentskanban/worktrees` inside the repo |
 | `agentsKanban.focusMode` | `wide` (default), `zen`, or `off` |
 | `agentsKanban.runCommand` / `runUrl` | How to start your app from a worktree |
+| `agentsKanban.orchestration` | How readily a new session splits itself: `minimal`, `balanced` (default), `maximum` |
+| `agentsKanban.hideSessionsOlderThanDays` | Hide sessions the board never touched once older than this (default 30); the hidden count stays visible |
+| `agentsKanban.discoverModels` | Ask the backend for its model list instead of using the built-in one (default on) |
+| `agentsKanban.notifyOnReview` / `statusBar` | The notification when a card reaches review; the status-bar item |
+| `agentsKanban.sideBarHome` / `closeOnClickAway` | Which view the left side bar returns to; whether clicking away closes the board |
+| `agentsKanban.claudeExecutable` / `codexExecutable` | Paths to the CLIs when they are not on `PATH` |
+| `agentsKanban.whisperPath` / `whisperModel` / `ffmpegPath` / `recordDevice` | Local dictation |
 
-Everything else — agents, backends, logins, remote control, dictation — lives
-on the **Agents Kanban: Settings** page.
+Everything else — agents, backends, logins, scheduled runs, remote control,
+dictation — lives on the **Agents Kanban: Settings** page.
 
 ## Building from source
 
@@ -174,6 +180,7 @@ npm run install-local # package and install into VS Code
 Press <kbd>F5</kbd> for an Extension Development Host.
 
 For the architecture and what is planned next, see **[PLAN.md](PLAN.md)**. For
+where everything is in the code, see **[docs/codemap/](docs/codemap/README.md)**. For
 why things are built the way they are, see **[docs/DECISIONS.md](docs/DECISIONS.md)**.
 
 ## Credits and licence

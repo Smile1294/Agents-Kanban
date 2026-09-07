@@ -15,9 +15,10 @@
  * that renders unthemed in the browser, and nothing else would notice.
  */
 import { promises as fs } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import * as path from 'node:path'
 
-const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..', '..')
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 let fails = 0
 const ok = (c, m) => { console.log(c ? '  ok:' : 'FAIL:', m); if (!c) fails++ }
 const read = (rel) => fs.readFile(path.join(repoRoot, rel), 'utf8').catch(() => '')

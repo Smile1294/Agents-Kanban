@@ -30,6 +30,7 @@ import {
   type DecompositionRecord, type OrchestrationLevel, type OrchestrationPolicy,
   type ProposalNote, MAX_STATED,
 } from '../board/decomposition.ts'
+import { knowledgeCheck, loadCodemap } from '../board/codemap.ts'
 import {
   agentKeyOf, describeSpawnAgents, resolveRoute,
   type PieceRoute, type SpawnAgent, type SpawnCatalogue,
@@ -407,6 +408,9 @@ export interface RunningAgent {
   branch: string
   /** The branch the worktree forked from, for the review panel's diff and merge. */
   base?: string
+  /** Whether the worktree carries a `docs/codemap/`. The knowledge-file rule is
+   *  stated in the brief and the tool description only where it applies. */
+  knowledgeFiles?: boolean
   /** The level this run LAUNCHED under. What the brief said, and therefore what
    *  the split gate must read — not whatever the picker says a turn later. */
   /** The model this run was started on. Carried onto every live text block so
@@ -1066,6 +1070,19 @@ export class AgentManager extends EventEmitter {
           return { ok: false, reason: 'failed', message: e instanceof Error ? e.message : String(e) }
         }
       },
+      // The knowledge-file gate, over the agent's OWN worktree: its diff against
+      // the base it forked from, and the codemap as the agent left it — so an
+      // area file the agent added counts. No worktree or no codemap means
+      // nothing is required, and the verdict says so rather than refusing.
+      knowledgeFiles: agent.knowledgeFiles === true,
+      knowledgeCheck: async () => {
+        const path = agent.worktreePath
+        if (!path) return { ok: true, areas: [] }
+        const areas = await loadCodemap(path)
+        if (!areas.length) return { ok: true, areas: [] }
+        const changed = await this.opts.worktrees.changedFiles(path, agent.base ?? 'HEAD')
+        return knowledgeCheck(changed, areas)
+      },
       // Mechanical 1:1 wires — the tool handlers own every decision, including
       // the creator stamp (`onScheduleCreate` gets `createdBy` from
       // `sessionTitle`, which the tools test pins). This file supplies only the
@@ -1543,6 +1560,12 @@ export class AgentManager extends EventEmitter {
       )
     }
 
+    // Does this worktree carry a knowledge base? Decided once per launch and
+    // remembered on the card: the brief and the `set_phase` description state
+    // the rule only where it applies, while the gate itself re-reads the folder
+    // at check time so an area file added mid-run counts.
+    agent.knowledgeFiles = (await loadCodemap(wt.path)).length > 0
+
     const boardTools = await this.boardToolsFor(rt.capabilities.boardTools, runId, agent, title, rt.label)
 
     // Provider profiles steer the backend of a runtime whose backend IS
@@ -1594,6 +1617,7 @@ export class AgentManager extends EventEmitter {
       executable: location.command,
       appendSystemPrompt: buildBrief(
         this.opts.board, title, wt.branch, policyFor(level), canSplit, spawnAgents,
+        agent.knowledgeFiles === true,
       ),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
@@ -1882,6 +1906,9 @@ export function buildBrief(
    *  offer, each with the models it serves. Omitted (the usual test case, or a
    *  host without the policy) leaves the paragraph as it always was. */
   spawnAgents?: SpawnAgent[],
+  /** Whether the worktree carries `docs/codemap/`. The rule is stated only
+   *  where it applies; on any other repository the paragraph would be noise. */
+  knowledgeFiles = false,
 ): string {
   const started = board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'
   const review = board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
@@ -1922,6 +1949,19 @@ export function buildBrief(
     'words or fewer. It renames the CARD only — your branch and worktree keep the',
     'names they started with.',
     '',
+    // Knowledge files move with the code. A request in a brief is not a fence —
+    // `set_phase` refuses the review move host-side — but the agent has to
+    // know the rule before it can follow it, and where the map is.
+    ...(knowledgeFiles
+      ? [
+          'Knowledge files move with the code. Read `docs/codemap/README.md` first — it says',
+          'where everything is — then only the area files your task touches. When you change',
+          'a source file, update the area file that owns it (the `paths:` in its frontmatter):',
+          'fix what is no longer true and append a line under "## Recent changes". Moving to',
+          `"${review}" is REFUSED while an area you changed has an untouched knowledge file.`,
+          '',
+        ]
+      : []),
     // The DISPOSITION half — how eagerly to split — comes from the level, and
     // is the only thing the level changes. The OPERATIONAL half below it is
     // invariant, because forking from base and splitting before editing are

@@ -9,6 +9,7 @@
 import { loadSdk } from '../sdk.ts'
 import { DEFAULT_BOARD, type BoardConfig } from '../../board/config.ts'
 import { ASKS_FIRST, boardToolName, boardToolNames, buildBoardTools, conventionalMessage, type BoardToolContext } from '../tools.ts'
+import type { KnowledgeVerdict } from '../../board/codemap.ts'
 import { guessLinkKind, normaliseTestPlan } from '../../sessions/meta.ts'
 import { AUTO_ALLOWED_FOR_TEST } from '../session.ts'
 
@@ -598,6 +599,62 @@ for (const c of DEFAULT_BOARD.columns) ok(d.includes(c.id), `the description lis
 ok(setTags!.description.length > 40, 'set_tags explains what tags are for')
 ok(d.includes('howToTest'), 'the description tells the agent a test plan is required')
 ok(d.includes('file') && d.includes('command') && d.includes('url'), 'and what the link kinds do')
+
+// --- knowledge files move with the code ------------------------------------
+// The review move is refused while an area the agent changed has an untouched
+// knowledge file; nothing is written on a refusal; a move that is not into
+// review never asks; and the description states the rule only where a codemap
+// exists. The check itself is the host's — this pins the tool's half of it.
+{
+  const phases: string[] = []
+  let asked = 0
+  const mkCtx = (verdict: KnowledgeVerdict) => ctxFor({
+    store: {
+      get: async () => ({ phase: 'implementing', tags: [] }),
+      card: async () => ({ phase: 'implementing', tags: [], title: 'T' }),
+      childrenOf: async () => [],
+      setPhase: async (_id: string, phase: string) => { phases.push(phase) },
+      setTags: async () => {}, setTestPlan: async () => {}, clearTestPlan: async () => {},
+      list: async () => [],
+    } as never,
+    knowledgeFiles: true,
+    knowledgeCheck: async () => { asked++; return verdict },
+  })
+  type Reply = { isError?: boolean; content: { text: string }[] }
+  const handler = (ctx: BoardToolContext) => {
+    const sp = byName(buildBoardTools(DEFAULT_BOARD, ctx, tool), 'set_phase')
+    return {
+      call: (a: unknown) => (sp as unknown as { handler: (x: unknown, e: unknown) => Promise<Reply> }).handler(a, {}),
+      description: sp!.description,
+    }
+  }
+  const plan = { howToTest: { summary: 's', steps: ['npm test'] } }
+
+  const refusing = handler(mkCtx({
+    ok: false,
+    missing: [{ area: 'board-model', file: 'docs/codemap/board-model.md', changed: ['src/board/config.ts'] }],
+    message: 'the knowledge files for what you changed have not moved with it. Update, in this worktree:\n' +
+      '  - docs/codemap/board-model.md — owns src/board/config.ts',
+  }))
+  const r = await refusing.call({ phase: 'validating', ...plan })
+  ok(r.isError === true, 'the review move is REFUSED when a changed area has an untouched knowledge file')
+  ok(r.content[0]!.text.includes('docs/codemap/board-model.md'), 'and the refusal names the file to update')
+  ok(r.content[0]!.text.startsWith('Moving to "validating" hands this work back'), 'in a sentence that says why it matters')
+  ok(phases.length === 0, 'nothing was written — the card stays where it was')
+  ok(asked === 1, 'the check ran exactly once')
+  await refusing.call({ phase: 'planning' })
+  ok(asked === 1 && phases.join() === 'planning', 'a move that is not into review never asks')
+  ok(refusing.description.includes('docs/codemap') && refusing.description.includes('REFUSED'),
+     'the description states the rule when the worktree has a codemap')
+
+  phases.length = 0
+  const passing = handler(mkCtx({ ok: true, areas: ['board-model'] }))
+  const r2 = await passing.call({ phase: 'validating', ...plan })
+  ok(!r2.isError && phases.join() === 'validating', 'with the files moved, the same move goes through')
+
+  const plain = handler(ctxFor())
+  ok(!plain.description.includes('docs/codemap'), 'and a repository without a codemap is told nothing about one')
+}
 
 console.log(fails === 0 ? 'PASS — board tools are reachable, and the approval boundary holds' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

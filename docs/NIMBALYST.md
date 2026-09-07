@@ -265,10 +265,11 @@ rather than looking at the board.
 | Context meter, per-step not cumulative | ✅ | Their NIM-868 |
 | Session resume with fail-loud mismatch | ⚠️ | Resume works; a session returning a *different* id is not detected |
 | Conflicts spawn a fixing agent | ❌ | We surface conflicts and offer Abort; we do not spawn |
-| Orchestration (`spawn_session`, `send_prompt`, …) | ❌ | Ten meta-agent tools. A whole subsystem, deliberately not started |
-| `schedule_wakeup` time triggers | ❌ | Not started |
-| Pin a session | ⚠️ | Stored and sorted on; no UI to set it |
+| Orchestration (`spawn_session`, `send_prompt`, …) | ⚠️ | `split_task` fans one brief into 2–4 real sessions, each routable to its own agent, backend and model, behind a dial and host-side gates, with a roll-up when the last one lands. The push-back half — a child's result onto the parent's prompt queue, `send_prompt`, `get_session_result` — is declined, not missing; see [ORCHESTRATION.md](ORCHESTRATION.md) |
+| `schedule_wakeup` time triggers | ✅ | `schedule_create` / `schedule_list` / `schedule_run` / `schedule_delete` board tools, and a section on the settings page. Fires only while the window is open; a missed moment is caught up once, never once per missed day |
+| Pin a session | ✅ | Card menu: Pin to top / Unpin |
 
-The three ❌ rows are the honest remainder. Orchestration in particular is not a
-missing button — it is agents spawning and driving other agents, with results
-pushed back onto a parent's prompt queue.
+One ❌ row remains. The orchestration ⚠️ is a decision rather than a gap: agents
+here do spawn other agents, but nothing pushes a child's result back onto the
+parent's prompt queue — an automatic wake is a billed turn nobody asked for.
+What that leaves open is listed in [PLAN.md §9](../PLAN.md).

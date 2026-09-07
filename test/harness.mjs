@@ -13,6 +13,7 @@
  *    UiState instead of a hand-written fixture that has quietly drifted.
  */
 import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -20,7 +21,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
-export const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
+export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 /** A throwaway git repository, because agents need a real one to make worktrees in. */
 export async function makeRepo(prefix = 'ck-') {

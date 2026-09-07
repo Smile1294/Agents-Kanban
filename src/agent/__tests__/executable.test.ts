@@ -17,6 +17,7 @@
    at all depended on how `npm install` had gone, so identical source crashed on
    one checkout and ran on another. Nothing in the suite crossed this seam. */
 import { resolveClaudeExecutable } from '../sdk.ts'
+import { fileURLToPath } from 'node:url'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -47,7 +48,7 @@ if (resolved) {
 // branch fired in the only place that ships. So: assert on the BUILT BUNDLE,
 // which is the artefact whose behaviour differed.
 const dist = path.join(
-  path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..', '..'),
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..'),
   'dist', 'extension.js',
 )
 const bundle = await fs.readFile(dist, 'utf8').catch(() => '')
@@ -59,7 +60,7 @@ if (bundle) {
 
 // And the source says the same thing, so the rule is visible where it is edited.
 const src = await fs.readFile(
-  path.join(path.resolve(path.dirname(new URL(import.meta.url).pathname), '..'), 'sdk.ts'),
+  path.join(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), 'sdk.ts'),
   'utf8',
 )
 const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
