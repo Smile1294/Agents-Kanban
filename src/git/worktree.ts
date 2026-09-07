@@ -200,7 +200,7 @@ async function gitRaw(cwd: string, args: string[]): Promise<string> {
  * optional because git may genuinely not know the name (see `mergeSourceName`),
  * so the sha is the fallback — never a guessed branch.
  */
-export function pendingMergeMessage(p: PendingMerge): string {
+function pendingMergeMessage(p: PendingMerge): string {
   const what = p.from ? `"${p.from}"` : `commit ${p.head.slice(0, 7)}`
   const n = p.files.length
   return p.conflicted

@@ -61,7 +61,7 @@ export interface KnowledgeGap {
 }
 
 /** Forward slashes, no leading `./`, no trailing slash. */
-export function normalisePath(p: string): string {
+function normalisePath(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
 }
 
@@ -205,7 +205,7 @@ export function knowledgeCheck(changed: readonly string[], areas: readonly Codem
 }
 
 /** The refusal, written for the agent that has to act on it. */
-export function knowledgeMessage(missing: readonly KnowledgeGap[]): string {
+function knowledgeMessage(missing: readonly KnowledgeGap[]): string {
   const rows = missing.map((m) => `  - ${m.file} — owns ${m.changed.join(', ')}`)
   return [
     'the knowledge files for what you changed have not moved with it. Update, in this worktree:',

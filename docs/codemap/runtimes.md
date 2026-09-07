@@ -160,3 +160,4 @@ once came back with empty transcripts that way). The settings page asks
 ## Recent changes
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
+- 2026-09-07 · task/S116g8 · dead-code sweep: `_resetSdkCache` (sdk.ts) and `_clearRuntimes` (runtime.ts) test hooks deleted — no test imported either; `RpcEvents` in jsonrpc.ts de-exported — zero references outside the module.

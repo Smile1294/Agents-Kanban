@@ -30,9 +30,6 @@ export function loadSdk(): Promise<Sdk> {
   return cached
 }
 
-/** Test hook. */
-export function _resetSdkCache(): void { cached = undefined }
-
 /** Locate the `claude` executable to spawn.
  *
  * The SDK ships a ~190MB per-platform binary. Bundling that into the .vsix

@@ -118,3 +118,4 @@ frames. Worktree cleanup is offered at `complete`, never automatic.
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S5kc3 · `changedFiles()` and `fileStatuses()` pass `-uall`, so untracked files in a new directory are listed one by one; found because the knowledge-file gate could not see the new `docs/codemap/` files and refused its own branch.
+- 2026-09-07 · task/S116g8 · dead-code sweep: `pendingMergeMessage` de-exported — module-private, called only in private method bodies.

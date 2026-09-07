@@ -900,7 +900,7 @@ export function hostOf(url: string): string {
  * A separate type from `ProviderKind` because it is somebody else's vocabulary
  * and will grow without asking us.
  */
-export type ResolvedProvider =
+type ResolvedProvider =
   | 'firstParty' | 'bedrock' | 'vertex' | 'foundry'
   | 'anthropicAws' | 'anthropicGoogleCloud' | 'mantle' | 'gateway'
 

@@ -642,6 +642,3 @@ export function getRuntime(id: RuntimeId): AgentRuntime | undefined {
 export function allRuntimes(): AgentRuntime[] {
   return RUNTIME_IDS.map((id) => registry.get(id)).filter((r): r is AgentRuntime => !!r)
 }
-
-/** Test hook: drop registrations so a test can install a fake. */
-export function _clearRuntimes(): void { registry.clear() }
