@@ -22,12 +22,35 @@ extension's own webview document, with two additions:
   Dialogs a real webview never draws — quick picks, input boxes, modal
   confirmations — are drawn by the bridge as overlays, and their answer is
   `POST /api/dialog`.
-- The **pairing code** is the only secret. The server prints one at startup
-  (or takes yours via `AGENTS_KANBAN_CODE`). The gate page holds it in
-  `sessionStorage` — never in the URL — and sends it as an `x-rc-code` header
-  on every request, plus as a `?code=` query parameter on the event stream
-  (an `EventSource` cannot set headers). The server compares sha-256 digests
-  with `timingSafeEqual`, so the code never sits on disk or in a log.
+- The **pairing code** is the only long-lived secret. The server prints one at
+  startup (or takes yours via `AGENTS_KANBAN_CODE`). The gate page exchanges it
+  **once** for a session token (`POST /api/session`) — 32 random bytes that
+  the server keeps in memory as a sha-256 digest, live for 5 minutes by default
+  (`AGENTS_KANBAN_TOKEN_TTL`). From then on the **token** rides as an
+  `x-rc-token` header on every request, and in the query of the event stream
+  alone (`?token=` — an `EventSource` cannot set headers). The code itself is
+  accepted on exactly two routes — the exchange and `POST /api/revoke` — and
+  never appears in a URL, so it cannot land in a request log, a proxy's access
+  log, or a history. The one credential that ever rides in a URL is the token,
+  which is exactly why it expires after five minutes, dies on `POST
+  /api/revoke` (which also ends any open event stream, so a revoked tab
+  receives nothing further — not even a reconnect), and dies on every restart.
+  The gate page keeps the code in `sessionStorage` so a dead token (expiry,
+  revoke, restart) can be re-exchanged **once without asking** — the one share
+  every page holds. A second death in the same page life is a dead end: the
+  gate returns with a note saying so, rather than retrying a dead token behind
+  an empty board.
+- Wrong pairing codes are **rate limited per client IP**: exponential backoff
+  (`429` + `Retry-After`) after `AGENTS_KANBAN_AUTH_BACKOFF_AFTER` failures, a
+  hard block (`403`, which refuses even the right code) after
+  `AGENTS_KANBAN_AUTH_BLOCK_AFTER` failures for
+  `AGENTS_KANBAN_AUTH_BLOCK_MINUTES` minutes. The counters live in memory: a
+  restart forgets every block, which is honest — the code did not change. A
+  restart also expires every token, and every open tab re-exchanges its stored
+  code on its own — once (see the dead-token paragraph above). Tokens are
+  deliberately not rate
+  limited: a token is 256 bits of randomness, so a failing one is almost always
+  your own, expired by the clock or the restart.
 - `media/theme.css` supplies the **theme**. The board's stylesheets take every
   colour from `--vscode-*` variables, which VS Code sets and a browser does not;
   this sheet is the editor's Dark Modern palette on `:root`, loaded before them,
@@ -63,9 +86,116 @@ way:
 - an **SSH tunnel** — `ssh -L 4310:127.0.0.1:4310 <box>` and open
   `http://127.0.0.1:4310` locally; or
 - a **VPN** (WireGuard/Tailscale), same idea; or
-- `AGENTS_KANBAN_HOST=0.0.0.0` to bind beyond localhost — put it behind TLS
-  (any reverse proxy, e.g. caddy: `caddy reverse-proxy --from board.example.com --to 127.0.0.1:4310`),
-  and know what you are exposing.
+- `AGENTS_KANBAN_HOST=0.0.0.0` to bind beyond localhost — then read *TLS,
+  access logs, and the firewall* below. Whoever holds the code can run agents
+  that spend money; bind this way only behind a proxy you control.
+
+### TLS, access logs, and the firewall
+
+A box that binds beyond loopback must answer on `https`, must not log the
+credential that rides in URLs, and must not expose the board's own port to the
+world at all. The config below is the whole story; the *why* of each piece is
+under it.
+
+**Caddy** — TLS from Caddy's store, access log with the query masked, proxy
+only:
+
+```caddyfile
+board.example.com {
+	reverse_proxy 127.0.0.1:4310 {
+		# Trusted only because the firewall below makes this proxy the only
+		# way in — which is what makes AGENTS_KANBAN_TRUST_PROXY=1 sound.
+		header_up X-Forwarded-For {remote_host}
+	}
+
+	log {
+		output file /var/log/caddy/board-access.log {
+			roll_size 100MiB
+			roll_keep 10
+		}
+		format filter {
+			# The ONLY credential that ever rides in a URL is the session token,
+			# in the event stream's query (?token=…, /api/events). Mask it — and
+			# `code` too, in case a log predates the token scheme. The path
+			# itself stays visible; nothing secret lives there.
+			request>uri query {
+				replace token [REDACTED]
+				replace code [REDACTED]
+			}
+			wrap json
+		}
+	}
+}
+```
+
+Use `wrap json`, never `wrap common_log`: `common_log` is rendered as one
+string before the filter runs, so per-field filters do not reach inside it and
+the token lands in the log unmasked (caddyserver/caddy#3837).
+
+**nginx** — the format never sees the query at all, because `$uri` excludes
+it. The default `combined` format logs `$request_uri` (query included), so the
+board must point `access_log` at its own format:
+
+```nginx
+log_format board '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # ssl_certificate / ssl_certificate_key: your certs
+
+    location / {
+        proxy_pass http://127.0.0.1:4310;
+        proxy_set_header Host $host;
+        # Trusted because the firewall below makes this proxy the only way in.
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+
+    access_log /var/log/nginx/board-access.log board;
+}
+```
+
+**The firewall** — the TLS terminator and SSH are the only ports the network
+may touch. The proxy is on the box itself, so loopback traffic still reaches
+the board after the rule that blocks its port:
+
+```bash
+# ufw
+sudo ufw allow 22/tcp            # ssh — or you lock yourself out
+sudo ufw allow 80,443/tcp        # the TLS terminator
+sudo ufw deny 4310/tcp           # the board's own port: proxy only
+sudo ufw enable
+
+# firewalld
+sudo firewall-cmd --permanent --add-service={ssh,http,https}
+sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=127.0.0.1 port port=4310 protocol=tcp accept'
+sudo firewall-cmd --reload
+
+# nftables (a minimal host policy; put the 4310 drop before any broad accept)
+# table inet filter {
+#   chain input {
+#     type filter hook input priority filter; policy drop;
+#     ct state established,related accept
+#     iif "lo" accept                  # the proxy's local connections
+#     iifname != "lo" tcp dport 4310 drop   # the board: proxy only
+#     tcp dport { 22, 80, 443 } accept      # ssh + the TLS terminator
+#   }
+# }
+```
+
+And on the server set the two env knobs that only make sense behind this
+setup: `AGENTS_KANBAN_HOST=0.0.0.0` and `AGENTS_KANBAN_TRUST_PROXY=1`.
+
+**Why the only URL credential is the one that dies.** The event stream has no
+header channel — an `EventSource` cannot set one — so the one request that
+must carry a credential in its URL is `GET /api/events?token=…`. The design
+keeps that fact survivable: what rides in the URL is a 256-bit random token
+that expires after `AGENTS_KANBAN_TOKEN_TTL`, dies on `POST /api/revoke`, and
+dies on every server restart — while the pairing code, which could mint tokens
+forever, is accepted on exactly two routes, never in a URL, and cannot leak
+into an access log in the first place. The log filter above is belt-and-braces
+on top of that: it masks a credential whose leak would cost little, rather
+than the one whose leak would cost everything.
 
 ### Keep it running
 
@@ -89,7 +219,12 @@ Restart=on-failure
 | `AGENTS_KANBAN_HOST` | `127.0.0.1` | bind address — see *Reaching it* |
 | `AGENTS_KANBAN_REPO` | the cwd | the repository the board works on |
 | `AGENTS_KANBAN_STORAGE` | `~/.agents-kanban` | extension state, sidecar, secrets — never inside the repo |
-| `AGENTS_KANBAN_CODE` | generated and printed | the pairing code. The only secret. |
+| `AGENTS_KANBAN_CODE` | generated and printed | the pairing code — the only long-lived secret |
+| `AGENTS_KANBAN_TOKEN_TTL` | `300` (5 min) | seconds a session token lives after the code exchange — the credential that rides in URLs, so it must die on a clock |
+| `AGENTS_KANBAN_AUTH_BACKOFF_AFTER` | `5` | wrong codes before the server answers `429` + `Retry-After` (exponential backoff) |
+| `AGENTS_KANBAN_AUTH_BLOCK_AFTER` | `20` | wrong codes before a hard `403` block — even the right code is refused |
+| `AGENTS_KANBAN_AUTH_BLOCK_MINUTES` | `15` | how long the hard block lasts (a restart clears it sooner) |
+| `AGENTS_KANBAN_TRUST_PROXY` | off | rate-limit by `X-Forwarded-For` instead of the socket address — ONLY behind a proxy that overwrites the header (see the TLS section), or anyone can forge it |
 | `AGENTS_KANBAN_CONFIG` | `{"focusMode":"off"}` | JSON merged into `agentsKanban` settings, e.g. `{"discoverModels":false}` |
 
 Each is also a `--name=value` argument (`node server/server.mjs --port 9000`).
