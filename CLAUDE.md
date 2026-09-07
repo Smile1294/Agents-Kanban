@@ -20,6 +20,7 @@ stream reference, current state, and what to build next.
 | Which AGENT PROGRAM runs a session — Claude Code, Codex? How do I add a third? | [docs/RUNTIMES.md](docs/RUNTIMES.md) |
 | How do I run agents on Bedrock, Vertex, a gateway or a local model? | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | How do I run it? | [README.md](README.md) |
+| What's planned for Remote Control (repo split, hardening, cleanup)? | [docs/REMOTE-CONTROL-PLAN.md](docs/REMOTE-CONTROL-PLAN.md) |
 
 ## Commands
 
