@@ -331,7 +331,7 @@ how model and effort already work per session here.
   exact place this codebase already has a postmortem (`ultracodeWarning()` being
   one-sided). **Add the seventh gate.**
 
-### Per-piece routing must be captured at enqueue
+### Per-piece routing must be captured at enqueue — DONE (`launchSettings`)
 
 `startRun()` reads `this.opts.defaults.model`, `.effort`, `.ultracode`,
 `.fastMode`, `this.opts.provider` and `this.opts.permissionMode` **after two
@@ -348,14 +348,40 @@ with different model ids and different bills. Per-run routing goes in
 This is the "a value captured before an `await` must be re-checked after it" rule
 appearing in a new place, and it is the reason `provider` is on the list.
 
-### Provider per task is the heading this research did not answer
+### Provider per task — BUILT, and the shape is one field, not two
 
-`LaunchOptions` gains `provider`/`providerEnv`, but `PieceProposal` has no
-`provider` field and `ProposalFacts.models` is keyed by runtime only — while the
-real catalogue is cached **per provider**. So *"local LLM for the cheap piece,
-cloud for the hard one"* is plumbed and not reachable, and `checkProposal` would
-validate a model id against the wrong catalogue if it were. Stated as a gap
-rather than papered over.
+This section named it as an open gap: *"`LaunchOptions` gains
+`provider`/`providerEnv`, but `PieceProposal` has no `provider` field and
+`ProposalFacts.models` is keyed by runtime only — while the real catalogue is
+cached per provider. So 'local LLM for the cheap piece, cloud for the hard one'
+is plumbed and not reachable, and `checkProposal` would validate a model id
+against the wrong catalogue if it were."*
+
+It is now built, in [`src/agent/routing.ts`](../src/agent/routing.ts), and the
+gap analysis was right about the danger and wrong about the shape.
+
+**Not `runtime` + `provider` as two fields.** One `agent` field naming a
+`<runtime>|<profile>` combination — the same flat list the composer offers, and
+for the reason the composer already has a postmortem about: two pickers make the
+reader do a cross product, and the answer on screen was half of it. A piece
+picks a row.
+
+**The wrong-catalogue danger was real and is what the fix is built around.** The
+spawn catalogue is composed per `(runtime, profile)` through
+`catalogueForProfile(profile, rt)` — the same memoised composition the composer
+uses — never from the active `catalogue`. `routing.test.ts` asserts exactly the
+failure this section predicted: `deepseek-reasoner` named against
+`claude|inherit` is refused, because a gate built from the active list would
+have passed it and the child would 404 on its first request with somebody
+else's error message.
+
+**And the seventh gate above is closed.** `spawn-effort` refuses a level the
+target model does not take, one-sided: an empty `efforts` list means nobody
+asked, not "none".
+
+See [DECISIONS.md](DECISIONS.md) — *"Per-piece routing"* — for the three bugs
+found while building it, all of which were the same shape: routing resolved
+twice, the second time minutes later.
 
 ---
 

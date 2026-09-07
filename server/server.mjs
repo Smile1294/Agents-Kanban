@@ -41,6 +41,7 @@ import { createRequire } from 'node:module'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { makeVscodeStub } from './stub.mjs'
+import { pageHtml } from './page.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const dist = path.join(root, 'dist', 'extension.js')
@@ -147,7 +148,7 @@ async function handle(req, res) {
     // the authed section below and every tab logs a 401.
     if (req.method === 'GET' && url.pathname === '/favicon.ico') {
       res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'no-cache' })
-      res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#238636"/><rect x="3" y="3" width="4" height="4" fill="#0d1117"/><rect x="9" y="3" width="4" height="4" fill="#0d1117"/><rect x="3" y="9" width="10" height="4" fill="#0d1117"/></svg>')
+      res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#0078d4"/><rect x="3" y="3" width="4" height="4" fill="#1f1f1f"/><rect x="9" y="3" width="4" height="4" fill="#1f1f1f"/><rect x="3" y="9" width="10" height="4" fill="#1f1f1f"/></svg>')
       return
     }
 
@@ -212,32 +213,8 @@ function guessType(p) {
 }
 
 function page(res, which) {
-  // Both scripts live in the BODY, after #root, and the bridge is first:
-  // board.js and settings.js call acquireVsCodeApi() the moment they load —
-  // exactly as they do in the real webview, where VS Code injects the API
-  // before any script runs — and they need #root to exist, which is why they
-  // sit in the body rather than the head.
-  const app = which === 'settings'
-    ? '<link rel="stylesheet" href="/media/board.css"><link rel="stylesheet" href="/media/settings.css">'
-    : '<link rel="stylesheet" href="/media/board.css">'
-  const html = `<!DOCTYPE html>
-<html lang="en"${which === 'board' ? ' data-layout="board"' : ''}>
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: blob:; connect-src 'self'; media-src 'self' blob:">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agents Kanban${which === 'settings' ? ' — Settings' : ''}</title>
-${app}
-<link rel="stylesheet" href="/bridge.css">
-</head>
-<body${which === 'settings' ? ' class="settings"' : ''}>
-<div id="root"></div>
-<script src="/bridge.js" data-surface="${which === 'settings' ? 'settings' : 'board'}"></script>
-<script src="${which === 'settings' ? '/media/settings.js' : '/media/board.js'}"></script>
-</body>
-</html>`
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' })
-  res.end(html)
+  res.end(pageHtml(which))
 }
 
 // --- SSE: one stream per browser tab, fanned out per surface -----------------

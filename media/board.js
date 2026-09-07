@@ -496,6 +496,10 @@
       s.mode, s.selectedKey || '', !!s.ready, !!s.noWorkspace, !!s.noRepo,
       !!s.focused, !!s.boardOpen, !!s.showArchived, s.busy || '',
       s.olderHidden || 0, !!s.showOlder, picked.size,
+      // Ages are DRAWN by ago(), so they enter at minute resolution for the
+      // same reason `updated` does — a live agent rewrites its transcript
+      // constantly, and raw milliseconds would differ on every frame.
+      (s.backgroundAgents || []).map((a) => [a.id, a.status, Math.floor((a.lastFrameAt || 0) / 60000)]),
       !!searching, !!control, s.running || 0, s.waiting || 0,
       !!s.transcriptMore,
       cards, composer, s.columns || [], s.commands || [],
@@ -1262,7 +1266,7 @@
   function renderCard(c) {
     const a = c.agent
     const kind = a ? a.kind : 'idle'
-    const cls = kind === 'working' || kind === 'starting' ? ' running'
+    const cls = kind === 'working' || kind === 'starting' || kind === 'waiting' ? ' running'
       : kind === 'needsInput' ? ' needs-input'
       : kind === 'error' ? ' failed' : ''
     const n = el('article', 'card' + cls + (c.archived ? ' archived' : '') + (c.pinned ? ' pinned' : ''))
@@ -1326,6 +1330,16 @@
     meta.append(kebab(c))
     n.append(meta)
 
+    // Above the agent strip, because it is about work that outlives this turn.
+    if (c.agents) {
+      const b = el('div', 'agents-badge' + (c.agents.orphaned ? ' warn' : ''))
+      b.append(el('span', null, (c.agents.orphaned ? '✖ ' : '◇ ') + c.agents.total + ' background agents'))
+      if (c.agents.orphaned) b.append(el('span', 'agents-badge-sub', 'no completion'))
+      b.title = c.agents.orphaned
+        ? c.agents.orphaned + ' of them never reported finishing, and cannot still be running'
+        : c.agents.total + ' background agents were spawned by this session'
+      n.append(b)
+    }
     if (a) n.append(renderAgentStrip(c, a))
     else if (c.interrupted) n.append(renderInterrupted(c, false))
     else if (c.stalled) n.append(renderStalled(c))
@@ -1359,10 +1373,23 @@
     // ride in `chromeSig()` once per card for nothing.
     const review = (s.columns || []).find((col) => col.category === 'review')
     if (!review) return box
-    const go = el('button', null, 'Move to ' + (review.name || review.id))
-    go.title = 'The agent left this here. Move it to review yourself.'
+    const acts = el('div', 'stalled-acts')
+    /* Asking is the PRIMARY action, because moving the card by hand produces no
+       test plan — and that plan is the entire reason a review column exists.
+       Only offered where there is a worktree to resume into: a turn that cannot
+       run is a button that cannot do what it says. It costs a real turn on a
+       real agent, so it is a click and never automatic. */
+    if (c.worktree) {
+      const ask = el('button', 'primary', 'Ask for test plan')
+      ask.title = 'Resume this session and ask it to move the card and write how to test the work'
+      ask.onclick = (e) => { stop(e); post('askTestPlan', { id: c.key }) }
+      acts.append(ask)
+    }
+    const go = el('button', null, c.worktree ? 'Move anyway' : 'Move to ' + (review.name || review.id))
+    go.title = 'Move it to ' + (review.name || review.id) + ' yourself, without spending a turn'
     go.onclick = (e) => { stop(e); post('move', { id: c.key, phase: review.id }) }
-    box.append(go)
+    acts.append(go)
+    box.append(acts)
     return box
   }
 
@@ -1445,7 +1472,7 @@
         const title = prompt('Session name', c.title)
         if (title && title.trim()) post('rename', { id: c.key, title })
       })
-      if (c.agent && ['working', 'starting', 'needsInput'].includes(c.agent.kind)) {
+      if (c.agent && ['working', 'starting', 'needsInput', 'waiting'].includes(c.agent.kind)) {
         item('Stop agent', () => post('stop', { id: c.key }))
       }
       // `pinned` was the board's primary sort key with nothing able to set it.
@@ -1457,15 +1484,27 @@
     return wrap
   }
 
+  /* The turn ended, the run did not: background agents this session spawned
+     are still working, or one has just reported back and the CLI is about to
+     answer it. Named, with the count, because "working" over an agent that has
+     said its last word reads as hung — and the previous behaviour, finishing
+     the run here, killed the follow-up turn that carries the findings back. */
+  function waitingLabel(a) {
+    const n = a.tasks || 0
+    if (!n) return 'Waiting for a background agent to report back'
+    return 'Waiting on ' + n + ' background agent' + (n === 1 ? '' : 's') + (a.on ? ': ' + a.on : '')
+  }
+
   /* "Is it still going?" answered at the bottom of the transcript: a spinner
      that only exists while a turn is running, the tool it is on, and a counter
      that ticks up every second. The spinner alone would be another thing that
      spins forever over a wedged process; the counter is the part you can check. */
   function renderActivity(a) {
-    if (a.kind !== 'working' && a.kind !== 'starting') return el('div', 'activity-idle', '')
+    if (a.kind !== 'working' && a.kind !== 'starting' && a.kind !== 'waiting') return el('div', 'activity-idle', '')
     const box = el('div', 'activity')
     box.append(el('span', 'spinner'))
     const what = a.kind === 'starting' ? 'Starting…'
+      : a.kind === 'waiting' ? waitingLabel(a)
       : a.subagent ? (a.tool || 'Task') + ' → ' + a.subagent
       : a.tool ? a.tool
       : 'Working'
@@ -1512,6 +1551,9 @@
         : a.tool ? a.tool + '…'
         : 'working…'
     }
+    // Alive and waiting on its background agents. The pulse is honest here —
+    // a subagent process IS running — and the age beside it is the check.
+    else if (a.kind === 'waiting') { dot.classList.add('pulse'); text = waitingLabel(a).toLowerCase() + '…' }
     else if (a.kind === 'needsInput') { dot.classList.add('warn'); text = 'needs you' }
     else if (a.kind === 'done') { dot.classList.add('ok'); text = 'done' + (a.costUsd ? ' · $' + a.costUsd.toFixed(2) : '') }
     else if (a.kind === 'error') { dot.classList.add('bad'); text = 'failed' }
@@ -1525,7 +1567,7 @@
       age.title = 'Waiting for a free agent slot. Raise agentsKanban.maxConcurrentAgents to run more at once.'
       row.append(age)
     }
-    if ((a.kind === 'working' || a.kind === 'starting') && a.lastEventAt) {
+    if ((a.kind === 'working' || a.kind === 'starting' || a.kind === 'waiting') && a.lastEventAt) {
       const age = el('span', 'age', since(a.lastEventAt))
       // Read by tickAges() so the number keeps climbing between messages.
       if (age.setAttribute) age.setAttribute('data-since', String(a.lastEventAt))
@@ -1759,7 +1801,7 @@
     head.append(toKanban)
     head.append(focusButton())
     if (c) {
-      const busy = c.agent && ['working', 'starting', 'needsInput'].includes(c.agent.kind)
+      const busy = c.agent && ['working', 'starting', 'needsInput', 'waiting'].includes(c.agent.kind)
       if (busy) {
         // Interrupt ends the TURN and leaves the session alive to take another
         // message. Stop ends the run. Nine times out of ten you want the first,
@@ -1812,6 +1854,7 @@
     // Above the review panel and NOT gated on `c.worktree`: the merge is on the
     // user's own branch, so it is true of the repository whatever card happens
     // to be open, including one that never had a worktree.
+    if (s.backgroundAgents && s.backgroundAgents.length) main.append(renderBackgroundAgents())
     if (s.pendingMerge) main.append(renderPendingMerge())
     if (c && c.worktree) main.append(renderReview(c))
 
@@ -2305,6 +2348,57 @@
     return box
   }
 
+  /* Background agents a session spawned with the `Agent` tool.
+     Reported as "I thought they are still working but they weren't": two were
+     launched, the turn ended, and the board said nothing — because subagent
+     frames were only ever read from the LIVE run. What is drawn here comes off
+     disk, so it survives the process that started it.
+
+     Every row shows the AGE of the agent's last frame, never a bare dot: a dot
+     pulses over a wedged process too, and the age is the number the reader can
+     actually check. */
+  function renderBackgroundAgents() {
+    const list = s.backgroundAgents || []
+    const orphaned = list.filter((a) => a.status === 'orphaned').length
+    const running = list.filter((a) => a.status === 'running').length
+    const box = disclosure(el('details', 'agents' + (orphaned ? ' warn' : '')), 'agents', true)
+    const sum = el('summary', 'agents-head')
+    sum.append(el('span', 'agents-title', 'Background agents'))
+    sum.append(el('span', 'agents-sub', list.length + ' · ' + (
+      orphaned ? orphaned + ' with no completion recorded'
+        : running ? running + ' may still be working'
+          : 'all reported back')))
+    box.append(sum)
+
+    const body = el('div', 'agents-body')
+    for (const a of list) {
+      const row = el('div', 'agent-row ' + a.status)
+      row.append(el('span', 'agent-dot', a.status === 'running' ? '●'
+        : a.status === 'completed' ? '✔' : a.status === 'stopped' ? '■' : '✖'))
+      const nm = el('span', 'agent-name', a.description)
+      if (a.agentType) nm.title = a.agentType
+      row.append(nm)
+      row.append(el('span', 'spacer'))
+      // What we KNOW, phrased as what we know. "Stopped" would assert an
+      // outcome nobody reported: the only authoritative statement is the
+      // notification in the session's transcript, and for these there is none.
+      row.append(el('span', 'agent-state',
+        a.status === 'completed' ? 'completed'
+          : a.status === 'stopped' ? 'stopped'
+            : a.status === 'orphaned' ? 'no completion recorded'
+              : 'working'))
+      if (a.lastFrameAt) row.append(el('span', 'agent-age', 'last wrote ' + ago(a.lastFrameAt)))
+      body.append(row)
+    }
+    if (orphaned) {
+      body.append(el('div', 'agents-note',
+        'A background agent is a child of the session\'s process, so these cannot still be ' +
+        'running. Their transcripts are kept, so nothing they did is lost.'))
+    }
+    box.append(body)
+    return box
+  }
+
   function renderNewSessionHint() {
     const box = el('div', 'setup')
     box.append(el('h2', null, 'Start a session'))
@@ -2356,7 +2450,7 @@
        the far LEFT of a second row the moment the pickers filled the first —
        the opposite of "next to the context", with its separator rule dangling
        at the start of a line. Grouped, they wrap together or not at all. */
-    const readouts = el('div', 'readouts')
+    const readouts = el('div', 'readouts ctl ctl-bare')
     // Counted rather than read back off the node: the stub DOM the view tests
     // run against has no `childNodes`, and that is the point of it — a view
     // that only works against a real browser cannot be unit-tested at all.
@@ -2392,7 +2486,7 @@
     const bar = el('div', 'composer-bar')
     // The fast path appends the readouts here when they appear mid-turn.
     syncBarNode = bar
-    bar.append(el('span', 'agent-badge', 'AGENT'))
+    bar.append(el('span', 'agent-badge ctl ctl-static', 'AGENT'))
     /* The menu carries the CLI's own one-liner for each model. That is what
        makes "Default (recommended) — Opus 5 with 1M context" a choice rather
        than a list of ids, and it costs nothing: the description arrived with
@@ -2418,11 +2512,7 @@
        model differs from the one it was on — the next turn re-reads it all
        at the new model's input price. Rendered beside the picker that
        triggered it, in the same amber used for the provider note. */
-    if (s.composer.modelSwitchNote) {
-      const sw = el('span', 'provider-note', '⚠ ' + s.composer.modelSwitchNote)
-      sw.title = s.composer.modelSwitchNote
-      bar.append(sw)
-    }
+    if (s.composer.modelSwitchNote) bar.append(noteChip(s.composer.modelSwitchNote))
     /* WHAT THIS SESSION RUNS ON: one entry per agent-and-backend combination.
        This was two pickers — an agent picker and, before that, a backend
        picker — and splitting them made the user do the cross product in their
@@ -2445,7 +2535,9 @@
        those is not a thing. */
     if (s.composer.agentLocked) {
       const rtEntry = (s.composer.runtimes || []).find((r) => r.id === s.composer.runtime)
-      const chip = el('span', 'picker static', '🤖 ' + (rtEntry ? rtEntry.label : (s.composer.runtime || 'Agent')))
+      const chip = el('span', 'picker static ctl ctl-static')
+      chip.append(el('span', 'ctl-ico', '🤖'))
+      chip.append(el('span', 'ctl-label', rtEntry ? rtEntry.label : (s.composer.runtime || 'Agent')))
       chip.title = 'This session runs on this agent program. Its transcript lives in that agent’s ' +
         'own store, so the agent itself cannot change.'
       bar.append(chip)
@@ -2458,11 +2550,12 @@
         })), s.selectedKey, s.composer.backendNote))
       }
     } else {
-      bar.append(picker('agent', '🤖 ' + agentName(), (s.composer.agents || []).map((a) => ({
+      bar.append(picker('agent', agentName(), (s.composer.agents || []).map((a) => ({
         value: a.key,
         label: a.label,
         meta: a.detail,
-      })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }])))
+      })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }]),
+      undefined, undefined, undefined, '🤖'))
     }
     /* HOW EAGERLY this card should break its work into subtasks.
        Per card, beside the model, because it is a judgement about THIS piece of
@@ -2510,25 +2603,26 @@
        It replaces the effort picker rather than sitting beside it: ultracode
        IS xhigh, and two controls arguing over one value is worse than one. */
     if (s.composer.ultracodeSupported) {
-      bar.append(picker('ultracode', '⚡ Ultracode: ' + (s.composer.ultracode ? 'On' : 'Off'), [
+      bar.append(picker('ultracode', 'Ultracode: ' + (s.composer.ultracode ? 'On' : 'Off'), [
         { value: 'off', label: 'Ultracode: Off' },
         { value: 'on', label: 'Ultracode: On — xhigh effort, and it orchestrates workflows' },
-      ], undefined, undefined, s.composer.ultracode ? 'on' : 'off'))
+      ], undefined, undefined, s.composer.ultracode ? 'on' : 'off', '⚡'))
     }
     if (s.composer.fastModeSupported) {
-      bar.append(picker('fastMode', '🚀 Fast: ' + (s.composer.fastMode ? 'On' : 'Off'), [
+      bar.append(picker('fastMode', 'Fast: ' + (s.composer.fastMode ? 'On' : 'Off'), [
         { value: 'off', label: 'Fast mode: Off' },
         { value: 'on', label: 'Fast mode: On — same model, faster output' },
-      ], undefined, undefined, s.composer.fastMode ? 'on' : 'off'))
+      ], undefined, undefined, s.composer.fastMode ? 'on' : 'off', '🚀'))
     }
     // Changeable mid-run: the SDK applies it to a live session, not just the next.
     const modes = s.composer.permissionModes || []
     const cur = modes.find((m) => m.key === s.composer.permissionMode)
     bar.append(picker(
       'permissionMode',
-      '🔑 ' + (cur ? cur.label : 'Ask'),
+      cur ? cur.label : 'Ask',
       modes.map((m) => ({ value: m.key, label: m.label + ' — ' + m.detail })),
       c ? c.key : undefined,
+      undefined, undefined, '🔑',
     ))
     /* The provider warning, and the reason this feature is trustworthy rather
        than decorative. Two cases reach here: a profile missing a required field
@@ -2537,11 +2631,7 @@
        matters — a managed settings file or an apiKeyHelper outranks anything we
        put in the environment, and without this the bar would keep naming the
        provider we requested while somebody else's account was billed. */
-    if (s.composer.providerNote) {
-      const note = el('span', 'provider-note', '⚠ ' + s.composer.providerNote)
-      note.title = s.composer.providerNote
-      bar.append(note)
-    }
+    if (s.composer.providerNote) bar.append(noteChip(s.composer.providerNote))
     bar.append(el('div', 'spacer'))
     /* Context fill and spend, and they STAY. Both used to come only from a
        live run, so restarting VS Code — or opening a session that finished
@@ -2559,7 +2649,7 @@
        run started, the way to backends, schedules, the spawn-model policy and
        the remote pairing code all disappeared at once. Reported as "how do I
        even access the remote board". This button never disappears. */
-    const gear = el('button', 'gear-btn', '⚙')
+    const gear = el('button', 'gear-btn ctl ctl-icon', '⚙')
     gear.title = 'Settings: agents, backends, spawn policy, schedules, remote control'
     gear.onclick = (e) => { stop(e); post('openSettings') }
     bar.append(gear)
@@ -2683,7 +2773,7 @@
       addImageFiles(Array.prototype.slice.call(files))
     }
 
-    const clip = el('button', 'attach', '📎')
+    const clip = el('button', 'attach ctl ctl-lg ctl-icon', '📎')
     clip.title = 'Attach an image'
     clip.onclick = () => {
       const picker = el('input')
@@ -2710,7 +2800,7 @@
     if (voice && voice.available) {
       const on = voice.recording || builtinMicOn
       const builtin = voice.mode === 'builtin'
-      mic = el('button', 'mic' + (on ? ' live' : ''), on ? '⏺' : '🎤')
+      mic = el('button', 'mic ctl ctl-lg ctl-icon' + (on ? ' live' : ''), on ? '⏺' : '🎤')
       mic.title = on
         ? 'Stop dictating'
         : builtin
@@ -2736,14 +2826,14 @@
         }
       }
     } else if (voice && voice.why) {
-      mic = el('button', 'mic missing', '🎤')
+      mic = el('button', 'mic missing ctl ctl-lg ctl-icon', '🎤')
       mic.title = voice.why
         + '\n\nOr enable VS Code built-in dictation — "Dictation: Enabled" (experimental, VS Code 1.131+), then hold Ctrl+Alt+V (⌥⌘V on macOS) with the message focused.'
         + '\n\nClick to open the settings page, which says how to install each piece.'
       mic.onclick = () => { dictateAt = -1; post('openSettings') }
     }
 
-    const send = el('button', 'primary send', '➤')
+    const send = el('button', 'primary send ctl ctl-lg ctl-icon', '➤')
     send.title = c ? 'Send' : 'Start session'
     send.onclick = submit
     function submit() {
@@ -2909,11 +2999,22 @@
    *  rows is a menu that scrolls for a page and a half. */
   const SHOW_AT_MOST = 50
 
-  function picker(key, label, options, forKey, note, selected) {
+  /** `icon` is an optional glyph for the chip's fixed slot — kept OUT of the
+   *  label, because an emoji in the label string is what made every chip that
+   *  carried one 5px taller than its neighbours (see `.ctl-ico`). */
+  function picker(key, label, options, forKey, note, selected, icon) {
     const chosen = selected === undefined ? s.composer[key] : selected
     const id = 'composer:' + key
     const wrap = el('span', 'picker-wrap')
-    const b = el('button', 'picker', label + ' ▾')
+    /* Three parts, not one string: the glyph sits in a fixed-width slot so it
+       cannot change the chip's height, the label is the one part allowed to
+       ellipsise on a narrow bar, and the caret stays at the end. The chip is a
+       `.ctl`, so it is exactly as tall as every other control on the bar —
+       measured by layout.test.mjs. */
+    const b = el('button', 'picker ctl')
+    if (icon) b.append(el('span', 'ctl-ico', icon))
+    b.append(el('span', 'ctl-label', label))
+    b.append(el('span', 'ctl-caret', '▾'))
     // The label may be ellipsised on a narrow bar, so the full one is always
     // reachable. A control whose text is cut off and unexplained is the same
     // failure as one that is cut off and wrapped.
@@ -2989,6 +3090,17 @@
       wrap.append(menu)
     }
     return wrap
+  }
+
+  /** An amber note on the bar, in the shape of a chip: the warning glyph in the
+   *  fixed slot and a label that ellipsises. The whole sentence is always in
+   *  the title — a warning that is cut off and unexplained is no warning. */
+  function noteChip(text) {
+    const n = el('span', 'provider-note ctl ctl-static')
+    n.append(el('span', 'ctl-ico', '⚠'))
+    n.append(el('span', 'ctl-label', text))
+    n.title = text
+    return n
   }
 
   /* The prefix used to be the literal string "Claude Agent". That is no longer

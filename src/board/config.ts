@@ -88,6 +88,13 @@ export type AgentState =
    *  which is the single most common reason the board looks frozen when it is
    *  in fact busy. */
   | { kind: 'working'; tool?: string; subagent?: string }
+  /** The TURN ended but the RUN has not: background agents this session spawned
+   *  are still working, or one has just reported back and the CLI is about to
+   *  run a follow-up turn on its notification. The process is alive. `tasks` is
+   *  how many are live and `on` names the first, so the card says what it is
+   *  waiting for rather than "working" over nothing. Ending the run here is
+   *  what killed the follow-up turn — see `background-turns.test.ts`. */
+  | { kind: 'waiting'; tasks: number; on?: string }
   | { kind: 'needsInput'; question: string; requestId: string }
   | { kind: 'done'; summary: string; costUsd?: number }
   | { kind: 'error'; message: string }

@@ -248,6 +248,14 @@ export interface AgentSessionOptions {
   /** Resume a previous Claude session. */
   resume?: string
   /** Explicit path to the `claude` binary; auto-detected when omitted. */
+  /**
+   * How long a run stays open after a turn when a background agent has reported
+   * back but the CLI has not yet started the follow-up turn it owes on that
+   * notification. Probed at ~6ms; 10s by default. It exists for the case the
+   * probe could not rule out — two notifications answered in ONE turn — where
+   * the count of turns owed would otherwise hold the run open forever.
+   */
+  followUpGraceMs?: number
   claudeExecutable?: string
   /** Extra environment for the CLI process; merged over the update guards. */
   env?: Record<string, string>
@@ -301,6 +309,28 @@ export class AgentSession extends EventEmitter implements AgentRun {
   private readonly permissions = new Map<string, PermissionRequest>()
   private q?: Query
   private _state: AgentState = { kind: 'idle' }
+  /**
+   * Background tasks the CLI says are live, task id → description, kept from
+   * the SDK's `task_started`, `task_updated`, `background_tasks_changed` and
+   * `task_notification` system frames. Non-ambient only: the CLI's own
+   * housekeeping tasks are flagged and must not hold a run open.
+   *
+   * These frames were dropped on the floor (`default: break`), so the run had
+   * no idea a subagent was still working when the turn's `result` arrived, and
+   * `finish()` stopped the process — with the agent's notification already
+   * queued as the next user message. Probed against the real CLI: kept alive, it
+   * runs that follow-up turn on its own (a fresh `init`, the answer, a second
+   * `result`). Killed, the answer is lost and "nothing came back".
+   */
+  private liveTasks = new Map<string, string>()
+  /** Notifications seen since this turn began. Each is a user message the CLI
+   *  has QUEUED and will run a turn on when the current one ends, so a result
+   *  with one of these outstanding is not the end of the run. */
+  private followUpsDue = 0
+  private graceTimer: ReturnType<typeof setTimeout> | undefined
+  /** The last turn's summary and billed figure — what `done` reports when the
+   *  run finally finishes, which may be several turns after the first result. */
+  private lastTurn: { summary: string; costUsd?: number } | undefined
   private _sessionId?: string
   /** `AccountInfo.apiProvider` — where the tokens are actually going. Asked once
    *  per run, never per frame. */
@@ -568,6 +598,13 @@ export class AgentSession extends EventEmitter implements AgentRun {
     if (parent) { this.handleSubagent(msg); return }
     // Back on the main thread, so no subagent is running any more.
     this.subagentTool = undefined
+    // A main-thread frame while WAITING is the follow-up turn beginning: the
+    // CLI dequeued a notification and is answering it. The probe saw a fresh
+    // `init` first, but any frame of the turn is proof enough.
+    if (this._state.kind === 'waiting' && (msg.type === 'system' || msg.type === 'assistant' || msg.type === 'stream_event')) {
+      const sub = (msg as { subtype?: string }).subtype
+      if (msg.type !== 'system' || sub === 'init') this.turnStarted()
+    }
     // And this frame's model is the MAIN thread's — the only model whose
     // context window is this session's meter. Captured here, after the
     // subagent early-return, precisely so a Task's frames can never set it;
@@ -581,10 +618,17 @@ export class AgentSession extends EventEmitter implements AgentRun {
     switch (msg.type) {
       case 'system': {
         if ('subtype' in msg && msg.subtype === 'init' && 'session_id' in msg) {
-          this._sessionId = msg.session_id as string
-          this.emit('sessionId', this._sessionId)
+          // Announced ONCE. Every follow-up turn the CLI runs on a background
+          // agent's notification opens with another `init` carrying the same
+          // id, and re-announcing it would re-run the manager's adoption and
+          // rename for a card that already has them.
+          if (this._sessionId !== msg.session_id) {
+            this._sessionId = msg.session_id as string
+            this.emit('sessionId', this._sessionId)
+          }
           this.checkFlagSettings(msg as unknown as { tools?: unknown })
         }
+        this.trackTask(msg as unknown as Record<string, unknown>)
         // After a compaction there is no assistant message, so the meter would
         // stay pinned at the pre-compaction figure. Reset it explicitly.
         if ('subtype' in msg && msg.subtype === 'compact_boundary') {
@@ -699,13 +743,13 @@ export class AgentSession extends EventEmitter implements AgentRun {
         } else {
           if (this.sawCommit) { this.sawCommit = false; this.emit('committed') }
           const summary = r.result || this.text.slice(-2000) || 'Finished.'
-          this.setState({ kind: 'done', summary, ...(r.total_cost_usd !== undefined ? { costUsd: r.total_cost_usd } : {}) })
-          // Three arguments, in the shape `RunEvents.done` declares: the
-          // session's meter, then this TURN's dollars. This used to pass
-          // `r.total_cost_usd` in the meter's slot — a bare number where the
-          // other runtime put a `Meter` — and the webview called `.toFixed(2)`
-          // on whichever arrived. See `parseMeter`.
-          this.emit('done', summary, this.meter, r.total_cost_usd)
+          this.lastTurn = { summary, ...(r.total_cost_usd !== undefined ? { costUsd: r.total_cost_usd } : {}) }
+          /* The TURN is over. Whether the RUN is depends on what the CLI told
+             us about background tasks: an agent still working, or a notification
+             it has queued and owes a turn on, means the process must stay alive
+             for that turn — the one that carries the agent's findings back. */
+          if (this.turnStillOpen()) { this.enterWaiting(); break }
+          this.finishRun()
         }
         break
       }
@@ -973,8 +1017,109 @@ export class AgentSession extends EventEmitter implements AgentRun {
 
   /** Tear the session down for good. */
   stop(): void {
+    this.clearGrace()
     this.abort.abort()
     this.queue.close()
+  }
+
+  // --- background tasks: what keeps a run open past its turn ------------------
+
+  /** Keep `liveTasks` in step with the CLI's task frames. Ambient tasks — the
+   *  CLI's own watchers — are excluded everywhere: they are not the user's work
+   *  and would otherwise hold every run open. */
+  private trackTask(m: Record<string, unknown>): void {
+    const sub = m.subtype
+    const id = typeof m.task_id === 'string' ? m.task_id : undefined
+    const name = () => (typeof m.description === 'string' && m.description) || id || 'background task'
+    if (sub === 'task_started' && id && m.is_backgrounded === true && m.ambient !== true) {
+      this.liveTasks.set(id, name())
+    } else if (sub === 'background_tasks_changed' && Array.isArray(m.tasks)) {
+      // REPLACE semantics, as the SDK declares: this is every live task.
+      this.liveTasks = new Map(
+        (m.tasks as Array<Record<string, unknown>>)
+          .filter((t) => t.ambient !== true && typeof t.task_id === 'string')
+          .map((t) => [t.task_id as string, (typeof t.description === 'string' && t.description) || (t.task_id as string)]),
+      )
+    } else if (sub === 'task_updated' && id) {
+      const st = (m.patch as { status?: unknown } | undefined)?.status
+      if (st === 'completed' || st === 'failed' || st === 'killed') this.liveTasks.delete(id)
+    } else if (sub === 'task_notification' && id && m.ambient !== true) {
+      // The agent reported back. The CLI has queued this as the next user
+      // message and OWES a turn on it — that turn is where the answer reaches
+      // the parent, and it is exactly the turn that used to be killed.
+      this.liveTasks.delete(id)
+      this.followUpsDue++
+    } else {
+      return
+    }
+    this.reconsiderWaiting()
+  }
+
+  /** Is this turn's `result` the end of the run, or only of the turn? */
+  private turnStillOpen(): boolean {
+    return this.liveTasks.size > 0 || this.followUpsDue > 0
+  }
+
+  private enterWaiting(): void {
+    const on = [...this.liveTasks.values()]
+    this.setState({ kind: 'waiting', tasks: on.length, ...(on[0] ? { on: on[0] } : {}) })
+    this.emit('waiting', on)
+    // Nothing live, only a turn owed: the CLI starts it within milliseconds. If
+    // it does not — two notifications answered in one turn, say — the grace
+    // timer finishes the run rather than leaving it "waiting" for ever.
+    if (!on.length) this.armGrace()
+  }
+
+  /** While waiting, every task frame re-asks the question. */
+  private reconsiderWaiting(): void {
+    if (this._state.kind !== 'waiting') return
+    if (this.liveTasks.size) {
+      this.clearGrace()
+      const on = [...this.liveTasks.values()]
+      this.setState({ kind: 'waiting', tasks: on.length, on: on[0]! })
+    } else {
+      // Nothing live. NOT the end yet: the probe recorded the CLI emptying its
+      // list (`background_tasks_changed []`) a few milliseconds BEFORE the
+      // agent's notification and the follow-up turn — finishing here killed
+      // that turn in the test for exactly this case. The grace timer decides:
+      // a turn arrives and cancels it, or nothing does and the run is over.
+      this.armGrace()
+    }
+  }
+
+  /** The follow-up turn began: one notification has been consumed. */
+  private turnStarted(): void {
+    this.clearGrace()
+    if (this.followUpsDue > 0) this.followUpsDue--
+    this.setState({ kind: 'working' })
+  }
+
+  private armGrace(): void {
+    this.clearGrace()
+    const t = setTimeout(() => {
+      this.graceTimer = undefined
+      if (this._state.kind !== 'waiting' || this.liveTasks.size) return
+      this.followUpsDue = 0
+      this.finishRun()
+    }, this.opts.followUpGraceMs ?? 10_000)
+    ;(t as { unref?: () => void }).unref?.()
+    this.graceTimer = t
+  }
+
+  private clearGrace(): void {
+    if (this.graceTimer) { clearTimeout(this.graceTimer); this.graceTimer = undefined }
+  }
+
+  /** The run is over. Reports the LAST turn — see `lastTurn`. */
+  private finishRun(): void {
+    this.clearGrace()
+    const last = this.lastTurn ?? { summary: this.text.slice(-2000) || 'Finished.' }
+    this.setState({ kind: 'done', summary: last.summary, ...(last.costUsd !== undefined ? { costUsd: last.costUsd } : {}) })
+    // Three arguments, in the shape `RunEvents.done` declares: the session's
+    // meter, then this TURN's dollars. This used to pass `r.total_cost_usd` in
+    // the meter's slot — a bare number where the other runtime put a `Meter` —
+    // and the webview called `.toFixed(2)` on whichever arrived. See `parseMeter`.
+    this.emit('done', last.summary, this.meter, last.costUsd)
   }
 }
 

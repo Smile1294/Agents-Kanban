@@ -4,7 +4,11 @@
    runId and adopts Claude Code's session id moments later, and the board has to
    show it correctly throughout. Both halves of that have failure modes that are
    completely silent. */
-import { AgentManager, durablePatch, MAX_SUBTASKS, titleFrom, buildBrief, type RunningAgent } from '../manager.ts'
+import {
+  AgentManager, durablePatch, MAX_SUBTASKS, titleFrom, buildBrief, launchSettings,
+  type RunningAgent,
+} from '../manager.ts'
+import { agentKeyOf, type SpawnCatalogue } from '../routing.ts'
 import { agentEnv, HOST_SESSION_VARS } from '../session.ts'
 import { DEFAULT_BOARD } from '../../board/config.ts'
 import { ORCHESTRATION_LEVELS, policyFor } from '../../board/decomposition.ts'
@@ -65,6 +69,23 @@ ok(brief.includes('task/S1-fix'), 'it tells the agent which branch it is on')
 ok(brief.includes('Fix login'), 'and which card is its own')
 ok(!brief.includes('complete'), 'it does NOT invite the agent to complete its own work')
 ok(brief.includes('set_title'), 'and it tells the agent the card name is a guess it can fix')
+
+// The brief LOSES to a slash command unless it says so.
+//
+// Real case: a project's own `/jira-task` command runs a long procedure whose
+// last step is "Then STOP. A human reviews and merges." The agent obeyed the
+// specific, procedural terminal step and treated moving its card as extra work
+// it had been told not to do — so the card sat in Implementing with the work
+// finished, and the user never got the test plan that reaching a review column
+// is supposed to produce. The brief is `appendSystemPrompt` and was present the
+// whole time; being present is not the same as outranking.
+// Matched on the whole claim, not on words that already appear elsewhere in the
+// brief ("then stop", "split BEFORE you change anything") — a loose regex here
+// passed against the unfixed brief and proved nothing.
+ok(/tells you to stop, call `set_phase` first/i.test(brief),
+   'the brief says to move the card BEFORE stopping, whatever told it to stop')
+ok(brief.includes('how a run ENDS'),
+   'and frames the move as part of ending, not as more work that can be skipped')
 
 // --- the level reaches the agent, and only through the brief ----------------
 //
@@ -601,7 +622,27 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
 // bill — so it is gated here, in code, before the user is asked to approve
 // anything. The tool description can only name the allowed set; this is the
 // fence, and the only one.
+//
+// Expressed through the spawn CATALOGUE now, which is the same policy with the
+// backend attached: a flat list of ids could only ever be checked against one
+// catalogue, so a piece routed elsewhere had its model validated against the
+// wrong backend's list. Every assertion below is the one it always was.
 {
+  const flatCatalogue = (models: () => string[]) => (): SpawnCatalogue => {
+    const ids = models()
+    return {
+      // The parent in these fixtures records no backend, so its key is
+      // `claude|` — and an agent with no allowed model is OMITTED, which is
+      // what makes an empty allowlist an empty catalogue.
+      agents: ids.length
+        ? [{
+            slug: 'claude', key: agentKeyOf('claude', ''), label: 'Claude Code',
+            runtime: 'claude', provider: '', known: true,
+            models: ids.map((id) => ({ id, efforts: [] })),
+          }]
+        : [],
+    }
+  }
   const makeGated = (spawnModels: () => string[], defaults: Record<string, unknown> = {}) => {
     const startedWith: { opts: Record<string, unknown> }[] = []
     const patches: { patch: Record<string, unknown> }[] = []
@@ -619,7 +660,7 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
       defaults,
       permissionMode: 'acceptEdits',
       maxConcurrent: 3,
-      spawnModels,
+      ...(spawnModels ? { spawnCatalogue: flatCatalogue(spawnModels) } : {}),
     })
     const inner = g as unknown as {
       agents: Map<string, RunningAgent>
@@ -725,15 +766,24 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
   // The spawn allowlist, named in the same paragraph. The brief is baked at
   // launch; the gate re-reads the policy at split time, so this sentence can
   // only ever be a stale but honest answer, never a wrong one that passes.
-  ok(buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, true, ['haiku-5'])
-    .includes('Spawned agents may only run on: haiku-5'),
-  'with an allowlist, the brief names the models a spawned agent may run on')
+  const oneAgent = [{
+    slug: 'deepseek', key: 'claude|dsk', label: 'DeepSeek',
+    runtime: 'claude' as const, provider: 'dsk', known: true,
+    models: [{ id: 'deepseek-reasoner', efforts: [] }],
+  }]
+  const routed = buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, true, oneAgent)
+  ok(routed.includes('Spawned agents may only run on'),
+     'with a catalogue, the brief names what a spawned agent may run on')
+  ok(routed.includes('deepseek') && routed.includes('deepseek-reasoner'),
+     'by short name AND by the models it serves — the two halves of one question')
+  ok(/names neither runs on this/.test(routed),
+     'and says what naming nothing means, since that is the default every piece takes')
   ok(buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, true, [])
     .includes('will be refused'),
   'and an empty allowlist says splitting will be refused rather than inviting a doomed call')
   ok(!buildBrief(DEFAULT_BOARD, 'T', 'task/x').includes('Spawned agents'),
      'without an allowlist the brief says nothing about models')
-  ok(!buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, false, ['haiku-5']).includes('Spawned agents'),
+  ok(!buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, false, oneAgent).includes('Spawned agents'),
      'and a session that cannot split is not told about spawn models either')
 }
 
@@ -959,6 +1009,213 @@ ok(parseMeter({ kind: 'unknown' })?.kind === 'unknown', '"unknown" is a first-cl
 // not read into a number the board displays as measured.
 for (const bad of [undefined, null, 'x', {}, { kind: 'martian' }, []]) {
   ok(parseMeter(bad) === undefined, `${JSON.stringify(bad) ?? 'undefined'} is no reading at all, not "unknown"`)
+}
+
+
+
+// --- routing a split across agents, backends and models ----------------------
+//
+// The feature: one objective session fanning out into subtasks that run on
+// DIFFERENT agent programs and DIFFERENT backends. And the bug underneath it:
+// `split()` passed the parent's RUNTIME to every child and said nothing about
+// its BACKEND, so `launch()` fell through to the workspace's ACTIVE profile —
+// a session that had been on DeepSeek all morning produced children on
+// Anthropic, with a different bill, silently.
+{
+  const card = { phase: 'planning', tags: [] as string[], parent: undefined as string | undefined }
+  const startedWith: { prompt: string; opts: Record<string, unknown> }[] = []
+  const patches: { key: string; patch: Record<string, unknown> }[] = []
+  const resolved: string[] = []
+
+  const catalogue: SpawnCatalogue = {
+    agents: [
+      {
+        slug: 'claude', key: 'claude|inherit', label: 'Claude Code',
+        runtime: 'claude', provider: 'inherit', known: true,
+        models: [{ id: 'claude-fable-5-1', efforts: ['low', 'high', 'max'] },
+                 { id: 'claude-opus-5', efforts: ['low', 'high', 'max'] }],
+      },
+      {
+        slug: 'deepseek', key: 'claude|dsk', label: 'DeepSeek',
+        runtime: 'claude', provider: 'dsk', known: true,
+        models: [{ id: 'deepseek-reasoner', efforts: [] }],
+      },
+      {
+        slug: 'codex', key: 'codex|', label: 'Codex',
+        runtime: 'codex', provider: '', known: true,
+        models: [{ id: 'gpt-5.5-codex', efforts: ['low', 'medium', 'high'] }],
+      },
+    ],
+  }
+
+  const mgr = new AgentManager({
+    store: {
+      card: async () => card,
+      childrenOf: async () => [],
+      setTags: async () => {},
+      patch: async (key: string, patch: Record<string, unknown>) => { patches.push({ key, patch }) },
+    } as never,
+    confirmSplit: async () => true,
+    worktrees: { isClean: async () => true, aheadOf: async () => 0 } as never,
+    board: DEFAULT_BOARD,
+    defaults: { model: 'deepseek-reasoner' },
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 3,
+    spawnCatalogue: () => catalogue,
+    // The host's half: a profile id becomes an actual environment patch, which
+    // needs SecretStorage and therefore cannot live in the manager.
+    resolveProvider: async (id: string) => {
+      resolved.push(id)
+      return { profile: { id, label: id, kind: 'gateway' }, env: { set: { X: id }, clear: [] } } as never
+    },
+  })
+
+  // The parent is on DeepSeek — NOT on the workspace's active profile.
+  const parent: RunningAgent = {
+    runId: 'run-1', runtime: 'claude', sessionId: 'sess-parent', title: 'Two backends',
+    provider: 'dsk',
+    state: { kind: 'working' }, worktreePath: '/tmp/wt/p', branch: 'task/p',
+    base: 'main', live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
+  }
+  const internals = mgr as unknown as {
+    agents: Map<string, RunningAgent>
+    start: (prompt: string, opts: Record<string, unknown>) => Promise<string>
+  }
+  internals.agents.set('run-1', parent)
+  internals.start = async (prompt, opts) => {
+    startedWith.push({ prompt, opts })
+    const runId = `run-child-${startedWith.length}`
+    internals.agents.set(runId, { ...parent, runId, branch: `task/${runId}` })
+    return runId
+  }
+  const reset = () => { startedWith.length = 0; patches.length = 0; resolved.length = 0 }
+  const piece = (extra: Record<string, unknown>) =>
+    ({ title: `T${Math.random()}`, prompt: 'Do the thing.', scope: ['src/a/'], ...extra })
+
+  // THE BUG. Neither piece names an agent, so both inherit the parent's whole
+  // agent: runtime AND backend.
+  {
+    const v = await mgr.split('sess-parent', [piece({}), piece({ scope: ['src/b/'] })])
+    ok(v.ok === true, 'a split with no routing at all still runs')
+    ok(startedWith.every((s) => s.opts.runtime === 'claude'), 'each child keeps the parent runtime')
+    ok(startedWith.every((s) => {
+      const pf = s.opts.providerFor as { profile?: { id?: string } } | undefined
+      return pf?.profile?.id === 'dsk'
+    }), `and the parent BACKEND, resolved by the host (${JSON.stringify(startedWith[0]?.opts.providerFor)})`)
+    ok(resolved.includes('dsk'), 'which means the host was asked for that profile, not the active one')
+    reset()
+  }
+
+  // Routing to another RUNTIME. A ChatGPT-subscription session is Codex, and
+  // Codex has no backend of its own, so no profile is resolved for it.
+  {
+    const v = await mgr.split('sess-parent', [
+      piece({ agent: 'codex', model: 'gpt-5.5-codex', effort: 'high' }),
+      piece({ scope: ['src/b/'] }),
+    ])
+    ok(v.ok === true, 'a piece may be routed to a different agent program')
+    const child = startedWith.find((s) => s.opts.runtime === 'codex')
+    ok(!!child, `one child runs on Codex (${startedWith.map((s) => s.opts.runtime).join(', ')})`)
+    ok((child?.opts.chosen as { model?: string })?.model === 'gpt-5.5-codex',
+       'with the model it named')
+    ok((child?.opts.chosen as { effort?: string })?.effort === 'high',
+       'and the effort it named')
+    ok(child?.opts.providerFor === undefined,
+       'and no backend profile, because that runtime signs in as itself')
+    // Its sibling named nothing and must still be on the parent's agent: a
+    // route is per piece, and one piece's choice cannot move another's.
+    const sibling = startedWith.find((s) => s.opts.runtime === 'claude')
+    ok((sibling?.opts.providerFor as { profile?: { id?: string } } | undefined)?.profile?.id === 'dsk',
+       'while its sibling stays on the parent backend')
+    reset()
+  }
+
+  // Routing to another BACKEND on the same runtime.
+  {
+    const v = await mgr.split('sess-parent', [
+      piece({ agent: 'claude', model: 'claude-fable-5-1' }),
+      piece({ scope: ['src/b/'] }),
+    ])
+    ok(v.ok === true, 'a piece may be routed to a different backend on the same runtime')
+    const on = startedWith.find((s) =>
+      (s.opts.providerFor as { profile?: { id?: string } } | undefined)?.profile?.id === 'inherit')
+    ok(!!on, `and the host resolves THAT profile (${resolved.join(', ')})`)
+    ok((on?.opts.chosen as { model?: string })?.model === 'claude-fable-5-1', 'with its own model')
+    reset()
+  }
+
+  // The gates. Each one refuses BEFORE any agent starts and is RECORDED on the
+  // parent — a session that tried to route, was refused, and did the work alone
+  // must not be byte-identical on the board to the correct adaptive outcome.
+  for (const [label, bad, rule] of [
+    ['an agent that is not configured', { agent: 'gemini' }, 'spawn-agent'],
+    ['a model that backend does not serve', { agent: 'codex', model: 'claude-opus-5' }, 'spawn-model'],
+    ['an effort the model does not take', { agent: 'codex', model: 'gpt-5.5-codex', effort: 'xhigh' }, 'spawn-effort'],
+    ['an effort that is not a level', { agent: 'codex', model: 'gpt-5.5-codex', effort: 'banana' }, 'spawn-effort'],
+  ] as const) {
+    const v = await mgr.split('sess-parent', [piece(bad), piece({ scope: ['src/b/'] })])
+    ok(v.ok === false, `${label} is refused`)
+    ok(startedWith.length === 0, `${label} starts NOTHING (${startedWith.length} agents)`)
+    ok(patches.some((x) => x.patch.decomposition
+      && (x.patch.decomposition as { rule?: string }).rule === rule),
+       `${label} is recorded on the parent as ${rule} ` +
+       `(${JSON.stringify(patches.map((x) => (x.patch.decomposition as { rule?: string })?.rule))})`)
+    ok(!patches.some((x) => x.patch.fanout !== undefined),
+       `${label} does not claim a fan-out that never happened`)
+    reset()
+  }
+
+  // A refused route must not be able to spend money. The order is the same one
+  // the spawn-model gate already has and for the same reason: a modal should
+  // never ask about a plan the host already knows it will refuse.
+  {
+    let asked = 0
+    const gated = new AgentManager({
+      store: {
+        card: async () => card, childrenOf: async () => [], setTags: async () => {},
+        patch: async () => {},
+      } as never,
+      confirmSplit: async () => { asked++; return true },
+      worktrees: { isClean: async () => true, aheadOf: async () => 0 } as never,
+      board: DEFAULT_BOARD, defaults: {}, permissionMode: 'acceptEdits', maxConcurrent: 3,
+      spawnCatalogue: () => catalogue,
+    })
+    ;(gated as unknown as { agents: Map<string, RunningAgent> }).agents.set('run-1', parent)
+    const v = await gated.split('sess-parent', [piece({ agent: 'gemini' }), piece({ scope: ['src/b/'] })])
+    ok(v.ok === false && asked === 0,
+       `a route the host will refuse never reaches the approval dialog (asked ${asked}x)`)
+  }
+}
+
+// --- what a run is decided ON, and WHEN ---------------------------------------
+//
+// `startRun()` read `this.opts.defaults` and `this.opts.provider` after two
+// awaits, and `drain()` launches a queued run minutes later — while
+// `setDefaults()` and `setProvider()` replace that state wholesale. MAX_SUBTASKS
+// (4) exceeds the default concurrency (3), so the FOURTH piece of a fan-out
+// always drains late: routing by mutating manager state hands one task another
+// task's model. Everything per-run is therefore resolved ONCE, here.
+{
+  const defaults = {
+    model: 'claude-opus-5', effort: 'high' as const, thinking: 'enabled' as const,
+    ultracode: true, fastMode: false,
+  }
+  const inherited = launchSettings({}, defaults)
+  ok(inherited.model === 'claude-opus-5', 'a run with no choice of its own takes the workspace default')
+  ok(inherited.effort === 'high' && inherited.thinking === 'enabled', 'for every dial, not just the model')
+  ok(inherited.ultracode === true && inherited.fastMode === false, 'session flags included')
+
+  const own = launchSettings({ chosen: { model: 'deepseek-reasoner', effort: 'low' } }, defaults)
+  ok(own.model === 'deepseek-reasoner', "a run's own model wins")
+  ok(own.effort === 'low', 'and its own effort')
+  ok(own.thinking === 'enabled', 'while the dials it did not choose still fall back')
+
+  // The flags are per run, and `false` is a CHOICE — not an absence to be
+  // overwritten by a default that says true. This is the `stripUndefined` trap
+  // in a new place: `?? ` on a boolean is only correct if the absent value is
+  // undefined and never false.
+  const off = launchSettings({ chosen: { ultracode: false } }, defaults)
+  ok(off.ultracode === false, 'a run that switched ultracode OFF stays off under a default that is on')
 }
 
 console.log(fails === 0 ? 'PASS — run identity, subtask boundaries, the meter contract and the agent brief hold' : `${fails} FAILURES`)

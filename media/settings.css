@@ -267,6 +267,10 @@ button.link {
   cursor: pointer;
   padding: 0;
   font-size: 12px;
+  /* A link, not a control: board.css makes every button the standard 24px
+     control, and these sit inline in a sentence. */
+  min-height: 0;
+  display: inline;
 }
 button.link:hover { text-decoration: underline; }
 button.link.danger { color: var(--vscode-errorForeground); }
@@ -275,9 +279,9 @@ button.primary {
   background: var(--vscode-button-background);
   color: var(--vscode-button-foreground);
   border: none;
-  border-radius: 3px;
-  padding: 4px 12px;
-  font-size: 12px;
+  border-radius: var(--ctl-radius, 5px);
+  padding: 0 12px;
+  font-size: var(--ctl-fs, 12px);
   cursor: pointer;
   white-space: nowrap;
 }

@@ -37,8 +37,14 @@
  *
  * Plain Node, no `vscode`, so all of it is unit-tested without an editor.
  */
-import type { RuntimeId } from '../agent/runtime.ts'
-import type { EffortLevel } from '../sessions/meta.ts'
+// TYPE-ONLY, and that is load-bearing rather than tidy. `sessions/meta.ts`
+// imports this file for `parseOrchestrationLevel`, and `agent/routing.ts`
+// imports `meta.ts` for the effort levels — so a VALUE import here closes the
+// cycle `meta -> decomposition -> routing -> meta`, and the whole board fails
+// to load with "Cannot access 'ALL_ROUTE_RULES' before initialization". A type
+// import is erased, so it carries no runtime edge. See `ALL_PROPOSAL_RULES`
+// below for how the rules stay enumerated exactly once anyway.
+import type { RouteRule } from '../agent/routing.ts'
 
 export type OrchestrationLevel = 'minimal' | 'balanced' | 'maximum'
 
@@ -162,24 +168,68 @@ export interface PieceProposal {
   scope?: string[]
   tags?: string[]
   /**
-   * The model the agent asks this piece to run on — one half of the routing
-   * reserved in `PieceRouting`. Carried through to `SubtaskSpec` and gated by
-   * the spawn allowlist in `AgentManager.split()`, which is the boundary; this
-   * file only passes the id along.
+   * WHAT THIS PIECE ASKS TO RUN ON, as the model wrote it.
+   *
+   * `agent` is a `<runtime>|<profile>` slug from the tool description — one
+   * agent program on one backend, the same flat combination the composer
+   * offers, because making the user do that cross product in their head got
+   * the answer wrong on screen once and would get it wrong here too. Absent
+   * means "the parent's whole agent", which is the only honest default while a
+   * session keeps the runtime it started on.
+   *
+   * All three are raw strings and all three are checked HOST-side, by
+   * `resolveRoute()` in `agent/routing.ts`: whether `deepseek` is a configured
+   * backend is a question about host state, and this function is deliberately
+   * pure of it — the same division `spawn-model` has always had. What happens
+   * here is only trimming and bounding, so a refusal can never quote an
+   * unbounded model-written value back at the user.
    */
+  agent?: string
   model?: string
+  effort?: string
 }
 
+/** Everything `checkProposal` can refuse on, plus everything the ROUTING gate
+ *  can — the latter produced by `AgentManager.split()` and never here, because
+ *  the allowed set is host state and this function is deliberately pure of it.
+ *
+ *  See `RouteRule` in `agent/routing.ts` for why the routing half is four
+ *  rules and not one: each has a different fix. */
 export type ProposalRule =
   | 'one-piece'
   | 'over-cap'
   | 'scope-missing'
   | 'brief-cross-reference'
   | 'brief-too-long'
-  /** The proposal named a model the spawn allowlist does not permit. Produced
-   *  by `AgentManager.split()`, never by `checkProposal` — the allowed set is
-   *  host state, and this function is deliberately pure of it. */
-  | 'spawn-model'
+  | RouteRule
+
+/**
+ * Every rule, enumerated so `decompositionLine()` can be SHOWN to render all
+ * of them. A rule with no case there falls through to "the split was declined"
+ * — the feature working and the feature broken rendering the same, on the one
+ * record that exists to tell them apart.
+ *
+ * Written as keys with a `satisfies Record<ProposalRule, true>` rather than as
+ * an array, because that makes the compiler the check: add a member to
+ * `ProposalRule` — here or in `RouteRule` — and this object fails to compile
+ * until it is listed. A `readonly ProposalRule[]` literal would have accepted a
+ * list missing half of them, which is exactly the drift a hand-written copy of
+ * the auto-allow list already caused once in this codebase.
+ */
+const PROPOSAL_RULES = {
+  'one-piece': true,
+  'over-cap': true,
+  'scope-missing': true,
+  'brief-cross-reference': true,
+  'brief-too-long': true,
+  'spawn-agent': true,
+  'spawn-model': true,
+  'spawn-catalogue': true,
+  'spawn-effort': true,
+} as const satisfies Record<ProposalRule, true>
+
+export const ALL_PROPOSAL_RULES: readonly ProposalRule[] =
+  Object.keys(PROPOSAL_RULES) as ProposalRule[]
 
 /** Recorded and SHOWN at the approval, never refused.
  *
@@ -222,6 +272,25 @@ export const MAX_STATED = 240
 const CROSS_REFERENCE = /\b(?:the other (?:task|subtask|agent|piece)|task (?:one|two|three|four|[1-4])\b|as (?:decided|agreed|described) (?:above|in the other)|see the other|sibling (?:task|agent))/i
 
 /**
+ * One model-written routing field, trimmed and bounded.
+ *
+ * The bound exists so a refusal message never carries an unbounded value the
+ * model wrote. Truncating cannot turn a disallowed id into an allowed one, only
+ * into a different disallowed one — so it is safe here in a way it is NOT safe
+ * for the piece list, which is refused rather than truncated.
+ */
+function bounded<K extends string>(key: K, raw: unknown): Record<K, string | undefined> {
+  const clean = typeof raw === 'string' && raw.trim() ? raw.trim().slice(0, 200) : undefined
+  // The key is ALWAYS written, `undefined` included, because these fields are
+  // spread from the model's own object first — so returning `{}` for a blank
+  // one left `agent: '   '` in place from that spread and the sanitiser did
+  // nothing. It was latent on `model` for the same reason and no test could
+  // see it: the only symptom is a whitespace id reaching the routing gate,
+  // where it is refused with a message quoting three spaces.
+  return { [key]: clean } as Record<K, string | undefined>
+}
+
+/**
  * Every host-side gate on a proposed split, in one pure function.
  *
  * Deliberately knows nothing about git, the manager or the editor, so the whole
@@ -247,9 +316,12 @@ export function checkProposal(
       // never carries an unbounded model-written value. Any truncation still
       // fails the spawn gate — it cannot turn a disallowed id into an allowed
       // one, only into a different disallowed one. Absent stays absent.
-      ...(typeof p.model === 'string' && p.model.trim()
-        ? { model: p.model.trim().slice(0, 200) }
-        : {}),
+      ...bounded('model', p.model),
+      // Same treatment, same reason. A blank one is ABSENT rather than an
+      // empty string, because absent is a meaning here — "inherit the
+      // parent's" — and `''` would be a third state nothing handles.
+      ...bounded('agent', p.agent),
+      ...bounded('effort', p.effort),
       ...(p.scope ? { scope: p.scope.filter((s) => typeof s === 'string' && s.trim()).map((s) => s.trim()) } : {}),
     }))
     .filter((p) => p.title && p.prompt)
@@ -390,15 +462,9 @@ export function decompositionLine(r: DecompositionRecord, started: number | unde
     : r.rule === 'brief-cross-reference' ? 'a brief depended on another subtask'
     : r.rule === 'brief-too-long' ? 'a brief was too long to hand over'
     : r.rule === 'spawn-model' ? 'a subtask asked for a model spawned agents may not run on'
+    : r.rule === 'spawn-agent' ? 'a subtask asked for an agent this board cannot start'
+    : r.rule === 'spawn-catalogue' ? 'a subtask named a model on a backend the board has not read'
+    : r.rule === 'spawn-effort' ? 'a subtask asked for an effort level its model does not take'
     : 'the split was declined'
   return `Kept as one agent — ${why}`
-}
-
-/** What a per-piece routing choice may say. Reserved for the piece the agent
- *  proposes; unset means "inherit the parent's", which is the only honest
- *  default while a session keeps the runtime it started on. */
-export interface PieceRouting {
-  runtime?: RuntimeId
-  model?: string
-  effort?: EffortLevel
 }

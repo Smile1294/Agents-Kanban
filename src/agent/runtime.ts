@@ -393,6 +393,13 @@ export interface RunEvents {
    */
   done: (summary: string, meter?: Meter, turnUsd?: number) => void
   error: (message: string) => void
+  /**
+   * A turn ended with background agents still live, or a notification from one
+   * still to be answered, so the run stays open. `on` names the live agents —
+   * EMPTY when nothing is live and only a follow-up turn is due. Emitted once
+   * per turn that waits; a runtime with no background-task concept never emits it.
+   */
+  waiting: (on: string[]) => void
 }
 
 /**

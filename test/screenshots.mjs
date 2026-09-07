@@ -5,9 +5,10 @@
  * by asserting on text; this answers the second by drawing it.
  *
  * It loads media/board.js and media/board.css unmodified — the same files the
- * extension ships — with VS Code's own theme variables supplied, because every
+ * extension ships — with media/theme.css in front of them, because every
  * colour in the stylesheet is a var(--vscode-*) that resolves to nothing outside
- * the editor.
+ * the editor. That sheet is what the headless board serves to a browser, so
+ * these pictures show what the remote board shows.
  *
  *   node test/screenshots.mjs [outDir]
  */
@@ -22,37 +23,16 @@ await fs.mkdir(outDir, { recursive: true })
 const css = await fs.readFile(path.join(repoRoot, 'media', 'board.css'), 'utf8')
 const js = await fs.readFile(path.join(repoRoot, 'media', 'board.js'), 'utf8')
 
-/** VS Code's Dark Modern, the default theme. Only the variables board.css uses. */
-const DARK = {
-  'font-family': '-apple-system, "Segoe UI", Ubuntu, "Droid Sans", sans-serif',
-  'font-size': '13px',
-  foreground: '#cccccc',
-  'editor-background': '#1f1f1f',
-  'editorWidget-background': '#202020',
-  'widget-border': '#313131',
-  'focusBorder': '#0078d4',
-  'list-hoverBackground': '#2a2d2e',
-  'menu-selectionBackground': '#04395e',
-  'button-background': '#0078d4',
-  'button-foreground': '#ffffff',
-  'button-hoverBackground': '#026ec1',
-  'input-background': '#313131',
-  'input-foreground': '#cccccc',
-  'input-border': '#3c3c3c',
-  'charts-green': '#89d185',
-  'charts-blue': '#3794ff',
-  'charts-yellow': '#cca700',
-  'charts-red': '#f14c4c',
-  'charts-purple': '#b180d7',
-  'editor-font-family': 'ui-monospace, "SF Mono", Menlo, monospace',
-  'scrollbarSlider-background': '#4f4f4f66',
-}
-const vars = Object.entries(DARK).map(([k, v]) => `--vscode-${k}: ${v};`).join('\n  ')
+/** The palette the browser gets: media/theme.css, the same sheet the headless
+ *  board serves. One source of truth rather than a private copy here — a copy
+ *  drifted once, listing "only the variables board.css uses" as of the day it
+ *  was written, and theme.test.mjs now keeps the real sheet complete. */
+const theme = await fs.readFile(path.join(repoRoot, 'media', 'theme.css'), 'utf8')
 
 const page_ = (layout, state) => `<!DOCTYPE html>
 <html lang="en" data-layout="${layout}">
 <head><meta charset="utf-8">
-<style>:root { ${vars} }</style>
+<style>${theme}</style>
 <style>${css}</style>
 </head>
 <body><div id="root"></div>

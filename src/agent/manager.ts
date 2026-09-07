@@ -30,25 +30,73 @@ import {
   type DecompositionRecord, type OrchestrationLevel, type OrchestrationPolicy,
   type ProposalNote, MAX_STATED,
 } from '../board/decomposition.ts'
+import {
+  agentKeyOf, describeSpawnAgents, resolveRoute,
+  type PieceRoute, type SpawnAgent, type SpawnCatalogue,
+} from './routing.ts'
+
+/** What a session runs on, per turn. The workspace default for a new session,
+ *  and — through `LaunchOptions.chosen` — the per-run choice that outranks it. */
+export interface RunSettings {
+  model?: string
+  effort?: EffortLevel
+  thinking?: ThinkingMode
+  /** Session flags. Offered only when the CLI says the model supports them —
+   *  see `ultracodeFor` — because the request path validates nothing. */
+  ultracode?: boolean
+  fastMode?: boolean
+}
+
+export interface AgentDefaults extends RunSettings {
+  /** How eagerly new sessions should split. Per session in the end; this is
+   *  the workspace default behind the composer bar's per-card choice. */
+  orchestration?: OrchestrationLevel
+  /** Which agent program new sessions run on. Per session in the end — the
+   *  whole point is that a Claude card and a Codex card sit on the same board
+   *  and run at the same time — this is only the default for a session that
+   *  does not say. */
+  runtime?: RuntimeId
+}
+
+/**
+ * Everything about a run that is decided when it is ASKED FOR, never when a
+ * slot frees.
+ *
+ * `startRun()` read `this.opts.defaults` and `this.opts.provider` after two
+ * awaits, `setDefaults()` and `setProvider()` replace that state wholesale, and
+ * `drain()` launches a queued run minutes later. `MAX_SUBTASKS` (4) exceeds the
+ * default concurrency (3), so **the fourth piece of a fan-out always drains
+ * late** — which means routing by mutating manager state hands one task another
+ * task's model, and a provider switch mid-fan-out runs half of it on a
+ * different backend with a different bill.
+ *
+ * This is "a value captured before an `await` must be re-checked after it"
+ * turned inside out: rather than re-reading, the answer is frozen once, in
+ * `start()`, into the queue entry that already exists.
+ *
+ * Pure, so the resolution order is testable without launching anything. Note
+ * `??` on the flags is only correct because their absent value is `undefined`
+ * and never `false`: a run that switched ultracode OFF must stay off under a
+ * workspace default that is on.
+ */
+export function launchSettings(opts: Pick<LaunchOptions, 'chosen'>, defaults: RunSettings): RunSettings {
+  const chosen = opts.chosen ?? {}
+  return {
+    ...(chosen.model ?? defaults.model ? { model: chosen.model ?? defaults.model } : {}),
+    ...(chosen.effort ?? defaults.effort ? { effort: chosen.effort ?? defaults.effort } : {}),
+    ...(chosen.thinking ?? defaults.thinking ? { thinking: chosen.thinking ?? defaults.thinking } : {}),
+    ...(chosen.ultracode ?? defaults.ultracode) !== undefined
+      ? { ultracode: chosen.ultracode ?? defaults.ultracode } : {},
+    ...(chosen.fastMode ?? defaults.fastMode) !== undefined
+      ? { fastMode: chosen.fastMode ?? defaults.fastMode } : {},
+  }
+}
 
 export interface ManagerOptions {
   store: SessionStore
   worktrees: WorktreeService
   board: BoardConfig
-  defaults: {
-    model?: string; effort?: EffortLevel; thinking?: ThinkingMode
-    /** Session flags. Offered only when the CLI says the model supports them —
-     *  see `ultracodeFor` — because the request path validates nothing. */
-    ultracode?: boolean; fastMode?: boolean
-    /** How eagerly new sessions should split. Per session in the end; this is
-     *  the workspace default behind the composer bar's per-card choice. */
-    orchestration?: OrchestrationLevel
-    /** Which agent program new sessions run on. Per session in the end — the
-     *  whole point is that a Claude card and a Codex card sit on the same board
-     *  and run at the same time — this is only the default for a session that
-     *  does not say. */
-    runtime?: RuntimeId
-  }
+  defaults: AgentDefaults
   /** All six the SDK accepts. It used to list four, and only compiled because
    *  extension.ts cast every value to 'acceptEdits' — a type that was a lie
    *  about values that were real at runtime. */
@@ -94,7 +142,10 @@ export interface ManagerOptions {
    */
   confirmSplit?: (
     parent: RunningAgent,
-    subtasks: readonly SubtaskSpec[],
+    /** RESOLVED, not as proposed: the dialog names the agent, backend and model
+     *  each piece will actually run on. A modal that showed the raw ask would
+     *  be asking the user to approve a plan and describing a different one. */
+    subtasks: readonly RoutedSubtask[],
     reason: string,
     /** Declared scopes two pieces share. Shown, never refused on: a prediction
      *  is not a contract, and refusing here would teach the model to
@@ -103,17 +154,37 @@ export interface ManagerOptions {
     notes: readonly ProposalNote[],
   ) => Promise<boolean>
   /**
-   * The models a spawned agent may run on — the host's spawn allowlist: what
-   * the active backend offers, minus what the user unticked on the settings
-   * page. Read FRESH at split time, because the policy can change between
-   * sessions while a tool description baked at launch is only ever policy.
+   * WHAT A SPAWNED SESSION MAY RUN ON: every agent program × backend
+   * combination on offer, each with the models the user has left ticked.
    *
-   * `split()` is the ONE place it is enforced: a spec may name a `model`, and
-   * a spec that names none inherits `defaults.model` — so the EFFECTIVE model
-   * is what is gated. Absent (unit tests, a host too old to supply it) means
-   * no gate, which is the pre-existing behaviour.
+   * Read FRESH at split time, because the policy can change between sessions
+   * while a tool description baked at launch is only ever policy. `split()` is
+   * the ONE place it is enforced — the description names the allowed set, this
+   * is the fence.
+   *
+   * It replaced a flat `() => string[]` of the ACTIVE backend's models, and the
+   * flatness was the bug: a piece routed to another backend had its model id
+   * checked against the wrong catalogue, so `deepseek-reasoner` passed a gate
+   * built from Anthropic's list and the child 404'd on its first request with
+   * somebody else's error message.
+   *
+   * Absent (unit tests, a host too old to supply it) means no gate, which is
+   * the pre-existing behaviour and is why `smoke.mjs` asserts the real host
+   * supplies one.
    */
-  spawnModels?: () => string[]
+  spawnCatalogue?: () => SpawnCatalogue
+  /**
+   * Turn a backend profile id into the environment patch it amounts to.
+   *
+   * Host-side because it reads `SecretStorage`, and this file never touches a
+   * credential — the same division `providerEnv` already has. Called once per
+   * routed child, before it launches, so a subtask on another backend gets
+   * that backend's environment rather than the workspace's active one.
+   *
+   * Absent means children inherit the active profile exactly as they used to,
+   * which is the behaviour every unit test here expects.
+   */
+  resolveProvider?: (profileId: string) => Promise<LaunchOptions['providerFor']>
   /**
    * The board's scheduled runs, behind callbacks into the host.
    *
@@ -238,29 +309,49 @@ export interface SubtaskSpec {
   tags?: string[]
   /**
    * The model this subtask asks to run on — the per-piece half of the routing
-   * reserved in `PieceRouting`. Gated by the spawn allowlist in `split()`
-   * before anyone is asked to approve anything; absent means the child runs
-   * on the default for new sessions.
+   * reserved for routing. Gated in `split()` before anyone is asked to approve
+   * anything; absent means the child runs on the default for new sessions.
    */
   model?: string
+  /**
+   * WHICH AGENT PROGRAM AND BACKEND this piece asks for: a `<runtime>|<profile>`
+   * slug from the tool description. Absent means the parent's whole agent —
+   * runtime AND backend, which is the half that used to be dropped.
+   */
+  agent?: string
+  /** The effort level this piece asks for. Raw, because the model wrote it, and
+   *  refused rather than dropped when the target model cannot take it. */
+  effort?: string
+}
+
+/** A piece whose routing has been resolved and checked. What the approval
+ *  dialog is shown, so the modal names the agent, backend and model that will
+ *  actually be started rather than repeating the workspace default back. */
+export interface RoutedSubtask extends SubtaskSpec {
+  route: PieceRoute
 }
 
 export type SplitResult =
   | { ok: true; started: { key: string; title: string; branch: string }[] }
   | { ok: false; message: string }
 
-interface LaunchOptions {
+export interface LaunchOptions {
   /**
-   * What this session is already running on, resolved once by `launch()`.
+   * WHAT THIS RUN IS ON, resolved once — by `start()`, at the moment it was
+   * asked for, not by `launch()` when a slot frees. See `launchSettings()`.
    *
    * A resumed session keeps ITS model, effort and thinking, not the workspace
    * default — otherwise picking a model on a card is a control that reverts the
    * moment the card is reopened, and resuming a DeepSeek session on a day when
    * the default is Opus would move it to a backend's model it has never used.
+   * A SPLIT child keeps the route its parent proposed for it, for the stronger
+   * version of the same reason: the fourth piece of a fan-out always drains
+   * late, so a route read at launch is a route another piece may have replaced.
+   *
    * Resolved in one place so the values recorded on the card and the values
    * handed to the runtime cannot disagree.
    */
-  chosen?: { model?: string; effort?: EffortLevel; thinking?: ThinkingMode }
+  chosen?: RunSettings
   /** Resume a Claude Code session (and reuse its worktree). */
   resume?: string
   title?: string
@@ -297,6 +388,17 @@ export interface RunningAgent {
   /** Which agent program is running this. Fixed for the life of the session:
    *  the transcript, the model ids and the login all belong to it. */
   runtime: RuntimeId
+  /**
+   * WHICH BACKEND it is on: the provider profile id, `''` for a runtime that
+   * signs in as itself.
+   *
+   * Beside `runtime` because the two together are what a session runs on, and
+   * carrying only one of them is what let `split()` hand every child the
+   * parent's agent PROGRAM and the workspace's active BACKEND. `providerLabel`
+   * below is a different thing — what the CLI said it resolved to, which can
+   * disagree with this and is drawn as an amber note when it does.
+   */
+  provider?: string
   /** Set once the runtime assigns one. Until then the card is keyed by runId. */
   sessionId?: string
   title: string
@@ -487,7 +589,7 @@ export class AgentManager extends EventEmitter {
    */
   get activeCount(): number {
     return this.launching.size + [...this.agents.values()].filter(
-      (a) => ['working', 'starting', 'needsInput'].includes(a.state.kind),
+      (a) => ['working', 'starting', 'needsInput', 'waiting'].includes(a.state.kind),
     ).length
   }
 
@@ -501,9 +603,30 @@ export class AgentManager extends EventEmitter {
   /** This manager is being torn down. Latched, never cleared. */
   private stopped = false
 
-  /** Start a new session from a prompt. Returns the local run id immediately. */
+  /**
+   * Start a new session from a prompt. Returns the local run id immediately.
+   *
+   * Everything about WHAT IT RUNS ON is frozen here, before the concurrency
+   * check, so a run that waits in the queue launches on what was chosen when it
+   * was asked for. See `launchSettings()` for the failure that fixes.
+   */
   async start(prompt: string, opts: LaunchOptions = {}): Promise<string> {
     const runId = `run-${++this.counter}-${Date.now().toString(36)}`
+    opts = {
+      ...opts,
+      chosen: launchSettings(opts, this.opts.defaults),
+      orchestration: opts.orchestration ?? this.opts.defaults.orchestration ?? DEFAULT_ORCHESTRATION,
+      runtime: opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME,
+      // The BACKEND, frozen with the rest. A resumed session already brings its
+      // own and a routed subtask brings the one its route named; anything else
+      // takes the profile that was active at this moment, rather than whichever
+      // one is active when a slot frees.
+      ...(opts.providerFor || !this.opts.provider
+        || !getRuntime(opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME)
+             ?.capabilities.providerProfiles
+        ? {}
+        : { providerFor: { profile: this.opts.provider, env: this.opts.providerEnv ?? { set: {}, clear: [] } } }),
+    }
     if (this.activeCount >= this.opts.maxConcurrent) {
       this.queue.push({ runId, prompt, opts })
       /* A queued run gets a CARD, and that is the whole fix for two separate
@@ -519,13 +642,17 @@ export class AgentManager extends EventEmitter {
          be a path the review panel could try to open. `launch()` fills them in. */
       this.agents.set(runId, {
         runId,
-        runtime: opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME,
+        runtime: opts.runtime ?? DEFAULT_RUNTIME,
         title: opts.title ?? titleFrom(prompt),
         state: { kind: 'queued', since: Date.now() },
         worktreePath: '', branch: '',
         live: [{ kind: 'prompt', at: Date.now(), text: prompt }],
         history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
         ...(opts.parent ? { parent: opts.parent } : {}),
+        // A queued card already knows its backend, so the composer describes
+        // the session rather than the workspace while it waits — and `split()`
+        // can read a queued parent's whole agent.
+        ...(opts.providerFor ? { provider: opts.providerFor.profile.id } : {}),
       })
       this.touch()
       return runId
@@ -633,49 +760,56 @@ export class AgentManager extends EventEmitter {
       })
       return { ok: false, message: verdict.message }
     }
-    const specs: SubtaskSpec[] = verdict.pieces.map((p) => ({
-      title: p.title,
-      prompt: p.prompt,
-      ...(p.scope?.length ? { scope: p.scope } : {}),
-      ...(p.tags?.length ? { tags: p.tags } : {}),
-      ...(p.model ? { model: p.model } : {}),
-    }))
+    /* WHERE EACH PIECE RUNS, resolved and checked HERE: after the proposal is
+       known to be structurally sound, and before the user is asked to approve
+       it — a modal should never ask about a plan the host already knows it will
+       refuse. The tool description names the allowed agents and models, but a
+       description is policy; this is the fence, and the only one.
 
-    // The spawn-model allowlist, and it has to be HERE: after the proposal is
-    // known to be structurally sound, before the user is asked to approve it —
-    // a modal should never ask about a plan the host already knows it will
-    // refuse. The tool description names the allowed models, but a description
-    // is policy; this is the fence, and the only one. A spec that names no
-    // model inherits the default for new sessions, so the EFFECTIVE model is
-    // what is gated — unticking the default on the settings page means "not
-    // even on my default", and an empty allowed set refuses every split.
-    const spawnAllowed = this.opts.spawnModels?.()
-    if (spawnAllowed) {
-      const offender = spawnAllowed.length === 0
-        ? specs[0]
-        : specs.find((s) => {
-            const effective = s.model ?? this.opts.defaults.model
-            return effective !== undefined && !spawnAllowed.includes(effective)
-          })
-      if (offender) {
-        const effective = offender.model ?? this.opts.defaults.model
-        const message = spawnAllowed.length === 0
-          ? 'No model is allowed for spawned agents right now — the user unticked every one ' +
-            'on the settings page. Do the work yourself, or ask the user to re-tick a model.'
-          : `Spawned agents may only run on: ${spawnAllowed.join(', ')}. ` +
-            `"${offender.title}" would run on ${effective ?? 'the runtime default'}` +
-            `${offender.model ? '' : ' (the default for new sessions)'}, which is not allowed. ` +
-            'Name one of the allowed models instead, or do the work yourself.'
-        // RECORDED like the proposal refusals above: a session that tried to
-        // split, was refused, and did the work alone must not be byte-identical
-        // on the board to the correct adaptive outcome.
+       The parent's WHOLE agent is the default for a piece that names none —
+       runtime AND backend. Passing only the runtime is what made a DeepSeek
+       objective fan out into children on whatever profile happened to be
+       active: a different backend, different model ids, a different bill, and
+       nothing on the board saying so. See `routing.ts`.
+
+       Read FRESH, because the policy can change between sessions while a tool
+       description baked at launch is only ever policy. */
+    const parentRoute = { runtime: parent.runtime, provider: parent.provider ?? '' }
+    const catalogue = this.opts.spawnCatalogue?.()
+    const specs: RoutedSubtask[] = []
+    for (const p of verdict.pieces) {
+      const routed = resolveRoute(
+        {
+          ...(p.agent ? { agent: p.agent } : {}),
+          ...(p.model ? { model: p.model } : {}),
+          ...(p.effort ? { effort: p.effort } : {}),
+        },
+        parentRoute,
+        catalogue,
+        this.opts.defaults.model,
+      )
+      if (!routed.ok) {
+        // RECORDED like every other refusal: a session that tried to route, was
+        // refused, and did the work alone must not be byte-identical on the
+        // board to the correct adaptive outcome. Each rule is separate because
+        // each has a different fix.
         await this.recordDecomposition(parentKey, {
           at: Date.now(), level, outcome: 'refused',
-          requested: subtasks.length, rule: 'spawn-model',
+          requested: subtasks.length, rule: routed.rule,
           ...(reason.trim() ? { stated: reason.trim().slice(0, MAX_STATED) } : {}),
         })
-        return { ok: false, message }
+        return { ok: false, message: `"${p.title}" cannot be routed. ${routed.message}` }
       }
+      specs.push({
+        title: p.title,
+        prompt: p.prompt,
+        ...(p.scope?.length ? { scope: p.scope } : {}),
+        ...(p.tags?.length ? { tags: p.tags } : {}),
+        ...(p.model ? { model: p.model } : {}),
+        ...(p.agent ? { agent: p.agent } : {}),
+        ...(p.effort ? { effort: p.effort } : {}),
+        route: routed.route,
+      })
     }
 
     // The real approval gate, and it has to be here.
@@ -719,23 +853,47 @@ export class AgentManager extends EventEmitter {
       ...(reason.trim() ? { stated: reason.trim().slice(0, MAX_STATED) } : {}),
     })
     const started: { key: string; title: string; branch: string }[] = []
+    /* One resolution per backend, not per piece: `resolveProvider` reads
+       SecretStorage, and a four-way fan-out onto one backend would read the
+       same credential four times. */
+    const envFor = new Map<string, LaunchOptions['providerFor']>()
     for (const spec of specs) {
+      // The BACKEND, resolved by the host — the manager never touches a
+      // credential. Handed in explicitly rather than left to `start()`, which
+      // would freeze whichever profile happens to be active: that is the whole
+      // bug this route exists to fix. A runtime with no backend concept gets
+      // nothing, because pairing it with a profile would configure something
+      // that cannot take effect.
+      if (spec.route.provider && !envFor.has(spec.route.provider)) {
+        envFor.set(spec.route.provider, await this.opts.resolveProvider?.(spec.route.provider))
+      }
+      const providerFor = spec.route.provider ? envFor.get(spec.route.provider) : undefined
       const runId = await this.start(spec.prompt, {
         title: spec.title,
         parent: parentKey,
-        // The model the spec named — already vetted by the allowlist gate
-        // above, which is the ONE place a model from an agent is checked.
-        // `chosen` rather than `defaults`, exactly like a resumed session:
-        // what the card shows and what the runtime is handed must be the
-        // same value, resolved once.
-        ...(spec.model ? { chosen: { model: spec.model } } : {}),
+        /* WHAT THIS CHILD RUNS ON, all of it, captured in the launch options —
+           never by mutating manager state, because `MAX_SUBTASKS` (4) exceeds
+           the default concurrency (3) and the fourth piece always drains late.
+           Routing through `setDefaults()` would hand that piece another
+           piece's model. `chosen` rather than `defaults`, exactly like a
+           resumed session: what the card shows and what the runtime is handed
+           must be the same value, resolved once. */
+        ...(spec.route.model || spec.route.effort
+          ? {
+              chosen: {
+                ...(spec.route.model ? { model: spec.route.model } : {}),
+                ...(spec.route.effort ? { effort: spec.route.effort } : {}),
+              },
+            }
+          : {}),
+        ...(providerFor ? { providerFor } : {}),
         ...(parent.base ? { base: parent.base } : {}),
         // A child inherits the PARENT's agent program, not the workspace
         // default. `split()` passed no runtime, so `launch()` fell through to
         // `defaults.runtime` — and a Codex objective's children ran on Claude
         // whenever that was the workspace default, permanently, because a
         // session keeps the runtime it started on.
-        runtime: parent.runtime,
+        runtime: spec.route.runtime,
       })
       if (spec.tags?.length) {
         await this.opts.store.setTags(runId, spec.tags).catch(() => {})
@@ -844,7 +1002,7 @@ export class AgentManager extends EventEmitter {
       // cannot update text the model has already read — which is fine, because
       // a description is policy and `split()` re-reads the allowlist at gate
       // time. This is the same division the orchestration level already has.
-      spawnModels: this.opts.spawnModels?.(),
+      spawnAgents: this.opts.spawnCatalogue?.().agents,
       onChanged: (change?: BoardChange) => {
         if (change?.phase) {
           agent.live.push({
@@ -1035,14 +1193,25 @@ export class AgentManager extends EventEmitter {
 
     /* Resolved ONCE, here, because two places need the same answer: the runtime
        that is about to be started, and the sidecar entry that records what this
-       card is on. Computing it twice is how they come to disagree. */
-    const chosen = {
-      ...(prior?.model ?? this.opts.defaults.model
-        ? { model: prior?.model ?? this.opts.defaults.model } : {}),
-      ...(resolveEffort(prior?.effort, this.opts.defaults.effort)
-        ? { effort: resolveEffort(prior?.effort, this.opts.defaults.effort) } : {}),
-      thinking: resolveThinking(prior?.thinking, this.opts.defaults.thinking),
-    }
+       card is on. Computing it twice is how they come to disagree.
+       `opts.chosen` is the answer `start()` already froze — the per-run choice
+       resolved against the workspace default at the moment the run was asked
+       for. This used to read `this.opts.defaults` DIRECTLY and so overwrote it,
+       which meant a subtask routed to a particular model launched on the
+       workspace default instead and the card recorded that default as fact. */
+    const chosen = launchSettings({
+      chosen: opts.resume
+        // A resumed session keeps what IT was on. The frozen launch settings
+        // are the floor under a field its sidecar never recorded.
+        ? {
+            ...opts.chosen,
+            ...(prior?.model ? { model: prior.model } : {}),
+            ...(resolveEffort(prior?.effort, opts.chosen?.effort)
+              ? { effort: resolveEffort(prior?.effort, opts.chosen?.effort) } : {}),
+            thinking: resolveThinking(prior?.thinking, opts.chosen?.thinking),
+          }
+        : opts.chosen,
+    }, this.opts.defaults)
 
     if (chosen.model) agent.model = chosen.model
 
@@ -1140,6 +1309,20 @@ export class AgentManager extends EventEmitter {
       agent.live.push({
         kind: 'notice', at: Date.now(), urgency: 'info',
         message: 'Interrupted. The session is still open — send another message to carry on.',
+      })
+      this.touch()
+    })
+    session.on('waiting', (on: string[]) => {
+      // Said in the transcript, because from the outside this looks exactly
+      // like the agent stopping: its text ended, the spinner would have gone,
+      // and the next thing to appear is a turn nobody typed a prompt for.
+      delete agent.streaming
+      agent.live.push({
+        kind: 'notice', at: Date.now(), urgency: 'info',
+        message: on.length
+          ? `Turn ended, but ${on.length} background agent${on.length === 1 ? '' : 's'} ${on.length === 1 ? 'is' : 'are'} still working (${on.join(', ')}). ` +
+            'The session stays open and will continue when they report back.'
+          : 'Turn ended. A background agent has reported back — the session is picking its findings up now.',
       })
       this.touch()
     })
@@ -1380,9 +1563,19 @@ export class AgentManager extends EventEmitter {
           ...(launchEnv?.clear?.length ? { envClear: launchEnv.clear } : {}),
         }
       : {}
+    // Recorded on the live card, not only in the sidecar: `split()` reads the
+    // parent's WHOLE agent off `RunningAgent`, and the sidecar entry does not
+    // exist until the runtime hands over a session id — which is after the
+    // first turn, and a parent can be split from before then.
+    agent.provider = rt.capabilities.providerProfiles ? (launchProfile?.id ?? '') : ''
 
-    // The SESSION's, when it has one — see `LaunchOptions.chosen`.
-    const effort = opts.chosen?.effort ?? resolveEffort(undefined, this.opts.defaults.effort)
+    /* WHAT THIS RUN IS ON, resolved once. `start()` froze it into `opts` at the
+       moment the run was asked for; this call is the floor under a caller that
+       reached `launch()` directly. Reading `this.opts.defaults` here as the
+       primary source is what let a queued run — and always the fourth piece of
+       a fan-out — launch on a model nobody picked for it. */
+    const settings = launchSettings(opts, this.opts.defaults)
+    const effort = settings.effort ?? resolveEffort(undefined, undefined)
     /* The level, captured HERE and remembered on the card.
        `buildBrief()` bakes the matching sentence into the system prompt once,
        and the split arrives a turn later — so the gate must read what the brief
@@ -1393,13 +1586,14 @@ export class AgentManager extends EventEmitter {
     agent.orchestration = level
     // A subtask may not split again, so it is not told how eagerly to.
     const canSplit = !opts.parent && !agent.parent
+    const spawnAgents = canSplit ? this.opts.spawnCatalogue?.().agents : undefined
     return rt.start({
       taskId: runId,
       cwd: wt.path,
       permissionMode: this.opts.permissionMode,
       executable: location.command,
       appendSystemPrompt: buildBrief(
-        this.opts.board, title, wt.branch, policyFor(level), canSplit, this.opts.spawnModels?.(),
+        this.opts.board, title, wt.branch, policyFor(level), canSplit, spawnAgents,
       ),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
@@ -1410,17 +1604,16 @@ export class AgentManager extends EventEmitter {
       // spread into a typed argument gets no excess-property check, so an
       // undeclared one compiles and is dropped in silence.
       ...(this.opts.modelBook ? { modelBook: this.opts.modelBook } : {}),
-      ...(opts.chosen?.model ?? this.opts.defaults.model
-        ? { model: opts.chosen?.model ?? this.opts.defaults.model } : {}),
+      ...(settings.model ? { model: settings.model } : {}),
       ...(effort ? { effort } : {}),
       // Only sent when the runtime has the concept. `thinking` is Claude's
       // adaptive-thinking switch; Codex expresses the same thing through effort
       // and would be receiving an option it has no meaning for.
       ...(rt.capabilities.thinkingToggle
-        && (opts.chosen?.thinking ?? resolveThinking(undefined, this.opts.defaults.thinking)) === 'disabled'
+        && resolveThinking(undefined, settings.thinking) === 'disabled'
         ? { thinking: 'disabled' as const } : {}),
-      ...(this.opts.defaults.ultracode ? { ultracode: true } : {}),
-      ...(this.opts.defaults.fastMode ? { fastMode: true } : {}),
+      ...(settings.ultracode ? { ultracode: true } : {}),
+      ...(settings.fastMode ? { fastMode: true } : {}),
     })
   }
 
@@ -1685,10 +1878,10 @@ export function buildBrief(
   branch: string,
   policy: OrchestrationPolicy = policyFor(DEFAULT_ORCHESTRATION),
   canSplit = true,
-  /** The spawn allowlist, for the split paragraph: the models a subtask may
-   *  name. Omitted (the usual test case, or a host without the policy) leaves
-   *  the paragraph as it always was. */
-  spawnModels?: string[],
+  /** What a subtask may be routed to: the agent programs and backends on
+   *  offer, each with the models it serves. Omitted (the usual test case, or a
+   *  host without the policy) leaves the paragraph as it always was. */
+  spawnAgents?: SpawnAgent[],
 ): string {
   const started = board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'
   const review = board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
@@ -1702,6 +1895,20 @@ export function buildBrief(
     'Keep your card honest with the `set_phase` tool:',
     `- Move to "${started}" as soon as you start changing code.`,
     `- Move to "${review}" when the work is done but not committed, then stop.`,
+    '',
+    // The brief is `appendSystemPrompt`, so it is present for the whole session
+    // — and being present is not the same as outranking. A project's own slash
+    // command ended its procedure with "Then STOP. A human reviews and merges."
+    // The agent obeyed the specific, procedural terminal step and treated
+    // moving its card as extra work it had been told to skip, so finished work
+    // sat in the started column and the user never got the test plan that
+    // reaching a review column exists to produce. Named here explicitly,
+    // because a generic instruction loses to a specific one every time.
+    'Moving your card is not extra work and it is not a step you can be told to skip —',
+    'it is how a run ENDS.',
+    // One line, deliberately: the assertion that guards this matches the whole
+    // claim, and a line break in the middle of it made the guard silently miss.
+    'If a command, skill or instruction tells you to stop, call `set_phase` first, then stop.',
     '',
     `Moving to "${review}" means "your turn to check it", so it REQUIRES \`howToTest\`:`,
     'a one-line summary, the concrete steps, and links to the files you changed and',
@@ -1732,12 +1939,22 @@ export function buildBrief(
           // The spawn allowlist. A sentence, not the fence — `split()` re-reads
           // the policy at gate time, so this can only ever be a stale but honest
           // answer, never a wrong one that passes.
-          ...(spawnModels
+          //
+          // It names the AGENTS and not just their models, because those are
+          // the two halves of one question: a model id belongs to a backend,
+          // and the composer already learned that offering them as two pickers
+          // makes the user do a cross product in their head and shows half the
+          // answer on screen. A subtask picks a row, not a pair.
+          ...(spawnAgents
             ? ['',
-               spawnModels.length
-                 ? `Spawned agents may only run on: ${spawnModels.join(', ')}. ` +
-                   'If you split, name each subtask\'s `model` from that list.'
-                 : 'No model is currently allowed for spawned agents, so `split_task` will be refused.',
+               ...(spawnAgents.length
+                 ? ['Spawned agents may only run on these — pick one per subtask by its short name,',
+                    'and name a `model` it serves. A subtask that names neither runs on this',
+                    "session's own agent and backend:",
+                    describeSpawnAgents(spawnAgents),
+                    'A subtask stays on the agent it starts on for life, so route it to the one',
+                    'whose strengths the work needs.']
+                 : ['No model is currently allowed for spawned agents, so `split_task` will be refused.']),
               ]
             : []),
         ]

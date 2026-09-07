@@ -15,7 +15,7 @@
  * would notice.
  */
 import {
-  aimSentence, checkProposal, decompositionLine, DEFAULT_ORCHESTRATION,
+  aimSentence, checkProposal, decompositionLine, DEFAULT_ORCHESTRATION, ALL_PROPOSAL_RULES,
   ORCHESTRATION_CHOICES, ORCHESTRATION_LEVELS, parseOrchestrationLevel, policyFor,
   MAX_BRIEF, type OrchestrationLevel, type PieceProposal,
 } from '../decomposition.ts'
@@ -240,6 +240,62 @@ for (const level of ORCHESTRATION_LEVELS) {
   ok(/Split into 3 subtasks/.test(
     decompositionLine({ at: 1, level: 'maximum', outcome: 'split', requested: 4 }, 3)),
      'a split reports what started, not what was proposed')
+
+  // Every rule renders, and each new one has its OWN sentence — because each
+  // has its own fix. A rule with no case here falls through to "the split was
+  // declined", which is the feature working and the feature broken rendering
+  // the same, on the one record that exists to tell them apart.
+  {
+    const lines = ALL_PROPOSAL_RULES.map((rule) =>
+      decompositionLine({ at: 1, level: 'balanced', outcome: 'refused', requested: 2, rule }, undefined))
+    ok(lines.every((l) => l.startsWith('Kept as one agent —') && l.length > 24),
+       'every proposal rule has an explanation')
+    ok(new Set(lines).size === lines.length,
+       `and no two rules render identically (${lines.length - new Set(lines).size} collisions)`)
+    ok(!lines.some((l) => /the split was declined/.test(l)),
+       'so none of them reaches the fallback sentence')
+  }
+}
+
+// --- what a piece may ask to run on -----------------------------------------
+//
+// `agent` and `effort` are model-written strings that reach the routing gate,
+// so they are bounded and trimmed HERE, before any refusal message can quote
+// them. A length asked for in a schema is not a limit — that is why `prompt`
+// has a cap in this file at all.
+{
+  const piece = (extra: Record<string, unknown>) => ({
+    title: 'Add SSO', prompt: 'Add SSO.', scope: ['src/auth/'], ...extra,
+  })
+  const second = { title: 'Fix test', prompt: 'Fix it.', scope: ['t.test.ts'] }
+
+  const v = checkProposal(
+    [piece({ agent: '  deepseek  ', effort: ' high ', model: ' deepseek-chat ' }), second],
+    policyFor('balanced'), 4,
+  )
+  ok(v.ok === true, 'a proposal that names an agent, a model and an effort is structurally fine')
+  ok(v.ok && v.pieces[0]!.agent === 'deepseek', 'the agent is trimmed')
+  ok(v.ok && v.pieces[0]!.effort === 'high', 'so is the effort')
+  ok(v.ok && v.pieces[0]!.model === 'deepseek-chat', 'and the model, as before')
+
+  const wild = checkProposal([piece({ agent: 'x'.repeat(500), effort: 'y'.repeat(500) }), second],
+                             policyFor('balanced'), 4)
+  ok(wild.ok === true && (wild.pieces[0]!.agent ?? '').length <= 200,
+     `an unbounded agent name is truncated, never quoted whole into a refusal (${(wild.ok && wild.pieces[0]!.agent?.length) ?? 'absent'})`)
+  ok(wild.ok === true && (wild.pieces[0]!.effort ?? '').length <= 200,
+     'and so is an unbounded effort')
+
+  const blank = checkProposal([piece({ agent: '   ', effort: '' }), second], policyFor('balanced'), 4)
+  ok(blank.ok === true && blank.pieces[0]!.agent === undefined,
+     'a blank agent is ABSENT, not an empty string — absent means "inherit the parent\'s"')
+  ok(blank.ok === true && blank.pieces[0]!.effort === undefined, 'and a blank effort is absent too')
+
+  // `checkProposal` stays pure of the catalogue. Whether `deepseek` is a real
+  // agent is a question about host state, and this function is deliberately
+  // testable without any — the same division `spawn-model` already has.
+  const nonsense = checkProposal([piece({ agent: 'not-an-agent' }), second], policyFor('balanced'), 4)
+  ok(nonsense.ok === true,
+     'an agent this function cannot verify is passed along, not refused — the gate is host-side')
 }
 
 console.log(fails === 0

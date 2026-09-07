@@ -28,6 +28,11 @@ extension's own webview document, with two additions:
   on every request, plus as a `?code=` query parameter on the event stream
   (an `EventSource` cannot set headers). The server compares sha-256 digests
   with `timingSafeEqual`, so the code never sits on disk or in a log.
+- `media/theme.css` supplies the **theme**. The board's stylesheets take every
+  colour from `--vscode-*` variables, which VS Code sets and a browser does not;
+  this sheet is the editor's Dark Modern palette on `:root`, loaded before them,
+  so the page is the editor's dark board rather than a white document. Dark only,
+  by design — the editor is where a theme is chosen.
 
 Because the host half is the real extension, every message the extension
 understands works — there is no second code path to drift.

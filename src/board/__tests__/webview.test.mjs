@@ -578,6 +578,95 @@ ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.int
   ok(!v4.text().includes('selected'), 'Clear empties the selection')
 }
 
+// 7c. Background agents a session spawned, and whether they can still be alive.
+//
+// Reported as "I thought they are still working but they weren't". Two agents
+// were launched, the parent's turn ended, and the board showed nothing at all.
+// The rule this breaks is the one the context meter already follows: what the
+// board shows must not depend on a process being alive.
+{
+  const now = Date.now()
+  const AG = [
+    { id: 'ac5028c484a2bcf9d', description: 'Independent PR assessment A',
+      agentType: 'general-purpose', lastFrameAt: now - 4 * 60000, status: 'orphaned' },
+    { id: 'a5a952bd7b5f05939', description: 'Independent PR assessment B',
+      agentType: 'general-purpose', lastFrameAt: now - 4 * 60000, status: 'orphaned' },
+  ]
+  const v = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], backgroundAgents: AG })
+  const t = v.text()
+  ok(t.includes('Background agents'), 'the panel is drawn when a session spawned some')
+  ok(t.includes('Independent PR assessment A') && t.includes('Independent PR assessment B'),
+     'every agent is named')
+  // The AGE, never a bare dot: a dot pulses over a wedged process too, and the
+  // number is the thing the reader can check.
+  ok(/4m/.test(t), `each carries the age of its last frame: ${/last wrote[^,)]*/.exec(t)?.[0] ?? 'MISSING'}`)
+  // The exact wording matters. We know there is no completion record; we do NOT
+  // know it failed, and "stopped" would assert an outcome nobody reported.
+  // Read off the ROW, not the panel: the summary line above also carries the
+  // phrase, so a text-wide regex stayed green with every row mislabelled.
+  const states = (view) => walkAll(view.root)
+    .filter((n) => n.className === 'agent-state').map((n) => n.textContent)
+  ok(states(v).every((x) => /no completion recorded/i.test(x)),
+     `each orphaned ROW says what is actually known: ${JSON.stringify(states(v))}`)
+
+  // A live one reads differently, and a wedged live one is visible BECAUSE the
+  // age is on screen rather than a status word.
+  const live = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    backgroundAgents: [
+      { id: 'x', description: 'Fast one', lastFrameAt: now - 3000, status: 'running' },
+      { id: 'y', description: 'Wedged one', lastFrameAt: now - 9 * 60000, status: 'running' },
+    ],
+  })
+  ok(/9m/.test(live.text()),
+     'a live agent that has written nothing for nine minutes shows exactly that')
+  ok(states(live).every((x) => !/no completion/i.test(x)),
+     `and a live one is not described as having no completion: ${JSON.stringify(states(live))}`)
+
+  const done = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    backgroundAgents: [{ id: 'z', description: 'Finished one', lastFrameAt: now - 60000, status: 'completed' }],
+  })
+  ok(states(done).join() === 'completed', `a reported completion is shown as one: ${JSON.stringify(states(done))}`)
+
+  ok(!run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [] }).text().includes('Background agents'),
+     'and a session that spawned none grows no panel')
+
+  // The card badge: the point is noticing WITHOUT opening the chat.
+  const badged = run({
+    ...base,
+    cards: [{ ...CARD, agent: undefined, agents: { total: 2, running: 0, orphaned: 2 } }],
+  })
+  ok(/2 background agents/i.test(badged.text()),
+     `the card says how many: ${/\d+ background agents[^,]*/i.exec(badged.text())?.[0] ?? 'MISSING'}`)
+  ok(/no completion/i.test(badged.text()), 'and that none of them reported finishing')
+  const working = run({
+    ...base,
+    cards: [{ ...CARD, agents: { total: 2, running: 2, orphaned: 0 } }],
+  })
+  ok(/2 background agents/i.test(working.text()) && !/no completion/i.test(working.text()),
+     'while agents that may still be working are counted without the warning')
+
+  // The panel appears MID-RUN, between two streaming frames — an agent is
+  // spawned while the parent is talking. A frame whose `chromeSig()` does not
+  // mention it takes the fast path, patches the transcript only, and the panel
+  // never draws. Same failure as the merge banner, in a new place.
+  const stream = (extra = {}) => ({
+    ...base, mode: 'chat', selectedKey: 'abc-123',
+    transcript: [{ kind: 'text', at: CARD.updated, text: 'spawning' }],
+    streaming: 'Hel', ...extra,
+  })
+  const sv = run(stream())
+  ok(!sv.text().includes('Background agents'), 'no panel before any agent exists')
+  sv.deliver(stream({ streaming: 'Hello', backgroundAgents: AG }))
+  ok(sv.text().includes('Background agents'),
+     'an agent spawned between two streaming frames still draws its panel')
+  // And the status settling — running to completed — must repaint too, or the
+  // panel says "working" over an agent that finished ten minutes ago.
+  sv.deliver(stream({ streaming: 'Hello!', backgroundAgents: [{ ...AG[0], status: 'completed' }] }))
+  ok(/complete/i.test(sv.text()), 'and a status that settles mid-stream is redrawn')
+}
+
 // 8a. A run that ENDED and left its card in a started column.
 //
 // Two real cards sat in Implementing with the work finished — PR open, tests
@@ -599,11 +688,28 @@ ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.int
   ok(t.includes('Stopped'), `a stalled card says the agent stopped: ${/Stopped[^A-Z]*/.exec(t)?.[0] ?? 'MISSING'}`)
   ok(/24m/.test(t), `and how long ago, not just that it did (${/Stopped \S+ \S+/.exec(t)?.[0]})`)
 
-  const hand = findButton(v.root, 'Move to Validating')
-  ok(!!hand, 'and offers to hand the work back in one click')
+  // The PRIMARY action asks the agent for the test plan, because moving the card
+  // by hand produces no `howToTest` — and that plan is the whole reason a review
+  // column exists. Reported exactly that way: "it should have moved to
+  // validation and gave me the test guide, but since it's stuck in implementing
+  // I will never get that."
+  const ask = findButton(v.root, 'Ask for test plan')
+  ok(!!ask, 'a stalled card offers to ask the agent for the test plan')
+  ask?.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(v.posted.some((m) => m.type === 'askTestPlan' && m.id === 'abc-123'),
+     'which posts askTestPlan for that session')
+
+  const hand = findButton(v.root, 'Move anyway')
+  ok(!!hand, 'and moving it by hand is still there for when you do not want to spend a turn')
   hand?.onclick({ stopPropagation() {}, preventDefault() {} })
   ok(v.posted.some((m) => m.type === 'move' && m.id === 'abc-123' && m.phase === 'validating'),
      'which posts a move to the review column')
+
+  // Asking costs a turn on a real agent, so it must not be offered where it
+  // cannot work: a card with no worktree has no session to resume.
+  const noWt = run({ ...withReview, cards: [{ ...CARD, agent: undefined, stalled: STOPPED }] })
+  ok(!findButton(noWt.root, 'Ask for test plan'),
+     'a session with no worktree is not offered a turn it cannot take')
 
   // A working card must NOT wear it: that is the whole distinction being drawn.
   ok(!run({ ...withReview, cards: [{ ...CARD, worktree: '/tmp/w', stalled: STOPPED }] }).text().includes('Stopped'),
@@ -1999,7 +2105,16 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
     composer: LOCKED,
   })
   const t = v.text()
-  ok(t.includes('🤖 Claude Code'), 'a started session names its agent program')
+  // The chip is a .ctl with the glyph in its own fixed slot and the name in a
+  // label span, so the two are siblings rather than one string — which is what
+  // stops an emoji making this chip taller than the chips beside it.
+  const lockedChip = (function find(n) {
+    if ((n.className || '').split(' ').includes('static')) return n
+    for (const c of n.children ?? []) { const hit = find(c); if (hit) return hit }
+    return null
+  })(v.root)
+  ok(!!lockedChip && lockedChip.textContent.includes('Claude Code') && lockedChip.textContent.includes('🤖'),
+     'a started session names its agent program, as a readout chip with the agent glyph in its icon slot')
   ok(t.includes('Backend: OpenRouter'), 'and beside it, a picker naming the backend it is on')
   const chip = findButton(v.root, 'Backend: OpenRouter')
   ok(!!chip, 'the backend is a control, not a readout')
@@ -2032,6 +2147,31 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
   })
   ok(!only.text().includes('Backend:'),
      'a session on the only combination its agent has gets no backend picker — there is nothing to switch to')
+}
+
+// --- a run waiting on a background agent --------------------------------------
+// The turn ended, the process is alive, a background agent is still working.
+// The run used to be finished on the spot, which killed the follow-up turn the
+// CLI was about to run on the agent's notification (background-turns.test.ts).
+// The card has to SAY it is waiting, and on what — and still offer Interrupt
+// and Stop, because a live process is one the user may want to end.
+{
+  const waitingCard = {
+    ...CARD,
+    agent: { kind: 'waiting', tasks: 1, on: 'Count knowledge domain files', contextTokens: 0, lastEventAt: Date.now() - 5000 },
+  }
+  const k = run({ ...base, cards: [waitingCard] })
+  ok(k.text().toLowerCase().includes('waiting on 1 background agent: count knowledge domain files'),
+     'a waiting card names what it is waiting on')
+  const c = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [waitingCard] })
+  ok(c.text().includes('Waiting on 1 background agent: Count knowledge domain files'),
+     'the chat foot says so too, beside the age of the last frame')
+  ok(!!findButton(c.root, 'Interrupt') && !!findButton(c.root, 'Stop'),
+     'and a waiting run can still be interrupted or stopped — the process is alive')
+  const none = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{ ...CARD, agent: { kind: 'waiting', tasks: 0, contextTokens: 0 } }] })
+  ok(none.text().includes('Waiting for a background agent to report back'),
+     'with nothing live and a follow-up turn owed, it says that instead of a count of zero')
 }
 
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)

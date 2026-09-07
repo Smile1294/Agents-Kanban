@@ -216,6 +216,27 @@ run, since each session needs a worktree.
   Merge and literally nothing happened" was a warning notification, fired every
   time, that the user never saw. An answer they can miss to an action they
   deliberately took is the same class of bug as a signal that cannot say "bad".
+- **A BACKGROUND agent outlives the turn that spawned it, and there is no status
+  field anywhere.** Subagent frames were read only by the LIVE run parser, so two
+  agents spawned with the `Agent` tool vanished from the board the moment the
+  parent's turn ended — reported as "I thought they are still working but they
+  weren't". They live at
+  `projects/<dir>/<session>/subagents/agent-<id>.{jsonl,meta.json}`; verified
+  against a real store, the sidecar carries `description`/`agentType`/`toolUseId`
+  and NOTHING about status, and the launch `tool_result` says only "Async agent
+  launched successfully". So the ONLY authoritative outcome is the
+  `<task-notification>` written back into the PARENT transcript, carrying
+  `<task-id>` and `<status>completed|stopped</status>`. Everything else is
+  derived and must say so: `orphaned` renders as "no completion recorded", never
+  "stopped", because a notification outside the loaded window would make
+  "stopped" an outcome nobody reported — while "cannot still be running" stays
+  true either way, a background agent being a child of the CLI process. The
+  liveness number is the AGE of the agent's last frame, never a dot; the scan is
+  ONE directory walk keyed by session (a badge is drawn per card, so per-session
+  walks would be O(cards x projects) on the render path); outcomes are parsed
+  only for the few sessions that actually spawned one; and the 5s tick exists
+  because this is the one readout that moves while nothing is streaming — so
+  nothing would otherwise repaint it.
 - **A card in a started column with no agent running must SAY so.**
   "Implementing" means an agent is changing code; with no live agent it means one
   stopped there without handing the work back, and the board drew both
@@ -228,6 +249,21 @@ run, since each session needs a worktree.
   `stalled` is normalised to the MINUTE in `chromeSig()` — it mirrors an mtime
   that moves while any other agent streams, so raw milliseconds would kill the
   fast path outright.
+- **A generic brief LOSES to a specific slash command, and being in the system
+  prompt does not change that.** A project's own `/jira-task` ended its
+  procedure with "Then STOP. A human reviews and merges." The agent obeyed that
+  terminal step, never called `set_phase`, and finished work sat in Implementing
+  — so the user never got the test plan a review column exists to produce. The
+  brief was `appendSystemPrompt` and present the whole time; PRESENT is not
+  OUTRANKING. So it now says the move is "how a run ENDS" and to call
+  `set_phase` first whatever told it to stop. That is a prompt and cannot be
+  guaranteed, which is why the recovery is a BUTTON: the stalled card's primary
+  action resumes the session and asks for the plan, because moving the card by
+  hand produces no `howToTest` and only the agent can write one. It is offered
+  only where there is a worktree to resume into, it is a click and never
+  automatic (a real turn, a real bill), and the host-written prompt explicitly
+  allows "not finished" as an answer — a prompt that only permits the reply you
+  want is how you get a test plan for work nobody did.
 - **A merge lands UNCOMMITTED, and `ok: true` does not mean it is on the
   branch.** `merge()` runs `--no-ff --no-commit`: an agent's work reaching the
   user's history on one click, before they have read a line of it, is the wrong
@@ -508,6 +544,38 @@ run, since each session needs a worktree.
   shape it cannot render falls back to Allow/Deny rather than showing an empty
   picker. The choices are module-level in `board.js` for the usual reason: a
   half-finished answer held in the DOM is destroyed by the next repaint.
+- **A subtask's route is ONE field, and its default is the parent's WHOLE
+  agent.** A piece of a split may name `agent` (a `<runtime>|<profile>` slug),
+  `model` and `effort`, and `agent/routing.ts` is the entire policy, pure.
+  `split()` used to pass `runtime: parent.runtime` and say nothing about the
+  backend, so `launch()` fell through to the ACTIVE profile — a session running
+  on DeepSeek all morning fanned out into children on Anthropic, silently, which
+  is the mirror of the runtime bug the comment above that line exists to record.
+  Four things are load-bearing. The route is one field naming a COMBINATION, not
+  an agent field and a backend field, because the composer already has a
+  postmortem about two pickers making the reader do the cross product. The model
+  is validated against the TARGET agent's catalogue (`catalogueForProfile(p, rt)`,
+  per runtime AND per profile), never the active one — a gate built from the
+  active list passes `deepseek-reasoner` on first-party and the child 404s with
+  somebody else's error. There are FOUR refusals because there are four fixes:
+  `spawn-agent`, `spawn-model`, `spawn-catalogue` (nobody has READ that backend,
+  so its list is the built-in Anthropic one standing in — refusing on that as
+  fact is the probe bug again) and `spawn-effort`, and each is RECORDED on the
+  parent. And `agentKeyOf()` builds the key for the picker, the spawn catalogue
+  and a live run alike: if those drift the picker shows nothing selected AND
+  every split is refused, so `smoke.mjs` asserts they agree.
+- **Everything a run is decided ON is frozen when it is ASKED FOR.**
+  `startRun()` read `this.opts.defaults` and `this.opts.provider` after two
+  awaits, `setDefaults()`/`setProvider()` replace that state wholesale, and
+  `drain()` launches a queued run minutes later — and `MAX_SUBTASKS` (4) exceeds
+  the default concurrency (3), so the FOURTH piece of a fan-out always drains
+  late. Routing by mutating manager state therefore hands one task another
+  task's model. `launchSettings()` resolves it once, in `start()`, into the queue
+  entry that already existed; `launch()` must never recompute it from
+  `this.opts.defaults`, which it did — overwriting a routed model with the
+  workspace default and then recording that default on the card as fact. `??` on
+  the flags is only correct because their absent value is `undefined` and never
+  `false`.
 - **A session may split into subtasks, but only downwards and only once.** An
   agent that decides its brief is two unrelated jobs calls `split_task`; each
   subtask is a real session with its own worktree. Every limit is in
@@ -588,6 +656,40 @@ run, since each session needs a worktree.
   an answer that looks like HTML is shown as characters. `markdown.test.mjs`
   asserts a `<script>` or `<img onerror>` in an answer creates no element. Links
   are `http(s)` and `mailto` only; everything else renders as its text.
+- **Every control is ONE height, and the height is a token.** Measured on the
+  composer bar: 13, 16, 18, 21 and 23px on one row, because each chip set its
+  own padding and font and nothing fixed the height — an emoji in the label
+  raised the line box of every chip that carried one by 5px. `--ctl-h` (24px),
+  `--ctl-h-lg` (32px, the input row) and `--ctl-h-xs` (20px, actions inside a
+  card) are the only sizes; the base `button` rule IS the standard control,
+  `.ctl` is the same geometry for chips that are spans, and a glyph goes in
+  `.ctl-ico`, never in the label string. Row-shaped buttons — menu rows, file
+  rows — opt out in ONE list with `min-height: auto; align-items: stretch`,
+  because the base `min-height` replaces a flex item's automatic minimum and
+  twenty menu rows in a bounded column collapsed to 24px each when it did.
+  `layout.test.mjs` measures every `.ctl` on the bar and fails if two differ.
+- **Outside the editor, the board supplies its own theme.** Every colour is
+  `var(--vscode-*)`; VS Code sets those inline, a browser sets nothing, and a
+  `var()` resolving to nothing paints a WHITE page — the headless board shipped
+  that way. `media/theme.css` is the Dark Modern palette on `:root`, loaded
+  first by `server/page.mjs` and by the screenshot renderer, inert in the editor
+  (an inline value outranks it) and not loaded there. `theme.test.mjs` fails on
+  any variable a stylesheet uses that the sheet does not define — a new colour
+  in board.css otherwise reaches the browser unthemed and nothing notices.
+- **A turn ending is not the run ending while background agents are live.**
+  `finish()` stopped the CLI on the turn's `result`, and the CLI had the
+  agent's `<task-notification>` queued as the next user message — so the
+  follow-up turn that carries the findings back died with the process, every
+  time. Probed live: kept alive, the CLI runs that turn itself (a fresh `init`,
+  the answer, a second `result`). The SDK declares the frames that say when —
+  `task_started`, `task_updated`, `background_tasks_changed`,
+  `task_notification` — and `handle()` dropped them all. `AgentSession` now
+  tracks live tasks (non-ambient only) and notifications seen, and a `result`
+  with either outstanding enters `waiting`, never `done`. Three things are
+  load-bearing: a repeated `init` with the same session id is NOT re-announced;
+  `waiting` counts as busy everywhere `working` does (slot, status bar,
+  Interrupt/Stop); and a grace timer finishes the run when only a follow-up is
+  owed and none comes. `background-turns.test.ts` feeds the recorded frames.
 
 ## Testing conventions
 

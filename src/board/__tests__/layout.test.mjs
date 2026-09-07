@@ -279,6 +279,16 @@ try {
       barOverflow: Math.round(bar.scrollWidth - bar.clientWidth),
       barHeight: Math.round(bb.height),
       ctx: box('.ctx'), spend: box('.spend'), meter: box('.ctx-meter'),
+      // Every control on the bar, by height. Measured before the shared class
+      // existed they came out at 13, 16, 18, 21 and 23px ON ONE ROW — every
+      // chip carrying an emoji 5px taller than the plain ones, because nothing
+      // fixed the height and an emoji glyph raises the line box. `.ctl` is
+      // the one class that does, and every control on the bar wears it.
+      // A control the narrow-pane rule has hidden (the AGENT badge below 480px)
+      // is not on the bar; one that is drawn at 0px would be, and would fail.
+      controls: [...bar.querySelectorAll('.ctl')]
+        .filter((n) => getComputedStyle(n).display !== 'none')
+        .map((n) => Math.round(n.getBoundingClientRect().height)),
     }
   }
 
@@ -306,6 +316,10 @@ try {
     }
     ok(readouts.meter && readouts.meter.width > 10, `${where}: the meter itself has width (${readouts.meter?.width}px)`)
     ok(readouts.barHeight < 90, `${where}: and the bar does not grow into the transcript (${readouts.barHeight}px)`)
+    ok(readouts.controls.length >= 7,
+       `${where}: every control on the bar carries the shared control class (${readouts.controls.length})`)
+    ok(new Set(readouts.controls).size === 1,
+       `${where}: and they are all ONE height (${[...new Set(readouts.controls)].join('/')}px)`)
   }
 
   checkReadouts(await chat.evaluate(measureReadouts), 'at 900px')
@@ -719,6 +733,7 @@ try {
       branch: 'task/S405w-jira-task-https-eachthing-atlassian-net-browse-PB-615',
       worktree: '/repo/.agentskanban/worktrees/S405w',
       stalled: Date.now() - 71 * 60000,
+      agent: undefined,
     }],
   }))
   await stalledPage.waitForSelector('.stalled', { timeout: 5000 })
@@ -726,21 +741,32 @@ try {
     const box = document.querySelector('.stalled')
     const card = box.closest('.card')
     const title = box.querySelector('.stalled-title')
-    const btn = box.querySelector('button')
+    const btns = [...box.querySelectorAll('button')]
     const cb = card.getBoundingClientRect()
-    const bb = btn ? btn.getBoundingClientRect() : null
     return {
       boxOverflow: Math.round(box.scrollWidth - box.clientWidth),
       cardOverflow: Math.round(card.scrollWidth - card.clientWidth),
       titleClipped: title.scrollWidth - title.clientWidth > 1,
-      label: btn && btn.textContent,
-      btnInside: !!bb && bb.right <= cb.right + 1 && bb.left >= cb.left - 1 && bb.width > 0 && bb.height > 0,
+      label: btns.map((b) => b.textContent),
+      // BOTH answers, not just the first: the marker now carries "ask" and
+      // "move anyway" side by side, and a second button that is pushed off the
+      // card is a choice the user never gets to make.
+      // Measured against the MARKER BOX, not just the card: the box is the
+      // tighter constraint and the card rect let a button that had already
+      // escaped its own container pass. A screenshot caught "Move anyway"
+      // hanging off the card edge while this assertion was green.
+      btnInside: btns.length === 2 && btns.every((b) => {
+        const r = b.getBoundingClientRect()
+        const bx = box.getBoundingClientRect()
+        return r.right <= Math.min(cb.right, bx.right) + 1 && r.left >= bx.left - 1
+          && r.width > 0 && r.height > 0
+      }),
     }
   })
   ok(stld.boxOverflow <= 1, `the stopped marker does not scroll horizontally (${stld.boxOverflow}px)`)
   ok(stld.cardOverflow <= 1, `nor widen its card (${stld.cardOverflow}px)`)
   ok(!stld.titleClipped, 'and its sentence is readable rather than ellipsised away')
-  ok(stld.btnInside, `the hand-back button is on screen in a 300px column: ${JSON.stringify(stld.label)}`)
+  ok(stld.btnInside, `BOTH hand-back buttons are on screen in a 300px column: ${JSON.stringify(stld.label)}`)
   await stalledPage.close()
 
   /* --- the uncommitted-merge banner, at split-editor width ------------------

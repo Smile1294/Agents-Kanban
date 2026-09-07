@@ -54,6 +54,10 @@ const server = spawn(process.execPath, [path.join(root, 'server', 'server.mjs')]
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
+// On EVERY way out, including the process.exit(1) paths above and below: a
+// server that outlives a failed test is an extension host, activated against
+// this repository, that nobody knows is running.
+process.on('exit', () => { try { server.kill() } catch { /* already gone */ } })
 let serverLog = ''
 server.stdout.on('data', (d) => { serverLog += d })
 server.stderr.on('data', (d) => { serverLog += d })
@@ -108,12 +112,20 @@ try {
   ok(Array.isArray(frame.state?.cards), 'the state carries the card list')
 
   // --- the same flow through a real browser -----------------------------------
+  // A cached build when there is one, else whatever playwright itself resolves —
+  // the same fallback layout.test.mjs has. Without it this gate could not run
+  // on a Mac at all: the hunt below knew only the Linux cache path, so it
+  // reported "no Chromium" on a machine with one, and did so AFTER spawning the
+  // server, which it then never killed (three orphaned servers were found).
   const exe = await findChromium()
-  if (!exe) {
+  let browser
+  try {
+    browser = await chromium.launch({ ...(exe ? { executablePath: exe } : {}), args: ['--no-sandbox'] })
+  } catch (e) {
     console.log('FAIL: no Chromium to drive the page with — run `npx playwright install chromium`')
+    console.log(`       (${String(e).split('\n')[0]})`)
     process.exit(1)
   }
-  const browser = await chromium.launch({ executablePath: exe, args: ['--no-sandbox'] })
   const errors = []
   const listen = (p) => {
     p.on('pageerror', (e) => errors.push(String(e)))
@@ -175,6 +187,7 @@ async function findChromium() {
   const roots = [
     ...(process.env.PLAYWRIGHT_BROWSERS_PATH ? [process.env.PLAYWRIGHT_BROWSERS_PATH] : []),
     path.join(os.homedir(), '.cache', 'ms-playwright'),
+    path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright'),
   ]
   const candidates = []
   for (const cache of roots) {
@@ -183,7 +196,9 @@ async function findChromium() {
       .filter((d) => /^chromium(_headless_shell)?-\d+$/.test(d))
       .sort((a, b) => Number(b.match(/\d+$/)[0]) - Number(a.match(/\d+$/)[0]))
     for (const d of builds) {
-      for (const rel of [['chrome-linux', 'headless_shell'], ['chrome-linux', 'chrome'], ['chrome-linux64', 'chrome']]) {
+      for (const rel of [['chrome-linux', 'headless_shell'], ['chrome-linux', 'chrome'], ['chrome-linux64', 'chrome'],
+                         ['chrome-mac', 'headless_shell'], ['chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'],
+                         ['chrome-mac-arm64', 'Chromium.app', 'Contents', 'MacOS', 'Chromium']]) {
         candidates.push(path.join(cache, d, ...rel))
       }
     }

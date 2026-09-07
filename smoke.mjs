@@ -456,6 +456,15 @@ for (const msg of [
   { type: 'removeMany' },
   { type: 'toggleOlder' },
   { type: 'toggleOlder' },
+  // Asking a stalled session for its test plan. Must survive being aimed at a
+  // session that has no worktree and no run to resume — which is what a stale
+  // webview, or a second click after the card moved, sends.
+  { type: 'askTestPlan', id: 'nope' },
+  // The background-agent scan runs on the render path for every card, so it has
+  // to survive a workspace whose sessions never spawned one — which is most of
+  // them — without contributing a card field or an error.
+  { type: 'select', id: 'nope' },
+  { type: 'askTestPlan' },
   // The merge now stops before the commit, so three more messages exist and
   // every one of them can arrive when there is no merge waiting at all — a
   // stale webview, or a second click on a banner that has just been actioned.
@@ -1448,6 +1457,26 @@ console.log('\n— providers: the picker, and where the credential goes')
       ok(latestState().composer.modelSource === 'builtin',
          'and with the endpoint forgotten, the picker falls back rather than remembering a list it can no longer justify')
     }
+  }
+
+  /* --- one vocabulary for "what does this run on" ------------------------
+     The composer offers agents keyed `<runtime>|<profile>`, and `split_task`
+     now lets an agent NAME one of those keys per subtask — so the same string
+     is built in three places: the picker, the spawn catalogue, and
+     `agentKeyOf(agent.runtime, agent.provider)` for a live run. If they drift,
+     the picker shows nothing selected AND every split is refused as
+     "spawn-agent", which is a feature that looks broken for a reason nothing
+     on screen explains. All three go through `agentKeyOf`; this is the gate
+     that says so through the REAL host state. */
+  {
+    const c = latestState().composer
+    const keys = (c.agents ?? []).map((a) => a.key)
+    ok(keys.length > 0, `the host offers at least one runnable agent (${keys.length})`)
+    ok(keys.includes(c.agent),
+       `the active agent is one the host offers — same key, one vocabulary (${c.agent} in [${keys}])`)
+    ok(keys.every((k) => /^(claude|codex)\|/.test(k)),
+       `every key is <runtime>|<profile>, so parseAgentKey can read it back ([${keys}])`)
+    ok(new Set(keys).size === keys.length, 'and no two rows share a key')
   }
 
   // --- where the model list came from --------------------------------------

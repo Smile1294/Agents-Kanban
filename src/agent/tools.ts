@@ -24,6 +24,7 @@ import { isHumanOnly, isReviewColumn, isStartedColumn, type BoardConfig } from '
 import { normaliseTestPlan, normaliseTitle } from '../sessions/meta.ts'
 import { describeWhen, parseScheduleDraft, type Schedule, type ScheduleDraft } from '../board/schedules.ts'
 import { loadSdk } from './sdk.ts'
+import { describeSpawnAgents, type SpawnAgent } from './routing.ts'
 
 /** The MCP namespace these tools are mounted under; `mcpServers: { board: … }`. */
 export const BOARD_SERVER = 'board'
@@ -62,6 +63,13 @@ export interface SubtaskProposal {
   /** The model this subtask asks to run on. Gated host-side by the spawn
    *  allowlist — the description below only names the allowed set. */
   model?: string
+  /** WHICH AGENT PROGRAM AND BACKEND: a short name from the description's list.
+   *  Absent means this session's own — runtime and backend both. */
+  agent?: string
+  /** The effort level this subtask asks for. Raw, and refused host-side when
+   *  the target model cannot take it — never silently dropped, which is what
+   *  made an ignored `ultracode` request invisible. */
+  effort?: string
 }
 
 export type SplitOutcome =
@@ -133,7 +141,7 @@ export interface BoardToolContext {
    * schema; the actual gate is behind `onSplit`, in `AgentManager.split()`.
    * Absent means no policy, and the tool says nothing about models.
    */
-  spawnModels?: string[]
+  spawnAgents?: SpawnAgent[]
   /**
    * Commit the session's worktree. Called on the move into a review column, so
    * the user's Merge button always has commits to merge. The host supplies it
@@ -473,18 +481,34 @@ export function buildBoardTools(
       'When this returns successfully your job is finished — say what you split and',
       'why, and STOP. Do not start doing one of the subtasks yourself; an agent is',
       'already on it.',
-      // The allowlist, named here because an agent can only ask for what it has
-      // been told exists. The fence itself is behind `onSplit` — a description
-      // that changes mid-session or a model that ignores it cannot make a
-      // disallowed spawn happen.
-      ...(ctx.spawnModels
+      // WHERE A SUBTASK CAN RUN, named here because an agent can only ask for
+      // what it has been told exists. The fence itself is behind `onSplit` — a
+      // description that changes mid-session, or a model that ignores it,
+      // cannot make a disallowed spawn happen.
+      //
+      // One list of AGENT + BACKEND combinations rather than an agent list and
+      // a model list, for the reason the composer already learned: two pickers
+      // make the reader do a cross product, and the answer on screen was half
+      // of it. A subtask picks a row and names a model that row serves.
+      ...(ctx.spawnAgents
         ? [
             '',
-            ctx.spawnModels.length
-              ? 'A subtask may name a `model` it runs on — one of: ' + ctx.spawnModels.join(', ') + '. ' +
-                'The host refuses any other id, and a subtask that names none runs on the default for new sessions.'
-              : 'No model is currently allowed for spawned agents, so this tool will be refused. ' +
-                'Ask the user to re-tick a model on the settings page.',
+            ...(ctx.spawnAgents.length
+              ? [
+                  'ROUTING. Each subtask may run on a different agent program and a different',
+                  'backend from this session. Set `agent` to one of these short names and `model`',
+                  'to an id that agent serves:',
+                  describeSpawnAgents(ctx.spawnAgents),
+                  'A subtask that names neither runs on THIS session\'s agent and backend, which is',
+                  'usually what you want. Route a piece elsewhere only for a reason you can state —',
+                  'a cheaper model for mechanical work, a different agent program for work it is',
+                  'better at. The host refuses an id the named agent does not serve, and an effort',
+                  'level its model cannot take, rather than quietly substituting one.',
+                ]
+              : [
+                  'No model is currently allowed for spawned agents, so this tool will be refused.',
+                  'Ask the user to re-tick a model on the settings page.',
+                ]),
           ]
         : []),
     ].join('\n'),
@@ -510,12 +534,24 @@ export function buildBoardTools(
               ),
             tags: z.array(z.string()).optional().describe('Tags for the subtask\'s card.'),
             // Offered only when there is a policy to name — a field the host has
-            // no gate for would be a control that cannot say no.
-            ...(ctx.spawnModels?.length
+            // no gate for would be a control that cannot say no. All three
+            // appear together, because naming a model without the agent that
+            // serves it is the ambiguity this whole module exists to remove.
+            ...(ctx.spawnAgents?.length
               ? {
+                  agent: z.string().optional().describe(
+                    'Which agent program and backend runs this subtask — one of: ' +
+                    ctx.spawnAgents.map((a) => a.slug).join(', ') + '. ' +
+                    "Omit to use this session's own.",
+                  ),
                   model: z.string().optional().describe(
-                    'A model id for this subtask — one of: ' + ctx.spawnModels.join(', ') + '. ' +
-                    'Anything else is refused.',
+                    'A model id the named agent serves. Anything else is refused, with the ' +
+                    'refusal naming what it does serve. Omit to use the default for new sessions ' +
+                    '— which is only valid on this session\'s own agent.',
+                  ),
+                  effort: z.string().optional().describe(
+                    'Reasoning effort for this subtask: low, medium, high, xhigh or max. ' +
+                    'Refused if the model does not take it. Omit to use the level the user chose.',
                   ),
                 }
               : {}),
@@ -537,9 +573,14 @@ export function buildBoardTools(
       // string-or-absent at this boundary — the gate behind `onSplit` is the
       // fence, but a junk-typed id must not even reach it.
       const result = await ctx.onSplit(
-        (args.subtasks ?? []).map(({ model, ...rest }) => ({
+        (args.subtasks ?? []).map(({ model, agent, effort, ...rest }) => ({
           ...rest,
+          // Kept string-or-absent at this boundary. The gate behind `onSplit`
+          // is the fence, but a junk-typed value must not even reach it — and
+          // `checkProposal` trims and bounds what does.
           ...(typeof model === 'string' && model.trim() ? { model: model.trim() } : {}),
+          ...(typeof agent === 'string' && agent.trim() ? { agent: agent.trim() } : {}),
+          ...(typeof effort === 'string' && effort.trim() ? { effort: effort.trim() } : {}),
         })),
         args.reason ?? '',
       )

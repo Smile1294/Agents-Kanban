@@ -294,7 +294,7 @@ forgiving moment for two of them to overlap.
 ---
 ## 8. Current state
 
-`npm run verify` — typecheck, 31 test files, build, launch gates.
+`npm run verify` — typecheck, 53 test files, build, launch gates.
 `npm run verify:package` — packages a `.vsix` and checks what is inside it.
 
 Every task goes through `scripts/with-node.sh`, which finds a Node 22.6+ before
@@ -305,6 +305,19 @@ from the desktop.
 
 Working:
 
+- **One control height, everywhere.** Every button and chip is 24px (32px on the
+  composer's input row, 20px inside a card), from tokens in `board.css`; a glyph
+  sits in a fixed slot so an emoji cannot resize its chip. Measured by
+  `layout.test.mjs`, which fails if two controls on the bar differ
+- **The headless board is the editor's dark board.** `media/theme.css` carries
+  the Dark Modern palette for every `--vscode-*` variable the stylesheets use;
+  `theme.test.mjs` keeps it complete. Inert in the editor, where VS Code sets
+  the variables inline
+- **A run waits for its background agents.** A turn that ends with agents
+  still working, or with one's notification queued, leaves the process alive in
+  a `waiting` state — the card names the agent and shows the age — and the CLI
+  runs the follow-up turn that brings the findings back. Ending the run on the
+  first `result` killed that turn every time
 - Both views; sessions started from chat land on the board
 - Agents run in their own worktrees and move their own cards
 - Transcripts read from Claude Code, surviving reloads
@@ -425,6 +438,14 @@ Working:
   The boundaries are code, not prose: at most four, one level deep, once per
   session. It is the only board tool that is not auto-allowed — starting other
   agents is worth a click
+- **A subtask can run on a different agent, backend and model from its parent.**
+  One objective session on Fable 5.1 can put one piece on Opus 5, one on DeepSeek
+  through a gateway and one on Codex against a ChatGPT subscription — each a real
+  session with its own worktree, card and meter. `split_task` takes `agent`,
+  `model` and `effort` per piece; the host validates them against THAT agent's
+  catalogue and refuses with one of four rules, each naming its own fix, rather
+  than substituting. A piece that names nothing inherits the parent's whole
+  agent — runtime AND backend, which is the half that used to be dropped
 - **Subtasks say where they came from, and when the whole thing is testable.**
   The child names its parent; the parent lists its subtasks with their phases
   and a `1/2 ready` count. Subtasks stay real cards in their own columns, so you
@@ -524,7 +545,9 @@ item. Three things are genuinely not started:
   half of it (`manager.send()` pushes a `{kind: 'prompt'}` indistinguishable from
   the user typing, into a session holding `split_task`) and stages the rest
   behind `split_task` plus a dial. It also names six bugs in the code as it
-  stands today.
+  stands today. **Per-piece routing and the seventh gate are now built** — see
+  [docs/DECISIONS.md](docs/DECISIONS.md), *"Per-piece routing"*; the parent-wake
+  half is still declined.
 - **A conflict-fixing agent** — they spawn a fresh session with a prescriptive
   prompt; we surface conflicts and offer Abort.
 - **`schedule_wakeup`** time triggers.

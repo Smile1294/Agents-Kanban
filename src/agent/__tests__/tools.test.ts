@@ -99,8 +99,8 @@ for (const n of ['Bash', 'Edit', 'Write']) {
 // been told exists, so the allowed set must be named here — and an empty set
 // must say the tool will be refused, rather than inviting a doomed call.
 {
-  const splitWith = (spawnModels: string[] | undefined) => {
-    const [t] = buildBoardTools(DEFAULT_BOARD, ctxFor({ spawnModels }), tool)
+  const splitWith = (spawnAgents: SpawnAgent[] | undefined) => {
+    const [t] = buildBoardTools(DEFAULT_BOARD, ctxFor({ spawnAgents }), tool)
       .filter((x) => x.name === 'split_task')
     return t as unknown as {
       description?: string | string[]
@@ -110,16 +110,34 @@ for (const n of ['Bash', 'Edit', 'Write']) {
   const textOf = (t: { description?: string | string[] }) =>
     Array.isArray(t.description) ? t.description.join('\n') : String(t.description ?? '')
 
-  const withList = splitWith(['haiku-5', 'deepseek-chat'])
-  ok(textOf(withList).includes('one of: haiku-5, deepseek-chat'),
+  const two: SpawnAgent[] = [
+    {
+      slug: 'claude', key: 'claude|inherit', label: 'Claude Code',
+      runtime: 'claude', provider: 'inherit', known: true,
+      models: [{ id: 'haiku-5', efforts: [] }],
+    },
+    {
+      slug: 'deepseek', key: 'claude|dsk', label: 'DeepSeek',
+      runtime: 'claude', provider: 'dsk', known: true,
+      models: [{ id: 'deepseek-chat', efforts: [] }],
+    },
+  ]
+
+  const withList = splitWith(two)
+  ok(textOf(withList).includes('haiku-5') && textOf(withList).includes('deepseek-chat'),
      'the split_task description names the models a spawned agent may run on')
-  ok(withList.inputSchema?.subtasks?.element?.shape?.model !== undefined,
-     'and the schema offers the `model` field to ask for one')
+  ok(textOf(withList).includes('deepseek') && textOf(withList).includes('DeepSeek'),
+     'and the BACKEND each one belongs to — an id with no backend is not a choice')
+  const shape = withList.inputSchema?.subtasks?.element?.shape
+  ok(shape?.model !== undefined, 'and the schema offers the `model` field to ask for one')
+  ok(shape?.agent !== undefined, 'and `agent`, so a piece can be routed at all')
+  ok(shape?.effort !== undefined, 'and `effort`, which the host gates against the model')
 
   const plain = splitWith(undefined)
-  ok(!textOf(plain).includes('may name a `model`'), 'with no allowlist the description says nothing about models')
+  ok(!textOf(plain).includes('ROUTING'), 'with no allowlist the description says nothing about routing')
   ok(plain.inputSchema?.subtasks?.element?.shape?.model === undefined,
      'and the schema has no model field — a control with no gate behind it cannot be offered')
+  ok(plain.inputSchema?.subtasks?.element?.shape?.agent === undefined, 'and no agent field either')
 
   const empty = splitWith([])
   ok(textOf(empty).includes('will be refused'),
@@ -137,6 +155,7 @@ for (const n of ['Bash', 'Edit', 'Write']) {
 // behaviour behind the names: junk never reaches the host callback, and the
 // list marks whose each schedule is.
 import type { Schedule } from '../../board/schedules.ts'
+import type { SpawnAgent } from '../routing.ts'
 {
   const created: { drafts: unknown[]; by: string[] } = { drafts: [], by: [] }
   const schedCtx = ctxFor({

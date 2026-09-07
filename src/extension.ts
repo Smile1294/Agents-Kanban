@@ -15,6 +15,9 @@ import {
   sessionFileFor, waitForQuiescent, type CheckpointMap,
 } from './sessions/checkpoints.ts'
 import {
+  agentStatus, parseTaskNotifications, scanBackgroundAgents, type BackgroundAgent,
+} from './sessions/subagents.ts'
+import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
   setBoardFocusMode, showSideBarView, toUiAgent,
   type BoardHost, type FocusMode, type Mode, type SearchAnswer, type SearchRow,
@@ -45,6 +48,9 @@ import {
 } from './agent/providers.ts'
 import { probeProvider } from './agent/probe.ts'
 import { allowedSpawnModels, parseSpawnPolicy, toggledSpawn, type SpawnPolicy } from './agent/spawn-policy.ts'
+import {
+  agentKeyOf, slugFor, spawnKeyFor, type SpawnAgent, type SpawnCatalogue,
+} from './agent/routing.ts'
 import {
   fetchEndpointModels, parseEndpointModels, type EndpointModel,
 } from './agent/endpoint.ts'
@@ -132,6 +138,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   /** A merge sitting on the user's branch, uncommitted, waiting to be read.
    *  Repo-level rather than per-card: it blocks every card's Merge button. */
   let pendingMerge: PendingMerge | undefined
+  /**
+   * Background agents, keyed by session, from ONE directory walk.
+   *
+   * Cached on the same short window as the session scan and for the same
+   * reason: `getState()` runs ten times a second while an agent streams, and
+   * this walks a directory tree. A card badge needs it for every card, so
+   * asking per session would be the per-repaint cost this project has a
+   * postmortem about.
+   */
+  let agentScan: { at: number; bySession: Map<string, BackgroundAgent[]> } | undefined
+  const AGENT_SCAN_TTL_MS = 3000
+  async function backgroundAgents(): Promise<Map<string, BackgroundAgent[]>> {
+    const now = Date.now()
+    if (!agentScan || now - agentScan.at >= AGENT_SCAN_TTL_MS) {
+      agentScan = { at: now, bySession: await scanBackgroundAgents(claudeHome()).catch(() => new Map()) }
+    }
+    return agentScan.bySession
+  }
   let busy: string | undefined
   let commands: SlashCommand[] = []
 
@@ -292,8 +316,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *  build whose `ModelChoice` had a different shape. Parsed rather than cast:
    *  `globalState` outlives the version that wrote it, and a stale entry reaches
    *  the composer as `undefined.includes(...)` — a blank panel, not an error. */
-  const cachedChoices = (id: string): ModelChoice[] =>
-    parseCachedChoices(context.globalState.get(catalogueKey(id)))
+  const cachedChoices = (id: string, rt: RuntimeId = runtime): ModelChoice[] =>
+    parseCachedChoices(context.globalState.get(catalogueKey(id, rt)))
 
   /**
    * Where a CUSTOM ENDPOINT's own catalogue is cached.
@@ -413,12 +437,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   }
 
-  function catalogueForProfile(p: ProviderProfile): ModelCatalogue {
-    const hit = perProfileCatalogue.get(p.id)
+  /** `rt` because the model cache is keyed by RUNTIME as well as profile — the
+   *  models are per agent program *and* per backend, and keying on the profile
+   *  alone filed one runtime's ids under the other's. The spawn catalogue asks
+   *  for combinations that are not the active one, which is where that
+   *  difference stops being theoretical. */
+  function catalogueForProfile(p: ProviderProfile, rt: RuntimeId = runtime): ModelCatalogue {
+    const memo = `${rt}:${p.id}`
+    const hit = perProfileCatalogue.get(memo)
     if (hit) return hit
-    const built = catalogueFor(p, cachedChoices(p.id), builtinChoices(),
+    const built = catalogueFor(p, cachedChoices(p.id, rt), builtinChoices(),
       { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, undefined, endpointFor(p))
-    perProfileCatalogue.set(p.id, built)
+    perProfileCatalogue.set(memo, built)
     return built
   }
 
@@ -1063,8 +1093,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * profile: Codex signs in as itself, and pairing it with a gateway would
    * offer a combination that cannot exist.
    */
+  /** Delegates the string to `agentKeyOf` — an agent named by a person on the
+   *  composer and an agent named by a model in `split_task` must be the same
+   *  key, and two functions that both know how to build it is one bug. What
+   *  stays here is the NORMALISATION: a runtime with no backend concept has an
+   *  empty profile half, because pairing it with one would offer a combination
+   *  that cannot exist. */
   const agentKey = (rt: RuntimeId, profileId: string): string =>
-    `${rt}|${getRuntime(rt)?.capabilities.providerProfiles ? profileId : ''}`
+    agentKeyOf(rt, getRuntime(rt)?.capabilities.providerProfiles ? profileId : '')
 
   function agentChoices(): { key: string; label: string; detail: string; runtime: string; provider: string }[] {
     const out: { key: string; label: string; detail: string; runtime: string; provider: string }[] = []
@@ -1341,6 +1377,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     60_000,
   )
   context.subscriptions.push({ dispose: () => clearInterval(scheduleTimer) })
+
+  /*
+   * The background-agent tick.
+   *
+   * These are the only rows on the board whose number moves while NOTHING is
+   * streaming: the parent's turn can end while its agents keep writing, which is
+   * exactly the state this feature exists for — and in that state no frames
+   * arrive, so nothing would repaint and the age would sit frozen at whatever it
+   * was. So a slow tick, and a deliberately narrow one:
+   *
+   *  - only while the board is open and a card is selected, because the panel is
+   *    the only thing that draws them;
+   *  - only while THAT session has background agents at all, so a board of
+   *    sessions that never spawned one ticks nothing. The scan is machine-wide
+   *    (every project directory under ~/.claude), so `bySession.size` was
+   *    the wrong gate: it is true for as long as any session on the machine
+   *    ever spawned an agent, which made this a five-second repaint of every
+   *    board with a card selected, forever;
+   *  - and it drops the scan cache first, or the tick would repaint the same
+   *    cached numbers and prove nothing.
+   *
+   * Five seconds, not one: `ago()` moves in minutes, so a faster tick would cost
+   * repaints to redraw identical text.
+   */
+  const agentTimer = setInterval(() => {
+    if (!BoardPanel.isOpen || !selectedKey) return
+    // A live run is keyed by run id until the runtime hands over a session id,
+    // so the key is resolved the way getState() resolves it before the lookup.
+    const sid = ws?.manager?.byKey(selectedKey)?.sessionId ?? selectedKey
+    if (!agentScan?.bySession.has(sid)) return
+    agentScan = undefined
+    refreshAll()
+  }, 5000)
+  context.subscriptions.push({ dispose: () => clearInterval(agentTimer) })
   // Catch-up for a morning that passed while the window was closed: activation
   // IS the moment the extension can run again, so it is the check. Never a bare
   // `void`: a rejection here is a schedule that silently did not fire.
@@ -2243,12 +2313,106 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      already been shown to lose fields. */
   const SPAWN_POLICY_KEY = 'spawnPolicy'
   const readSpawnPolicy = (): SpawnPolicy => parseSpawnPolicy(state.get(SPAWN_POLICY_KEY))
-  /** Everything the ACTIVE backend offers, minus what the user unticked.
-   *  Composed in exactly one place — the manager gates on this list, the tool
-   *  descriptions name it, and the refusal repeats it, so three consumers
-   *  cannot drift into three answers. */
+  /** Everything the ACTIVE backend offers, minus what the user unticked. Still
+   *  the settings page's list — the ticks are per backend, and this is the one
+   *  the page is showing. */
   const spawnAllowedList = (): string[] =>
     allowedSpawnModels(readSpawnPolicy(), providerId, catalogue.choices.map((m) => m.id))
+
+  /**
+   * WHAT A SPAWNED SESSION MAY RUN ON: every agent program × backend on offer,
+   * each with the models the user has left ticked.
+   *
+   * The same flat cross product `agentChoices()` builds for the composer, and
+   * deliberately so — one vocabulary for "what does this run on", whether a
+   * person picks it or an agent names it. Splitting them would be the two-picker
+   * mistake again, one screen further along.
+   *
+   * Three things here are load-bearing.
+   *
+   * An agent with no allowed model is OMITTED rather than offered empty, so an
+   * empty catalogue means one thing — everything is unticked — which is what
+   * lets `resolveRoute` answer that with `spawn-model` and the fix ("re-tick a
+   * model") rather than a refusal about backends.
+   *
+   * `known` says whether the model list was READ from that backend or is the
+   * built-in Anthropic table standing in. First-party and inherit are `known`
+   * because that table genuinely is about them; a gateway is not, and naming an
+   * id against a list nobody fetched would be the probe bug again — reporting
+   * `Query.supportedModels()` as the endpoint's answer when it is assembled
+   * before any request leaves the machine.
+   *
+   * And the models come from `catalogueForProfile(profile, rt)` — the same
+   * memoised composition the composer uses, per runtime AND per profile, never
+   * the active `catalogue`. Gating one backend's ids against another's list is
+   * the whole bug this replaced.
+   */
+  const spawnCatalogue = (): SpawnCatalogue => {
+    const policy = readSpawnPolicy()
+    const taken = new Set<string>()
+    const agents: SpawnAgent[] = []
+    for (const row of agentChoices()) {
+      const rt = parseRuntimeId(row.runtime)
+      const def = rt ? getRuntime(rt) : undefined
+      if (!rt || !def) continue
+      const profile = def.capabilities.providerProfiles
+        ? providers.find((p) => p.id === row.provider)
+        : undefined
+      if (def.capabilities.providerProfiles && !profile) continue
+
+      // A runtime that signs in as itself has no backend catalogue: what it
+      // serves is what it told the settings page when it was asked, with its
+      // own built-in list as the floor. Never empty, so the agent is offered
+      // rather than silently missing — but `known` records which it was.
+      const asked = profile ? undefined : runtimeModels.get(rt)
+      const offered = profile
+        ? catalogueForProfile(profile, rt).choices
+        : (asked?.models ?? def.builtinModels()).map((m) => ({
+            id: m.id,
+            efforts: 'supportedEffort' in m ? (m.supportedEffort ?? []) : [],
+          }))
+      const source = profile ? catalogueForProfile(profile, rt).source : (asked ? 'runtime' : 'builtin')
+      const firstParty = !profile || profile.kind === 'inherit' || profile.kind === 'anthropic'
+
+      const allowed = allowedSpawnModels(policy, spawnKeyFor(rt, row.provider), offered.map((m) => m.id))
+      if (!allowed.length) continue
+      const slug = slugFor(row.label, taken)
+      taken.add(slug)
+      agents.push({
+        slug,
+        key: row.key,
+        label: row.label,
+        runtime: rt,
+        provider: row.provider,
+        known: source !== 'builtin' || firstParty,
+        models: allowed.map((id) => ({
+          id,
+          efforts: (offered.find((m) => m.id === id) as { efforts?: EffortLevel[] } | undefined)?.efforts ?? [],
+        })),
+      })
+    }
+    return { agents }
+  }
+
+  /**
+   * A backend profile id, resolved into the environment patch it amounts to.
+   *
+   * The credential half of routing, and it has to be here: `SecretStorage` is
+   * `vscode`, and `AgentManager` never touches a credential — the division
+   * `providerEnv` already has. Answers `undefined` for a profile that no longer
+   * exists, which `split()` treats as "no backend of its own" rather than
+   * inventing one.
+   */
+  const resolveProviderById = async (
+    id: string,
+  ): Promise<{ profile: ProviderProfile; env: ProviderEnv } | undefined> => {
+    const p = providers.find((x) => x.id === id)
+    if (!p) return undefined
+    const secret = p.hasCredential
+      ? await context.secrets.get(credentialKey(p.id)).then((v) => v ?? undefined, () => undefined)
+      : undefined
+    return { profile: p, env: envForProfile(p, secret, process.env) }
+  }
 
   const ensureManager = (): AgentManager => {
     const w = requireWs()
@@ -2277,10 +2441,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         provider: currentProvider(),
         providerEnv,
         modelBook: modelBook(),
-        // The models a spawned agent may run on, read FRESH at split time —
-        // the settings page can change the policy between sessions, and the
-        // gate in `split()` is the one place it is enforced.
-        spawnModels: spawnAllowedList,
+        // What a spawned agent may run on, read FRESH at split time — the
+        // settings page can change the policy between sessions, and the gate
+        // in `split()` is the one place it is enforced.
+        spawnCatalogue,
+        resolveProvider: resolveProviderById,
         // The board's scheduled runs, bound once for every session. The tool
         // handlers have already fenced the args with `parseScheduleDraft` —
         // that fence is host-side code in every transport, in-process and
@@ -2343,11 +2508,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // this starts processes that cost money. Dismissing it is a refusal —
         // `showWarningMessage` resolves undefined, which is not the button.
         confirmSplit: async (parent, subtasks, reason) => {
-          // The model each piece asked for rides on its line: the allowlist
-          // gate has already vetted it, and the user approving a split should
-          // see what each of N new bills will run on.
+          /* WHERE EACH PIECE WILL RUN rides on its line: the routing gate has
+             already vetted it, and the user approving a split should see what
+             each of N new bills will run on.
+             The RESOLVED route, not the raw ask — the agent may have named
+             `deepseek` and the label on screen is "DeepSeek", and a modal that
+             quoted the slug would be asking about one thing and describing
+             another. A piece staying on the parent's own agent says nothing,
+             because "same as this card" is the default and naming it on every
+             line would bury the one line that is different. */
+          const known = spawnCatalogue().agents
+          const parentKey = agentKeyOf(parent.runtime, parent.provider ?? '')
           const titles = subtasks
-            .map((t, i) => `${i + 1}. ${t.title}${t.model ? ` — ${t.model}` : ''}`)
+            .map((t, i) => {
+              const key = agentKeyOf(t.route.runtime, t.route.provider)
+              const where = key === parentKey
+                ? undefined
+                : known.find((a) => a.key === key)?.label ?? key
+              const bits = [where, t.route.model, t.route.effort && `${t.route.effort} effort`]
+                .filter(Boolean)
+              return `${i + 1}. ${t.title}${bits.length ? ` — ${bits.join(' · ')}` : ''}`
+            })
             .join('\n')
           const choice = await vscode.window.showWarningMessage(
             `"${parent.title}" wants to split into ${subtasks.length} subtasks, each its own agent in its own worktree.`,
@@ -2674,6 +2855,55 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       const listed = await ws.store.list({ includeArchived: showArchived })
+      const agentsBySession = await backgroundAgents()
+      /* Outcomes are read ONLY for sessions that actually spawned an agent —
+         typically none or a handful — because the only authoritative statement
+         is the `<task-notification>` in that session's own transcript, and
+         parsing one per card would be the per-repaint cost this project has a
+         postmortem about. The store's parse is cached, so a session already on
+         screen costs nothing. */
+      const badges = new Map<string, { total: number; running: number; orphaned: number }>()
+      if (agentsBySession.size) {
+        const liveIds = new Set((ws.manager?.list() ?? []).map((a) => a.sessionId).filter(Boolean))
+        const drawn = new Set<string>([...listed.map((x) => x.id), ...liveIds as Set<string>])
+        for (const [sid, spawned] of agentsBySession) {
+          if (!drawn.has(sid)) continue
+          const reported = parseTaskNotifications(await ws.store.transcript(sid).catch(() => []))
+          const live = liveIds.has(sid)
+          let running = 0, orphaned = 0
+          for (const a of spawned) {
+            const st = agentStatus(a, reported, live)
+            if (st === 'running') running++
+            else if (st === 'orphaned') orphaned++
+          }
+          badges.set(sid, { total: spawned.length, running, orphaned })
+        }
+      }
+      const agentBadge = (sid: string | undefined) => {
+        const b = sid ? badges.get(sid) : undefined
+        return b ? { agents: b } : {}
+      }
+      /* The selected session's agents in full, with what can honestly be said
+         about each. Only for the selected one: the panel is the only place that
+         draws them, and this is the render path. */
+      const selectedAgents: NonNullable<UiState['backgroundAgents']> = []
+      {
+        const sid = ws.manager?.byKey(selectedKey ?? '')?.sessionId ?? selectedKey
+        const spawned = sid ? agentsBySession.get(sid) : undefined
+        if (sid && spawned?.length) {
+          const live = !!ws.manager?.byKey(selectedKey ?? '')
+          const reported = parseTaskNotifications(await ws.store.transcript(sid).catch(() => []))
+          for (const a of spawned) {
+            selectedAgents.push({
+              id: a.id,
+              description: a.description,
+              ...(a.agentType ? { agentType: a.agentType } : {}),
+              ...(a.lastFrameAt ? { lastFrameAt: a.lastFrameAt } : {}),
+              status: agentStatus(a, reported, live),
+            })
+          }
+        }
+      }
       // A run has no Claude Code session for its first moment, and may never get
       // one if its id collided. Its board state lives in the sidecar under the
       // run id, so read that too or the card renders as a default with whatever
@@ -2727,6 +2957,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...(a.parent ?? m?.parent ? { parent: (a.parent ?? m?.parent)! } : {}),
           ...(testPlan ? { testPlan } : {}),
           ...(a.queued?.length ? { queued: a.queued } : {}),
+          ...agentBadge(a.sessionId),
           agent: toUiAgent(a),
         })
       }
@@ -2758,6 +2989,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...(s.parent ? { parent: s.parent } : {}),
           ...(s.testPlan ? { testPlan: s.testPlan } : {}),
           ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
+          ...agentBadge(s.id),
           // Only reachable in THIS loop, and that is the point: these are the
           // sessions with no live agent. A card in a started column with
           // nothing running is an agent that stopped without handing the work
@@ -3028,10 +3260,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(Object.keys(disclosures).length ? { disclosures } : {}),
         ...(review && review.key === selectedKey ? { review: review.data } : {}),
         ...(pendingMerge ? { pendingMerge } : {}),
+        ...(selectedAgents.length ? { backgroundAgents: selectedAgents } : {}),
         ...(busy ? { busy } : {}),
         ...(boardFocusApplied() ? { focused: true } : {}),
         ...(BoardPanel.isOpen ? { boardOpen: true } : {}),
-        running: kind('working') + kind('starting'),
+        running: kind('working') + kind('starting') + kind('waiting'),
         waiting: kind('needsInput'),
       }
     },
@@ -3570,6 +3803,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         'The editor restarted while you were working, so your last turn was cut off part-way ' +
         'through. Check the current state of your worktree before doing anything — your last ' +
         'action may or may not have completed — then carry on from there.',
+      )
+    },
+
+    /**
+     * Ask a stalled session to hand its work back properly.
+     *
+     * The case this exists for: a project's own slash command runs a long
+     * procedure ending "Then STOP. A human reviews and merges." The agent obeys
+     * that specific terminal step, never calls `set_phase`, and the card sits in
+     * a started column with the work finished — so the user never gets the test
+     * plan that reaching a review column is supposed to produce. Moving the card
+     * by hand does not produce one either; only the agent can write it.
+     *
+     * A CLICK, never automatic, and for the same reason `resume` is: this starts
+     * a real turn on a real agent with a real bill, on a session that may be
+     * long. The prompt is fixed and host-written so it cannot be steered by
+     * anything in the transcript, and it explicitly allows "not finished" as an
+     * answer — an instruction that only permits the reply we want is how you get
+     * a test plan for work that was never done.
+     */
+    async askTestPlan(key) {
+      const w = requireWs()
+      const review = w.board.columns.find((c) => c.category === 'review')
+      if (!review) {
+        vscode.window.showInformationMessage('This board has no review column to hand work back to.')
+        return
+      }
+      await this.sendMessage(
+        key,
+        `Your run ended with this card still in "${w.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'}". ` +
+        `If the work is finished, call set_phase("${review.id}") with howToTest — a one-line summary, ` +
+        'the concrete steps to check it, and links to the files you changed and the command that ' +
+        'verifies them. If it is NOT finished, say what is left instead of moving the card. ' +
+        'Moving the card is how a run ends, so do it before you stop.',
       )
     },
 
@@ -4590,7 +4857,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (cfg().get<boolean>('statusBar') === false) { statusItem.hide(); return }
     const live = ws?.manager?.list() ?? []
     const waiting = live.filter((a) => a.state.kind === 'needsInput').length
-    const running = live.filter((a) => ['working', 'starting'].includes(a.state.kind)).length
+    const running = live.filter((a) => ['working', 'starting', 'waiting'].includes(a.state.kind)).length
     statusItem.text = waiting
       ? `$(kanban) ${waiting} waiting on you`
       : running

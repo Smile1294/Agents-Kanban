@@ -272,6 +272,115 @@ live button would only ever produce an error toast.
 
 ## Postmortems
 
+### "It says completed but nothing came back, and the second one never launched"
+
+A test session spawned a background agent with the `Agent` tool, said "waiting
+on its completion notification", and ended its turn. The board then showed the
+agent as completed (the on-disk scan from the entry above was right) — and
+nothing else happened: no findings reached the parent, and the second agent the
+parent had promised to spawn never appeared.
+
+The parent's transcript has the whole story in one second. At 15:29:27.042 the
+assistant's last text; at .115 a `queue-operation: dequeue`; at .116 a user
+message `<task-notification>… <status>completed</status> … <result>Total count:
+23 …`, with `origin: {kind: "task-notification"}`. The CLI had queued the
+agent's notification as the NEXT USER MESSAGE and was about to run a turn on
+it. Then nothing, because `finish()` in the manager calls `stop()` on the
+session the moment the turn's `result` frame arrives — deliberately, to fix
+the idle-process leak recorded earlier in this file — and the follow-up turn
+died with the process.
+
+Probed against the real CLI in SDK streaming mode with the process KEPT ALIVE,
+the sequence is unambiguous: `task_started` (is_backgrounded) → the agent's
+`task_notification` → the turn's `result` → six milliseconds later a fresh
+`system/init`, the answer ("Agent returned: pong"), and a second `result`, with
+no input from us. The SDK also declares every frame needed to know this is
+coming — `task_started`, `task_progress`, `task_updated`,
+`background_tasks_changed` (REPLACE semantics), `task_notification` — and
+`AgentSession.handle()` dropped all of them in `default: break`.
+
+So a run now outlives its TURN while background tasks are live. The session
+tracks them from those frames (non-ambient only; the CLI's own watchers are
+flagged and must not hold a run open), counts notifications it has seen as
+follow-up turns the CLI owes, and on a `result` with either outstanding enters
+a new `waiting` state instead of `done`: the process stays alive, the card
+says "waiting on 1 background agent: <description>" with the age of the last
+frame, the chat foot says the same beside its spinner, and Interrupt and Stop
+stay offered. The follow-up turn's `init` puts it back to `working`; the
+`result` with nothing left live finishes the run, reporting the LAST turn. Two
+guards. A repeated `init` with the same session id is not re-announced, or
+every follow-up turn would re-run the card's adoption and rename. And when
+only a follow-up turn is owed and nothing is live, a ten-second grace timer
+finishes the run if no turn comes — the one case the probe could not rule out
+is two notifications answered in a single turn, which would otherwise leave
+the count of turns owed above zero for ever. `background-turns.test.ts` feeds
+the recorded frame order through the real handler and was red before the
+change on exactly the reported case.
+
+### "The remote is fully white"
+
+The headless board (`server/server.mjs`) served `media/board.css` unchanged, and
+every colour in that file is `var(--vscode-*)`. Inside the editor VS Code sets
+those variables inline on `<html>` from the active theme; in a browser nothing
+sets them, so every `var()` resolved to nothing and the page painted as an
+unstyled document — white background, black text, default blue links, the
+browser's light 15px scrollbars. The screenshot renderer never showed it because
+it carried a private map of Dark Modern values: the one place that supplied a
+theme was the one place a user never looks.
+
+The fix is `media/theme.css`: the Dark Modern palette declared on `:root`, plus
+the scrollbar, link and code baseline the webview preamble gives for free.
+`server/page.mjs` loads it before the app stylesheets on both pages, and
+`test/screenshots.mjs` loads it instead of its own map. Three things are
+load-bearing. It is declared on `:root`, where the editor's inline values
+outrank it — it would be inert in the editor, and it is not loaded there at all.
+`theme.test.mjs` extracts every `var(--vscode-*)` the stylesheets and view
+scripts use and fails on one the sheet does not define, because a colour added
+to board.css would otherwise reach the browser unthemed and nothing would
+notice. And the page HTML moved into a pure `page.mjs` so the test asserts on
+the DOCUMENT order — theme before board.css — rather than on how server.mjs is
+written: the first draft of that assertion compared source offsets and was wrong
+about a page that was right.
+
+Found on the way: the headless gate itself (`src/remote/__tests__/headless.test.mjs`)
+could not run on a Mac. Its Chromium hunt knew only the Linux cache path and,
+unlike `layout.test.mjs`, had no fallback to the build playwright resolves on its
+own — so it reported "no Chromium" on a machine with one, AFTER spawning its
+server, which it then never killed. Three orphaned servers were running here,
+each an activated extension host watching this repository. It falls back now,
+and the server dies on every exit path. It had been masked for as long as the
+layout test failed ahead of it, since the runner stops at the first red file.
+
+### "The button sizes vary a lot"
+
+Measured on the composer bar in real Chromium, one row: the AGENT badge 13px, a
+provider note 16px, a plain picker 18px, the gear 21px, and every picker that
+carried an emoji — 🤖 Claude Code, ⚡ Ultracode, 🚀 Fast, 🔑 Auto — 23px. Each
+control had its own padding and its own font size in `em`, nothing fixed the
+height, and an emoji glyph raises the line box it sits in by about 5px. The same
+bar wrapped to four rows in a 560px split editor (the rail takes 258px of that),
+which is the `layout.test.mjs` failure that had been red on `main` for two
+commits: 96px against a 90px ceiling.
+
+The fix is tokens and one geometry. `--ctl-h` (24px), `--ctl-h-lg` (32px, the
+input row) and `--ctl-h-xs` (20px, actions inside a card) are the only heights,
+with one font size and one radius beside them. The base `button` rule IS the
+standard control — `min-height`, inline-flex, centred — `.ctl` is the same
+geometry as a class for the chips that are `<span>`s, and `.ctl-ico` is a
+fixed-width slot for a glyph, so an emoji cannot resize the chip it is in. Under
+480px the bar sheds its decorative parts through a container query — the badge,
+the carets — which is what brings a 300px bar to three even rows. Two traps,
+both caught by the Chromium gate on the way. `min-height: 24px` on the base
+rule REPLACES a flex item's automatic minimum, so twenty menu rows in the
+bounded 320px column list shrank to 24px each with two lines of text crushed
+into one. And the base `align-items: center` stopped a menu label stretching to
+its column, so its ellipsis stopped working and the row overflowed by 6px.
+Row-shaped buttons — menu rows, file rows — opt out in one list, with
+`min-height: auto; align-items: stretch`. The layout test now measures every
+`.ctl` on the bar and fails if two differ. Tailwind was considered and
+rejected: the webview CSP forbids CDN scripts, and a build step would add a
+dependency for what eight tokens do.
+
 ### "It fetched all and I cant remove them"
 
 Reported as "it fetches remote chats from claude code". They were **Codex**
@@ -370,6 +479,94 @@ confirmed a modal, and got a corner notification they missed — so from their
 seat the button did nothing. Every refusal on a path the user explicitly clicked
 is now modal. A dismissible answer to a deliberate action is the same class of
 bug as a signal that cannot say "bad".
+
+### Background agents that were never on the board at all
+
+Reported as "I thought they are still working but they weren't". A session
+spawned two agents with the `Agent` tool, its turn ended, the CLI process went
+away, and the board showed nothing — not that they had stopped, not that they
+had existed. The rule broken is the one the context meter already follows and
+this did not: **what the board shows must not depend on a process being alive.**
+Subagent frames were read in exactly one place, `agent/session.ts`, which is the
+live-run parser.
+
+**What is actually knowable, established against a real store rather than
+assumed.** Claude Code writes each one to
+`projects/<dir>/<session>/subagents/agent-<id>.{jsonl,meta.json}`. The sidecar
+carries `agentType`, `description`, `toolUseId`, `spawnDepth` — **no status
+field**. The launch's own `tool_result` reads "Async agent launched
+successfully", which is the start. The `tasks/<id>.output` file that the
+notification points at turns out to be a *symlink to the same `.jsonl`*, so it
+adds nothing. The only authoritative statement of outcome anywhere is the
+`<task-notification>` the harness writes back into the PARENT transcript, with
+`<task-id>` and `<status>completed|stopped</status>`.
+
+So three of the four states are derived, and the wording had to be chosen
+carefully. `orphaned` renders as **"no completion recorded"**, never "stopped":
+the notification could be outside the transcript window, and "stopped" would
+assert an outcome nobody reported. "Cannot still be running" stays true either
+way — a background agent is a child of the CLI process — so the panel says that
+instead. An unrecognised `<status>` is DROPPED rather than mapped onto one we
+know, for the same reason: the vocabulary belongs to another program and can
+grow.
+
+**The liveness number is the age of the last frame**, not a dot, because a dot
+pulses over a wedged process too — a live agent that has written nothing for
+nine minutes is the case the panel exists to make visible.
+
+Three things are load-bearing about the cost. The scan is ONE directory walk
+keyed by session id, because a badge is drawn on every card and asking per
+session would be O(cards x project directories) of `stat` on the render path.
+Outcomes are parsed only for the handful of sessions that actually spawned an
+agent, since that needs the session's transcript. And there is a 5s tick,
+deliberately narrow — only with the board open, a card selected, and agents on
+disk — because this is the one readout on the board that moves while NOTHING is
+streaming: the parent's turn can end while its agents keep writing, and in that
+state no frames arrive, so the age would sit frozen at whatever it was.
+
+A follow-up, found on review of that change: the five-second tick gated on
+`bySession.size`, and the scan is machine-wide — every project directory under
+`~/.claude` — so the gate was true for as long as ANY session on the machine had
+ever spawned an agent, which made it a five-second repaint of every board with a
+card selected, forever. It gates on the SELECTED session having agents now,
+resolving a live run's key to its session id the way `getState()` does.
+
+### A slash command that outranks the board's brief
+
+The follow-up to the case below, with the cause named. The project's own
+`/jira-task` command is a long procedure whose §8 defines DONE as ending after
+§11 and whose last line is "Then STOP. A human reviews and merges." The agent
+obeyed that specific, procedural terminal step and treated moving its card as
+extra work it had been told to skip.
+
+Worth stating because the first guess was wrong: nothing was being drowned out
+mechanically. `buildBrief()` goes in as `appendSystemPrompt`, so it was present
+for every turn of the session. **Present is not the same as outranking** — a
+generic background instruction loses to a specific procedural one every time. So
+the brief now names the conflict directly: the move is "how a run ENDS", and if
+a command, skill or instruction says to stop, call `set_phase` FIRST.
+
+That is a prompt and cannot be guaranteed, which is the whole reason the
+recovery exists in the UI. `stalledSince` already put a marker on the card; its
+primary action is now **Ask for test plan**, which resumes the session with a
+fixed host-written prompt asking it to move the card AND write `howToTest`.
+Moving the card by hand — the action that was there before — produces no test
+plan at all, and the plan is the entire reason a review column exists; only the
+agent can write one. Three things are deliberate: it is offered ONLY where there
+is a worktree to resume into (a turn that cannot run is a button that cannot do
+what it says), it is a CLICK and never automatic (a real turn on a real agent
+with a real bill, on a session that may be long), and the prompt explicitly
+allows "it is not finished" as an answer — one that only permits the reply we
+want is how you get a test plan for work nobody did.
+
+The layout of those two buttons is its own small lesson. As a rigid row
+(`flex: 0 0 auto`) they overflowed the card and "Move anyway" — the escape
+hatch — was the half that fell off the edge. A screenshot caught it while the
+Chromium gate was green, because the gate's page uses `sans-serif` and the real
+webview uses `-apple-system`: the same box, different metrics. The fix is not a
+wider measurement, it is CSS that cannot overflow at any metric — wrap, shrink,
+ellipsis — and a gate that measures against the MARKER BOX rather than the card,
+which is the tighter constraint.
 
 ### Cards that sit in Implementing after the agent has gone
 
@@ -2629,8 +2826,108 @@ sequence — and every assertion starts with the rule the fix encodes: the
 page's text must never *be* the string "undefined". Shown to fail against
 the unfixed page, as a new gate must be.
 
+### Per-piece routing: an objective on one model, its subtasks on others
+
+**Asked for as:** *"I use the best model as composer — Fable 5.1 — and it should
+be able to use DeepSeek, Opus 5, Kimi 3 and ChatGPT to work on the features as
+subagents."*
+
+Half of that already worked and half of it could not, and the line between them
+was not where anyone would guess: `split_task` had a per-piece `model` from the
+day it shipped, so a Fable 5.1 parent could already put a child on Opus 5. What
+it could not do was cross a BACKEND or a RUNTIME — and DeepSeek, Kimi and
+ChatGPT are all one of those two, not models. See the rule about a runtime not
+being a provider; this is that distinction becoming a feature.
+
+**Paperclip does it, and it is worth naming how**, because it is not a router.
+An agent row there carries its own adapter and model config, so a company's
+employees sit on different providers by construction. Ours is the same idea one
+level down: the route is a property of the SUBTASK, not of a routing service.
+There is deliberately still no requirement-vector router — the facts one would
+need are absent on the default runtime (`claudeRuntime.models()` omits
+`supportedEffort`), so it would announce *"Opus 5 has no effort levels"* about a
+model with five. **The agent names, the host refuses.**
+
+`agent/routing.ts` is the whole policy, pure. `split_task` takes `agent`
+(a `<runtime>|<profile>` slug), `model` and `effort` per piece; `resolveRoute()`
+resolves and checks them; `AgentManager.split()` is the only caller.
+
+**One picker, one vocabulary.** The route is ONE field naming an agent+backend
+combination, not an agent field and a backend field, because the composer
+already learned that lesson the hard way — two pickers made the user do the
+cross product in their head and the bar showed half the answer. `agentKeyOf()`
+builds the key for the picker, for the spawn catalogue and for a live run's own
+identity, and `smoke.mjs` asserts all three agree through the real host state.
+If they drift, the picker shows nothing selected AND every split is refused, and
+nothing on screen explains why.
+
+**Four refusals, because there are four fixes.** `spawn-agent` (not
+configured), `spawn-model` (that backend does not serve the id, or every model
+is unticked), `spawn-catalogue` (the board has never READ that backend, so its
+"model list" is the built-in Anthropic table standing in — refusing on that as
+fact would be the probe bug again), `spawn-effort` (the model does not take that
+level). Each is recorded on the parent, because a session that tried to route,
+was refused, and did the work alone must not be byte-identical on the board to
+the correct adaptive outcome.
+
+**The effort gate is the seventh gate, and it was a named open gap.** A piece
+proposing `xhigh` on a model with no such level was accepted, silently dropped
+by the flag gate at launch, and nothing on the card said the request had been
+discarded. It is ONE-SIDED: an EMPTY `efforts` list means nobody asked that
+backend, and refusing on an absence would stop every gateway session choosing a
+level it may well support. A junk level (`banana`) is refused whether or not
+there is a catalogue — that needs no facts.
+
+#### Three bugs found on the way, all in the same shape
+
+- **A child inherited the parent's RUNTIME and the workspace's BACKEND.**
+  `split()` passed `runtime: parent.runtime` and nothing else, so `launch()`
+  fell through to `this.opts.provider` — the ACTIVE profile. A session that had
+  been running on DeepSeek all morning fanned out into children on Anthropic:
+  a different backend, different model ids, a different bill, silently. It is
+  the exact mirror of the runtime bug the comment above that line exists to
+  record, in the one place the fix was never applied. `RunningAgent.provider`
+  now carries the other half, and a route defaults to the parent's WHOLE agent.
+
+- **Routing was resolved twice, and the second time was minutes later.**
+  `startRun()` read `this.opts.defaults` and `this.opts.provider` after two
+  awaits, while `setDefaults()` and `setProvider()` replace that state
+  wholesale and `drain()` launches a queued run much later. `MAX_SUBTASKS` (4)
+  exceeds the default concurrency (3), so **the fourth piece of a fan-out always
+  drains late** — routing by mutating manager state hands one task another
+  task's model. `launchSettings()` freezes every per-run choice in `start()`,
+  into the queue entry that already existed. Worse, `launch()` recomputed
+  `chosen` from `this.opts.defaults` DIRECTLY and overwrote whatever the caller
+  passed, so a routed model reached the runtime as the workspace default and
+  the card recorded that default as fact.
+
+- **A blank routing field survived its own sanitiser.** `checkProposal` spreads
+  the model's object and then adds the cleaned fields, so returning `{}` for a
+  blank one left `model: '   '` in place from the spread. Latent since the
+  `model` field shipped, and invisible to every test: the only symptom is a
+  whitespace id reaching the gate and a refusal quoting three spaces. `bounded()`
+  now always writes the key, `undefined` included.
+
+#### What is deliberately NOT built
+
+- **No per-piece `thinking`.** It is Claude's adaptive-thinking switch and
+  omitting the option IS the on state, so a per-piece tri-state would be a
+  control whose middle value is indistinguishable from absent.
+- **`ultracode` / `fastMode` are per run but NOT persisted.** `SessionMeta` has
+  no field for them and adding a write with no round trip is not persistence —
+  the rule `contextWindow` has a postmortem for.
+- **A runtime with no backend concept has no tick list on the settings page.**
+  `spawnKeyFor()` gives it one (`runtime:codex`), so absence reads as "all
+  allowed" — the documented default. Named here rather than papered over.
+
 ## Still open
 
+- **A routed subtask's backend must be READ once before the board can check it.**
+  `spawn-catalogue` refuses a model named on a gateway profile whose catalogue
+  nobody has fetched, and the fix is a click on the settings page. Honest, and
+  still a step a first-time user will hit. Seeding every configured profile's
+  endpoint list at activation would remove it, at the cost of N HTTP requests on
+  a path that is currently free.
 - **`verify` tests before it builds, and one test reads the build.**
   `executable.test.ts` greps `dist/extension.js`, so after a pull that changes
   bundled code it inspects yesterday's bundle and fails until someone runs

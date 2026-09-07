@@ -218,6 +218,11 @@ export interface UiCard {
    * `interrupted` — see `stalledSince`.
    */
   stalled?: number
+  /** Background agents this session spawned, summarised for the card. Present
+   *  only when it spawned any. `orphaned` is the one worth scanning for: it
+   *  means agents that cannot still be working, which used to look identical to
+   *  agents hard at work. */
+  agents?: { total: number; running: number; orphaned: number }
   /** Follow-ups typed while this turn is still running. */
   queued?: string[]
   agent?: {
@@ -228,6 +233,10 @@ export interface UiCard {
     tool?: string
     /** What a Task's subagent is running, so a long Task is not a dead row. */
     subagent?: string
+    /** `waiting` only: how many background agents are still live, and the first
+     *  one's description — the turn ended, the run did not. */
+    tasks?: number
+    on?: string
     /** When the CLI last emitted anything. The view shows its AGE — a claim the
      *  user can check, unlike a dot that pulses whether or not anything moved. */
     lastEventAt?: number
@@ -298,6 +307,16 @@ export interface UiState {
    * others refusing for a reason that is nowhere on screen.
    */
   pendingMerge?: PendingMerge
+  /** The selected session's background agents, with what can honestly be said
+   *  about each. See `sessions/subagents.ts` — there is no status field on
+   *  disk, so `running` and `orphaned` are DERIVED and say so. */
+  backgroundAgents?: Array<{
+    id: string
+    description: string
+    agentType?: string
+    lastFrameAt?: number
+    status: 'completed' | 'stopped' | 'running' | 'orphaned'
+  }>
   /** Set while a merge is in progress so the view can disable the button. */
   busy?: string
   /** True while the board has taken over the window. */
@@ -527,6 +546,9 @@ export interface BoardHost {
   openTestLink(key: string, kind: string, target: string): Promise<void>
   commitWorktree(key: string): Promise<void>
   mergeWorktree(key: string, into?: string): Promise<void>
+  /** Resume a stalled session and ask it to hand the work back properly —
+   *  move its own card AND write the test plan that move requires. */
+  askTestPlan(key: string): Promise<void>
   /** Commit the merge waiting for review — the user saying yes. */
   commitMerge(): Promise<void>
   /** Throw the waiting merge away, leaving the branch as it was. */
@@ -660,6 +682,7 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
           break
         case 'commit': await host.commitWorktree(id()); await refresh(); break
         case 'merge': await host.mergeWorktree(id(), typeof msg.into === 'string' ? msg.into : undefined); await refresh(); break
+        case 'askTestPlan': await host.askTestPlan(id()); await refresh(); break
         case 'commitMerge': await host.commitMerge(); await refresh(); break
         case 'abortMerge': await host.abortMerge(); await refresh(); break
         case 'mergeDiff': await host.openMergeDiff(String(msg.file ?? '')); break
@@ -1017,6 +1040,7 @@ export function toUiAgent(a: RunningAgent): NonNullable<UiCard['agent']> {
     ...(s.kind === 'queued' ? { since: s.since } : {}),
     ...(s.kind === 'working' && s.tool ? { tool: s.tool } : {}),
     ...(s.kind === 'working' && s.subagent ? { subagent: s.subagent } : {}),
+    ...(s.kind === 'waiting' ? { tasks: s.tasks, ...(s.on ? { on: s.on } : {}) } : {}),
     ...(s.kind === 'error' ? { message: s.message } : {}),
     ...(a.lastEventAt ? { lastEventAt: a.lastEventAt } : {}),
     ...(a.costUsd !== undefined ? { costUsd: a.costUsd } : {}),
