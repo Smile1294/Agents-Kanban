@@ -425,14 +425,19 @@ Working:
   `vscode` stub (the `test/harness.mjs` technique) with the browser as its
   webview: the real `media/board.js` page, `acquireVsCodeApi` supplied by
   `server/bridge.js` — `postMessage` becomes a POST, host frames arrive over
-  SSE, dialogs become overlays — and a pairing code (`x-rc-code` header /
-  `?code=` on the stream, sha-256 compared `timingSafeEqual`) gates everything.
+  SSE, dialogs become overlays — and a pairing code (accepted on exactly two
+  routes, sha-256 compared `timingSafeEqual`) buys a short-lived token by
+  `POST /api/session`; everything else is gated by the token, which expires in
+  five minutes, dies on `POST /api/revoke` (which also ends every open event
+  stream) and on restart, and is re-exchanged from the stored code once per
+  page life — a second death draws the gate with an explanation.
   Every webview message the extension understands works from a browser, so a
   VPS or a mini PC holding the repo is a complete board reachable from
   anywhere. The gate test (`src/remote/__tests__/headless.test.mjs`) spawns
   the server against a throwaway repo and drives the whole flow through a real
   Chromium: 401s without the code, state over the stream, the gate, the
-  composer, the settings tab, zero console errors. The relay in `remote/`
+  composer, the settings tab, the first-death recovery and the second-death
+  dead end, zero console errors. The relay in `remote/`
   remains as the smaller mirror mode. See [server/README.md](server/README.md)
 - Archive (soft, reversible) and permanent delete
 - Permission prompts inline on the card

@@ -89,7 +89,13 @@ Two more routes are public on purpose: `POST /api/session` exchanges the
 pairing code ONCE for a session token (32 random bytes kept as a sha-256
 digest), and `POST /api/revoke` takes the code OR a live token and bumps the
 in-memory revocation epoch, killing every token minted before it — a restart
-bumps it too, and an expiry sweep (`setInterval`…`unref()`) drops dead tokens.
+bumps it too (nothing token- or epoch-related is persisted), and an expiry
+sweep (`setInterval`…`unref()`) drops dead tokens. The revoke also ENDS every
+open SSE response (`revokeStreams()` — the clients registry maps surface →
+`Map<response, heartbeat>`, so the end clears the heartbeat too), because a
+stream opened on a revoked token must not keep reading board state no matter
+how many further epochs pass: the browser sees the stream close, its EventSource
+errors, and the bridge re-exchanges.
 The CODE is accepted on those two routes and nowhere else; every gated route
 reads `x-rc-token`, and the events route alone ALSO reads `?token=`
 (`EventSource` cannot set headers); auth failures log the PATHNAME only, never
@@ -108,7 +114,8 @@ silent. Config by env or `--flag`: `AGENTS_KANBAN_PORT` (4310), `_HOST`
 (127.0.0.1 — anyone with the code can run agents that spend money), `_REPO`,
 `_STORAGE` (`~/.agents-kanban`, never in the repo), `_CODE` (the only
 LONG-LIVED secret, compared as sha-256 digests with `timingSafeEqual`),
-`_CONFIG`, plus `_TOKEN_TTL` (43200), `_AUTH_BACKOFF_AFTER`, `_AUTH_BLOCK_AFTER`,
+`_CONFIG`, plus `_TOKEN_TTL` (300 — five minutes: the token is the one
+credential that rides in a URL, so it must die on a clock), `_AUTH_BACKOFF_AFTER`, `_AUTH_BLOCK_AFTER`,
 `_AUTH_BLOCK_MINUTES`, `_TRUST_PROXY`. `stub.mjs`: a fake VS Code kept
 deliberately SMALL so a missing API fails at activation as it would in the
 editor; a webview's `postMessage` becomes an SSE frame to every watcher; dialogs
@@ -119,16 +126,30 @@ white; `bridge.js` before the app scripts. `bridge.js`: installs
 control frames, draws the gate, dialogs and toasts. The token lives in
 `sessionStorage` and travels as `x-rc-token` (`?token=` on the stream); the
 code sits there ONLY so a dead token — expiry, revoke, restart — can be
-re-exchanged ONCE (a 401 retries the request, and the stream's blind onerror
-is told apart from a network blip by a `/api/ping`); a failed recovery shows
-the gate with an "expired session" note. Neither the code nor the token is
-ever printed to the console or put in the URL bar. Tests: `headless.test.mjs`
+re-exchanged ONCE per page life (a 401 retries the request, and the stream's
+blind onerror is told apart from a network blip by a `/api/ping`); a failed
+recovery shows the gate with an "expired session" note. A SECOND death in one
+page life is the dead end: the one share of the code was spent, so
+`recoverAuth()` closes the EventSource (ending its retry loop, not just the
+response), draws the gate with a note, and further requests keep retrying
+serialised through a `recovering`/`reexchanged` guard — the EventSource's own
+reconnect firing mid-exchange shares the in-flight recovery instead of
+answering "dead end" to an attempt that was still going to succeed. Neither
+the code nor the token is ever printed to the console or put in the URL bar.
+Tests: `headless.test.mjs`
 — spawns the server against a throwaway repo, checks the 401 gate AND that
 the code is refused on `/api/msg` and in the stream URL, exchanges for a token,
 drives `/api/msg` + the `?token=` stream, then real Chromium: gate, board,
-settings, zero console errors; `headless-auth.test.mjs` — the whole hardening
+settings, then the token lifecycle — a first revoke recovered silently (a new
+token in the stream URL), a second dead-ending at the gate with the honest
+note and NO further stream requests (no retry loop), and re-entering the code
+working again — zero console errors (dead-token 401s are expected and filtered);
+`headless-auth.test.mjs` — the whole hardening
 curve on one server: 401 → 429+Retry-After → 403, the block refusing the right
-code and logging once, the block lifting, revoke by code and by token, expiry
+code and logging once, the block lifting, revoke by code and by token, a
+revoke ENDING open event streams (no frame delivered after it), a restart
+resetting the epoch, the code never appearing in the log during
+exchange/wrong-code/revoke flows, expiry
 naming itself "expired", and the non-loopback startup warnings (each guard was
 shown RED when reverted).
 
@@ -176,6 +197,12 @@ host half IS the extension.
 
 ## Recent changes
 
+- 2026-09-07 · task/S106bw-fix · closed the hardening's loose ends: revoke now
+  ends every open event stream (a revoked tab receives nothing further), a
+  second token death in one page life dead-ends at the gate instead of an
+  EventSource retry loop, `AGENTS_KANBAN_TOKEN_TTL` defaults to 5 minutes, the
+  pairing code never appears in server output, and a restart-resets-the-epoch
+  test guards the ephemeral design.
 - 2026-09-07 · task/S106bw · hardened the headless board's auth: the code is
   exchanged once for a short-lived token (URLs and logs never see the code),
   wrong codes are rate limited per IP with backoff and a hard block, revoke

@@ -125,5 +125,9 @@ Headless: `server/server.mjs` activates the built extension against
 frames arrive over SSE, `postMessage` becomes `POST /api/msg`. The pairing code
 is exchanged once for a short-lived token (`POST /api/session`); the token
 gates everything else as an `x-rc-token` header, and `?token=` on the event
-stream alone — the code itself never rides in a URL. See [remote.md](remote.md)
+stream alone — the code itself never rides in a URL. A revoke (or a restart)
+kills every token AND ends every open event stream, so a revoked tab
+receives nothing further. The bridge re-exchanges the stored code once per
+page life; a second death draws the gate with an explanation instead of
+letting the EventSource retry a dead token forever. See [remote.md](remote.md)
 and `server/README.md`.

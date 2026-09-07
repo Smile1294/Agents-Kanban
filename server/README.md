@@ -25,17 +25,21 @@ extension's own webview document, with two additions:
 - The **pairing code** is the only long-lived secret. The server prints one at
   startup (or takes yours via `AGENTS_KANBAN_CODE`). The gate page exchanges it
   **once** for a session token (`POST /api/session`) — 32 random bytes that
-  the server keeps in memory as a sha-256 digest, live for 12 hours by default
+  the server keeps in memory as a sha-256 digest, live for 5 minutes by default
   (`AGENTS_KANBAN_TOKEN_TTL`). From then on the **token** rides as an
   `x-rc-token` header on every request, and in the query of the event stream
   alone (`?token=` — an `EventSource` cannot set headers). The code itself is
   accepted on exactly two routes — the exchange and `POST /api/revoke` — and
   never appears in a URL, so it cannot land in a request log, a proxy's access
   log, or a history. The one credential that ever rides in a URL is the token,
-  which is exactly why tokens expire and can be revoked. The gate page keeps
-  the code in `sessionStorage` only so a dead token (expiry, revoke, restart)
-  can be re-exchanged once without asking — when even that fails, the gate
-  returns with an "expired session" note instead of a bare error.
+  which is exactly why it expires after five minutes, dies on `POST
+  /api/revoke` (which also ends any open event stream, so a revoked tab
+  receives nothing further — not even a reconnect), and dies on every restart.
+  The gate page keeps the code in `sessionStorage` so a dead token (expiry,
+  revoke, restart) can be re-exchanged **once without asking** — the one share
+  every page holds. A second death in the same page life is a dead end: the
+  gate returns with a note saying so, rather than retrying a dead token behind
+  an empty board.
 - Wrong pairing codes are **rate limited per client IP**: exponential backoff
   (`429` + `Retry-After`) after `AGENTS_KANBAN_AUTH_BACKOFF_AFTER` failures, a
   hard block (`403`, which refuses even the right code) after
@@ -43,7 +47,8 @@ extension's own webview document, with two additions:
   `AGENTS_KANBAN_AUTH_BLOCK_MINUTES` minutes. The counters live in memory: a
   restart forgets every block, which is honest — the code did not change. A
   restart also expires every token, and every open tab re-exchanges its stored
-  code on its own within a request or two. Tokens are deliberately not rate
+  code on its own — once (see the dead-token paragraph above). Tokens are
+  deliberately not rate
   limited: a token is 256 bits of randomness, so a failing one is almost always
   your own, expired by the clock or the restart.
 - `media/theme.css` supplies the **theme**. The board's stylesheets take every
@@ -215,7 +220,7 @@ Restart=on-failure
 | `AGENTS_KANBAN_REPO` | the cwd | the repository the board works on |
 | `AGENTS_KANBAN_STORAGE` | `~/.agents-kanban` | extension state, sidecar, secrets — never inside the repo |
 | `AGENTS_KANBAN_CODE` | generated and printed | the pairing code — the only long-lived secret |
-| `AGENTS_KANBAN_TOKEN_TTL` | `43200` (12 h) | seconds a session token lives after the code exchange |
+| `AGENTS_KANBAN_TOKEN_TTL` | `300` (5 min) | seconds a session token lives after the code exchange — the credential that rides in URLs, so it must die on a clock |
 | `AGENTS_KANBAN_AUTH_BACKOFF_AFTER` | `5` | wrong codes before the server answers `429` + `Retry-After` (exponential backoff) |
 | `AGENTS_KANBAN_AUTH_BLOCK_AFTER` | `20` | wrong codes before a hard `403` block — even the right code is refused |
 | `AGENTS_KANBAN_AUTH_BLOCK_MINUTES` | `15` | how long the hard block lasts (a restart clears it sooner) |

@@ -13,9 +13,11 @@
  * sessionStorage then holds the token (`x-rc-token` on every request; `?token=`
  * on the EventSource, which cannot set headers) and keeps the code ONLY so a
  * dead token — expired, revoked, or a server restart — can be re-exchanged
- * once without asking the user again. When even that fails, the gate returns
- * with an explanation. Neither the code nor the token is ever printed to the
- * console or put in the URL bar.
+ * once without asking the user again. When even that fails — and a SECOND
+ * death in one page life is always that, the one share of the code being
+ * spent — the gate returns with an explanation rather than leaving the
+ * EventSource to retry a dead token forever. Neither the code nor the token
+ * is ever printed to the console or put in the URL bar.
  */
 ;(function () {
   'use strict'
@@ -59,20 +61,39 @@
   // The code is kept only to re-exchange — and only ONCE per page life, or a
   // loop of dead tokens and re-exchanges would chase its own tail.
   let reexchanged = false
+  let recovering = null
   let stream = null
 
   /** One 401 recovery: kill the dead stream, re-exchange the code once, tell
    *  the caller whether a fresh token is now stored. Shows the gate — with an
-   *  honest note — when the session cannot be recovered. */
+   *  honest note — when the session cannot be recovered.
+   *
+   *  A SECOND dead token in the same page life is a dead end, not another
+   *  retry: the one share of the code was spent, and an EventSource left to
+   *  itself would retry a dead token every `retry:` (2s) forever behind an
+   *  empty board — a stranding tab the user can only close. So the stream is
+   *  closed and the gate goes back up, with a message. Concurrent triggers of
+   *  the SAME death — the EventSource's own reconnect firing while the
+   *  exchange is still in flight — share one recovery, or the second would
+   *  answer "dead end" to an attempt that was still going to succeed. */
   async function recoverAuth() {
-    if (reexchanged) return false
-    reexchanged = true
-    const expired = !code() // a token died and there is nothing left to re-exchange it with
-    closeStream()
-    const ex = await exchange()
-    if (typeof ex === 'string') return true
-    showGate(noteFor(ex, expired))
-    return false
+    if (!recovering) {
+      recovering = (async () => {
+        if (reexchanged) {
+          closeStream() // ends the EventSource's retry loop, not just the response
+          showGate(DEAD_END_NOTE)
+          return false
+        }
+        reexchanged = true
+        const expired = !code() // a token died and there is nothing left to re-exchange it with
+        closeStream()
+        const ex = await exchange()
+        if (typeof ex === 'string') return true
+        showGate(noteFor(ex, expired))
+        return false
+      })()
+    }
+    try { return await recovering } finally { recovering = null }
   }
 
   function closeStream() {
@@ -80,6 +101,7 @@
   }
 
   const GATE_DEFAULT = 'This board is locked with a pairing code. The server printed it when it started.'
+  const DEAD_END_NOTE = 'This session is no longer valid — enter the pairing code again.'
   function noteFor(ex, expired) {
     if (ex === null) {
       return expired ? 'The session expired — enter the pairing code again.' : 'The board did not answer — is the server still running?'

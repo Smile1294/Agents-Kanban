@@ -10,6 +10,10 @@
  *  - a real Chromium opens the page, passes the gate, sees the real board
  *    render, clicks the settings gear and gets the settings tab — with zero
  *    console errors anywhere
+ *  - and the token-lifecycle part, in the same Chromium: a revoke is recovered
+ *    ONCE, silently, by re-exchanging the stored code; a SECOND revoke is a
+ *    dead end — the gate returns with an explanation and the EventSource stops
+ *    retrying a dead token
  *
  * The chromium part follows test/layout.test.mjs: whatever build the
  * machine's playwright cache holds — any newer Chromium beats a fresh 170MB
@@ -148,6 +152,18 @@ try {
   }
   const page = await browser.newPage()
   listen(page)
+  // Every token a /api/events request on THIS page used, from the first gate
+  // exchange on: each recovery opens a NEW EventSource with a new token in the
+  // URL, while a retry loop keeps reusing the dead one — that difference is
+  // what makes the token set the observable.
+  const eventsTokens = []
+  page.on('request', (r) => {
+    if (r.url().includes('/api/events')) {
+      const t = new URL(r.url()).searchParams.get('token')
+      if (t) eventsTokens.push(t)
+    }
+  })
+  const distinctTokens = () => new Set(eventsTokens).size
 
   await page.goto(base + '/')
   await page.waitForSelector('#ak-gate')
@@ -181,9 +197,58 @@ try {
   await popup.waitForSelector('text=Backends', { timeout: 15000 })
   console.log('ok: the settings tab renders in the popup')
 
+  // --- a token death is recovered once; a SECOND one is a dead end ------------
+  // A revoke ends the page's stream. The bridge's one recovery — re-exchange
+  // the stored code — is allowed ONCE per page life, so the first death is
+  // silent and the board comes straight back. A second death is where the old
+  // bridge strand was: an EventSource left to its own devices retries a dead
+  // token every `retry:` (2s) forever, behind a board that never changes — a
+  // stranding tab. The gate must come back, with an explanation, and the
+  // retries must stop.
+  const revoke = () => fetch(`${base}/api/revoke`, { method: 'POST', headers: { 'x-rc-code': CODE } })
+
+  await revoke()
+  // First death: the stream ends, the page pings, re-exchanges and re-opens
+  // ONCE. A second events token is the proof that the page recovered — the
+  // gate stays gone.
+  for (let i = 0; i < 60 && distinctTokens() < 2; i++) await page.waitForTimeout(200)
+  ok(distinctTokens() >= 2, 'a first revoke is recovered silently — the page re-exchanges and re-opens the stream')
+  ok((await page.locator('#ak-gate').count()) === 0, 'and the gate does not come back on the first death')
+
+  await revoke()
+  // Second death: nothing left to spend. The gate returns with the dead-end
+  // note, and the EventSource does NOT keep retrying — no new stream requests.
+  for (let i = 0; i < 60 && (await page.locator('#ak-gate').count()) === 0; i++) await page.waitForTimeout(200)
+  await page.waitForSelector('#ak-gate', { timeout: 5000 })
+  ok((await page.locator('#ak-gate p').innerText()).includes('no longer valid'), 'a second death draws the gate with the honest note')
+  // Let any in-flight reconnect (the retry timer is 2s) land first, then watch:
+  // a dead-ended page must not make another stream request.
+  await page.waitForTimeout(3000)
+  const requestsAtDeadEnd = eventsTokens.length
+  ok((await page.locator('#ak-gate').count()) > 0, 'the gate stays up, a message instead of an empty board')
+  await page.waitForTimeout(5000)
+  ok(eventsTokens.length === requestsAtDeadEnd, 'a dead-ended page stops retrying the dead token (no retry loop)')
+
+  // Re-entering the code starts over: the gate closes and a new exchange
+  // opens a fresh stream on a new token.
+  await page.fill('#ak-gate input', CODE)
+  await page.click('#ak-gate button:not(.ak-link)')
+  await page.waitForSelector('#ak-gate', { state: 'detached' })
+  const tokensAfterReentry = distinctTokens()
+  for (let i = 0; i < 60 && distinctTokens() === tokensAfterReentry; i++) await page.waitForTimeout(200)
+  ok(distinctTokens() > tokensAfterReentry, 're-entering the code exchanges again and reconnects the board')
+  await page.waitForSelector('text=AGENT SESSIONS', { timeout: 15000 })
+  console.log('ok: the dead-ended page recovers from the gate with the code')
+
   await page.waitForTimeout(300)
+  // The lifecycle section above issues dead-token /api/ping requests ON
+  // PURPOSE — that 401 is the signal the bridge reads to tell a dead token
+  // from a network blip. Chromium logs every non-ok resource load as
+  // "Failed to load resource", so those entries are filtered here, not counted
+  // as errors, and everything else still fails the gate.
   if (errors.length) console.error('server log:\n' + serverLog)
-  ok(errors.length === 0, 'no console errors anywhere' + (errors.length ? ':\n  ' + errors.join('\n  ') : ''))
+  const realErrors = errors.filter((e) => !e.includes('status of 401'))
+  ok(realErrors.length === 0, 'no console errors anywhere (expected dead-token 401 resource logs are not counted)' + (realErrors.length ? ':\n  ' + realErrors.join('\n  ') : ''))
 
   await browser.close()
 } catch (err) {

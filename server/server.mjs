@@ -22,8 +22,8 @@
  * when a token expires or a revoke kills it, and sends the token from then on
  * — as `x-rc-token` on every request except the event stream, which takes
  * `?token=` in the query because EventSource cannot set headers. A token in a
- * URL is the reason tokens die: 12h by default, sooner on `POST /api/revoke`
- * or a restart.
+ * URL is the reason tokens die: 5 minutes by default, sooner on
+ * `POST /api/revoke` or a restart.
  *
  *   AGENTS_KANBAN_PORT=4310   port (default 4310)
  *   AGENTS_KANBAN_HOST=0.0.0.0  bind beyond localhost (know what that means
@@ -35,7 +35,7 @@
  *   AGENTS_KANBAN_STORAGE=~   where the sidecar and extension state live
  *                             (default ~/.agents-kanban — never in the repo)
  *   AGENTS_KANBAN_CONFIG={}   JSON merged into `agentsKanban` settings
- *   AGENTS_KANBAN_TOKEN_TTL=43200        seconds a session token lives (12h)
+ *   AGENTS_KANBAN_TOKEN_TTL=300          seconds a session token lives (5m)
  *   AGENTS_KANBAN_AUTH_BACKOFF_AFTER=5   wrong codes before 429 backoff starts
  *   AGENTS_KANBAN_AUTH_BLOCK_AFTER=20    wrong codes before the hard block
  *   AGENTS_KANBAN_AUTH_BLOCK_MINUTES=15  how long the hard block lasts
@@ -74,7 +74,7 @@ const codeEnv = process.env.AGENTS_KANBAN_CODE || args.code
 const codeSupplied = Boolean(codeEnv)
 const code = codeEnv || randomBytes(12).toString('base64url')
 const codeDigest = createHash('sha256').update(code).digest()
-const tokenTtlS = confNum('AGENTS_KANBAN_TOKEN_TTL', 'token-ttl', 12 * 60 * 60)
+const tokenTtlS = confNum('AGENTS_KANBAN_TOKEN_TTL', 'token-ttl', 5 * 60)
 const authBackoffAfter = confNum('AGENTS_KANBAN_AUTH_BACKOFF_AFTER', 'auth-backoff-after', 5)
 const authBlockAfter = confNum('AGENTS_KANBAN_AUTH_BLOCK_AFTER', 'auth-block-after', 20)
 const authBlockMinutes = confNum('AGENTS_KANBAN_AUTH_BLOCK_MINUTES', 'auth-block-minutes', 15)
@@ -111,10 +111,10 @@ if (!fs.existsSync(dist)) {
 // body) and POST /api/revoke (x-rc-code header) — never in a URL and never on
 // any other route, so it cannot land in a request log or a proxy's access log.
 // It exchanges for a TOKEN: 32 random bytes, held here as its sha-256, live
-// for tokenTtlS seconds (12h by default), carried as `x-rc-token` on every
-// request except the event stream, which takes `?token=` in the query because
-// EventSource cannot set headers. A credential that rides in a URL must be
-// the one that dies — that is what expiry and revocation are for.
+// for tokenTtlS seconds (5 minutes by default), carried as `x-rc-token` on
+// every request except the event stream, which takes `?token=` in the query
+// because EventSource cannot set headers. A credential that rides in a URL
+// must be the one that dies — that is what expiry and revocation are for.
 const tokens = new Map() // sha-256(token) hex -> { expiry, epoch }
 let authEpoch = 0 // bumped by POST /api/revoke; not persisted, so a restart revokes too
 const tokenSweep = setInterval(() => {
@@ -208,9 +208,10 @@ const ctl = {
   repo,
   config: configSeed,
   log: (line) => console.log(line.trimEnd()),
-  clients: new Map(), // surface -> Set<ServerResponse>
+  clients: new Map(), // surface -> Map<ServerResponse, interval> — the interval
+  // is stored so a revoke that ENDS the streams can clear it too
   broadcast(surface, msg) {
-    for (const res of ctl.clients.get(surface) ?? []) {
+    for (const res of ctl.clients.get(surface)?.keys() ?? []) {
       try { res.write(`data: ${JSON.stringify(msg)}\n\n`) } catch { /* gone; pruned on close */ }
     }
   },
@@ -373,6 +374,7 @@ function revoke(req, res, url) {
 
 function doRevoke(res, ip) {
   authEpoch++ // every token minted before this instant is dead
+  revokeStreams() // ...and no stream opened on one of them keeps reading
   authFailures.delete(ip)
   ok(res, 200, 'revoked')
 }
@@ -449,11 +451,27 @@ function sse(req, res, surface) {
     connection: 'keep-alive',
   })
   res.write('retry: 2000\n\n')
-  const set = ctl.clients.get(surface) ?? new Set()
-  set.add(res)
-  ctl.clients.set(surface, set)
+  let set = ctl.clients.get(surface)
+  if (!set) { set = new Map(); ctl.clients.set(surface, set) }
   const beat = setInterval(() => { try { res.write(': ping\n\n') } catch { /* closed */ } }, HEARTBEAT_MS)
+  set.set(res, beat)
   req.on('close', () => { clearInterval(beat); set.delete(res) })
+}
+
+/** A revoke kills every token, so a stream opened on one of them is a reading
+ *  door the bumped epoch no longer protects. Every open response is ENDED:
+ *  the browser sees the stream close, reconnects, gets a 401, and re-exchanges
+ *  (a page with no code to re-exchange with draws the gate). Nothing is
+ *  delivered after the revoke — the sets are cleared in the same tick the
+ *  epoch bumped, and each ended response has its heartbeat timer stopped. */
+function revokeStreams() {
+  for (const [surface, set] of ctl.clients) {
+    for (const [res, beat] of set) {
+      clearInterval(beat)
+      try { res.end() } catch { /* socket already gone */ }
+    }
+    set.clear()
+  }
 }
 
 // --- inbound messages: the browser IS the webview ----------------------------
