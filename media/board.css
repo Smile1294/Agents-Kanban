@@ -271,6 +271,11 @@ button.pill.on { background: color-mix(in srgb, var(--run) 22%, transparent); bo
 /* ------------------------------------------------------------------ chat */
 
 .chat-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+/* A disabled button in this row USED to be a blink — `busy` clears itself when
+   the merge returns. A merge waiting for review does not: Merge stays dead
+   until the user commits or aborts it, so a control that still looks clickable
+   is one they will press and press again. The tooltip says why. */
+.chat-head button[disabled] { opacity: 0.45; cursor: default; }
 .chat-titles { min-width: 0; }
 .chat-title { font-weight: 600; font-size: 1.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-titles .labels { margin-top: 4px; }
@@ -711,6 +716,85 @@ details.thinking summary::-webkit-details-marker { display: none; }
   margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--line);
   white-space: pre-wrap; color: var(--muted); line-height: 1.5;
 }
+
+/* --- a merge that has landed but is not committed --------------------------
+   Deliberately louder than the review panel below it: this one describes a
+   change to the USER'S branch that they have not agreed to yet, and it is the
+   reason every Merge button on the board has gone grey.
+
+   The `overflow: hidden` beside every `text-overflow: ellipsis` below is
+   load-bearing twice over: it clips the text, AND it is what zeroes a flex
+   item's automatic minimum size — the thing whose default (`min-width: auto`)
+   put a card title 94px outside its box and a transcript at 0px wide.
+   `min-width: 0` is therefore redundant next to it and is deliberately NOT
+   here; measured at 560px with a 200-character branch name, adding it changes
+   nothing. Remove either `overflow: hidden` and `layout.test.mjs` measures
+   1070px and 734px of overflow respectively. */
+.pending-merge {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 9px 14px 10px;
+  border-top: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 40%;
+  overflow-y: auto;
+}
+.pending-merge.conflicted {
+  border-top-color: color-mix(in srgb, var(--bad) 50%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--bad) 50%, transparent);
+  background: color-mix(in srgb, var(--bad) 10%, transparent);
+}
+.pending-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.pending-icon { color: var(--warn); flex: 0 0 auto; }
+.pending-merge.conflicted .pending-icon { color: var(--bad); }
+.pending-title {
+  font-weight: 600;
+  font-size: 0.86em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pending-sub { color: var(--muted); font-size: 0.8em; }
+.pending-files {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--panel);
+}
+.merge-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  color: var(--vscode-foreground);
+  font-size: 0.82em;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+.merge-file:last-child { border-bottom: none; }
+.merge-file:hover { background: var(--vscode-list-hoverBackground); }
+.merge-file .fp {
+  font-family: var(--vscode-editor-font-family);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.pending-merge .row-actions button[disabled] { opacity: 0.5; cursor: default; }
 
 /* --- review: what the agent changed, and how to get it back ---------------- */
 

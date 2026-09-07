@@ -196,9 +196,67 @@ const dirty = await svc.merge(idle.branch, 'main')
 ok(!dirty.ok && dirty.reason === 'dirty', `a dirty main worktree refuses the merge: ${!dirty.ok ? dirty.reason : 'MERGED'}`)
 await fs.rm(path.join(repo, 'local-edit.txt'))
 
+// --- the merge STOPS BEFORE THE COMMIT --------------------------------------
+//
+// A merge that commits itself gives the user nothing to review: an agent's work
+// is in their history before they have read a line of it, and the only way back
+// is a revert. So `merge()` runs --no-commit, and "success" means the incoming
+// work is sitting in the working tree, staged, with the merge still in progress
+// and NOTHING written to the branch yet.
+const headBefore = (await g(['rev-parse', 'HEAD'])).stdout.trim()
 const merged = await svc.merge(idle.branch, 'main')
 ok(merged.ok, `merge succeeds into a clean base: ${merged.ok ? merged.merged : JSON.stringify(merged)}`)
 ok(await fs.access(path.join(repo, 'wip.txt')).then(() => true, () => false), 'the merged file is in the main worktree')
+ok((await g(['rev-parse', 'HEAD'])).stdout.trim() === headBefore,
+   'and nothing is committed to main — the whole point is to read it first')
+ok(merged.ok && merged.pending === true && merged.staged.includes('wip.txt'),
+   `the result says the merge is pending, and what it staged: ${JSON.stringify(merged)}`)
+
+// The pending state is read from GIT, never remembered: it has to survive a
+// window reload, and it has to see a merge the user started in their terminal.
+const pending = await svc.pendingMerge()
+ok(pending?.into === 'main' && pending?.from === idle.branch,
+   `pendingMerge names both sides: ${JSON.stringify(pending)}`)
+ok(!!pending?.files.includes('wip.txt'), `and lists what is staged: ${JSON.stringify(pending?.files)}`)
+
+// A second merge while one is pending must say THAT. The tree is dirty because
+// of a merge WE left there, so the old 'dirty' message — "commit or stash your
+// own changes" — is advice about someone else's edit, the same failure the
+// .gitignore case above exists to prevent.
+const whilePending = await svc.merge(wt.branch, 'main')
+ok(!whilePending.ok && whilePending.reason === 'merging',
+   `a merge while one is pending refuses with its own reason: ${!whilePending.ok ? whilePending.reason : 'MERGED'}`)
+const whyMerging = !whilePending.ok && 'message' in whilePending ? whilePending.message : ''
+ok(whyMerging.includes(idle.branch) && !/your own changes/i.test(whyMerging),
+   `and names the merge in the way rather than blaming the user: ${whyMerging}`)
+
+// Committing it is the user saying yes, and it must produce a REAL merge commit
+// — two parents — or the branch history loses where the work came from.
+const mergeSha = await svc.commitMerge()
+ok(!!mergeSha, `commitMerge returns the new sha (${mergeSha})`)
+ok(await svc.pendingMerge() === undefined, 'and the merge is no longer pending')
+ok(await svc.isClean(repo), 'the main worktree is clean again')
+const parents = (await g(['rev-list', '--parents', '-n', '1', 'HEAD'])).stdout.trim().split(/\s+/)
+ok(parents.length === 3, `the commit is a real merge, with two parents (got ${parents.length - 1})`)
+ok(parents[1] === headBefore, 'whose first parent is where main was')
+ok((await g(['log', '-1', '--pretty=%s'])).stdout.trim().includes(idle.branch),
+   `and git's own merge message survives: ${(await g(['log', '-1', '--pretty=%s'])).stdout.trim()}`)
+
+// Aborting instead — the "actually, no" the review exists to make possible —
+// must leave no trace at all.
+const second = await svc.create({ taskId: 'TASK-022', title: 'Second thoughts' })
+await fs.writeFile(path.join(second.path, 'maybe.txt'), 'maybe\n')
+await svc.commitAll(second.path, 'Add maybe')
+const beforeAbort = (await g(['rev-parse', 'HEAD'])).stdout.trim()
+ok((await svc.merge(second.branch, 'main')).ok, 'a second session merges in for review')
+ok(!!(await svc.pendingMerge()), 'and is pending')
+await svc.abortMerge()
+ok(await svc.pendingMerge() === undefined, 'abortMerge clears the pending merge')
+ok(await svc.isClean(repo), 'and leaves the working tree clean')
+ok((await g(['rev-parse', 'HEAD'])).stdout.trim() === beforeAbort, 'with main exactly where it was')
+ok(!(await fs.access(path.join(repo, 'maybe.txt')).then(() => true, () => false)),
+   'and the merged file gone again')
+await svc.remove(second.path, { force: true })
 
 // A genuine conflict is surfaced with its files, not swallowed.
 const conflictWt = await svc.create({ taskId: 'TASK-021', title: 'Conflicting' })
@@ -367,10 +425,12 @@ ok(slug('!!!') === 'task', 'a title with nothing sluggable still names the direc
   ok(await fs.access(path.join(proj, 'sso.ts')).then(() => true, () => false), 'its file lands on main')
   ok(!(await fs.access(path.join(proj, 'flaky.test.ts')).then(() => true, () => false)),
      'and the subtask still in progress is NOT dragged in with it')
+  await svc2.commitMerge()
 
   const mergedB = await svc2.merge(b.branch, 'main')
   ok(mergedB.ok, `the second merges afterwards, on top: ${mergedB.ok ? mergedB.merged : JSON.stringify(mergedB)}`)
   ok(await fs.access(path.join(proj, 'flaky.test.ts')).then(() => true, () => false), 'and both are now on main')
+  await svc2.commitMerge()
 
   // The parent never held code, so there is nothing left to merge from it —
   // which is why the two-level integration branch it would otherwise need does

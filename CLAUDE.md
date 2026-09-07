@@ -176,6 +176,27 @@ run, since each session needs a worktree.
   tokens and beyond that the service downscales anyway; and the transcript
   entry keeps the COUNT, never the bytes, because that array is serialised to
   the webview on every repaint.
+- **A merge lands UNCOMMITTED, and `ok: true` does not mean it is on the
+  branch.** `merge()` runs `--no-ff --no-commit`: an agent's work reaching the
+  user's history on one click, before they have read a line of it, is the wrong
+  default when every other output on the board is inspectable first — and the
+  only way back out was a revert on a branch a teammate may have pulled.
+  `--no-ff` stays, so the eventual commit is still a real two-parent merge. Four
+  things are load-bearing. The success arm carries `pending: true` and `staged`,
+  and the toast says "NOT committed", because a board claiming a state git is
+  not in is the usual failure. `pendingMerge()` reads `MERGE_HEAD` rather than a
+  flag of ours — a flag dies with the window and is blind to a merge the user
+  started in their own terminal — and it answers `conflicted` too, which is what
+  collapsed the conflict path and the review path into one banner. The
+  `'merging'` refusal is checked BEFORE `isClean()`, or the generic "commit or
+  stash your own changes" sends the user hunting for an edit this extension
+  made — the `.gitignore` failure again. And `s.pendingMerge` is in
+  `chromeSig()`: a merge starts while an agent is mid-turn, so it arrives
+  between two streaming frames, and without it those frames take the fast path
+  and the banner never draws. The branch NAME is optional on purpose
+  (`MERGE_MSG` is user-editable, `name-rev` answers `main~3` for a commit on no
+  branch), and falls back to the sha — a name we cannot justify is worse than
+  none.
 - **Starting the app is one button, and it waits for the port.** `run/recipe.ts`
   prefers the project's own per-worktree launcher (`wt`) over anything guessed,
   because it owns the port, the database and the session cookie — none of which

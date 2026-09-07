@@ -252,21 +252,40 @@ silently. The review panel therefore separates committed from uncommitted work
 and disables Merge until there is something to merge, rather than appearing to
 succeed.
 
+The merge itself then **stops before the commit**. `--no-ff --no-commit`: the
+work lands staged in your working tree, git stays in its merging state, and
+nothing enters your history until you say so. Reviewing an agent's changes after
+they are already committed is not a review — the only way back is a revert, on a
+branch someone may have pulled.
+
 ```
 agent stops at "validating"
       ↓
 Changes panel     src/auth.ts  M            (click → native diff vs. base)
                   src/new.ts   ?  uncommitted
       ↓  Commit 2 files…
-      ↓  Merge into main…      ← modal confirmation: it writes to YOUR checkout
+      ↓  Merge into main…      ← modal: lands UNCOMMITTED, nothing written yet
       ↓
-conflict?  →  left in progress to resolve in the editor, or Abort merge
+◆ Merged task/S1 into main, not committed
+  2 files staged on main. Read them, then commit the merge or abort it.
+  src/auth.ts                             (click → diff vs. main's HEAD)
+  src/new.ts
+  [Commit merge]  [Abort merge]
+      ↓
+conflict?  →  same banner, in red: resolve in the editor, or Abort merge
 ```
 
 `WorktreeService.merge()` refuses rather than improvises. A dirty main worktree,
-a branch with no commits, or being on the wrong branch each come back as a
-*described* failure, not an exception and not a silent no-op. Conflicts are left
-in progress on purpose: aborting automatically would throw the resolution away.
+a merge already waiting to be reviewed, a branch with no commits, or being on
+the wrong branch each come back as a *described* failure, not an exception and
+not a silent no-op. Conflicts are left in progress on purpose: aborting
+automatically would throw the resolution away.
+
+`pendingMerge()` reads `MERGE_HEAD` straight from git rather than remembering a
+flag, so the banner survives a window reload and also sees a merge you started
+yourself in a terminal. It is repo-level state and disables *every* card's Merge
+button, which is why it renders as a banner above the review panel rather than
+inside one card's. See [docs/DECISIONS.md](docs/DECISIONS.md).
 
 All of it is serialised on the per-repo lock, because VS Code's own Git
 extension issues commands against the same repository, and a merge is the least

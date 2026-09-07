@@ -505,6 +505,94 @@ panelMerge.onclick()
 ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.into === 'main'),
   'the panel button posts its base as the merge target')
 
+// 8b. A merge that has landed but is NOT committed.
+//
+// The whole reason merge() stops early: the work is on the user's branch, in
+// their working tree, and they have not agreed to it yet. The board has to say
+// so somewhere they cannot miss, and it has to stop offering to start another
+// one — a second merge on top would be refused by git anyway, so a live button
+// is a control that cannot do what it says.
+const PENDING = {
+  into: 'main', from: 'task/S1-fix', head: 'd8293def79a69d84ff02264ca216243a815db152',
+  files: ['src/auth.ts', 'src/new.ts'], conflicted: false,
+}
+const waiting = run({ ...reviewBase, pendingMerge: PENDING })
+const wt2 = waiting.text()
+ok(wt2.includes('not committed'), `the banner says the merge is uncommitted: ${/[^\n]*not committed[^\n]*/.exec(wt2)?.[0] ?? 'MISSING'}`)
+ok(wt2.includes('task/S1-fix') && wt2.includes('main'), 'and names both branches')
+ok(wt2.includes('src/auth.ts') && wt2.includes('src/new.ts'), 'every staged file is listed for review')
+ok(wt2.includes('2 files'), `the count is shown, not just a vague warning: ${/\d+ files?/.exec(wt2)?.[0]}`)
+
+const commitBtn = findButton(waiting.root, 'Commit merge')
+ok(commitBtn && commitBtn.disabled === false, 'committing the merge is offered')
+commitBtn.onclick()
+ok(waiting.posted.some((m) => m.type === 'commitMerge'), 'and posts commitMerge')
+
+const abortBtn = findButton(waiting.root, 'Abort merge')
+ok(!!abortBtn, 'aborting it is offered too — "no" has to be one click')
+abortBtn.onclick()
+ok(waiting.posted.some((m) => m.type === 'abortMerge'), 'and posts abortMerge')
+
+// Every route into a new merge must be shut while one is waiting.
+const blockedToolbar = findButton(waiting.root, 'Merge')
+ok(blockedToolbar && blockedToolbar.disabled === true,
+   'the toolbar Merge button is disabled while a merge waits')
+const blockedPanel = findButton(run({
+  ...reviewBase, pendingMerge: PENDING,
+  review: { base: 'main', ahead: 2, dirty: 0, files: [{ path: 'src/auth.ts', status: 'M', committed: true }] },
+}).root, 'Merge into main')
+ok(blockedPanel && blockedPanel.disabled === true,
+   'and so is the panel one, even with commits ready to go')
+
+// A staged file opens a diff against the branch, not against a worktree.
+const fileRow = (function find(n) {
+  if (n.tagName === 'button' && n.textContent.includes('src/auth.ts') && n.className?.includes('merge-file')) return n
+  for (const c of n.children ?? []) { const h = find(c); if (h) return h }
+  return null
+})(waiting.root)
+ok(!!fileRow, 'staged files are clickable rows')
+fileRow?.onclick()
+ok(waiting.posted.some((m) => m.type === 'mergeDiff' && m.file === 'src/auth.ts'),
+   'and clicking one posts mergeDiff for that file')
+
+// A conflicted merge is a DIFFERENT state and must not read as ready to commit.
+const clashing = run({
+  ...reviewBase,
+  pendingMerge: { ...PENDING, conflicted: true, files: ['src/auth.ts'] },
+})
+ok(clashing.text().toLowerCase().includes('conflict'),
+   'a conflicted merge says so rather than looking ready')
+const clashCommit = findButton(clashing.root, 'Commit merge')
+ok(clashCommit && clashCommit.disabled === true,
+   'and committing is disabled — git would refuse, so the button must too')
+
+// No pending merge, no banner. A warning that is always on screen is not a signal.
+ok(!run(reviewBase).text().includes('Abort merge'), 'with no merge waiting there is no banner')
+
+// The banner has to survive the STREAMING FAST PATH, which is the only way it
+// will ever actually arrive: a merge is something the user starts while an
+// agent is mid-turn, so it lands between two streaming frames. A frame whose
+// `chromeSig()` does not mention it patches the transcript and nothing else,
+// and the board changes in no visible way — the same dead-fast-path failure
+// that made scrolling, chat switching and the kanban board all unreachable.
+{
+  const streamFrame = (extra = {}) => ({
+    ...reviewBase,
+    transcript: [{ kind: 'text', at: CARD.updated, text: 'working on it' }],
+    streaming: 'Hel',
+    ...extra,
+  })
+  const v = run(streamFrame())
+  ok(!v.text().includes('Abort merge'), 'mid-run, before the merge, there is no banner')
+  v.deliver(streamFrame({ streaming: 'Hello', pendingMerge: PENDING }))
+  ok(v.text().includes('Abort merge'),
+     'a merge landing between two streaming frames still draws its banner')
+  ok(v.text().includes('Hello'), 'and the streamed text kept up')
+  v.deliver(streamFrame({ streaming: 'Hello there' }))
+  ok(!v.text().includes('Abort merge'),
+     'and it disappears again the moment the merge is committed')
+}
+
 // 9. The test plan: the agent's own instructions, made clickable.
 const PLAN = {
   summary: 'Adds subtract() and multiply() to calc.js',

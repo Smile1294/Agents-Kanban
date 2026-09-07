@@ -488,7 +488,7 @@
       !!searching, !!control, s.running || 0, s.waiting || 0,
       !!s.transcriptMore,
       cards, composer, s.columns || [], s.commands || [],
-      s.disclosures || {}, s.review || null,
+      s.disclosures || {}, s.review || null, s.pendingMerge || null,
     ])
   }
 
@@ -1643,8 +1643,13 @@
         // The other half of the review loop, where you can see it: one click,
         // then pick the branch to merge into. The host asks which branch.
         const merge = el('button', null, 'Merge')
-        merge.title = 'Merge this branch back into the repository — pick the branch to merge into'
-        merge.disabled = s.busy === c.key
+        // A merge already waiting for review blocks this one — git refuses a
+        // second merge on top of an uncommitted one, so a live button here
+        // would be a control that cannot do what it says.
+        merge.disabled = s.busy === c.key || !!s.pendingMerge
+        merge.title = s.pendingMerge
+          ? 'Finish the merge waiting for review first'
+          : 'Merge this branch back into the repository — pick the branch to merge into'
         merge.onclick = () => post('merge', { id: c.key })
         head.append(merge)
       }
@@ -1663,6 +1668,10 @@
     if (c && c.interrupted && !c.agent) main.append(renderInterrupted(c, true))
     if (c && c.subtasks && c.subtasks.length) main.append(renderSubtasks(c))
     if (c && c.testPlan) main.append(renderTestPlan(c))
+    // Above the review panel and NOT gated on `c.worktree`: the merge is on the
+    // user's own branch, so it is true of the repository whatever card happens
+    // to be open, including one that never had a worktree.
+    if (s.pendingMerge) main.append(renderPendingMerge())
     if (c && c.worktree) main.append(renderReview(c))
 
     syncKey = c ? c.key : null
@@ -2078,16 +2087,80 @@
       actions.append(commit)
     }
 
-    const merge = el('button', r.ahead ? 'primary' : null, 'Merge into ' + r.base + '…')
-    merge.disabled = !r.ahead || s.busy === c.key
-    merge.title = r.ahead
-      ? 'Merge this branch into ' + r.base
-      : 'Nothing committed to merge yet — commit the worktree first.'
+    const merge = el('button', r.ahead && !s.pendingMerge ? 'primary' : null, 'Merge into ' + r.base + '…')
+    merge.disabled = !r.ahead || s.busy === c.key || !!s.pendingMerge
+    merge.title = s.pendingMerge
+      ? 'Finish the merge waiting for review first'
+      : r.ahead
+        ? 'Merge this branch into ' + r.base
+        : 'Nothing committed to merge yet — commit the worktree first.'
     merge.onclick = () => post('merge', { id: c.key, into: r.base })
     actions.append(merge)
 
     body.append(actions)
     box.append(body)
+    return box
+  }
+
+  /** A merge that has landed on the user's branch and is NOT committed.
+   *
+   * This is what the whole --no-commit change buys: the work is sitting in the
+   * working tree, readable, and neither answer has been given yet. So the panel
+   * shows the count, every staged file, and BOTH exits — a review with only a
+   * yes on it is not a review.
+   *
+   * Never a disclosure: it is repo-wide state that blocks every Merge button on
+   * the board, and a collapsed warning explains nothing about a button that has
+   * gone grey somewhere else on screen.
+   */
+  function renderPendingMerge() {
+    const p = s.pendingMerge
+    const from = p.from || (p.head || '').slice(0, 7)
+    const n = (p.files || []).length
+    const box = el('div', 'pending-merge' + (p.conflicted ? ' conflicted' : ''))
+
+    const head = el('div', 'pending-head')
+    head.append(el('span', 'pending-icon', p.conflicted ? '✖' : '◆'))
+    head.append(el('span', 'pending-title', p.conflicted
+      ? 'Merge conflict — ' + from + ' into ' + p.into
+      : 'Merged ' + from + ' into ' + p.into + ', not committed'))
+    box.append(head)
+
+    box.append(el('div', 'pending-sub', p.conflicted
+      ? n + ' file' + (n === 1 ? '' : 's') + ' still unresolved. Fix the conflicts in the editor, ' +
+        'stage them, then commit — or abort and leave ' + p.into + ' as it was.'
+      : n + ' file' + (n === 1 ? '' : 's') + ' staged on ' + p.into + '. Read them, then commit ' +
+        'the merge or abort it — nothing is in your history yet.'))
+
+    if (n) {
+      const files = el('div', 'pending-files')
+      for (const f of (p.files || []).slice(0, 200)) {
+        const row = el('button', 'merge-file')
+        row.append(el('span', 'fp', f))
+        row.title = 'Diff ' + f + ' against ' + p.into
+        row.onclick = () => post('mergeDiff', { file: f })
+        files.append(row)
+      }
+      box.append(files)
+    }
+
+    const actions = el('div', 'row-actions')
+    const commit = el('button', p.conflicted ? null : 'primary', 'Commit merge')
+    // git refuses to commit over unresolved files, so the button refuses too
+    // rather than offering a click whose only outcome is an error toast.
+    commit.disabled = !!p.conflicted
+    commit.title = p.conflicted
+      ? 'Resolve the conflicts first — git will not commit over them'
+      : 'Commit this merge to ' + p.into
+    commit.onclick = () => post('commitMerge', {})
+    actions.append(commit)
+
+    const abort = el('button', 'danger', 'Abort merge')
+    abort.title = 'Undo the merge and put ' + p.into + ' back exactly as it was'
+    abort.onclick = () => post('abortMerge', {})
+    actions.append(abort)
+    box.append(actions)
+
     return box
   }
 

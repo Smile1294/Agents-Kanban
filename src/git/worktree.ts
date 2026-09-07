@@ -52,11 +52,34 @@ export interface WorktreeReview {
   lastCommit?: { sha: string; message: string }
 }
 
-/** The outcome of merging a task branch back. Conflicts are surfaced, never swallowed. */
+/** A merge that has landed in the working tree but is NOT committed yet.
+ *
+ *  Read from git itself (`MERGE_HEAD`), never from something we remembered, so
+ *  it survives a window reload and so a merge the user started in their own
+ *  terminal is seen too. `from` is best-effort: git records the merged commit,
+ *  and the branch NAME only in MERGE_MSG, which a user can rewrite. */
+export interface PendingMerge {
+  /** The branch the work is landing on — the checkout's current branch. */
+  into: string
+  /** The branch being merged in, if git still knows its name. */
+  from?: string
+  /** The commit being merged in. Always known; `from` may not be. */
+  head: string
+  /** Staged paths, so the board can list what would be committed. */
+  files: string[]
+  /** True once at least one file is still unresolved — a conflicted merge. */
+  conflicted: boolean
+}
+
+/** The outcome of merging a task branch back. Conflicts are surfaced, never swallowed.
+ *
+ *  `ok: true` does NOT mean the work is on the branch: the merge deliberately
+ *  stops before the commit so it can be reviewed, so `pending` is always true
+ *  and `staged` is what is waiting. See `merge()`. */
 export type MergeResult =
-  | { ok: true; merged: string; into: string }
+  | { ok: true; merged: string; into: string; pending: true; staged: string[] }
   | { ok: false; reason: 'conflict'; files: string[] }
-  | { ok: false; reason: 'dirty' | 'nothing-to-merge' | 'wrong-branch' | 'failed'; message: string }
+  | { ok: false; reason: 'dirty' | 'nothing-to-merge' | 'wrong-branch' | 'failed' | 'merging'; message: string }
 
 export class GitError extends Error {
   readonly stderr: string
@@ -168,6 +191,24 @@ async function gitRaw(cwd: string, args: string[]): Promise<string> {
     maxBuffer: 32 * 1024 * 1024,
   })
   return stdout.replace(/\n$/, '')
+}
+
+/**
+ * Why a merge waiting for review is in the way, phrased so the user can act.
+ *
+ * Names the branch and the count, and offers the two real exits. `from` is
+ * optional because git may genuinely not know the name (see `mergeSourceName`),
+ * so the sha is the fallback — never a guessed branch.
+ */
+export function pendingMergeMessage(p: PendingMerge): string {
+  const what = p.from ? `"${p.from}"` : `commit ${p.head.slice(0, 7)}`
+  const n = p.files.length
+  return p.conflicted
+    ? `A merge of ${what} into "${p.into}" is still in progress and has unresolved conflicts. ` +
+      'Resolve and commit it, or abort it, before merging again.'
+    : `A merge of ${what} into "${p.into}" is waiting for you to review it — ` +
+      `${n} file${n === 1 ? '' : 's'} staged, not committed yet. ` +
+      'Commit or abort that merge before starting another.'
 }
 
 /** Split newline-separated git path output, dropping blanks. */
@@ -563,6 +604,11 @@ export class WorktreeService {
    * without saying what is in the way is a dead end either way.
    */
   async dirtyMessage(): Promise<string> {
+    // Our own mess first. A merge left for review dirties the tree by design,
+    // and telling the user to "commit or stash your own changes" for it sends
+    // them looking for an edit they never made.
+    const waiting = await this.pendingMerge()
+    if (waiting) return pendingMergeMessage(waiting)
     const porcelain = await gitRaw(this.repoRoot, ['status', '--porcelain']).catch(() => '')
     const files = porcelain.split('\n')
       .map(parsePorcelainLine)
@@ -600,16 +646,32 @@ export class WorktreeService {
    * commands against the same repository and a merge is the least forgiving
    * moment for two of them to overlap.
    *
-   * Refuses rather than improvises: a dirty main worktree, a branch with
-   * nothing on it, or a conflict all come back as a described failure. A
-   * conflict leaves the merge in progress so it can be resolved in the editor —
-   * `abortMerge()` is the way out.
+   * Refuses rather than improvises: a dirty main worktree, a merge already
+   * waiting to be reviewed, a branch with nothing on it, or a conflict all come
+   * back as a described failure. A conflict leaves the merge in progress so it
+   * can be resolved in the editor — `abortMerge()` is the way out.
+   *
+   * It STOPS BEFORE THE COMMIT (`--no-commit`). An agent's work reaching the
+   * user's history before they have read a line of it is the wrong default: the
+   * only way back out is a revert, on a branch other people may already have
+   * pulled. So the incoming work lands staged in the working tree, git stays in
+   * its merging state, and `commitMerge()` — the user saying yes — is what
+   * writes it. `--no-ff` stays: it keeps a real two-parent merge commit, so the
+   * eventual history still records where the work came from.
    */
   async merge(branch: string, base: string): Promise<MergeResult> {
     return withRepoLock(this.repoRoot, async () => {
       const current = await git(this.repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])
       if (current !== base) {
         return { ok: false, reason: 'wrong-branch', message: `The repository is on "${current}", not "${base}". Switch to ${base} first.` }
+      }
+      // Before the clean check, and it has to be: a merge left for review makes
+      // the tree dirty BY DESIGN, so the generic refusal would hand the user
+      // advice about "your own changes" for a mess this extension made — the
+      // same failure the .gitignore case above exists to prevent.
+      const waiting = await this.pendingMerge()
+      if (waiting) {
+        return { ok: false, reason: 'merging', message: pendingMergeMessage(waiting) }
       }
       if (!(await this.isClean(this.repoRoot))) {
         return { ok: false, reason: 'dirty', message: await this.dirtyMessage() }
@@ -619,8 +681,8 @@ export class WorktreeService {
         return { ok: false, reason: 'nothing-to-merge', message: `"${branch}" has no commits that "${base}" does not. If the agent left its work uncommitted, commit the worktree first.` }
       }
       try {
-        await git(this.repoRoot, ['merge', '--no-ff', branch, '-m', `Merge ${branch}`])
-        return { ok: true, merged: branch, into: base }
+        await git(this.repoRoot, ['merge', '--no-ff', '--no-commit', branch, '-m', `Merge ${branch}`])
+        return { ok: true, merged: branch, into: base, pending: true, staged: await this.stagedPaths() }
       } catch (e) {
         const conflicted = await gitRaw(this.repoRoot, ['diff', '--name-only', '--diff-filter=U'])
           .catch(() => '')
@@ -641,11 +703,90 @@ export class WorktreeService {
     })
   }
 
-  /** Back out of a conflicted merge, leaving the repository as it was. */
+  /** Back out of a merge in progress, leaving the repository as it was.
+   *
+   *  Reached from BOTH ends now: a conflict the user does not want to resolve,
+   *  and a clean merge they read and rejected. That is the point of stopping
+   *  before the commit — "no" costs one click instead of a revert. */
   async abortMerge(): Promise<void> {
     return withRepoLock(this.repoRoot, async () => {
       await git(this.repoRoot, ['merge', '--abort']).catch(() => {})
     })
+  }
+
+  /**
+   * A merge that has landed but is not committed, straight from git.
+   *
+   * `MERGE_HEAD` is the fact, not a flag of ours: it outlives a window reload,
+   * and it is equally true of a merge the user started in their own terminal —
+   * which the board must not offer to start a second merge on top of.
+   */
+  async pendingMerge(): Promise<PendingMerge | undefined> {
+    const head = await git(this.repoRoot, ['rev-parse', '--verify', '-q', 'MERGE_HEAD']).catch(() => '')
+    if (!head) return undefined
+    const [into, files, unmerged, from] = await Promise.all([
+      git(this.repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => ''),
+      this.stagedPaths(),
+      gitRaw(this.repoRoot, ['diff', '--name-only', '--diff-filter=U']).catch(() => ''),
+      this.mergeSourceName(),
+    ])
+    return {
+      into,
+      ...(from ? { from } : {}),
+      head,
+      files,
+      conflicted: unquotePaths(unmerged).length > 0,
+    }
+  }
+
+  /**
+   * The name of the branch being merged in, if git still knows one.
+   *
+   * Best effort ON PURPOSE, and it says so by being optional. git records the
+   * merged COMMIT in `MERGE_HEAD`; the branch name survives only in `MERGE_MSG`,
+   * which the user can rewrite, and in `name-rev`, which will happily answer
+   * `main~3` for a commit that is on no branch at all. A name we cannot justify
+   * is worse than none — the board falls back to the sha.
+   */
+  private async mergeSourceName(): Promise<string | undefined> {
+    const dir = await git(this.repoRoot, ['rev-parse', '--git-dir']).catch(() => '')
+    if (dir) {
+      const file = path.isAbsolute(dir) ? dir : path.join(this.repoRoot, dir)
+      const msg = await fs.readFile(path.join(file, 'MERGE_MSG'), 'utf8').catch(() => '')
+      // Ours ("Merge <branch>") and git's own ("Merge branch 'x' into y").
+      const m = /^Merge (?:(?:remote-tracking )?branch |commit |tag )?'?(.+?)'?(?: into .+)?$/
+        .exec(msg.split('\n')[0]?.trim() ?? '')
+      if (m?.[1]) return m[1]
+    }
+    // Only an EXACT branch name counts. `name-rev` answers with an offset
+    // ("task/foo~2") for a commit that is merely an ancestor of a branch, and
+    // reporting that as the thing being merged would be a fabricated readout.
+    const named = await git(this.repoRoot, [
+      'name-rev', '--name-only', '--refs=refs/heads/*', 'MERGE_HEAD',
+    ]).catch(() => '')
+    return named && named !== 'undefined' && !/[~^]/.test(named) ? named : undefined
+  }
+
+  /**
+   * Commit a merge that is waiting for review. This is the user saying yes.
+   *
+   * `--no-edit` rather than a message of our own: git wrote `MERGE_MSG` when the
+   * merge started, so this keeps whatever the merge was actually called and
+   * keeps a conflict resolved by hand from being retitled behind the user's
+   * back. Throws if the merge is still conflicted — git refuses, and inventing
+   * a commit over unresolved markers is exactly the wrong recovery.
+   */
+  async commitMerge(): Promise<string> {
+    return withRepoLock(this.repoRoot, async () => {
+      await git(this.repoRoot, ['commit', '--no-edit'])
+      return git(this.repoRoot, ['rev-parse', '--short', 'HEAD'])
+    })
+  }
+
+  /** Paths staged against HEAD — what committing right now would record. */
+  private async stagedPaths(): Promise<string[]> {
+    const out = await gitRaw(this.repoRoot, ['diff', '--name-only', '--cached', 'HEAD']).catch(() => '')
+    return unquotePaths(out).sort()
   }
 
   /** A file's contents at a ref, for the left-hand side of a diff. */

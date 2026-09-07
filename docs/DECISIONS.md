@@ -206,6 +206,70 @@ Fixes, and the rules they encode:
 
 ---
 
+### The merge stops before the commit
+
+Reported as: *"I wanna see the uncommitted stuff before the merge happens on my
+branch that I am merging to so I can review them."*
+
+`merge()` ran `git merge --no-ff` and the work was in the user's history before
+they had read a line of it. That is the wrong default for this project
+specifically. Every other destination for an agent's output is inspectable
+first — the review panel lists the changed files, a click diffs one, the test
+plan is a plan and not a run — and then the last step in the chain committed
+somebody else's code to the user's branch on one click. The only way back out
+was a revert, on a branch a teammate may already have pulled.
+
+So the merge runs `--no-ff --no-commit`. The incoming work lands staged in the
+working tree, git stays in its merging state, and `commitMerge()` — the user
+saying yes — is what writes it. `--no-ff` stays: it keeps the two-parent merge
+commit, so the eventual history still records where the work came from.
+
+**`ok: true` no longer means the work is on the branch,** so the type says so.
+`MergeResult`'s success arm carries `pending: true` and `staged: string[]`, and
+the toast reads "merged into main but NOT committed — 2 files staged" rather
+than "Merged". A board that says a thing git is not doing is the failure mode
+this repository already has a rule about.
+
+**The pending state is read from git, never remembered.** `pendingMerge()` asks
+for `MERGE_HEAD`. A flag of ours would be equally true right up until the window
+reloads, and it would be blind to a merge the user started in their own terminal
+— which the board must not offer to start a second merge on top of. The same
+call answers `conflicted`, so the conflict path and the review path became one
+piece of UI instead of two: both are "a merge is in progress", and they differ
+only in whether committing is possible yet.
+
+**The refusal had to be rewritten, and that is the whole point of the change
+being visible.** A merge left for review dirties the main worktree BY DESIGN, so
+the existing `dirty` refusal — *"commit or stash your own changes first"* —
+would now be advice about a mess this extension made, sending the user to look
+for an edit they never made. Exactly the `.gitignore` failure above, in a new
+place. `merge()` checks `pendingMerge()` **before** `isClean()` and answers
+`reason: 'merging'` with a message naming the branch, the count, and both exits.
+
+**The branch name is best-effort and says so by being optional.** git records
+the merged COMMIT in `MERGE_HEAD`; the name survives only in `MERGE_MSG`, which
+a user can rewrite. `name-rev` will happily answer `main~3` for a commit on no
+branch at all, so only an exact branch name is accepted and the sha is the
+fallback. A name we cannot justify is worse than none.
+
+**The banner is repo-level, not per-card.** A waiting merge disables every card's
+Merge button, so rendering it inside one card's review panel would leave the
+others greyed out for a reason nowhere on screen. It hangs off `BoardState`
+beside `review`, loads inside `loadReview()` before that function's early
+returns (a repository fact stays true when nothing is selected), and — the part
+with no type to catch it — is in `chromeSig()`. A merge is something the user
+starts while an agent is mid-turn, so it arrives between two streaming frames;
+without it in the signature those frames take the fast path, patch only the
+transcript, and the board changes in no visible way. `webview.test.mjs` delivers
+two streaming frames with the merge appearing between them, and that assertion
+was watched failing with the field removed from the signature.
+
+**Committing is confirmed too.** Up to that click nothing was irreversible; that
+click is the one that writes to the branch. `--no-edit` rather than a message of
+our own, so a conflict resolved by hand is not retitled behind the user's back.
+Committing is disabled outright while files are unresolved — git refuses, so a
+live button would only ever produce an error toast.
+
 ## Postmortems
 
 ### The board was blank and every command was "not found"

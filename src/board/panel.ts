@@ -11,7 +11,7 @@
  */
 import * as vscode from 'vscode'
 import type { RunningAgent } from '../agent/manager.ts'
-import type { WorktreeReview } from '../git/worktree.ts'
+import type { PendingMerge, WorktreeReview } from '../git/worktree.ts'
 import type { Entry } from '../sessions/store.ts'
 import type { TranscriptHit } from '../sessions/search.ts'
 import type { AttachedImage } from '../agent/images.ts'
@@ -274,6 +274,14 @@ export interface UiState {
   /** What the selected session changed in its worktree. Computed on demand, not
    *  on every refresh — it costs four git calls and refreshes fire per token. */
   review?: WorktreeReview
+  /**
+   * A merge that has landed on the user's branch and is waiting to be reviewed.
+   *
+   * REPO-level, not per-card, and that is the point: it blocks every card's
+   * Merge button, so keeping it inside one card's review panel would leave the
+   * others refusing for a reason that is nowhere on screen.
+   */
+  pendingMerge?: PendingMerge
   /** Set while a merge is in progress so the view can disable the button. */
   busy?: string
   /** True while the board has taken over the window. */
@@ -503,6 +511,12 @@ export interface BoardHost {
   openTestLink(key: string, kind: string, target: string): Promise<void>
   commitWorktree(key: string): Promise<void>
   mergeWorktree(key: string, into?: string): Promise<void>
+  /** Commit the merge waiting for review — the user saying yes. */
+  commitMerge(): Promise<void>
+  /** Throw the waiting merge away, leaving the branch as it was. */
+  abortMerge(): Promise<void>
+  /** Diff one staged file of the waiting merge against the branch's HEAD. */
+  openMergeDiff(file: string): Promise<void>
   archive(key: string, archived: boolean): Promise<void>
   pin(key: string, pinned: boolean): Promise<void>
   remove(key: string): Promise<void>
@@ -614,6 +628,9 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
           break
         case 'commit': await host.commitWorktree(id()); await refresh(); break
         case 'merge': await host.mergeWorktree(id(), typeof msg.into === 'string' ? msg.into : undefined); await refresh(); break
+        case 'commitMerge': await host.commitMerge(); await refresh(); break
+        case 'abortMerge': await host.abortMerge(); await refresh(); break
+        case 'mergeDiff': await host.openMergeDiff(String(msg.file ?? '')); break
         case 'archive': await host.archive(id(), msg.archived !== false); break
       case 'pin': await host.pin(id(), msg.pinned !== false); break
         case 'remove': await host.remove(id()); break

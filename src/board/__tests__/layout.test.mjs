@@ -693,6 +693,56 @@ try {
   ok(search.pillVisible, 'both pills are on screen')
   await searchPage.close()
 
+  /* --- the uncommitted-merge banner, at split-editor width ------------------
+   *
+   * It carries the two things this stylesheet has been bitten by twice — a
+   * branch name in a flex row and a list of file paths — plus a list long
+   * enough that the banner's own height cap has to hold. Nothing else in the
+   * suite can see any of it: every text assertion on this banner is green
+   * whether or not it is readable. Each assertion below was watched failing
+   * (1070px of overflow with the title's ellipsis removed, 734px with the file
+   * row's, a 1000px-tall banner with its max-height removed). Abort especially
+   * has to stay on screen: a review with only a yes on it is not a review. */
+  const mergePage = await browser.newPage({ viewport: { width: 560, height: 800 } })
+  await mergePage.setContent(page$({
+    ...chatState,
+    pendingMerge: {
+      into: 'main',
+      from: 'task/S1mtmz1zmy-' + 'can-you-please-review-this-repository-and-figure-out-how-it-works'.repeat(3),
+      head: 'd8293def79a69d84ff02264ca216243a815db152',
+      files: [
+        'src/board/__tests__/' + 'very/deeply/nested/directory/'.repeat(6) + 'component.test.ts',
+        ...Array.from({ length: 40 }, (_, i) => `src/generated/module-${i}.ts`),
+      ],
+      conflicted: false,
+    },
+  }, 'compact'))
+  await mergePage.waitForSelector('.pending-merge', { timeout: 5000 })
+  const pm = await mergePage.evaluate(() => {
+    const box = document.querySelector('.pending-merge')
+    const row = document.querySelector('.merge-file')
+    const bb = box.getBoundingClientRect()
+    const buttons = [...box.querySelectorAll('.row-actions button')]
+    return {
+      boxOverflow: Math.round(box.scrollWidth - box.clientWidth),
+      rowOverflow: Math.round(row.scrollWidth - row.clientWidth),
+      files: document.querySelectorAll('.merge-file').length,
+      height: Math.round(bb.height),
+      labels: buttons.map((b) => b.textContent),
+      buttonsInside: buttons.every((b) => {
+        const r = b.getBoundingClientRect()
+        return r.right <= bb.right + 1 && r.left >= bb.left - 1 && r.width > 0 && r.height > 0
+      }),
+    }
+  })
+  ok(pm.boxOverflow <= 1, `a long branch name does not make the banner scroll sideways (${pm.boxOverflow}px)`)
+  ok(pm.rowOverflow <= 1, `nor does a deep file path widen its row (${pm.rowOverflow}px)`)
+  ok(pm.files === 41, `every staged file drew (${pm.files})`)
+  ok(pm.height > 0 && pm.height < 400,
+     `41 files leave the banner bounded, not half the screen (${pm.height}px)`)
+  ok(pm.buttonsInside, `both answers are on screen at 560px: ${JSON.stringify(pm.labels)}`)
+  await mergePage.close()
+
   /* --- upward pagination, MEASURED: the reader stays on their paragraph ------
    *
    * The stub DOM cannot reflow, so the anchor arithmetic — scrollTop += the

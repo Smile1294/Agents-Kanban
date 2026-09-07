@@ -20,7 +20,7 @@ import {
   type BoardHost, type FocusMode, type Mode, type SearchAnswer, type SearchRow,
   type UiCard, type UiState,
 } from './board/panel.ts'
-import { WorktreeService, findRepoRoot, realResolveInWorktree, type WorktreeReview } from './git/worktree.ts'
+import { WorktreeService, findRepoRoot, realResolveInWorktree, type PendingMerge, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type SessionMeta, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts } from './sessions/usage.ts'
 import { SessionStore, TRANSCRIPT_LIMIT, interruptedSessions, type Entry } from './sessions/store.ts'
@@ -126,6 +126,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   /** Review data is four git calls, and refreshAll() fires on every streamed
    *  token — so it is computed on demand and cached against its own card. */
   let review: { key: string; data: WorktreeReview } | undefined
+  /** A merge sitting on the user's branch, uncommitted, waiting to be read.
+   *  Repo-level rather than per-card: it blocks every card's Merge button. */
+  let pendingMerge: PendingMerge | undefined
   let busy: string | undefined
   let commands: SlashCommand[] = []
 
@@ -2461,6 +2464,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   async function loadReview(key: string | undefined): Promise<void> {
     review = undefined
+    // Before the early returns and deliberately not keyed to the selection: a
+    // waiting merge is a fact about the REPOSITORY, and it stays true when no
+    // card is selected or the selected one has no worktree at all.
+    pendingMerge = ws?.worktrees
+      ? await ws.worktrees.pendingMerge().catch(() => undefined)
+      : undefined
     if (!key || !ws?.worktrees) return
     const wt = await worktreeOf(key).catch(() => undefined)
     if (!wt) return
@@ -2992,6 +3001,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(commands.length ? { commands } : {}),
         ...(Object.keys(disclosures).length ? { disclosures } : {}),
         ...(review && review.key === selectedKey ? { review: review.data } : {}),
+        ...(pendingMerge ? { pendingMerge } : {}),
         ...(busy ? { busy } : {}),
         ...(boardFocusApplied() ? { focused: true } : {}),
         ...(BoardPanel.isOpen ? { boardOpen: true } : {}),
@@ -4061,16 +4071,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const switches = target !== current
       const ahead = await w.worktrees.aheadOf(wt.dir, target)
       const choice = await vscode.window.showWarningMessage(
-        `Merge ${wt.branch} into ${target}?`,
+        `Merge ${wt.branch} into ${target} for review?`,
         {
           modal: true,
-          detail: `${ahead} commit${ahead === 1 ? '' : 's'} will be merged into your working tree. ` +
+          detail: `${ahead} commit${ahead === 1 ? '' : 's'} will land in your working tree and stay ` +
+            `UNCOMMITTED so you can read them first. Nothing is written to ${target}'s history ` +
+            'until you commit the merge, and Abort puts everything back. ' +
             (switches ? `Your checkout moves from ${current} to ${target} first. ` : '') +
             'The worktree and its branch are left in place.',
         },
-        'Merge',
+        'Merge for review',
       )
-      if (choice !== 'Merge') return
+      if (choice !== 'Merge for review') return
 
       busy = key
       refreshAll()
@@ -4086,7 +4098,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         const result = await w.worktrees.merge(wt.branch, target)
         if (result.ok) {
-          vscode.window.showInformationMessage(`Merged ${wt.branch} into ${target}.`)
+          // Not "Merged": nothing is committed, and saying so would be the
+          // board claiming a state git is not in. The count is the number the
+          // user acts on, and the board carries the buttons.
+          const n = result.staged.length
+          vscode.window.showInformationMessage(
+            `${wt.branch} is merged into ${target} but NOT committed — ` +
+            `${n} file${n === 1 ? '' : 's'} staged for you to review.`,
+          )
         } else if (result.reason === 'conflict') {
           // Left in progress on purpose: the editor is the right place to
           // resolve it, and silently aborting would throw the work away.
@@ -4115,6 +4134,117 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await loadReview(key)
         refreshAll()
       }
+    },
+
+    /** Commit the merge waiting for review. The user has read it and said yes.
+     *
+     *  Confirmed, like the merge itself, because this is the step that writes
+     *  to their branch — up to here nothing was irreversible. */
+    async commitMerge() {
+      const w = requireWs()
+      if (!w.worktrees) return
+      const waiting = await w.worktrees.pendingMerge().catch(() => undefined)
+      if (!waiting) {
+        vscode.window.showInformationMessage('There is no merge waiting to be committed.')
+        await loadReview(selectedKey)
+        refreshAll()
+        return
+      }
+      if (waiting.conflicted) {
+        vscode.window.showWarningMessage(
+          `${waiting.files.length} file${waiting.files.length === 1 ? '' : 's'} still have conflict ` +
+          'markers. Resolve them and stage the results, then commit.',
+        )
+        return
+      }
+      const what = waiting.from ?? waiting.head.slice(0, 7)
+      const n = waiting.files.length
+      const choice = await vscode.window.showWarningMessage(
+        `Commit the merge of ${what} into ${waiting.into}?`,
+        {
+          modal: true,
+          detail: `${n} file${n === 1 ? '' : 's'} will be committed to ${waiting.into}. ` +
+            'This is the point it enters your history.',
+        },
+        'Commit merge',
+      )
+      if (choice !== 'Commit merge') return
+      try {
+        const sha = await w.worktrees.commitMerge()
+        vscode.window.showInformationMessage(`Committed ${sha} — ${what} is now on ${waiting.into}.`)
+      } catch (e) {
+        vscode.window.showErrorMessage(
+          `Could not commit the merge: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      await loadReview(selectedKey)
+      refreshAll()
+    },
+
+    /** Throw the waiting merge away. Confirmed, and the confirmation says what
+     *  is lost — nothing of the agent's, because the branch keeps every commit;
+     *  only a hand-resolved conflict can actually be destroyed here. */
+    async abortMerge() {
+      const w = requireWs()
+      if (!w.worktrees) return
+      const waiting = await w.worktrees.pendingMerge().catch(() => undefined)
+      if (!waiting) {
+        vscode.window.showInformationMessage('There is no merge in progress.')
+        await loadReview(selectedKey)
+        refreshAll()
+        return
+      }
+      const what = waiting.from ?? waiting.head.slice(0, 7)
+      const choice = await vscode.window.showWarningMessage(
+        `Abort the merge of ${what} into ${waiting.into}?`,
+        {
+          modal: true,
+          detail: `${waiting.into} goes back to exactly where it was. ` +
+            `${what} keeps all of its commits, so you can merge it again later.` +
+            (waiting.conflicted ? '\n\nAny conflicts you have resolved by hand WILL be lost.' : ''),
+        },
+        'Abort merge',
+      )
+      if (choice !== 'Abort merge') return
+      try {
+        await w.worktrees.abortMerge()
+        vscode.window.showInformationMessage(`Merge aborted. ${waiting.into} is unchanged.`)
+      } catch (e) {
+        vscode.window.showErrorMessage(
+          `Could not abort the merge: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      await loadReview(selectedKey)
+      refreshAll()
+    },
+
+    /** Diff one staged file of the waiting merge: the branch as it stands
+     *  against what the merge would make of it.
+     *
+     *  The left side is HEAD in the MAIN checkout, not a worktree's merge-base:
+     *  the question here is "what does this change on my branch", and HEAD is
+     *  where the branch actually is. Beside the board, like openDiff, because an
+     *  editor opened into the board's own group closes the board. */
+    async openMergeDiff(file) {
+      const w = requireWs()
+      if (!w.worktrees || !file) return
+      const waiting = await w.worktrees.pendingMerge().catch(() => undefined)
+      if (!waiting) return
+      const root = w.worktrees.repoRoot
+      const right = vscode.Uri.file(path.join(root, file))
+      const left = vscode.Uri.from({
+        scheme: BASE_SCHEME,
+        path: '/' + file,
+        query: new URLSearchParams({ dir: root, ref: 'HEAD' }).toString(),
+      })
+      const what = waiting.from ?? waiting.head.slice(0, 7)
+      await ownLayoutChange(async () => {
+        await vscode.commands.executeCommand(
+          'vscode.diff', left, right,
+          `${path.basename(file)} — ${waiting.into} ↔ merging ${what}`,
+          { viewColumn: vscode.ViewColumn.Beside },
+        )
+      })
     },
 
     async rename(key, title) {

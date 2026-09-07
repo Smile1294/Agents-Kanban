@@ -442,6 +442,13 @@ for (const msg of [
   { type: 'diff', id: 'nope', file: 'src/x.ts' },
   { type: 'commit', id: 'nope' },
   { type: 'merge', id: 'nope' },
+  // The merge now stops before the commit, so three more messages exist and
+  // every one of them can arrive when there is no merge waiting at all — a
+  // stale webview, or a second click on a banner that has just been actioned.
+  { type: 'commitMerge' },
+  { type: 'abortMerge' },
+  { type: 'mergeDiff', file: 'src/x.ts' },
+  { type: 'mergeDiff' },
   { type: 'testLink', id: 'nope', kind: 'file', target: 'src/x.ts' },
   { type: 'testLink', id: 'nope', kind: 'command', target: 'npm test' },
   { type: 'testLink', id: 'nope', kind: 'url', target: 'http://localhost:3000' },
