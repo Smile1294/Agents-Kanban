@@ -132,6 +132,12 @@
           "default": true,
           "description": "Close the board when you click away from it \u2014 open a file, switch to another tab \u2014 putting the terminal and the right-hand chat back. Turn this off to make the board a pure toggle that only the icon, Ctrl+Alt+K or its tab's X can close, which is what you want if you like to glance at a file and come straight back."
         },
+        "agentsKanban.hideSessionsOlderThanDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "markdownDescription": "Hide sessions this board has never touched once they are older than this many days. Another agent's session store can be global to the machine rather than per project — Codex's is — so opening a repository you used months ago otherwise adopts every old session it can match at once. Sessions the board has started, moved, tagged or archived are always shown, however old, and search always finds every session regardless of this setting. Set to `0` to adopt everything."
+        },
         "agentsKanban.model": {
           "type": "string",
           "default": "claude-opus-5",

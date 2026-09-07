@@ -176,6 +176,28 @@ run, since each session needs a worktree.
   tokens and beyond that the service downscales anyway; and the transcript
   entry keeps the COUNT, never the bytes, because that array is serialised to
   the webview on every repaint.
+- **A session ADOPTED off another runtime's store has no metadata, and routing
+  on `meta.runtime` silently reads the wrong store.** `runtimeOf()` fell back to
+  "Claude Code" for every card `foreign()` found on disk, so their transcripts
+  came back EMPTY, their meters read zero, and `delete()` called Claude Code's
+  `deleteSession` on a Codex uuid — then "verified" with Claude Code's
+  `getSessionInfo`, which of course reported it absent, and returned
+  `deleted: true` while the rollout sat untouched. The card came back on the
+  next scan. Measured on a real machine: 51 such cards. So resolution falls back
+  to the foreign scan (the same cached read that drew the card),
+  `RuntimeHistory.delete?()` is OPTIONAL for the reason `rename` is absent — a
+  runtime we can read but not write is real, and the board must say so rather
+  than claim a success — and a foreign delete is verified against that
+  runtime's OWN listing. Checking the wrong store is what made the lie.
+- **Another agent's session store may be global to the MACHINE.** Claude Code
+  keys by working directory; Codex keys by date, so `list(dir)` reads every
+  rollout on disk and filters by `cwd`. Opening a repo you used months ago
+  adopts all of them. `splitByAge` bounds it, and three things are load-bearing:
+  the line is METADATA not age (anything the board ever touched is shown however
+  old), the bound is applied by the HOST and never inside `SessionStore.list()`
+  (search reads the same list, and a session you cannot find is worse than one
+  you cannot see), and the hidden COUNT is drawn and clickable — hiding without
+  saying how much is losing things, not filtering.
 - **The ignore rule lives in TWO places, and the untracked one is the one that
   works.** `.gitignore` is the copy the team gets and it stays, but it is
   TRACKED — so it is lost when a user discards the unexplained edit, switches to

@@ -22,6 +22,10 @@ const claudeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-store-claude-'))
 const prevConfig = process.env.CLAUDE_CONFIG_DIR
 process.env.CLAUDE_CONFIG_DIR = claudeHome
 
+// Registers the runtimes. Without it `allRuntimes()` is empty, `foreign()`
+// contributes nothing, and every assertion about an adopted Codex session would
+// pass vacuously against a board that simply has no such card.
+await import('../../agent/runtimes/index.ts')
 const { MetaStore } = await import('../meta.ts')
 const { SessionStore, interruptedSessions, summariseTool } = await import('../store.ts')
 type BoardSession = import('../store.ts').BoardSession
@@ -55,14 +59,45 @@ const SEEDED_ID = '99999999-8888-7777-6666-555555555555'
   ].map((l) => JSON.stringify(l)).join('\n') + '\n')
 }
 
+// A Codex rollout for the SAME repo, with NO sidecar entry — which is exactly
+// the state of every adopted session on a real board: the runtime is known only
+// from the foreign scan, never from metadata we wrote.
+const CODEX_ID = '11111111-2222-3333-4444-555555555555'
+const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-store-codex-'))
+const prevCodex = process.env.CODEX_HOME
+process.env.CODEX_HOME = codexHome
+{
+  const day = path.join(codexHome, 'sessions', '2026', '05', '06')
+  await fs.mkdir(day, { recursive: true })
+  const rec = (type: string, payload: unknown) =>
+    JSON.stringify({ timestamp: '2026-05-06T10:00:00.000Z', type, payload })
+  await fs.writeFile(
+    path.join(day, `rollout-2026-05-06T10-00-00-${CODEX_ID}.jsonl`),
+    [
+      rec('session_meta', {
+        id: CODEX_ID, cwd: repo, timestamp: '2026-05-06T10:00:00.000Z',
+        model: 'gpt-5-codex', instructions: 'x'.repeat(64),
+      }),
+      rec('event_msg', { type: 'user_message', message: 'update the screening tabs' }),
+      rec('event_msg', { type: 'agent_message', message: 'Done.' }),
+    ].join('\n') + '\n',
+    'utf8',
+  )
+  await fs.writeFile(
+    path.join(codexHome, 'session_index.jsonl'),
+    `${JSON.stringify({ id: CODEX_ID, thread_name: 'Update screening tabs', updated_at: '2026-05-06T10:05:00.000Z' })}\n`,
+    'utf8',
+  )
+}
+
 const store = new SessionStore(repo, new MetaStore(tmp, repo))
 
 const list = await store.list()
 ok(Array.isArray(list), 'list() returns sessions from Claude Code without throwing')
 // An ASSERTION, not a guard. If the SDK ever changes where it looks, this goes
 // red and names it rather than skipping the rest of the file.
-ok(list.length === 1,
-   `the seeded session is found — the SDK's project-directory encoding still holds (${list.length})`)
+ok(list.filter((s) => !s.runtime || s.runtime === 'claude').length === 1,
+   `the seeded Claude session is found — the SDK's project-directory encoding still holds (${list.length})`)
 ok(list.some((s) => s.id === SEEDED_ID), 'and it is the one that was seeded')
 
 {
@@ -336,6 +371,42 @@ ok(outcome.reason === undefined, 'and no spurious warning to show the user')
 // runs next in the same process.
 if (prevConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
 else process.env.CLAUDE_CONFIG_DIR = prevConfig
+// --- an ADOPTED session from another runtime ---------------------------------
+//
+// The state every pre-existing Codex session on a real board is in: it appears
+// because `foreign()` found it on disk, and there is NO sidecar entry, so
+// `meta.runtime` is undefined. Everything that routed on `meta.runtime` alone
+// therefore treated it as a Claude Code session. Measured on a real machine: 51
+// of them, every one older than 30 days, none removable and none readable.
+{
+  const all = await store.list()
+  const adopted = all.find((s) => s.id === CODEX_ID)
+  ok(!!adopted, `an adopted Codex session is on the board (${all.length} sessions)`)
+  ok(adopted?.runtime === 'codex', `and the board knows which runtime it belongs to (${adopted?.runtime})`)
+  ok((await store.allMeta())[CODEX_ID] === undefined,
+     'while having no sidecar entry at all — which is the whole difficulty')
+
+  // Reading it. This routed through Claude Code's parser and came back empty,
+  // so every one of those cards opened as a blank chat.
+  const entries = await store.transcript(CODEX_ID)
+  ok(entries.length > 0, `its transcript reads through the runtime that owns it (${entries.length} entries)`)
+  ok(entries.some((e) => (e as { text?: string }).text === 'update the screening tabs'),
+     'and it is the real conversation, not an empty list')
+
+  // Deleting it. `deleteSession` is Claude Code's and knows only Claude Code's
+  // store, so it reported success, dropped our sidecar row, and the card came
+  // back on the next scan. A delete that cannot be seen to have happened is
+  // worse than a refusal.
+  const result = await store.delete(CODEX_ID)
+  ok(result.deleted, `deleting it reports success: ${JSON.stringify(result)}`)
+  const after = await store.list()
+  ok(!after.some((s) => s.id === CODEX_ID),
+     `and it STAYS gone — the card does not come back on the next scan (${after.length} left)`)
+}
+
+if (prevCodex === undefined) delete process.env.CODEX_HOME
+else process.env.CODEX_HOME = prevCodex
+await fs.rm(codexHome, { recursive: true, force: true })
 await fs.rm(claudeHome, { recursive: true, force: true })
 await fs.rm(repo, { recursive: true, force: true })
 await fs.rm(tmp, { recursive: true, force: true })

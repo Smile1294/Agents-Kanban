@@ -1,6 +1,6 @@
 /* The board's policy rules. These decide what an agent may do and when the user
    is interrupted, so they are code with tests rather than prose in a prompt. */
-import { DEFAULT_BOARD, columnById, isHumanOnly, isReviewColumn, isStartedColumn, stalledSince, type BoardConfig } from '../config.ts'
+import { DEFAULT_BOARD, columnById, isHumanOnly, isReviewColumn, isStartedColumn, splitByAge, stalledSince, type BoardConfig } from '../config.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -94,6 +94,52 @@ ok(stalledSince(renamed, { phase: 'doing', updated: ENDED, worktree: '/w' }) ===
    'a renamed started column still reports a stalled run')
 ok(stalledSince(renamed, { phase: 'implementing', updated: ENDED, worktree: '/w' }) === undefined,
    'and the old id is no longer a started column on that board')
+
+// --- which sessions the board adopts off disk --------------------------------
+//
+// The board lists every session the agent programs have for this directory.
+// Codex's store is keyed by DATE and is global to the machine, so opening a
+// repo you used Codex in months ago adopts every rollout at once: measured on a
+// real machine, 51 of them, every one older than 30 days, all landing in the
+// default column. Reported as "it fetched all and I cant remove them".
+//
+// The line is METADATA, not age alone: anything the board has ever touched —
+// started, moved, tagged, archived — is always shown, however old. Only a
+// session we have never written a thing about can be hidden.
+const DAY = 86400000
+const now = 1_800_000_000_000
+const sess = (id: string, ageDays: number) => ({ id, updated: now - ageDays * DAY })
+
+{
+  const all = [sess('new', 2), sess('old', 90), sess('ours', 200)]
+  const metas = { ours: { phase: 'planning' } }
+  const r = splitByAge(all, { metas, days: 30, now })
+  ok(r.shown.map((s) => s.id).join(',') === 'new,ours',
+     `a recent session and one the board owns are both shown (${r.shown.map((s) => s.id).join(',')})`)
+  ok(r.hidden === 1, `and only the untouched old one is hidden (${r.hidden})`)
+  ok(r.shown.every((s) => s.id !== 'old'), 'which is not in the shown list')
+}
+
+// The count is what makes hiding honest: the board says how many, so nothing
+// disappears silently. A signal that cannot say "there is more" is the same
+// mistake as one that cannot say "bad".
+ok(splitByAge([sess('a', 90), sess('b', 90)], { metas: {}, days: 30, now }).hidden === 2,
+   'the hidden COUNT is reported, never a silent drop')
+
+// Turned off, and the "show older" escape hatch, must both be exact.
+ok(splitByAge([sess('a', 900)], { metas: {}, days: 0, now }).shown.length === 1,
+   'days: 0 means adopt everything, as before')
+ok(splitByAge([sess('a', 900)], { metas: {}, days: 30, now, showOlder: true }).shown.length === 1,
+   'and "show older" reveals them without changing the setting')
+ok(splitByAge([sess('a', 900)], { metas: {}, days: 30, now, showOlder: true }).hidden === 0,
+   'with nothing left to report as hidden')
+
+// The boundary, in the direction that matters: a session exactly at the cutoff
+// is still SHOWN. Off by one here silently eats a day of somebody's work.
+ok(splitByAge([sess('edge', 30)], { metas: {}, days: 30, now }).shown.length === 1,
+   'a session exactly at the cutoff is kept')
+ok(splitByAge([sess('edge', 31)], { metas: {}, days: 30, now }).shown.length === 0,
+   'and one a day past it is not')
 
 console.log(fails === 0 ? 'PASS — board policy holds, including on a renamed board' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

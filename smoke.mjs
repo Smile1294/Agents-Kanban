@@ -442,6 +442,20 @@ for (const msg of [
   { type: 'diff', id: 'nope', file: 'src/x.ts' },
   { type: 'commit', id: 'nope' },
   { type: 'merge', id: 'nope' },
+  // The bulk paths, and the shapes a stale or hostile webview can send: these
+  // ids reach a DELETE, so a non-array, a non-string member and an empty batch
+  // must all be survivable rather than trusted.
+  { type: 'archiveMany', ids: ['nope'], archived: true },
+  { type: 'archiveMany', ids: ['nope'], archived: false },
+  { type: 'archiveMany', ids: [] },
+  { type: 'archiveMany', ids: 'not-an-array' },
+  { type: 'archiveMany' },
+  { type: 'removeMany', ids: [] },
+  { type: 'removeMany', ids: [null, 42, '', '   '] },
+  { type: 'removeMany', ids: 'not-an-array' },
+  { type: 'removeMany' },
+  { type: 'toggleOlder' },
+  { type: 'toggleOlder' },
   // The merge now stops before the commit, so three more messages exist and
   // every one of them can arrive when there is no merge waiting at all — a
   // stale webview, or a second click on a banner that has just been actioned.

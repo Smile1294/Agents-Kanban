@@ -272,6 +272,65 @@ live button would only ever produce an error toast.
 
 ## Postmortems
 
+### "It fetched all and I cant remove them"
+
+Reported as "it fetches remote chats from claude code". They were **Codex**
+rollouts, and there were two separate faults.
+
+**The board adopted every one of them.** Claude Code keys its store by encoded
+working directory, so "which sessions belong here" is a directory listing.
+Codex keys by DATE and its store is global to the MACHINE, so `list(dir)` reads
+every rollout on disk and filters by `cwd`. Opening a repository you used Codex
+in months ago therefore adopts the lot at once. Measured on the reporting
+machine: **51 sessions, every one older than 30 days**, all landing in the
+default column above the work in progress.
+
+**And Delete could not remove them, while reporting that it had.**
+`SessionStore.delete()` called Claude Code's `deleteSession` on any id, then
+verified with Claude Code's `getSessionInfo` — which reports a Codex uuid as
+absent, because it was never in that store. So it returned `deleted: true`, the
+sidecar row was dropped, nothing on disk was touched, and the card came back on
+the next scan. `rename()` already carried a long comment about exactly this trap
+and routed through `runtimeOf`; `delete()` never got the same treatment.
+
+**The routing itself was also wrong for these cards**, and this is the part that
+made the fix bigger than one branch. `runtimeOf()` read `meta.runtime` — but an
+ADOPTED session has no sidecar entry at all, because it is on the board only
+because `foreign()` found it on disk. So it answered "Claude Code" for all 51,
+and `transcript()`, `usage()` and `meter()` mis-routed with it: those cards
+opened as blank chats with zero meters. It now falls back to the foreign scan,
+which is the same cached read that drew the card.
+
+`RuntimeHistory` gains an OPTIONAL `delete?(id)`, for the reason `rename` is
+deliberately absent: a runtime whose history we can read but not write is a real
+thing, and the board must be able to say "this agent owns its own history"
+rather than report a success it did not achieve. Codex implements it by
+unlinking the rollout AND pruning `session_index.jsonl` — leaving that row puts
+a dangling entry in `codex resume` pointing at a file that is gone. Verification
+is against the runtime's OWN listing, because checking the wrong store is what
+manufactured the false success in the first place.
+
+**Bulk selection**, because one modal per card is not a way out of 51. Selection
+is module-level in `board.js` for the usual reason — the tree is replaced
+several times a second and a checked box held in the DOM dies between the click
+and the next frame — and it is PRUNED on every render, or the bar counts cards
+that are no longer there. Archive leads and is unconfirmed: it touches nothing
+on disk and `Show archived` reverses it, and a modal in front of a reversible
+hide is one people learn to dismiss without reading. Delete takes one
+confirmation for the whole batch, and failures are collected and NAMED rather
+than counted — "3 failed" sends the user looking; the reason is usually one
+sentence that says what to do.
+
+**The age bound is a pure function applied by the host, never a filter inside
+`SessionStore.list()`.** Search reads the same list, and a session you cannot
+FIND is worse than one you cannot see. `splitByAge` draws the line on METADATA,
+not age alone: anything the board has ever written about is shown however old,
+because that is a session someone chose to care about; only one we have never
+recorded a fact about can be hidden. It returns the count and the board draws
+it as `47 older hidden`, clickable — hiding without saying how much is losing
+things rather than filtering.
+
+
 ### "I press Merge and literally nothing happens"
 
 Two bugs, reported as one, and neither was where it looked.

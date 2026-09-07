@@ -274,6 +274,58 @@ export const codexHistory: RuntimeHistory = {
     const found = await load(id)
     return found?.usage ?? { contextTokens: 0, meter: { kind: 'unknown' } }
   },
+
+  /**
+   * Remove a rollout, and the index row that points at it.
+   *
+   * Both halves matter. The rollout is what `list()` walks, so leaving it makes
+   * the card come back on the next scan — which is the bug this exists to fix.
+   * The index is Codex's OWN resume list, so leaving that row puts a dangling
+   * entry in `codex resume` pointing at a file that is gone.
+   *
+   * A missing rollout answers `false` rather than throwing: two board windows,
+   * or a second click on a batch, must not raise a failure dialog for work that
+   * is already done.
+   */
+  async delete(id: string): Promise<boolean> {
+    const home = codexHome()
+    let file = (await rolloutFiles(home)).find((f) => idFromName(f) === id)
+    if (!file) {
+      // Same re-walk as `load()`: the cached listing may predate the file.
+      walkCache = undefined
+      file = (await rolloutFiles(home)).find((f) => idFromName(f) === id)
+    }
+    if (!file) return false
+    await fs.rm(file, { force: true })
+    parsed.delete(file)
+    await pruneIndex(home, id)
+    _resetCodexCaches()
+    return true
+  },
+}
+
+/**
+ * Drop one id from `session_index.jsonl`, leaving every other line byte for
+ * byte as it was.
+ *
+ * Rewritten line-wise rather than parsed and re-serialised: this is Codex's
+ * file, it may carry fields this build has never heard of, and round-tripping
+ * it through our own idea of the shape would quietly rewrite them. A line we
+ * cannot parse is KEPT — it is not ours to discard.
+ */
+async function pruneIndex(home: string, id: string): Promise<void> {
+  const file = path.join(home, 'session_index.jsonl')
+  const raw = await fs.readFile(file, 'utf8').catch(() => undefined)
+  if (raw === undefined) return
+  const keep = raw.split('\n').filter((line) => {
+    if (!line.trim()) return false
+    try {
+      return (JSON.parse(line) as { id?: unknown }).id !== id
+    } catch {
+      return true
+    }
+  })
+  await fs.writeFile(file, keep.length ? `${keep.join('\n')}\n` : '', 'utf8')
 }
 
 /** Locate and parse one session, reusing the last parse while the file is

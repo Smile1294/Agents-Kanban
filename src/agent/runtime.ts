@@ -584,6 +584,20 @@ export interface RuntimeHistory {
   transcript(id: string): Promise<unknown[]>
   /** Context fill and spend for a session nothing is running. */
   usage(id: string): Promise<{ contextTokens: number; contextWindow?: number; meter: Meter }>
+  /**
+   * Remove a session from this runtime's own store. `false` means there was
+   * nothing there; a real failure throws.
+   *
+   * OPTIONAL, and the optionality is the point — the same reasoning as the
+   * deliberately absent `rename`. A runtime whose history we can read but not
+   * write is a real thing, and `SessionStore.delete()` must be able to say
+   * "this agent owns its own history" rather than report a success it did not
+   * achieve. That false success is exactly what shipped: Claude Code's
+   * `deleteSession` was called on Codex uuids, Claude Code's `getSessionInfo`
+   * confirmed the id was absent from ITS store, and the board reported the card
+   * deleted while the rollout sat untouched on disk.
+   */
+  delete?(id: string): Promise<boolean>
 }
 
 export interface HistoricSession {

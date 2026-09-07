@@ -266,6 +266,12 @@ export interface UiState {
   mode: Mode
   selectedKey?: string
   showArchived?: boolean
+  /** How many sessions the age bound is holding back. Drawn as a count the user
+   *  can click — hiding without saying how much is losing things, not
+   *  filtering. Absent (0) when nothing is held back. */
+  olderHidden?: number
+  /** The user asked to see them anyway. */
+  showOlder?: boolean
   columns: ColumnDef[]
   cards: UiCard[]
   /** Only for the selected session — sending every transcript would be wasteful. */
@@ -528,6 +534,11 @@ export interface BoardHost {
   /** Diff one staged file of the waiting merge against the branch's HEAD. */
   openMergeDiff(file: string): Promise<void>
   archive(key: string, archived: boolean): Promise<void>
+  /** Archive or unarchive several cards at once, with no per-card prompt.
+   *  Safe by construction: nothing on disk is touched and it is reversible. */
+  archiveMany(keys: string[], archived: boolean): Promise<void>
+  /** Delete several sessions, behind ONE confirmation for the whole batch. */
+  removeMany(keys: string[]): Promise<void>
   pin(key: string, pinned: boolean): Promise<void>
   remove(key: string): Promise<void>
   rename(key: string, title: string): Promise<void>
@@ -542,6 +553,8 @@ export interface BoardHost {
     agent?: string
   }): void
   toggleArchived(): void
+  /** Show or re-hide the sessions the age bound is holding back. */
+  toggleOlder(): void
   /** Give the board the whole window, or hand it back. */
   toggleFocus(): Promise<void>
   /** Open the full board in the editor area. */
@@ -602,6 +615,15 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
   return webview.onDidReceiveMessage(async (msg: Record<string, unknown>) => {
     try {
       const id = () => String(msg.id ?? '')
+      /* A batch of ids from the webview. PARSED, never cast: this arrives from
+         a page that renders another program's output, and it is about to be
+         handed to a delete. Non-strings are dropped, blanks are dropped,
+         duplicates collapse, and the batch is capped — a runaway list must not
+         become an unbounded loop of file deletions. */
+      const ids = (raw: unknown): string[] =>
+        Array.isArray(raw)
+          ? [...new Set(raw.filter((v): v is string => typeof v === 'string' && !!v.trim()))].slice(0, 500)
+          : []
       switch (msg.type) {
         /* A webview saying it has just loaded, so it holds nothing.
            `onReady` exists for one reason: the state omits anything the view
@@ -641,7 +663,13 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
         case 'commitMerge': await host.commitMerge(); await refresh(); break
         case 'abortMerge': await host.abortMerge(); await refresh(); break
         case 'mergeDiff': await host.openMergeDiff(String(msg.file ?? '')); break
+        case 'toggleOlder': host.toggleOlder(); await refresh(); break
         case 'archive': await host.archive(id(), msg.archived !== false); break
+        case 'archiveMany':
+          await host.archiveMany(ids(msg.ids), msg.archived !== false)
+          await refresh()
+          break
+        case 'removeMany': await host.removeMany(ids(msg.ids)); await refresh(); break
       case 'pin': await host.pin(id(), msg.pinned !== false); break
         case 'remove': await host.remove(id()); break
         case 'rename': await host.rename(id(), String(msg.title ?? '')); break

@@ -510,8 +510,18 @@ export class SessionStore {
    */
   private async runtimeOf(id: string): Promise<RuntimeHistory | undefined> {
     const meta = (await this.meta.getAll())[id]
-    if (!meta?.runtime || meta.runtime === 'claude') return undefined
-    return getRuntime(meta.runtime)?.history
+    if (meta?.runtime) return meta.runtime === 'claude' ? undefined : getRuntime(meta.runtime)?.history
+    // An ADOPTED session has no sidecar entry at all — it is on the board only
+    // because `foreign()` found it on disk — so `meta.runtime` is undefined and
+    // this used to answer "Claude Code" for it. Every caller then read the
+    // wrong store: the transcript came back EMPTY, the meters read zero, and
+    // `delete()` called Claude Code's API on a Codex uuid. Measured on a real
+    // machine: 51 such cards, none readable and none removable.
+    //
+    // The foreign scan is the same cached read `list()` already does to draw
+    // the card, so this costs an array scan on a warm cache, not a walk.
+    const found = (await this.foreign()).find((f) => f.id === id)
+    return found ? getRuntime(found.runtime)?.history : undefined
   }
 
   /**
@@ -795,6 +805,16 @@ export class SessionStore {
   }
 
   async delete(id: string): Promise<{ deleted: boolean; reason?: string }> {
+    // Route on the owning runtime FIRST, exactly as `rename()` does. Without
+    // it this called Claude Code's `deleteSession` on a Codex uuid, then
+    // "verified" with Claude Code's `getSessionInfo` — which reports any Codex
+    // id as absent — and returned `deleted: true`. The sidecar row was dropped,
+    // nothing on disk was touched, and the card reappeared on the next scan.
+    // A delete that reports a success it did not achieve is worse than one that
+    // refuses: the user presses it repeatedly and concludes the board is broken.
+    const rt = await this.runtimeOf(id)
+    if (rt) return this.deleteForeign(id, rt)
+
     const { deleteSession, getSessionInfo } = await loadSdk()
     let reason: string | undefined
     try {
@@ -816,6 +836,36 @@ export class SessionStore {
         'Claude Code still has this session open and wrote it back after it was deleted. ' +
         'Close its tab in Claude Code, then delete again.',
     }
+  }
+
+  /**
+   * Delete a session that belongs to another runtime, through that runtime.
+   *
+   * Verified against ITS store, never Claude Code's — checking the wrong store
+   * is precisely what manufactured the false success. A runtime that cannot
+   * delete says so and KEEPS its sidecar row: dropping phase and tags for a
+   * card that is going to reappear anyway loses the only thing we did own.
+   */
+  private async deleteForeign(
+    id: string,
+    rt: RuntimeHistory,
+  ): Promise<{ deleted: boolean; reason?: string }> {
+    if (!rt.delete) {
+      return { deleted: false, reason: 'this agent owns its own history, so its sessions can only be archived' }
+    }
+    try {
+      await rt.delete(id)
+    } catch (e) {
+      return { deleted: false, reason: e instanceof Error ? e.message : String(e) }
+    }
+    await this.meta.remove(id)
+    this.invalidate()
+    this.transcripts.delete(id)
+    // The claim being made is "the card will not come back", so that is what is
+    // checked: the runtime's own listing, re-read after the caches were dropped.
+    const survived = (await rt.list(this.dir)).some((s) => s.id === id)
+    if (!survived) return { deleted: true }
+    return { deleted: false, reason: 'the agent still lists this session after it was deleted.' }
   }
 
   /** Unscoped by directory, for the same reason as `transcript()`: an agent's

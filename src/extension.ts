@@ -26,7 +26,7 @@ import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts
 import { SessionStore, TRANSCRIPT_LIMIT, interruptedSessions, type Entry } from './sessions/store.ts'
 import { searchEntries } from './sessions/search.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
-import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, stalledSince, type BoardConfig } from './board/config.ts'
+import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, splitByAge, stalledSince, type BoardConfig } from './board/config.ts'
 import { linkSubtasks, rollUpState } from './board/subtasks.ts'
 import {
   DEFAULT_ORCHESTRATION, ORCHESTRATION_CHOICES, decompositionLine,
@@ -123,6 +123,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let mode: Mode = 'kanban'
   let selectedKey: string | undefined
   let showArchived = false
+  /** The user asked to see sessions the age bound is holding back. Session
+   *  state, never a setting: it is "show me now", not "change the rule". */
+  let showOlder = false
   /** Review data is four git calls, and refreshAll() fires on every streamed
    *  token — so it is computed on demand and cached against its own card. */
   let review: { key: string; data: WorktreeReview } | undefined
@@ -2670,12 +2673,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
       }
 
-      const stored = await ws.store.list({ includeArchived: showArchived })
+      const listed = await ws.store.list({ includeArchived: showArchived })
       // A run has no Claude Code session for its first moment, and may never get
       // one if its id collided. Its board state lives in the sidecar under the
       // run id, so read that too or the card renders as a default with whatever
       // the agent recorded — phase, tags, test plan — invisible.
       const metas = await ws.store.allMeta()
+      // The age bound is applied HERE and never inside `store.list()`, because
+      // `searchTranscript` reads the same list: a session you cannot find is
+      // worse than one you cannot see. See `splitByAge`.
+      const aged = splitByAge(listed, {
+        metas,
+        days: cfg().get<number>('hideSessionsOlderThanDays') ?? 30,
+        ...(showOlder ? { showOlder: true } : {}),
+      })
+      const stored = aged.shown
       const live = ws.manager?.list() ?? []
       const cards: UiCard[] = []
       const seen = new Set<string>()
@@ -3004,6 +3016,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const kind = (k: string) => live.filter((a) => a.state.kind === k).length
       return {
         ready: true, mode, columns: ws.board.columns, cards, composer, showArchived,
+        ...(aged.hidden ? { olderHidden: aged.hidden } : {}),
+        ...(showOlder ? { showOlder: true } : {}),
         ...(ws.repoRoot ? {} : { noRepo: true }),
         ...(selectedKey ? { selectedKey } : {}),
         ...(transcript ? { transcript } : {}),
@@ -3050,6 +3064,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       loadReview(selectedKey).catch((e) => log.error(`Review load failed: ${String(e)}`))
     },
     toggleArchived() { showArchived = !showArchived },
+    toggleOlder() { showOlder = !showOlder },
 
     /** Flip the layout by hand, whatever the setting says. Useful when the
      *  setting is "off" but you want the board wide just this once. */
@@ -3914,6 +3929,86 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
       if (selectedKey === key) selectedKey = undefined
+      refreshAll()
+    },
+
+    /** Archive or unarchive a batch. No confirmation: nothing on disk is
+     *  touched and "Show archived" is one click away — a modal for a reversible
+     *  hide is the kind of prompt people learn to dismiss without reading. */
+    async archiveMany(keys, archived) {
+      const w = requireWs()
+      let done = 0
+      for (const key of keys) {
+        const id = w.manager?.byKey(key)?.sessionId ?? key
+        // A run with no session id yet has nothing to archive — the single-card
+        // path says so out loud, but in a batch that would be one dialog per
+        // card, so it is skipped and counted.
+        if (id.startsWith('run-')) continue
+        w.manager?.release(key)
+        try { await w.store.archive(id, archived); done++ } catch (e) {
+          log.warn(`Could not archive ${id}: ${String(e)}`)
+        }
+      }
+      if (done < keys.length) {
+        vscode.window.showWarningMessage(
+          `Archived ${done} of ${keys.length}. The rest have not started yet or could not be ` +
+          'written — see the Agents Kanban log.',
+        )
+      }
+      if (selectedKey && keys.includes(selectedKey) && archived) selectedKey = undefined
+      refreshAll()
+    },
+
+    /**
+     * Delete a batch, behind ONE confirmation.
+     *
+     * The reason this exists: another agent's session store can be global to
+     * the machine, so a board can arrive holding dozens of sessions nobody
+     * asked for — 51 on the machine this was reported from. One modal per card
+     * is not a way out of that.
+     *
+     * The confirmation names the count and says the transcripts go, because
+     * this is the one board action that destroys something the user cannot get
+     * back. Failures are COLLECTED and reported: a batch that half worked must
+     * not read as a batch that worked.
+     */
+    async removeMany(keys) {
+      const w = requireWs()
+      if (!keys.length) return
+      const choice = await vscode.window.showWarningMessage(
+        `Delete ${keys.length} session${keys.length === 1 ? '' : 's'} permanently?`,
+        {
+          modal: true,
+          detail:
+            `${keys.length} transcript${keys.length === 1 ? '' : 's'} will be removed from the agent ` +
+            'that owns them. This cannot be undone. Git worktrees and branches are left alone.\n\n' +
+            'To take them off the board without deleting anything, cancel and press Archive instead.',
+        },
+        'Delete',
+      )
+      if (choice !== 'Delete') return
+
+      const failed: string[] = []
+      for (const key of keys) {
+        const id = w.manager?.byKey(key)?.sessionId ?? key
+        w.manager?.stop(key)
+        if (id.startsWith('run-')) { await w.store.forget(id); continue }
+        try {
+          const r = await w.store.delete(id)
+          if (!r.deleted) failed.push(r.reason ?? id)
+        } catch (e) {
+          failed.push(e instanceof Error ? e.message : String(e))
+        }
+        if (selectedKey === key) selectedKey = undefined
+      }
+      if (failed.length) {
+        // Named, not counted. "3 failed" sends the user looking; the reason is
+        // usually one sentence that tells them exactly what to do.
+        await vscode.window.showWarningMessage(
+          `Deleted ${keys.length - failed.length} of ${keys.length}.`,
+          { modal: true, detail: [...new Set(failed)].slice(0, 5).join('\n\n') },
+        )
+      }
       refreshAll()
     },
 

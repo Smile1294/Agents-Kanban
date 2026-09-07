@@ -150,6 +150,53 @@ export function stalledSince(
   return s.updated
 }
 
+/**
+ * Split adopted sessions into what the board shows and how many it is holding
+ * back, by age.
+ *
+ * The board lists every session the agent programs have for this directory, and
+ * that is usually what you want — until it isn't. Codex's store is keyed by
+ * DATE and is global to the MACHINE, not per project, so opening a repository
+ * you used Codex in months ago adopts every rollout it can match at once.
+ * Measured on a real machine: 51 sessions, every one older than 30 days, all
+ * landing in the default column at the top of the board.
+ *
+ * The line drawn here is METADATA, not age alone. Anything the board has ever
+ * written about — started, moved, tagged, pinned, archived — is shown however
+ * old it is, because that is a session someone chose to care about. Only one we
+ * have never recorded a single fact about can be hidden.
+ *
+ * `hidden` is returned rather than swallowed, and the board draws it: a count
+ * the user can click is the difference between filtering and losing things.
+ * This is also why the bound is applied HERE and not inside `SessionStore.list`
+ * — search reads the same list, and a session you cannot find is worse than one
+ * you cannot see.
+ */
+export function splitByAge<T extends { id: string; updated: number }>(
+  sessions: readonly T[],
+  opts: {
+    /** The board's sidecar. An entry — any entry — means "shown". */
+    metas: Record<string, unknown>
+    /** Cutoff in days. `0` disables the bound entirely. */
+    days: number
+    now?: number
+    /** The user asked to see them anyway, without changing the setting. */
+    showOlder?: boolean
+  },
+): { shown: T[]; hidden: number } {
+  if (!opts.days || opts.showOlder) return { shown: [...sessions], hidden: 0 }
+  const cutoff = (opts.now ?? Date.now()) - opts.days * 86400000
+  const shown: T[] = []
+  let hidden = 0
+  for (const s of sessions) {
+    // `>=`, so a session exactly at the cutoff is kept. Off by one in the other
+    // direction quietly eats a day of somebody's work.
+    if (opts.metas[s.id] || s.updated >= cutoff) shown.push(s)
+    else hidden++
+  }
+  return { shown, hidden }
+}
+
 /** A column meaning "this one is off the agent's plate" — handed back for
  *  review, or approved. What a subtask has to reach before its parent can say
  *  the whole task is ready. */

@@ -343,6 +343,9 @@
   const stop = (e) => e.stopPropagation()
 
   function render() {
+    // Before anything is drawn: a card that has left the board must leave the
+    // selection with it, or the bar counts something nobody can see.
+    pruneSelection()
     const sc = root.querySelector('.transcript-scroll')
     if (sc) stick = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 60
     // Every scroll container is destroyed by the rebuild below, and an agent at
@@ -492,6 +495,7 @@
     return JSON.stringify([
       s.mode, s.selectedKey || '', !!s.ready, !!s.noWorkspace, !!s.noRepo,
       !!s.focused, !!s.boardOpen, !!s.showArchived, s.busy || '',
+      s.olderHidden || 0, !!s.showOlder, picked.size,
       !!searching, !!control, s.running || 0, s.waiting || 0,
       !!s.transcriptMore,
       cards, composer, s.columns || [], s.commands || [],
@@ -958,6 +962,24 @@
     rail.append(list)
 
     const foot = el('div', 'rail-foot')
+    // Above the two toggles, because it is about what you just did rather than
+    // what the board is showing. Only drawn when something is ticked: a bar
+    // that is always there is chrome, not an answer.
+    if (picked.size) foot.append(renderSelectionBar())
+    // What the age bound is holding back, as a COUNT that can be clicked.
+    // Hiding without saying how much is losing things rather than filtering —
+    // and the sessions being hidden here are ones nobody on this board ever
+    // touched, adopted straight off another agent's store.
+    if (s.olderHidden || s.showOlder) {
+      const older = el('button', s.showOlder ? 'on' : '',
+        s.showOlder ? '✓ Showing older sessions' : s.olderHidden + ' older hidden')
+      older.title = s.showOlder
+        ? 'Hide sessions older than the cutoff again'
+        : s.olderHidden + ' session' + (s.olderHidden === 1 ? '' : 's') +
+          ' this board has never touched are older than the cutoff. Search still finds them.'
+      older.onclick = () => post('toggleOlder')
+      foot.append(older)
+    }
     const arch = el('button', s.showArchived ? 'on' : '', s.showArchived ? '✓ Showing archived' : 'Show archived')
     arch.onclick = () => post('toggleArchived')
     foot.append(arch)
@@ -1039,6 +1061,13 @@
     const row = el('div', 'rail-item' + (c.key === s.selectedKey ? ' active' : '') + (c.archived ? ' archived' : ''))
     row.onclick = () => { closeSearch(); post('select', { id: c.key }); post('setMode', { mode: 'chat' }) }
     const top = el('div', 'rail-item-top')
+    // Selectable from here too. The rail is where a board holding dozens of
+    // adopted sessions actually looks like a mess, so making the kanban card
+    // the only place you can tick one would put the tool on the wrong screen.
+    const box = el('button', 'pick' + (picked.has(c.key) ? ' on' : ''), picked.has(c.key) ? '☑' : '☐')
+    box.title = 'Select this session'
+    box.onclick = (e) => { stop(e); pick(c, e) }
+    top.append(box)
     top.append(el('span', 'ai', '✦'))
     top.append(el('span', 'nm', c.title))
     row.append(top)
@@ -1167,6 +1196,69 @@
     return c
   }
 
+  /* Which cards are ticked, and the last one ticked so shift can take a range.
+     MODULE-LEVEL for the reason the composer draft and the disclosure map are:
+     `render()` replaces the whole tree several times a second while an agent
+     streams, so anything held in the DOM is destroyed between the click that
+     set it and the next frame. */
+  const picked = new Set()
+  let lastPicked = null
+
+  /** Drop keys that are no longer on the board. A selection that counts cards
+   *  that have gone acts on ghosts — and the count on the bar would be a number
+   *  the user cannot reconcile with what they can see. */
+  function pruneSelection() {
+    if (!picked.size) return
+    const live = new Set((s.cards || []).map((c) => c.key))
+    for (const k of [...picked]) if (!live.has(k)) picked.delete(k)
+    if (lastPicked && !live.has(lastPicked)) lastPicked = null
+  }
+
+  /** Tick or untick one card, taking the range from the last one on shift. */
+  function pick(c, e) {
+    const order = (s.cards || []).map((x) => x.key)
+    if (e && e.shiftKey && lastPicked && order.includes(lastPicked)) {
+      const a = order.indexOf(lastPicked), b = order.indexOf(c.key)
+      for (const k of order.slice(Math.min(a, b), Math.max(a, b) + 1)) picked.add(k)
+    } else if (picked.has(c.key)) {
+      picked.delete(c.key)
+    } else {
+      picked.add(c.key)
+    }
+    lastPicked = c.key
+    render()
+  }
+
+  /* What to do with the ticked cards. Archive is the safe one and leads: it
+     hides the card and touches nothing on disk, and `Show archived` brings it
+     straight back. Delete destroys the agent's own transcript, so it is the
+     plain button and the host puts ONE confirmation in front of the batch. */
+  function renderSelectionBar() {
+    const bar = el('div', 'selbar')
+    bar.append(el('span', 'selbar-count', picked.size + ' selected'))
+    // Its own row. The rail is 300px and `3 selected` plus three buttons does
+    // not fit on one line — laid out as one, every button stretched to full
+    // width and the bar became a stack of slabs.
+    const acts = el('div', 'selbar-acts')
+    const ids = () => [...picked]
+    const arch = el('button', 'primary', 'Archive')
+    arch.title = 'Hide these cards. Nothing on disk is touched, and "Show archived" brings them back.'
+    arch.onclick = (e) => {
+      stop(e); post('archiveMany', { ids: ids(), archived: true })
+      picked.clear(); lastPicked = null; render()
+    }
+    acts.append(arch)
+    const del = el('button', 'danger', 'Delete')
+    del.title = 'Delete these sessions and their transcripts permanently'
+    del.onclick = (e) => { stop(e); post('removeMany', { ids: ids() }) }
+    acts.append(del)
+    const clr = el('button', null, 'Clear')
+    clr.onclick = (e) => { stop(e); picked.clear(); lastPicked = null; render() }
+    acts.append(clr)
+    bar.append(acts)
+    return bar
+  }
+
   function renderCard(c) {
     const a = c.agent
     const kind = a ? a.kind : 'idle'
@@ -1193,6 +1285,13 @@
     }
 
     const t = el('div', 'title')
+    // Its own button, and it stops the event: the card body opens the chat, so
+    // without `stop()` ticking a box would also navigate away from the board
+    // the user is trying to tidy.
+    const box = el('button', 'pick' + (picked.has(c.key) ? ' on' : ''), picked.has(c.key) ? '☑' : '☐')
+    box.title = 'Select this card'
+    box.onclick = (e) => { stop(e); pick(c, e) }
+    t.append(box)
     t.append(el('span', 'ai', '✦'), document.createTextNode(c.title))
     n.append(t)
 

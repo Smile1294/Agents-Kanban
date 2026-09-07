@@ -505,6 +505,79 @@ panelMerge.onclick()
 ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.into === 'main'),
   'the panel button posts its base as the merge target')
 
+// 7b. Selecting several cards and acting on them at once.
+//
+// A board that adopts another agent's session store can arrive holding dozens
+// of cards nobody asked for — measured on a real machine, 51 Codex sessions,
+// every one older than 30 days. Clearing that one modal at a time is not a
+// feature anyone can use. Selection lives MODULE-LEVEL, never in the DOM: the
+// tree is replaced several times a second while an agent streams, so a checked
+// box held in the DOM is destroyed between the click and the next frame.
+{
+  const cards = [
+    { ...CARD, key: 'k1', sessionId: 'k1', title: 'Old one', agent: undefined },
+    { ...CARD, key: 'k2', sessionId: 'k2', title: 'Older still', agent: undefined },
+    { ...CARD, key: 'k3', sessionId: 'k3', title: 'Oldest', agent: undefined },
+  ]
+  const st = { ...base, cards }
+  const v = run(st)
+  ok(!v.text().includes('selected'), 'with nothing selected there is no selection bar')
+
+  // Both surfaces carry a tick box — the kanban card and the rail row — so the
+  // count is 2x the cards, and a test that indexed across BOTH would silently
+  // take a range spanning two differently-ordered lists.
+  const allBoxes = walkAll(v.root).filter((n) => n.className.startsWith('pick'))
+  ok(allBoxes.length === 6, `card and rail row both offer selection (${allBoxes.length})`)
+  const railPicks = (view) => walkAll(view.root)
+    .filter((n) => n.className.startsWith('rail-item-top'))
+    .map((row) => (row.children ?? []).find((ch) => ch.className.startsWith('pick')))
+  const boxes = railPicks(v)
+  ok(boxes.length === 3, `every session in the rail carries one (${boxes.length})`)
+  boxes[0].onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(v.text().includes('1 selected'), `selecting one says so: ${/\d+ selected/.exec(v.text())?.[0] ?? 'MISSING'}`)
+  ok(!v.posted.some((m) => m.type === 'select'),
+     'and ticking a box does NOT open the chat — that is what the card body is for')
+
+  // The repaint hazard, which is the whole reason this is module-level.
+  v.deliver({ ...st, running: 2 })
+  ok(v.text().includes('1 selected'), 'the selection survives a full repaint')
+
+  railPicks(v)[2].onclick({ stopPropagation() {}, preventDefault() {}, shiftKey: true })
+  ok(v.text().includes('3 selected'),
+     `shift-click takes the range between them: ${/\d+ selected/.exec(v.text())?.[0]}`)
+
+  const arch = findButton(v.root, 'Archive')
+  arch?.onclick({ stopPropagation() {}, preventDefault() {} })
+  const posted = v.posted.find((m) => m.type === 'archiveMany')
+  ok(!!posted && posted.ids.length === 3 && posted.archived === true,
+     `Archive posts one batch for all three: ${JSON.stringify(posted)}`)
+  ok(!v.text().includes('selected'), 'and the selection clears once it has been acted on')
+
+  // Delete is the destructive one and goes through its own message, so the host
+  // can put ONE confirmation in front of the whole batch.
+  const v2 = run(st)
+  railPicks(v2)[1].onclick({ stopPropagation() {}, preventDefault() {} })
+  findButton(v2.root, 'Delete')?.onclick({ stopPropagation() {}, preventDefault() {} })
+  const del = v2.posted.find((m) => m.type === 'removeMany')
+  ok(!!del && del.ids.length === 1 && del.ids[0] === 'k2',
+     `Delete posts the selected ids and nothing else: ${JSON.stringify(del)}`)
+
+  // A card that leaves the board must leave the selection with it, or the bar
+  // counts something that is not there and the batch acts on a ghost.
+  const v3 = run(st)
+  railPicks(v3)[0].onclick({ stopPropagation() {}, preventDefault() {} })
+  railPicks(v3)[1].onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(v3.text().includes('2 selected'), 'two selected')
+  v3.deliver({ ...st, cards: [cards[0]] })
+  ok(v3.text().includes('1 selected'),
+     `a card that disappears is pruned from the selection: ${/\d+ selected/.exec(v3.text())?.[0]}`)
+
+  const v4 = run(st)
+  railPicks(v4)[0].onclick({ stopPropagation() {}, preventDefault() {} })
+  findButton(v4.root, 'Clear')?.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(!v4.text().includes('selected'), 'Clear empties the selection')
+}
+
 // 8a. A run that ENDED and left its card in a started column.
 //
 // Two real cards sat in Implementing with the work finished — PR open, tests

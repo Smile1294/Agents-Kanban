@@ -20,7 +20,7 @@
  * page must NOT say: a session that was cut off must not leave a tool row
  * ticking forever, and a subscription session must not produce a dollar figure.
  */
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
 import { codexHistory, codexHome, parseRollout, _resetCodexCaches } from '../codex-store.ts'
@@ -225,6 +225,34 @@ async function main(): Promise<void> {
        'an id that does not exist is empty, not an error')
     ok((await codexHistory.transcript('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')).length > 0,
        'and the real session is still readable afterwards')
+  }
+
+  // --- deleting a session, which the board could not do at all ---------------
+  //
+  // `SessionStore.delete()` calls Claude Code's `deleteSession` on ANY id, then
+  // verifies with Claude Code's `getSessionInfo` — which of course reports a
+  // Codex uuid as gone. So the board reported a successful delete, dropped the
+  // sidecar entry, and the card came straight back on the next scan because the
+  // rollout was untouched. Measured on a real machine: 51 Codex sessions, every
+  // one older than 30 days, none of them removable.
+  //
+  // A runtime that owns its own history has to own deleting from it.
+  {
+    const id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    ok(typeof codexHistory.delete === 'function', 'the Codex runtime can delete from its own store')
+    ok((await codexHistory.list(repo)).length === 1, 'the session is there to begin with')
+    ok((await codexHistory.delete!(id)) === true, 'deleting it reports success')
+    _resetCodexCaches()
+    ok((await codexHistory.list(repo)).length === 0, 'and it is GONE from the listing, not just from our sidecar')
+    ok((await codexHistory.transcript(id)).length === 0, 'its transcript is gone too')
+    // The index is Codex's own resume list. Leaving the entry behind would put
+    // a dangling row in `codex resume` pointing at a file that no longer exists.
+    const index = await readFile(path.join(home, 'session_index.jsonl'), 'utf8').catch(() => '')
+    ok(!index.includes(id), `the session_index entry is pruned as well: ${JSON.stringify(index.trim().slice(0, 60))}`)
+    // Deleting what is not there is not an error — two board windows, or a
+    // double click on a batch, must not produce a failure dialog.
+    ok((await codexHistory.delete!('ffffffff-ffff-ffff-ffff-ffffffffffff')) === false,
+       'deleting an id that does not exist answers false rather than throwing')
   }
 
   if (prevHome === undefined) delete process.env.CODEX_HOME

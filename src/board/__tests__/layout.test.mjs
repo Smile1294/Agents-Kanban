@@ -184,7 +184,10 @@ try {
   // The clamp: one pathological title must not make a card tower over the rest.
   // Measured on the card whose title is the 200-character token — the split
   // card beside it is legitimately taller, because it is carrying a list.
-  const clamped = measured.find((m) => m.title.startsWith('✦xxxx'))
+  // Matched on the token rather than the row's opening character: the title row
+  // now leads with the select-this-card box, so anchoring on '✦' silently found
+  // NOTHING and the clamp assertion read `undefinedpx`.
+  const clamped = measured.find((m) => m.title.includes('xxxx'))
   ok(!!clamped && clamped.height < 200,
      `a 200-character title is clamped, not a full-height card (${clamped?.height}px)`)
 

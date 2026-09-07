@@ -717,6 +717,42 @@ details.thinking summary::-webkit-details-marker { display: none; }
   white-space: pre-wrap; color: var(--muted); line-height: 1.5;
 }
 
+/* --- selecting several cards at once ---------------------------------------
+   The tick box sits in the title row and must never grow with it: `flex: 0 0
+   auto` plus its own click target, because the card body opens the chat and a
+   box that shares the row's flex would be the first thing squeezed away. */
+.pick {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  margin-right: 2px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.95em;
+  line-height: 1;
+}
+.pick:hover { color: var(--vscode-foreground); }
+.pick.on { color: var(--vscode-focusBorder); }
+.selbar {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  width: 100%;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border-radius: var(--radius);
+  border: 1px solid var(--vscode-focusBorder);
+  background: color-mix(in srgb, var(--vscode-focusBorder) 12%, transparent);
+  min-width: 0;
+}
+.selbar-count { font-size: 0.82em; font-weight: 600; }
+.selbar-acts { display: flex; gap: 5px; min-width: 0; }
+/* `flex: 1 1 0` with `min-width: 0`, so three buttons share the row evenly and
+   shrink together instead of the last one being pushed out of a 300px rail. */
+.selbar-acts button { flex: 1 1 0; min-width: 0; padding: 2px 4px; font-size: 0.8em; }
+
 /* --- a run that ended without handing the work back ------------------------
    Quieter than .interrupted on purpose: nothing was lost and nothing is broken,
    the agent simply stopped in a started column. It states a fact and offers the
