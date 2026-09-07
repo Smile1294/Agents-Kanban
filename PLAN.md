@@ -142,7 +142,9 @@ src/
 media/                  Board UI (vanilla JS, native HTML5 drag and drop), the
                         settings page, theme.css for outside the editor
 server/                 The headless board: the built extension on a box
-remote/                 The relay site (Netlify / Workers / Node), a lift-out
+                        (the relay site lives in its own sibling repository,
+                        agents-kanban-relay; remote-contract.json pins the
+                        rules both ends share)
 scripts/                preflight, the test runner, run-bin, with-node.sh
 test/
   harness.mjs           A fake VS Code: activates the built bundle and talks to it
@@ -437,8 +439,10 @@ Working:
   the server against a throwaway repo and drives the whole flow through a real
   Chromium: 401s without the code, state over the stream, the gate, the
   composer, the settings tab, the first-death recovery and the second-death
-  dead end, zero console errors. The relay in `remote/`
-  remains as the smaller mirror mode. See [server/README.md](server/README.md)
+  dead end, zero console errors. The relay remains as the smaller mirror
+  mode — in its own sibling repository, agents-kanban-relay, with
+  remote-contract.json pinning the shared rules. See
+  [server/README.md](server/README.md)
 - Archive (soft, reversible) and permanent delete
 - Permission prompts inline on the card
 - Multiple tags per session

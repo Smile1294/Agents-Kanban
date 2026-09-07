@@ -748,9 +748,9 @@ function dictationSection() {
 /* --- Remote Control ----------------------------------------------------------
  *
  * This machine PUSHES the board to a small site the user deploys — the
- * remote/ folder in this repo lifts into its own repo and runs on Netlify,
- * Cloudflare or any Node server. The redaction happens ONCE, here, in
- * cards.ts: the page never sees more than the board shows. The page is
+ * relay, which lives in its own sibling repository (agents-kanban-relay) and
+ * runs on Netlify, Cloudflare or any Node server. The redaction happens ONCE,
+ * here, in cards.ts: the page never sees more than the board shows. The page is
  * read-only until the user switches ON the write channel below — then
  * prompts typed on it run on THIS machine, so the toggle is an explicit,
  * separately-enabled, honestly described capability.
@@ -874,7 +874,7 @@ function remoteSection() {
   url.placeholder = 'https://your-board.netlify.app'
   url.value = remoteDraft.url
   url.setAttribute('data-focus', 'remote::url')
-  url.title = 'The relay site you deployed from the remote/ folder'
+  url.title = 'The relay site you deployed from the agents-kanban-relay repository'
   url.addEventListener('input', (e) => {
     remoteDraft.url = (e && e.target && e.target.value != null ? e.target.value : url.value) || ''
     render()
@@ -915,7 +915,7 @@ function remoteSection() {
       () => post({ type: 'clearRemoteCode' })))
   }
   if (!remoteDraft.url.trim()) {
-    acts.appendChild(el('span', 'muted small', 'Deploy the remote/ folder first — its README walks through it.'))
+    acts.appendChild(el('span', 'muted small', 'Deploy the relay first — it lives in its own repository (agents-kanban-relay), whose README walks through it.'))
   } else if (!r.hasCode && !remoteDraft.code.trim()) {
     acts.appendChild(el('span', 'muted small',
       'A pairing code is needed once: choose one here, and enter the same one on the relay page to watch the board.'))

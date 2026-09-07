@@ -1,9 +1,11 @@
 /**
  * Remote Control — the shape of what leaves this machine.
  *
- * The board is streamed to a relay the user deploys (see remote/README.md) so
- * it can be watched from anywhere. What may leave is the question this module
- * answers, and the answer is narrower than the board itself:
+ * The board is streamed to a relay the user deploys — its own sibling
+ * repository, agents-kanban-relay (the shared rules are pinned in
+ * remote-contract.json) — so it can be watched from anywhere. What may leave
+ * is the question this module answers, and the answer is narrower than the
+ * board itself:
  *
  *  - the COLUMNS and the CARDS — title, phase, tags, runtime, when it was last
  *    updated, and a one-line "what the agent is doing" (kind and tool name,

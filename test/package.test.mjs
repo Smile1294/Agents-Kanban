@@ -110,11 +110,12 @@ ok(!hasPrefix('docs/screenshots/'), 'screenshots stay out of the package')
 // not part of the extension.
 ok(!hasPrefix('.agentskanban/'), 'agent worktrees stay out of the package')
 
-// The remote/ folder is a lift-out for the user's own Netlify site, with its
-// own package.json. It is the relay Remote Control pushes to, never part of
-// the extension — if it shipped, an install would carry code no VS Code
-// process ever runs.
-ok(!hasPrefix('remote/'), 'the remote relay folder stays out of the package')
+// The relay lives in its own repo (agents-kanban-relay, a sibling of this
+// one) — it is the site Remote Control pushes to, never part of the
+// extension. The guard stays because a merge of a branch that predates the
+// split, or an accidental re-add, must not ship it: if it did, an install
+// would carry code no VS Code process ever runs.
+ok(!hasPrefix('remote/'), 'the relay stays out of the package — it lives in its own repo')
 
 // The externals. These are the ones a packaging mistake silently drops.
 ok(has('node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs'),

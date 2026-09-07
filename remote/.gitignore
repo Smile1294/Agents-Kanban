@@ -1,6 +1,0 @@
-node_modules/
-.netlify/
-*.vsix
-# The plain-Node server's board store (server.js).
-data/
-.wrangler/

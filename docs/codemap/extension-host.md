@@ -75,9 +75,13 @@ smoothed. Pure and timer-injectable. Test: `coalesce.test.ts`.
 **`package.json`**. The manifest: `contributes.commands`, `views`,
 `configuration` (every `agentsKanban.*` setting with its description — the
 descriptions are documentation, keep them true), `keybindings`, `menus`; the
-npm scripts (every one starts with `node scripts/preflight.mjs`); the two
-runtime dependencies (`@anthropic-ai/claude-agent-sdk`, `zod` — both externals).
-Test: `smoke.mjs` §manifest (declared ↔ registered), `test/package.test.mjs`.
+npm scripts (every one starts with `node scripts/preflight.mjs`; `verify` runs
+`scripts/check-contract.mjs` after the tests — see
+[build-and-test.md](build-and-test.md)); the two runtime dependencies
+(`@anthropic-ai/claude-agent-sdk`, `zod` — both externals); `relayRepo`, the
+URL of the sibling relay repository that the contract gate falls back to when
+no local `../agents-kanban-relay` exists. Test: `smoke.mjs` §manifest (declared
+↔ registered), `test/package.test.mjs`.
 
 ## How it works
 
@@ -179,4 +183,7 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-07 · task/S968q-split-the-relay-repo-out · package.json grew the
+  `relayRepo` field and `verify` gained the relay-contract step
+  (scripts/check-contract.mjs) between the tests and smoke.
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.

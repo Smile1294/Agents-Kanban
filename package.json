@@ -418,7 +418,7 @@
     "test": "node scripts/preflight.mjs && node scripts/test.mjs",
     "package": "node scripts/preflight.mjs && node scripts/run-bin.mjs @vscode/vsce vsce package",
     "smoke": "node scripts/preflight.mjs && node smoke.mjs",
-    "verify": "node scripts/preflight.mjs && npm run typecheck && npm run build && npm run test && npm run smoke",
+    "verify": "node scripts/preflight.mjs && npm run typecheck && npm run build && npm run test && node scripts/check-contract.mjs && npm run smoke",
     "verify:package": "node scripts/preflight.mjs && npm run build && node test/package.test.mjs",
     "screenshots": "node scripts/preflight.mjs && node test/screenshots.mjs",
     "remote": "node scripts/preflight.mjs && npm run build && node server/server.mjs",
@@ -442,6 +442,7 @@
     "type": "git",
     "url": "https://github.com/Smile1294/Agents-Kanban.git"
   },
+  "relayRepo": "https://github.com/Smile1294/agents-kanban-relay",
   "icon": "media/icon.png",
   "keywords": [
     "kanban",

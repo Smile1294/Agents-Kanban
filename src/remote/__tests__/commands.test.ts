@@ -6,8 +6,11 @@
  * queue is written by a browser the host does not control.
  *
  * The rules asserted here agree, character for character, with the relay's
- * (remote/functions/board-core.mjs): the host must not accept what the relay
- * refused, and the relay must not refuse what the host would act on.
+ * (functions/board-core.mjs in the sibling agents-kanban-relay repository):
+ * the host must not accept what the relay refused, and the relay must not
+ * refuse what the host would act on. The agreement is pinned by
+ * remote-contract.json, which both repos carry verbatim and which
+ * scripts/check-contract.mjs checks on every verify.
  */
 import {
   acceptCommands,
@@ -153,12 +156,13 @@ function ctx(over: Partial<AcceptCtx> = {}): AcceptCtx & { seen: Set<string>; ex
   }).ready === false, 'no board id (no pairing code), not ready')
 }
 
-// --- the two ends agree on the limits, stated literally ----------------------
+// --- the two ends agree on the limits, through the contract ------------------
 // The host must not accept what the relay refused (and vice versa); a drifted
 // copy of either rule is a command that dies on the wire, silently. This file
-// cannot import board-core.mjs (it would drag remote/ into tsc), so both ends
-// are pinned to the SAME literals here and in handler.test.mjs — the agreement
-// is through the literal.
+// cannot import the relay's board-core.mjs (it lives in another repository),
+// so both ends are pinned to remote-contract.json — the relay side by its own
+// tests/contract.test.mjs, this side by scripts/check-contract.mjs in verify.
+// These literals are a sanity gate on the code itself, on top of that file.
 {
   ok(NONCE_OK.source === '^[A-Za-z0-9._-]{1,64}$', 'NONCE_OK is the literal both ends carry')
   ok(CMD_TEXT_MAX === 20_000, 'CMD_TEXT_MAX is 20000 on both ends')

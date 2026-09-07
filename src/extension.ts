@@ -1419,8 +1419,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   /* --- Remote Control: the half on this machine ------------------------------
    *
    * The board can be watched from anywhere through a small site the user
-   * deploys (see remote/README.md — that folder lifts into its own repo). This
-   * machine is the only writer; the site only stores and serves. The tested
+   * deploys — the relay, in its own sibling repository (agents-kanban-relay;
+   * remote-contract.json pins the shared rules). This machine is the only
+   * writer; the site only stores and serves. The tested
    * decisions live in src/remote/: relay.ts is the SHAPE of what may leave
    * (its tests pin the redaction field by field), pusher.ts is WHEN (cadence,
    * heartbeat, backoff), feed.ts is WHAT changed (a transcript tail travels

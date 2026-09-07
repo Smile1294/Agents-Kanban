@@ -112,8 +112,9 @@ Mirror: every repaint nudges `RemotePusher`; at most one push per
 `MIN_INTERVAL`, nothing when idle, a heartbeat after `HEARTBEAT_MS`.
 `RemoteFeed.build()` decides what travels (a tail only when its transcript
 grew); `projectIndex`/`projectTail` in `relay.ts` decide what MAY travel —
-`RemoteCardSource` is the redaction boundary. The relay (`remote/`) stores it
-under `boardIdOf(code)`; the viewer page fetches it. Prompts back:
+`RemoteCardSource` is the redaction boundary. The relay — its own sibling
+repository, `agents-kanban-relay` — stores it under `boardIdOf(code)`; the
+viewer page fetches it. Prompts back:
 `RemoteCommandClient` polls, `acceptCommands()` gates on `remote.writes`
 (default off; enabling flushes the queue), nonces, and a live-session check,
 then routes through the same `host.sendMessage` / `host.newSession` as the local
