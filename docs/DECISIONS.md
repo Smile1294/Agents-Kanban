@@ -2938,6 +2938,50 @@ there is a catalogue — that needs no facts.
   `spawnKeyFor()` gives it one (`runtime:codex`), so absence reads as "all
   allowed" — the documented default. Named here rather than papered over.
 
+### The suite was red on any checkout whose path had a space — and the smoke gate on every checkout
+
+Found by the first agent this board spawned on a machine whose repository lives
+under `Projects/Agents Repo/`. Three test-only bugs, none of them in the thing
+the failing output named, so `npm run verify` had been failing here without
+saying what was wrong.
+
+**A `%20` in the repo root.** Five test files — `executable.test.ts`,
+`layout.test.mjs`, `theme.test.mjs`, `viewer.test.mjs` and `test/harness.mjs`
+— derived the repository root from `new URL(import.meta.url).pathname`, which
+leaves a space URL-encoded. `executable.test.ts` then read a file that did not
+exist and reported *"the built bundle is there to inspect (run `npm run build`
+first)"*: a message blaming the build for a path the test itself had mangled,
+with a `.catch(() => '')` swallowing the `ENOENT` that would have said so. The
+fix is `fileURLToPath(import.meta.url)`, everywhere. The rule: a filesystem
+path comes out of a `file:` URL only through `fileURLToPath`; `.pathname` is a
+URL component, not a path.
+
+**A gate that read the wire raw.** `smoke.mjs`'s `latestState()` took the last
+`state` frame the host posted. The "326KB per frame" change made the host omit
+`composer.models` from any frame whose list the view already holds, and a
+coalesced repaint posts more than one frame for a single `ready` — so the last
+frame carried no models, and *"the composer offers models"* failed on a pristine
+`main` while the real board offered them fine. `board.js` keeps the last list it
+was sent; the gate now folds the list forward the same way, and nothing else.
+The rule: a test that reads the wire must model what the view does with it,
+or an optimisation of the wire fails the test and not the product — which is
+the failure mode a gate exists to rule out.
+
+**A teardown that could overturn the verdict.** `smoke.mjs` deleted its temp
+directories straight after `ext.deactivate()`, which returns before the host's
+asynchronous work has finished — a sidecar patch, an index cache, the stop of
+the queued run the last section starts. A write landing inside a directory
+`fs.rm` was walking is an `ENOTEMPTY` thrown out of the gate AFTER every
+assertion passed. Measured at one run in four; eleven leaked `ck-claude-*`
+directories in `/tmp` said it had been happening for a while. The `rm` now
+retries (`maxRetries`, Node's own knob for this race), and a directory that
+still will not go is reported and left rather than failing a run whose
+assertions all held. A gate's exit code is its verdict; cleanup is not part of
+the verdict.
+
+All three are the same shape as *"Test assertions that were wrong twice in the
+same way"*: the failing output pointed away from the cause.
+
 ## Still open
 
 - **A routed subtask's backend must be READ once before the board can check it.**
@@ -2946,13 +2990,10 @@ there is a catalogue — that needs no facts.
   still a step a first-time user will hit. Seeding every configured profile's
   endpoint list at activation would remove it, at the cost of N HTTP requests on
   a path that is currently free.
-- **`verify` tests before it builds, and one test reads the build.**
-  `executable.test.ts` greps `dist/extension.js`, so after a pull that changes
-  bundled code it inspects yesterday's bundle and fails until someone runs
-  `npm run build` by hand — F5 included, since its pre-launch task is `verify`.
-  Moving `build` ahead of `test` in the script would fix it. Preflight likewise
-  checks a fixed list of five packages, so a newly added devDependency
-  (playwright, this week) passes preflight and fails in the test that imports it.
+- **Preflight checks a fixed list of five packages**, so a newly added
+  devDependency (playwright) passes preflight and fails in the test that imports
+  it. (`verify` now builds before it tests, so the stale-bundle half of this
+  entry is closed.)
 - **No syntax highlighting in code blocks.** Language label and monospace only.
 
 - **A live process still cannot be re-attached after a restart**, and never will
@@ -2970,12 +3011,6 @@ there is a catalogue — that needs no facts.
   agent streams, so it deliberately does not recompute inside `getState()`. An
   agent finishing while a *different* card is selected leaves stale data behind
   Refresh.
-- **A subtask queued behind `maxConcurrentAgents` is invisible until it starts.**
-  A queued run has no card at all (it lives in the manager's queue, not its
-  agent list), so a 4-way split on the default limit of 3 briefly shows "2
-  subtasks" before the rest appear. It corrects itself within seconds, when the
-  parent's turn ends and frees its slot, but the count is momentarily short in
-  exactly the place the count is the point.
 - **Nothing re-runs a parent once its subtasks land.** The roll-up moves the
   parent card into review and says so; integrating the pieces, if they need it,
   is a follow-up message the user sends. Auto-resuming the parent would start a

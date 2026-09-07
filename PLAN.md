@@ -15,6 +15,14 @@ Nimbalyst is an Electron app.
   docs are wrong in several places.**
 - [docs/DECISIONS.md](docs/DECISIONS.md) — why it's built this way, and the bugs
   already fallen into.
+- [docs/CODEMAP.md](docs/CODEMAP.md) — where everything is in the code, file by
+  file, with its test and its trap; a task → files index; the flows. Read it
+  before grepping.
+- [docs/RUNTIMES.md](docs/RUNTIMES.md) and [docs/PROVIDERS.md](docs/PROVIDERS.md)
+  — which agent program runs a session, and which backend sits behind Claude
+  Code. Two axes, not one.
+- [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) — the research behind
+  `split_task`, the dial and per-piece routing, and what of it is still unbuilt.
 
 ---
 
@@ -53,7 +61,10 @@ read that store instead of duplicating it.
 | Title | `renameSession()` | Same field the CLI's `/rename` writes. |
 | Phase, tags, archive flag | Extension global storage (`MetaStore`) | Claude Code has no concept of these. Sidecar, mirroring Nimbalyst's `ai_sessions.metadata` JSON column. |
 | Worktree ↔ session | Same sidecar | An absolute path means nothing on another machine. |
-| Model / effort / thinking | `workspaceState` + settings | Per-session choice, workspace default behind it. |
+| Model / effort / thinking / agent / backend / orchestration level | Same sidecar, recorded at launch (`durablePatch`) | Per session. The settings hold only what the NEXT new session gets; the composer describes the selected card, never the default. |
+| Scheduled runs | `workspaceState` (`schedules`) | Per workspace; fire only while the window is open. |
+| Provider credentials | `SecretStorage` | Never in settings, which sync and get committed. |
+| Model catalogues | `globalState`, per provider | Discovery spawns a CLI; the cache keeps it off the render path. |
 
 **Nothing is written to your repository.** The sidecar lives under the
 extension's global storage directory, keyed by workspace root.
@@ -67,15 +78,30 @@ terminal appears here, and a session started here resumes with `claude --resume`
 
 ```
 src/
-  extension.ts          VS Code surface: activation, commands, host wiring
+  extension.ts          VS Code surface: activation, commands, the host behind
+                        every board message, getState(), schedule firing, roll-ups
+  board-mcp.ts          Its own bundle (dist/board-mcp.js). Spawned BY Codex;
+                        forwards to board-bridge and holds no board logic
   board/
-    config.ts           Columns, phases, the humanOnly rule, AgentState
-    panel.ts            Editor WebviewPanel + side bar control view, focus layout
-    settings.ts         The settings TAB: agents, backends, logins
+    config.ts           Columns, phases, the humanOnly rule, AgentState, stalled
+    panel.ts            Editor WebviewPanel + side bar control view, UiState,
+                        the webview message switch, focus layout
+    settings.ts         The settings TAB: agents, backends, logins, schedules
+    coalesce.ts         The repaint rate limiter, scaled to what a repaint cost
+    questions.ts        AskUserQuestion -> a renderable picker
+    decomposition.ts    The orchestration dial, the gates on a split, the record
+    subtasks.ts         Parent <-> subtask thread, derived on every render
+    schedules.ts        Scheduled runs: next fire time, the catch-up rule
   sessions/
-    meta.ts             Sidecar metadata; effort/thinking resolution order
-    store.ts            Every runtime's sessions + our metadata, merged
+    store.ts            Every runtime's sessions + our metadata, merged; Entry
+    meta.ts             Sidecar metadata; per-session model/effort/thinking/
+                        agent/backend; the running mark; recovery across installs
+    usage.ts            Context fill and spend arithmetic; the rate/window tables
     codex-store.ts      Codex's own rollout transcripts, read back off disk
+    subagents.ts        Background agents read off disk, outcomes from the parent
+    search.ts           Search across every rendered transcript row
+    checkpoints.ts      "Try again from here": file-history snapshots restored
+    commands.ts         Slash-command discovery (.claude/commands)
   agent/
     runtime.ts          WHAT AN AGENT PROGRAM IS: the contract + the registry
     runtimes/
@@ -86,29 +112,47 @@ src/
     board-bridge.ts     The board's tools over a socket, for a runtime that
                         spawns MCP servers rather than taking one in-process
     sdk.ts              Lazy ESM loader; resolves the `claude` binary
+    connect.ts          Ask the CLI a question without starting a turn
     providers.ts        WHICH BACKEND: a profile -> an environment patch
     endpoint.ts         What a custom endpoint says it serves, asked of the
                         endpoint — ids, windows and prices. Never the CLI's list
     models.ts           Which models the picker offers, and where the list came
                         from (endpoint -> CLI -> built-in)
     probe.ts            Is this backend there, and will it have us?
-    tools.ts            In-process MCP tools the agent uses on its own card
-    session.ts          One query() run: streaming, permissions, usage, interrupt
-    manager.ts          N concurrent agents, one worktree each
-  board-mcp.ts          Its own bundle (dist/board-mcp.js). Spawned BY Codex;
-                        forwards to board-bridge and holds no board logic
+    status.ts           Every runtime's install + login state, for settings
+    tools.ts            The board tools the agent uses on its own card
+    routing.ts          A subtask's route: agent, model, effort, four refusals
+    spawn-policy.ts     Which models a split may spawn on, per backend
+    images.ts           A pasted image -> an image content block
+    dictation.ts        Local dictation: ffmpeg -> whisper-cli
+    session.ts          One query() run: streaming, permissions, usage,
+                        interrupt, background tasks
+    manager.ts          N concurrent agents, one worktree each; queue, split
   git/
     lock.ts             Per-repo mutex
     worktree.ts         Worktree lifecycle, review, commit and merge back
-media/                  Board UI (vanilla JS, native HTML5 drag and drop)
+  run/
+    recipe.ts           What starts the app in a worktree, and on which port
+  remote/               The relay's extension side: what leaves (redacted),
+                        when, and prompts coming back
+media/                  Board UI (vanilla JS, native HTML5 drag and drop), the
+                        settings page, theme.css for outside the editor
+server/                 The headless board: the built extension on a box
+remote/                 The relay site (Netlify / Workers / Node), a lift-out
+scripts/                preflight, the test runner, run-bin, with-node.sh
 test/
   harness.mjs           A fake VS Code: activates the built bundle and talks to it
   dom.mjs               A DOM small enough to run media/board.js in
   package.test.mjs      Asserts the .vsix carries the externals it needs
+  screenshots.mjs       Renders the real view in Chromium -> docs/screenshots
+smoke.mjs               The launch gate
 ```
 
-Everything outside `extension.ts` and `board/panel.ts` is free of `vscode`
-imports and unit-tested in plain Node.
+Per-file detail — exports, the test that covers each file, the trap its header
+states, and a task → files index — is in [docs/CODEMAP.md](docs/CODEMAP.md).
+
+Everything outside `extension.ts`, `board/panel.ts` and `board/settings.ts` is
+free of `vscode` imports and unit-tested in plain Node.
 
 ### Three non-obvious constraints
 
@@ -226,10 +270,12 @@ You can still drag a card to Complete. The guard constrains the agent, not you.
 
 Worktrees live inside the repository, under the one directory this extension
 owns, and `.gitignore` is given `/.agentskanban/` before the first one is
-created. The ignore rule is load-bearing rather than tidy: `merge()` refuses on
-a dirty main worktree, so an unignored scratch directory would block every merge
-from the first session onwards. `agentsKanban.worktreeRoot` still moves it, and
-pointing it outside the repository writes nothing to your `.gitignore`.
+created — and `.git/info/exclude` too, the copy that cannot be discarded, moved
+off by a branch switch, or itself dirty the tree. The ignore rule is
+load-bearing rather than tidy: `merge()` refuses on a dirty main worktree, so an
+unignored scratch directory would block every merge from the first session
+onwards. `agentsKanban.worktreeRoot` still moves it, and pointing it outside the
+repository writes nothing to your `.gitignore`.
 
 The session's `cwd` is that worktree — that is what makes parallel agents safe.
 Destructive git operations are serialised per repository, which matters more
@@ -294,7 +340,7 @@ forgiving moment for two of them to overlap.
 ---
 ## 8. Current state
 
-`npm run verify` — typecheck, 53 test files, build, launch gates.
+`npm run verify` — typecheck, build, 54 test files, launch gates.
 `npm run verify:package` — packages a `.vsix` and checks what is inside it.
 
 Every task goes through `scripts/with-node.sh`, which finds a Node 22.6+ before
@@ -451,7 +497,48 @@ Working:
   and a `1/2 ready` count. Subtasks stay real cards in their own columns, so you
   test each as it lands — and when the last one reaches review the parent moves
   there too and says "all N subtasks are ready", which is the news, rather than
-  a second toast about one card
+  a second toast about one card. A subtask queued behind `maxConcurrentAgents`
+  gets a card too, so the count is never short in exactly the place the count
+  is the point
+- **An orchestration dial per card** — `minimal · balanced · maximum`, chosen
+  on the composer bar beside the model — biases how readily a session splits
+  without ever dictating a number. The gate is host-side (`confirmSplit`), a
+  refused split is recorded on the card rather than reaching only the model,
+  and `SessionMeta.fanout` keeps the roll-up honest. See
+  [`src/board/decomposition.ts`](src/board/decomposition.ts)
+- **Scheduled runs.** `schedule_create` / `schedule_list` / `schedule_run` /
+  `schedule_delete` board tools, and a section on the settings page: a time on
+  set weekdays starts a NEW session with a fixed brief, in its own worktree, on
+  the board like any other card. A schedule fires only while the window is open;
+  a moment that passed while it was closed is caught up once at the next check,
+  never once per missed day. Creating, deleting or running one asks first. See
+  [`src/board/schedules.ts`](src/board/schedules.ts)
+- **Search across transcripts** — every rendered row kind, prompts, answers,
+  thinking, tool rows and nested subagent transcripts included, from the board's
+  own search screen. See [`src/sessions/search.ts`](src/sessions/search.ts)
+- **"Try again from here."** Claude Code's own file-history snapshots are read
+  out of the raw session file and restored over the worktree, and the session
+  is forked at that message. See
+  [`src/sessions/checkpoints.ts`](src/sessions/checkpoints.ts)
+- **Local dictation** on the composer's microphone — ffmpeg captures,
+  `whisper-cli` transcribes, nothing leaves the machine — or the editor's
+  built-in speech when it is installed. See
+  [`src/agent/dictation.ts`](src/agent/dictation.ts)
+- **A card says when its run is not running, and which way.** Interrupted (the
+  host died mid-turn — "Interrupted 9m ago"), stalled (a started column with no
+  live agent — the move is offered, never made), failed, waiting on background
+  agents, or queued behind the concurrency limit. Each is a different readout,
+  because a card that looks identical in all five states cannot say "bad"
+- **Real questions.** `AskUserQuestion` renders as the question with its
+  options — pick one, tick several, or type — and the answer goes back where
+  the tool reads it, instead of an Allow/Deny pair with the question nowhere on
+  screen. See [`src/board/questions.ts`](src/board/questions.ts)
+- **Old foreign sessions are hidden by age, and the hidden count is shown and
+  clickable.** Codex keys its store by date, not by directory, so opening a repo
+  you used months ago would otherwise adopt every rollout on the machine.
+  Anything this board ever touched is always shown, however old; search always
+  finds everything (`hideSessionsOlderThanDays`)
+- **Pin a session** to the top of its column, from the card menu
 - **Repaints are bounded at 10Hz.** `refreshAll()` runs on every event an agent
   produces, streamed tokens included, and it used to do a full `getState()` per
   event, per surface — 105 seconds of extension-host work for every 60 seconds
@@ -513,6 +600,13 @@ Notable tests:
 
 ## 9. What to build next
 
+Checked against the code on 2026-09-07. Items that had shipped since this list
+was first written — scheduled runs, per-session model choice, transcript search,
+the orchestration dial, per-piece routing — were removed rather than struck
+through; §8 describes them. Where a doc file answers "is X done", it is listed
+in [docs/CODEMAP.md](docs/CODEMAP.md), which is also where to look before
+grepping.
+
 ### Runtimes: what is not done
 
 Codex is driven natively and the abstraction is real (`startRun()` has no branch
@@ -533,44 +627,54 @@ on runtime identity), but three things are honest gaps rather than decisions:
   (`thread/start` takes a `cwd`), which would be cheaper; per-session matches the
   existing lifecycle exactly, so it is where this starts.
 
-### The remaining Nimbalyst gaps
+### Orchestration: what is left after `split_task`
 
-[docs/NIMBALYST.md §11](docs/NIMBALYST.md) tracks the interaction surface item by
-item. Three things are genuinely not started:
+[docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) is the research. Its stage 1 —
+the dial, the host-side `confirmSplit` gate, refusals recorded on the card,
+`SessionMeta.fanout` — and the routing half of stage 2 are built, and the six
+bugs it found in the code are fixed. What remains, in the order it hurts:
 
-- **Orchestration** — their ten meta-agent tools (`spawn_session`, `send_prompt`,
-  `get_session_result`, …), with a child's completion pushed onto the parent's
-  prompt queue. A subsystem, not a button. **Researched**, in
-  [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md), which declines the parent-wake
-  half of it (`manager.send()` pushes a `{kind: 'prompt'}` indistinguishable from
-  the user typing, into a session holding `split_task`) and stages the rest
-  behind `split_task` plus a dial. It also names six bugs in the code as it
-  stands today. **Per-piece routing and the seventh gate are now built** — see
-  [docs/DECISIONS.md](docs/DECISIONS.md), *"Per-piece routing"*; the parent-wake
-  half is still declined.
-- **A conflict-fixing agent** — they spawn a fresh session with a prescriptive
-  prompt; we surface conflicts and offer Abort.
-- **`schedule_wakeup`** time triggers.
+- **Nothing owns the objective after a fan-out.** The roll-up moves the parent
+  card to review and notifies the USER; nothing pushes a child's result onto the
+  parent's prompt queue and nothing re-runs the parent. The automatic wake is
+  declined on purpose (a billed turn nobody asked for), but ORCHESTRATION.md §12
+  is right that this leaves the question open: at four ready branches, who
+  integrates them?
+- **Nothing sequences four merges.** `merge()` is per card and runs in the main
+  worktree, which holds one merge at a time; the second branch conflicting after
+  the first landed has no story beyond the conflict banner.
+- **A conflict-fixing agent.** Nimbalyst spawns a fresh session with a
+  prescriptive prompt; we surface conflicts in the banner and offer Abort.
+- **Stage 2's measurement half** — scope drift checked at merge, `MeterTotal`
+  across a parent and its children, a budget. Each is gated on an experiment
+  listed in ORCHESTRATION.md §13, and none of those has been run.
 
 ### Milestone 5 — resume and durability
 
-- ~~Rehydrate live agents after an extension host restart~~ — done, as far as it
-  can be: the CLI process dies with the host and cannot be re-attached, so a run
-  still marked running at startup is shown as interrupted and offered a resume.
-  See docs/DECISIONS.md.
-- Permission prompts that survive a window reload
-- Fail loudly when a resumed session comes back with a different id than the one
-  we asked for, as Nimbalyst does
+- **Permission prompts that survive a window reload.** A pending request lives
+  in memory on the `AgentSession` and is denied when the session ends.
+- **Fail loudly when a resumed session comes back with a different id** than the
+  one we asked for, as Nimbalyst does. The reverse case — two runs sharing an
+  id — warns; this one is not detected.
 
 ### Smaller, worthwhile
 
-- Commit cards in the transcript (detect `git commit`, read the new HEAD —
-  `session.ts` already emits `committed`)
-- A `Fixes <id>` commit-message watcher to close a card, as Nimbalyst's
-  `CommitTrackerLinker` does
-- Per-session model override (currently workspace-wide)
-- Board config from a file, so columns are customisable
-- Search across transcripts
+- **Commit cards in the transcript.** `session.ts` emits `committed` and the
+  host hears it — to reload the review panel and the Merge button. No `commit`
+  entry kind exists and nothing reads the new HEAD, so a commit is not yet a row
+  in the transcript.
+- **A `Fixes <id>` commit-message watcher** to close a card, as Nimbalyst's
+  `CommitTrackerLinker` does. **The `set_phase` description already promises
+  this** — "The user marks work complete, or a commit message closes it", in
+  `board/config.ts` — and nothing implements it. A prose promise the code does
+  not keep is the class of bug this project keeps a rule about: build it, or
+  reword the description.
+- **Board config from a file**, so columns are customisable. `DEFAULT_BOARD` in
+  `board/config.ts` is a constant.
+- **Syntax highlighting in code blocks.** Language label and monospace only.
+- **Real timestamps on rehydrated transcripts.** `readTranscript` stamps every
+  entry with the time it was PARSED; `SessionMessage.timestamp` now exists in
+  the SDK and nothing uses it.
 
 ### Known limits
 
@@ -609,10 +713,12 @@ item. Three things are genuinely not started:
 **Node 22.6+**, because the tests run through `node --experimental-strip-types`.
 
 ```bash
-npm run verify        # preflight (installs if needed) → typecheck → tests → build → smoke
-npm run watch         # rebuild on change
-npm run install-local # package and install into VS Code, on any platform
-npm run screenshots   # render the real view -> docs/screenshots
+npm run verify         # preflight (installs if needed) → typecheck → build → tests → smoke
+npm run verify:package # package a .vsix and check what is inside it
+npm run watch          # rebuild on change
+npm run install-local  # package and install into VS Code, on any platform
+npm run screenshots    # render the real view -> docs/screenshots
+npm run remote         # build, then serve the headless board (server/README.md)
 ```
 
 Every script begins with `scripts/preflight.mjs`. It installs dependencies on a
@@ -622,9 +728,15 @@ install is only partial. npm runs scripts through `sh`, so script logic lives in
 covered two directory levels by accident.
 
 Press <kbd>F5</kbd> for an Extension Development Host. It runs `verify` first —
-about four seconds — because building alone will launch an extension whose
-manifest and code disagree. Open a **git repository**: the board renders without
-one, but agents cannot run, since each session needs a worktree.
+about thirteen seconds once dependencies are installed — because building alone
+will launch an extension whose manifest and code disagree. Open a **git
+repository**: the board renders without one, but agents cannot run, since each
+session needs a worktree.
+
+Two things about a fresh worktree, which is what every agent session works in:
+it has no `node_modules` (preflight installs them on the first `npm run`), and
+the layout, theme and headless gates need a Chromium that Playwright can find —
+they FAIL without one rather than skip, and say so.
 
 Conventions worth keeping:
 
