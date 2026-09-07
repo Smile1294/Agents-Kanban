@@ -272,6 +272,79 @@ live button would only ever produce an error toast.
 
 ## Postmortems
 
+### "I press Merge and literally nothing happens"
+
+Two bugs, reported as one, and neither was where it looked.
+
+**The merge was being refused, every time.** On a real repository
+`.agentskanban/` was untracked: no rule in `.gitignore`, none in
+`.git/info/exclude`, and — checked across every branch — none that had ever
+existed. So `isClean()` was false, `merge()` answered `dirty`, and the user was
+told to *"commit or stash your own changes first"* about a directory this
+extension created. `git rev-parse MERGE_HEAD` confirmed nothing had run. It had
+to be unblocked by hand, with a commit reading
+`chore(gitignore): add /.agentskanban/ to ignore list`.
+
+The rule is written ONCE, at `create()` time, into a **tracked** file. That
+makes it losable three ordinary ways: the user discards an unexplained
+`.gitignore` edit in their SCM panel, they switch to a branch that predates it,
+or it never lands. Any of them blocks every merge from then on, permanently, and
+blames the user.
+
+So the rule now also goes to `.git/info/exclude`. `.gitignore` stays — it is the
+copy the team gets, which is why it was chosen — but the exclude file is
+untracked, inside `.git`, and cannot be discarded, cannot move with a branch,
+and **cannot itself dirty the tree**. That last property is what lets `merge()`
+re-assert it on the way past; `.gitignore` can never be re-asserted there,
+because an uncommitted edit to it is precisely what blocks the merge.
+`ensureIgnored()` asks `check-ignore` BEFORE laying the belt, or the belt would
+satisfy the check and the team's copy would never be written.
+
+And `dirtyMessage()` now tells our mess from theirs: when every uncommitted path
+is inside the directory we own, it says so and names the fix. The existing
+special case only covered `.gitignore` being uncommitted — the far more common
+presentation was the directory itself, and it fell through to the generic
+message.
+
+**The other half is that the answer was a toast.** The user pressed a button,
+confirmed a modal, and got a corner notification they missed — so from their
+seat the button did nothing. Every refusal on a path the user explicitly clicked
+is now modal. A dismissible answer to a deliberate action is the same class of
+bug as a signal that cannot say "bad".
+
+### Cards that sit in Implementing after the agent has gone
+
+Reported as "some tasks instead of moving themselves to validation stay in
+implementation". The board was telling the truth: reading the transcripts, two
+of the four sessions had called `set_phase` exactly once, to `implementing`, and
+never again. Both agents had ended their turn mid-thought — *"I'll post the
+checklist once both verdicts are in"* — waiting on subagents that had already
+reported. The work was finished: PR open, tests green.
+
+Nothing was broken in the phase machinery, and the two sessions that DID move
+recorded proper test plans. What was broken is that a card in a started column
+with **no agent running** drew identically to one being actively worked on. That
+is a signal that cannot say "bad": "Implementing" is supposed to mean an agent is
+changing code, and it was also being used to mean an agent stopped here without
+saying why.
+
+`stalledSince()` derives the difference from facts the board already has — a
+started column, a worktree, no live agent, not interrupted — and returns the
+TIME, like `interrupted` does, because "stopped 2m ago" and "stopped last
+Tuesday" call for different reactions. The card says so and offers the move; it
+does NOT make it. Auto-moving was rejected: the review column's whole guarantee
+is that arriving there means `howToTest` was written, and a card moved by the
+host would land looking ready with nothing to check.
+
+Two things are load-bearing. It is never set alongside `interrupted` — that is a
+louder, different fact and one card tells one story. And `stalled` is normalised
+to the MINUTE in `chromeSig()`, exactly as `updated` is: it mirrors the session's
+mtime, which moves while any other agent streams, so at millisecond resolution
+the signature would differ on every frame and the fast path would never run
+once. That is the bug `updated` already carries a comment about, and the gate
+for it was watched failing.
+
+
 ### The board was blank and every command was "not found"
 
 **Cause:** `activate()` returned early when no workspace folder was open —

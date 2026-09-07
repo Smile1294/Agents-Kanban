@@ -176,6 +176,36 @@ run, since each session needs a worktree.
   tokens and beyond that the service downscales anyway; and the transcript
   entry keeps the COUNT, never the bytes, because that array is serialised to
   the webview on every repaint.
+- **The ignore rule lives in TWO places, and the untracked one is the one that
+  works.** `.gitignore` is the copy the team gets and it stays, but it is
+  TRACKED — so it is lost when a user discards the unexplained edit, switches to
+  a branch that predates it, or it never lands. Any of those blocks every merge
+  forever and blames the user for a directory this extension made; it happened,
+  and had to be unblocked by a hand-written commit. So `ensureExcluded()` also
+  writes `.git/info/exclude`, which cannot be discarded, cannot move with a
+  branch, and — the property that matters — cannot itself dirty the tree, which
+  is what lets `merge()` re-assert it on the way past. `.gitignore` can NEVER be
+  re-asserted there: an uncommitted edit to it is precisely what blocks the
+  merge. `ensureIgnored()` asks `check-ignore` BEFORE laying the belt, or the
+  belt satisfies the check and the team's copy is never written. And
+  `dirtyMessage()` tells our mess from theirs — every uncommitted path inside
+  the directory we own gets a message naming it, not "commit your own changes".
+- **A refusal on a path the user CLICKED is modal, never a toast.** "I pressed
+  Merge and literally nothing happened" was a warning notification, fired every
+  time, that the user never saw. An answer they can miss to an action they
+  deliberately took is the same class of bug as a signal that cannot say "bad".
+- **A card in a started column with no agent running must SAY so.**
+  "Implementing" means an agent is changing code; with no live agent it means one
+  stopped there without handing the work back, and the board drew both
+  identically. Real cause, read out of the transcripts: agents ending their turn
+  mid-thought and never calling `set_phase`, with the work already finished.
+  `stalledSince()` derives it from what the board has and returns the TIME, like
+  `interrupted`. It never fires alongside `interrupted` (one card, one story),
+  the board OFFERS the move and never makes it (auto-moving would land a card in
+  review with no `howToTest`, which is the one thing that column guarantees), and
+  `stalled` is normalised to the MINUTE in `chromeSig()` — it mirrors an mtime
+  that moves while any other agent streams, so raw milliseconds would kill the
+  fast path outright.
 - **A merge lands UNCOMMITTED, and `ok: true` does not mean it is on the
   branch.** `merge()` runs `--no-ff --no-commit`: an agent's work reaching the
   user's history on one click, before they have read a line of it, is the wrong

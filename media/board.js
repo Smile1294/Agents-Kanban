@@ -468,7 +468,14 @@
          its mtime moves constantly; the host used to stamp the clock here
          outright. Sort order can flip inside a minute without a rebuild.
          That is the trade, and it is invisible. */
-      const base = { ...c, updated: Math.floor((c.updated || 0) / 60000) }
+      const base = {
+        ...c,
+        updated: Math.floor((c.updated || 0) / 60000),
+        // Same rule, same reason: `stalled` is drawn by `ago()`, whose finest
+        // step is a minute. At millisecond resolution it would differ on every
+        // frame and the fast path would never run once.
+        ...(c.stalled ? { stalled: Math.floor(c.stalled / 60000) } : {}),
+      }
       if (!c.agent) return base
       const a = { ...c.agent }
       delete a.tool
@@ -1222,7 +1229,42 @@
 
     if (a) n.append(renderAgentStrip(c, a))
     else if (c.interrupted) n.append(renderInterrupted(c, false))
+    else if (c.stalled) n.append(renderStalled(c))
     return n
+  }
+
+  /* A run that ENDED and left the card where it started.
+     "Implementing" means an agent is changing code. With no agent running it
+     means something else — one stopped here and did not say why — and the board
+     drew both the same. Two real cards sat like this with the work already
+     finished, because the agents ended their turn mid-thought and never called
+     set_phase. The user read it as the board being stuck.
+
+     The TIME, not a badge, for the reason every indicator here shows its
+     number. And it is never shown beside an agent strip or an Interrupted
+     notice: one card tells one story. */
+  function renderStalled(c) {
+    const box = el('div', 'stalled')
+    const head = el('div', 'stalled-head')
+    head.append(el('span', 'stalled-icon', '◌'))
+    // Just the fact and its age. "— card not moved" was true and did not fit:
+    // a column is 300px on a good day, and the phrase pushed the whole line
+    // into an ellipsis, which is a sentence nobody can read. The button says
+    // what to do about it and the tooltip carries the rest.
+    const title = el('span', 'stalled-title', 'Stopped ' + ago(c.stalled))
+    title.title = 'The run ended without moving this card out of its column.'
+    head.append(title)
+    box.append(head)
+    // The destination comes from the BOARD, not from a field copied onto every
+    // card: it is one fact about the column layout, and a per-card copy would
+    // ride in `chromeSig()` once per card for nothing.
+    const review = (s.columns || []).find((col) => col.category === 'review')
+    if (!review) return box
+    const go = el('button', null, 'Move to ' + (review.name || review.id))
+    go.title = 'The agent left this here. Move it to review yourself.'
+    go.onclick = (e) => { stop(e); post('move', { id: c.key, phase: review.id }) }
+    box.append(go)
+    return box
   }
 
   /* A run the editor killed on its way out — a reload, a reinstall, a crash.

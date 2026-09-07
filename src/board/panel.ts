@@ -208,6 +208,16 @@ export interface UiCard {
    * a bare badge cannot tell them apart.
    */
   interrupted?: number
+  /**
+   * When a run ENDED leaving this card in a started column.
+   *
+   * "Implementing" means an agent is changing code; with no agent running it
+   * means one stopped there without saying why, and the board drew both the
+   * same. The TIME, like `interrupted`, because "stopped 2m ago" and "stopped
+   * last Tuesday" call for different reactions. Never set alongside
+   * `interrupted` — see `stalledSince`.
+   */
+  stalled?: number
   /** Follow-ups typed while this turn is still running. */
   queued?: string[]
   agent?: {

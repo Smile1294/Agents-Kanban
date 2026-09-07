@@ -505,6 +505,62 @@ panelMerge.onclick()
 ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.into === 'main'),
   'the panel button posts its base as the merge target')
 
+// 8a. A run that ENDED and left its card in a started column.
+//
+// Two real cards sat in Implementing with the work finished — PR open, tests
+// green — because both agents ended their turn mid-thought and never called
+// `set_phase`. With no agent running, a card in a started column drew exactly
+// like one being actively worked on, so the board could not say "an agent
+// stopped here". The time is shown, not a badge: "stopped 2m ago" and "stopped
+// last Tuesday" are different situations.
+{
+  const STOPPED = Date.now() - 24 * 60000
+  const stalledCard = { ...CARD, worktree: '/tmp/w', agent: undefined, stalled: STOPPED }
+  // The shared COLUMNS fixture has no review column; the real board does, and
+  // the offered destination is read from the board rather than copied onto
+  // every card.
+  const REVIEW_COLS = [...COLUMNS.slice(0, 2), { id: 'validating', name: 'Validating', category: 'review' }, COLUMNS[2]]
+  const withReview = { ...base, columns: REVIEW_COLS }
+  const v = run({ ...withReview, cards: [stalledCard] })
+  const t = v.text()
+  ok(t.includes('Stopped'), `a stalled card says the agent stopped: ${/Stopped[^A-Z]*/.exec(t)?.[0] ?? 'MISSING'}`)
+  ok(/24m/.test(t), `and how long ago, not just that it did (${/Stopped \S+ \S+/.exec(t)?.[0]})`)
+
+  const hand = findButton(v.root, 'Move to Validating')
+  ok(!!hand, 'and offers to hand the work back in one click')
+  hand?.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(v.posted.some((m) => m.type === 'move' && m.id === 'abc-123' && m.phase === 'validating'),
+     'which posts a move to the review column')
+
+  // A working card must NOT wear it: that is the whole distinction being drawn.
+  ok(!run({ ...withReview, cards: [{ ...CARD, worktree: '/tmp/w', stalled: STOPPED }] }).text().includes('Stopped'),
+     'a card with a live agent shows its agent, never the stopped notice')
+  // Nor may it double up with Interrupted, which is a different, louder fact.
+  const both = run({ ...withReview, cards: [{ ...stalledCard, interrupted: STOPPED }] }).text()
+  ok(both.includes('Interrupted') && !both.includes('Stopped'),
+     'an interrupted card says only that — one card, one story')
+  ok(!run({ ...withReview, cards: [{ ...CARD, worktree: '/tmp/w', agent: undefined }] }).text().includes('Stopped'),
+     'and an ordinary finished card is left alone')
+
+  // `stalled` is drawn by `ago()`, so it must enter `chromeSig()` at MINUTE
+  // resolution like `updated` does. It mirrors the session's mtime, which moves
+  // while any other agent is streaming — at millisecond resolution the
+  // signature would differ on every frame, the fast path would never run, and
+  // the tree would be rebuilt ten times a second under whatever the user is
+  // doing. That is the exact bug `updated` already carries a comment about.
+  const chat = (ms) => ({
+    ...withReview, mode: 'chat', selectedKey: 'abc-123',
+    cards: [{ ...CARD, worktree: '/tmp/w', agent: undefined, stalled: STOPPED + ms }],
+    transcript: [{ kind: 'text', at: CARD.updated, text: 'done' }],
+    streaming: 'Hel',
+  })
+  const fast = run(chat(0))
+  const scroll1 = fast.root.querySelector('.transcript-scroll')
+  fast.deliver({ ...chat(1200), streaming: 'Hello' })
+  ok(fast.root.querySelector('.transcript-scroll') === scroll1,
+     'a stalled timestamp moving inside its minute does NOT rebuild the tree')
+}
+
 // 8b. A merge that has landed but is NOT committed.
 //
 // The whole reason merge() stops early: the work is on the user's branch, in

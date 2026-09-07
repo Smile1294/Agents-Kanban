@@ -1,6 +1,6 @@
 /* The board's policy rules. These decide what an agent may do and when the user
    is interrupted, so they are code with tests rather than prose in a prompt. */
-import { DEFAULT_BOARD, columnById, isHumanOnly, isReviewColumn, isStartedColumn, type BoardConfig } from '../config.ts'
+import { DEFAULT_BOARD, columnById, isHumanOnly, isReviewColumn, isStartedColumn, stalledSince, type BoardConfig } from '../config.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -59,6 +59,41 @@ ok(columnById(DEFAULT_BOARD, 'missing') === undefined, 'columnById returns undef
 for (const c of DEFAULT_BOARD.columns.filter((x) => x.category !== 'backlog')) {
   ok(!!c.agentHint, `"${c.id}" tells the agent what it means`)
 }
+
+// --- a run that ended without handing the work back --------------------------
+//
+// Found on a real board: two cards sat in Implementing with the work finished —
+// PR open, tests green — because both agents ended their turn mid-thought
+// ("I'll post the checklist once both verdicts are in") and never called
+// `set_phase`. Their runs were over. Nothing on the board said so, and a card in
+// a started column with no agent running looks exactly like one being worked on.
+// That is a signal that cannot say "bad".
+const ENDED = 1_700_000_000_000
+ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED, worktree: '/w' }) === ENDED,
+   'a finished run left in a started column reports WHEN it stopped')
+ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED, worktree: '/w', running: true }) === undefined,
+   'a card with a live agent is not stalled — it is working')
+ok(stalledSince(DEFAULT_BOARD, { phase: 'validating', updated: ENDED, worktree: '/w' }) === undefined,
+   'a card that reached review handed its work back, so it is not stalled')
+ok(stalledSince(DEFAULT_BOARD, { phase: 'planning', updated: ENDED, worktree: '/w' }) === undefined,
+   'a card that never started is not stalled either')
+// Interrupted is a LOUDER and different state — the host went away mid-turn and
+// the process is gone. Showing both would say two things about one card.
+ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED, worktree: '/w', interrupted: ENDED }) === undefined,
+   'an interrupted run is not also reported as stalled')
+ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED }) === undefined,
+   'a session with no worktree never ran, so there is nothing it failed to hand back')
+ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED, worktree: '/w', archived: true }) === undefined,
+   'an archived card is not nagging anybody')
+// A renamed board must work the same: the rule is the CATEGORY, never the id.
+const renamed: BoardConfig = {
+  ...DEFAULT_BOARD,
+  columns: DEFAULT_BOARD.columns.map((c) => (c.category === 'started' ? { ...c, id: 'doing', name: 'Doing' } : c)),
+}
+ok(stalledSince(renamed, { phase: 'doing', updated: ENDED, worktree: '/w' }) === ENDED,
+   'a renamed started column still reports a stalled run')
+ok(stalledSince(renamed, { phase: 'implementing', updated: ENDED, worktree: '/w' }) === undefined,
+   'and the old id is no longer a started column on that board')
 
 console.log(fails === 0 ? 'PASS — board policy holds, including on a renamed board' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

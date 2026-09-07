@@ -326,6 +326,11 @@ export class WorktreeService {
     // does match anything beneath it, which is what we actually care about.
     const ignored = await exec('git', ['check-ignore', '-q', '--', rel], { cwd: this.repoRoot })
       .then(() => true, () => false)
+    // Asked BEFORE the belt goes on, deliberately: writing the exclude file
+    // first would satisfy `check-ignore` and `.gitignore` — the copy the TEAM
+    // gets, which is the whole reason that file was chosen — would never be
+    // written on a fresh repository.
+    await this.ensureExcluded()
     if (ignored) return undefined
 
     const file = path.join(this.repoRoot, '.gitignore')
@@ -337,6 +342,57 @@ export class WorktreeService {
         `# Generated, never yours — safe to delete when no session is running.\n${entry}\n`,
     )
     return entry
+  }
+
+  /**
+   * The same rule, in `.git/info/exclude`: the copy that cannot be lost.
+   *
+   * `.gitignore` is the copy the team gets and it stays. But it is TRACKED, and
+   * that makes it losable in three ordinary ways — the user discards the
+   * unexplained edit in their SCM panel, they switch to a branch that predates
+   * it, or it never lands at all. Found on a real repository in exactly that
+   * state: `.agentskanban/` untracked, no rule anywhere, no branch that had ever
+   * carried one, and so EVERY merge refused as "dirty" with a message telling
+   * the user to commit changes they never made.
+   *
+   * This file is untracked and inside `.git`, so it cannot be discarded, cannot
+   * move with a branch, and — the property that matters — cannot itself dirty
+   * the tree. That is what lets `merge()` re-assert it on the way past;
+   * `.gitignore` can never be re-asserted there, because an uncommitted edit to
+   * it is precisely the thing that blocks the merge.
+   *
+   * Best-effort and silent: a repository whose `.git` we cannot write to is not
+   * a reason to fail a merge, and `dirtyMessage()` still names the directory.
+   */
+  async ensureExcluded(): Promise<boolean> {
+    const entry = this.ignoreEntry()
+    if (!entry) return false
+    try {
+      // `--git-common-dir`, not `.git`: in a linked worktree `.git` is a FILE,
+      // and the exclude file that counts belongs to the shared directory.
+      const dir = await git(this.repoRoot, ['rev-parse', '--git-common-dir'])
+      const base = path.isAbsolute(dir) ? dir : path.join(this.repoRoot, dir)
+      const file = path.join(base, 'info', 'exclude')
+      const current = await fs.readFile(file, 'utf8').catch(() => '')
+      if (current.split('\n').some((l) => l.trim() === entry)) return false
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      const gap = !current || current.endsWith('\n') ? '' : '\n'
+      await fs.writeFile(
+        file,
+        `${current}${gap}# Agents Kanban: one git worktree per agent session lives under here.\n${entry}\n`,
+      )
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** The directory this extension owns inside the repository, as git reports
+   *  it — used to tell our own mess apart from the user's. */
+  private ownedDir(): string | undefined {
+    const rel = this.relativeRoot()
+    if (!rel) return undefined
+    return rel === KANBAN_DIR || rel.startsWith(`${KANBAN_DIR}/`) ? KANBAN_DIR : rel
   }
 
   async currentBranch(): Promise<string> {
@@ -618,6 +674,15 @@ export class WorktreeService {
       return `The only uncommitted change is the "${this.ignoreEntry()}" rule Agents Kanban added ` +
         'to .gitignore for its worktree directory. Commit that line and merge again.'
     }
+    // Our own worktree directory, unignored. The user never made it, so the
+    // generic message sends them hunting for an edit that does not exist —
+    // which is exactly what happened on a real repository, on every merge.
+    const owned = this.ownedDir()
+    if (owned && files.length && files.every((f) => f === owned || f.startsWith(`${owned}/`))) {
+      return `The only uncommitted thing is Agents Kanban's own worktree directory ` +
+        `("${owned}/"), which should be ignored and is not — nothing of yours is in the way. ` +
+        `Add "${this.ignoreEntry()}" to .gitignore, or run "Agents Kanban: Initialise", and merge again.`
+    }
     const shown = files.slice(0, 5).join(', ')
     const more = files.length > 5 ? `, and ${files.length - 5} more` : ''
     return 'Commit or stash your own changes first — merging into a dirty working tree is how ' +
@@ -665,6 +730,12 @@ export class WorktreeService {
       if (current !== base) {
         return { ok: false, reason: 'wrong-branch', message: `The repository is on "${current}", not "${base}". Switch to ${base} first.` }
       }
+      // Our own scratch directory must not be what makes the tree dirty. The
+      // rule normally lands at create() time, but it lives in a TRACKED file
+      // and is losable — so it is re-asserted here, in the untracked copy,
+      // which cannot itself dirty anything. Without this a repository that lost
+      // the rule can never merge again, and blames the user for it.
+      await this.ensureExcluded()
       // Before the clean check, and it has to be: a merge left for review makes
       // the tree dirty BY DESIGN, so the generic refusal would hand the user
       // advice about "your own changes" for a mess this extension made — the

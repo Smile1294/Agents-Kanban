@@ -693,6 +693,53 @@ try {
   ok(search.pillVisible, 'both pills are on screen')
   await searchPage.close()
 
+  /* --- the "agent stopped here" marker, in a real 300px column --------------
+   *
+   * A kanban column is 300px on a good day, and this marker carries a sentence
+   * and a button on a card that already has a title, tags and a branch line. The
+   * first draft read "Stopped 24m ago — card not moved" and ellipsised away to
+   * "Stopped 24m ago — car…", which is a sentence nobody can read. A screenshot
+   * caught it; no text assertion could, because every character was present and
+   * correct in a box too narrow to show them. So: does it fit, and is the
+   * button — the only action on it — actually on screen? */
+  const stalledPage = await browser.newPage({ viewport: { width: 1400, height: 900 } })
+  await stalledPage.setContent(page$({
+    ...state,
+    // The shared COLUMNS fixture has no review column; the real board does, and
+    // the marker reads its destination off the board rather than off the card.
+    columns: [...COLUMNS, { id: 'validating', name: 'Validating', category: 'review' }],
+    cards: [{
+      key: 'sk', sessionId: 'sk',
+      title: 'Fix supplier invite 404 without registration number (PB-615)',
+      phase: 'implementing', tags: ['PB-615', 'suppliers', 'supply-chain'],
+      updated: Date.now() - 71 * 60000,
+      branch: 'task/S405w-jira-task-https-eachthing-atlassian-net-browse-PB-615',
+      worktree: '/repo/.agentskanban/worktrees/S405w',
+      stalled: Date.now() - 71 * 60000,
+    }],
+  }))
+  await stalledPage.waitForSelector('.stalled', { timeout: 5000 })
+  const stld = await stalledPage.evaluate(() => {
+    const box = document.querySelector('.stalled')
+    const card = box.closest('.card')
+    const title = box.querySelector('.stalled-title')
+    const btn = box.querySelector('button')
+    const cb = card.getBoundingClientRect()
+    const bb = btn ? btn.getBoundingClientRect() : null
+    return {
+      boxOverflow: Math.round(box.scrollWidth - box.clientWidth),
+      cardOverflow: Math.round(card.scrollWidth - card.clientWidth),
+      titleClipped: title.scrollWidth - title.clientWidth > 1,
+      label: btn && btn.textContent,
+      btnInside: !!bb && bb.right <= cb.right + 1 && bb.left >= cb.left - 1 && bb.width > 0 && bb.height > 0,
+    }
+  })
+  ok(stld.boxOverflow <= 1, `the stopped marker does not scroll horizontally (${stld.boxOverflow}px)`)
+  ok(stld.cardOverflow <= 1, `nor widen its card (${stld.cardOverflow}px)`)
+  ok(!stld.titleClipped, 'and its sentence is readable rather than ellipsised away')
+  ok(stld.btnInside, `the hand-back button is on screen in a 300px column: ${JSON.stringify(stld.label)}`)
+  await stalledPage.close()
+
   /* --- the uncommitted-merge banner, at split-editor width ------------------
    *
    * It carries the two things this stylesheet has been bitten by twice — a

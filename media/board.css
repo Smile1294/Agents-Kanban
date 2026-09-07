@@ -717,6 +717,40 @@ details.thinking summary::-webkit-details-marker { display: none; }
   white-space: pre-wrap; color: var(--muted); line-height: 1.5;
 }
 
+/* --- a run that ended without handing the work back ------------------------
+   Quieter than .interrupted on purpose: nothing was lost and nothing is broken,
+   the agent simply stopped in a started column. It states a fact and offers the
+   one action, and it is muted rather than alarming because the common cause is
+   an agent that finished the work and forgot the last step. */
+.stalled {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+  background: color-mix(in srgb, var(--muted) 8%, transparent);
+  min-width: 0;
+}
+/* `min-width` in EM, not 0: with `min-width: 0` the label is the only thing that
+   can shrink, so the button wins the whole row and "Stopped 24m ago" collapses
+   to "S…". A floor here means the row runs out of space instead, and
+   `flex-wrap` above puts the button on its own line — which is the readable
+   outcome in a 300px column. */
+.stalled-head { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 7.5em; }
+.stalled-icon { color: var(--muted); flex: 0 0 auto; }
+.stalled-title {
+  color: var(--muted);
+  font-size: 0.8em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.stalled button { padding: 1px 8px; font-size: 0.8em; flex: 0 0 auto; }
+
 /* --- a merge that has landed but is not committed --------------------------
    Deliberately louder than the review panel below it: this one describes a
    change to the USER'S branch that they have not agreed to yet, and it is the

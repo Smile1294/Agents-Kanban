@@ -115,6 +115,41 @@ export function isStartedColumn(board: BoardConfig, id: StatusId): boolean {
   return columnById(board, id)?.category === 'started'
 }
 
+/**
+ * When a run ENDED and left its card in a started column, or undefined.
+ *
+ * A card in "Implementing" means an agent is changing code. With no agent
+ * running it means something else entirely — an agent stopped there and did not
+ * say why — and the board drew the two identically. Found on a real board: two
+ * cards sat in Implementing with the work actually finished (PR open, tests
+ * green) because both agents ended their turn mid-thought, waiting on subagents
+ * that had already reported. Neither ever called `set_phase`.
+ *
+ * The TIME is returned, not a flag, for the same reason `interrupted` carries
+ * one: "stopped 2 minutes ago" and "stopped last Tuesday" call for different
+ * reactions, and a bare badge cannot tell them apart.
+ *
+ * Deliberately NOT reported for `interrupted` sessions — that is a louder and
+ * different fact (the host went away, the process is gone) and a card must not
+ * claim two things at once. Nor for a session with no worktree: it never ran,
+ * so there is nothing it failed to hand back.
+ */
+export function stalledSince(
+  board: BoardConfig,
+  s: {
+    phase: StatusId
+    updated: number
+    worktree?: string
+    running?: boolean
+    interrupted?: number
+    archived?: boolean
+  },
+): number | undefined {
+  if (s.running || s.interrupted || s.archived || !s.worktree) return undefined
+  if (!isStartedColumn(board, s.phase)) return undefined
+  return s.updated
+}
+
 /** A column meaning "this one is off the agent's plate" — handed back for
  *  review, or approved. What a subtask has to reach before its parent can say
  *  the whole task is ready. */

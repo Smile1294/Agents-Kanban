@@ -26,7 +26,7 @@ import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts
 import { SessionStore, TRANSCRIPT_LIMIT, interruptedSessions, type Entry } from './sessions/store.ts'
 import { searchEntries } from './sessions/search.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
-import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, type BoardConfig } from './board/config.ts'
+import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, stalledSince, type BoardConfig } from './board/config.ts'
 import { linkSubtasks, rollUpState } from './board/subtasks.ts'
 import {
   DEFAULT_ORCHESTRATION, ORCHESTRATION_CHOICES, decompositionLine,
@@ -2746,6 +2746,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...(s.parent ? { parent: s.parent } : {}),
           ...(s.testPlan ? { testPlan: s.testPlan } : {}),
           ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
+          // Only reachable in THIS loop, and that is the point: these are the
+          // sessions with no live agent. A card in a started column with
+          // nothing running is an agent that stopped without handing the work
+          // back, and it used to draw identically to one still working.
+          ...(() => {
+            const at = stalledSince(ws.board, {
+              phase: s.phase, updated: s.updated, archived: s.archived,
+              ...(s.worktree ? { worktree: s.worktree } : {}),
+              ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
+            })
+            return at ? { stalled: at } : {}
+          })(),
         })
       }
 
@@ -4091,7 +4103,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // refused by name rather than carried across branches or clobbered.
         if (switches) {
           if (!(await w.worktrees.isClean(w.worktrees.repoRoot))) {
-            vscode.window.showWarningMessage(await w.worktrees.dirtyMessage())
+            // Modal, like every other answer on this path: see below.
+            await vscode.window.showWarningMessage(
+              `Cannot merge into ${target} yet.`,
+              { modal: true, detail: await w.worktrees.dirtyMessage() },
+            )
             return
           }
           await w.worktrees.checkout(target)
@@ -4125,7 +4141,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             vscode.window.showInformationMessage('Merge aborted. The repository is unchanged.')
           }
         } else {
-          vscode.window.showWarningMessage(result.message)
+          // MODAL, not a toast. The user pressed a button and confirmed a
+          // dialog; answering in a corner notification they can miss is how
+          // "I pressed Merge and literally nothing happened" happens — reported
+          // exactly that way, against a refusal that was firing every time.
+          await vscode.window.showWarningMessage(
+            `${wt.branch} was not merged into ${target}.`,
+            { modal: true, detail: result.message },
+          )
         }
       } catch (e) {
         vscode.window.showErrorMessage(`Merge failed: ${e instanceof Error ? e.message : String(e)}`)

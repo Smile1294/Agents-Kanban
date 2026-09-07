@@ -443,6 +443,74 @@ ok(slug('!!!') === 'task', 'a title with nothing sluggable still names the direc
   ok(!(await svc2.list()).some((w) => w.path === a.path), 'a finished subtask is removed like any other worktree')
 }
 
+// --- the ignore rule must not be losable ------------------------------------
+//
+// Found on a real repository: `.agentskanban/` untracked, no rule in
+// `.gitignore`, none in `.git/info/exclude`, and no branch that had ever
+// carried one. Every merge from that point on was refused as "dirty" and the
+// message told the user to commit or stash THEIR changes — for a directory this
+// extension made. The rule was written once, at create() time, into a TRACKED
+// file: discard that edit in the SCM panel, or switch to a branch that predates
+// it, and the board can never merge again.
+//
+// So the rule goes to `.git/info/exclude` as well. That file is untracked and
+// inside `.git`, so it cannot be discarded, cannot be lost in a branch switch,
+// and cannot itself dirty the tree — and it is re-asserted before every merge,
+// which `.gitignore` can never be (an uncommitted .gitignore edit is exactly
+// the thing that blocks the merge).
+{
+  const lost = path.join(tmp, 'lost-rule')
+  await fs.mkdir(lost)
+  const gl = (args: string[], cwd = lost) => exec('git', args, { cwd })
+  await gl(['init', '-b', 'main'])
+  await gl(['config', 'user.email', 'test@example.com']); await gl(['config', 'user.name', 'Test'])
+  await fs.writeFile(path.join(lost, 'README.md'), '# lost\n')
+  await gl(['add', '-A']); await gl(['commit', '-m', 'init'])
+  const svc3 = new WorktreeService((await findRepoRoot(lost))!)
+
+  await svc3.ensureIgnored()
+  const excludePath = path.join(lost, '.git', 'info', 'exclude')
+  ok((await fs.readFile(excludePath, 'utf8').catch(() => '')).includes(`/${KANBAN_DIR}/`),
+     'ensureIgnored writes the rule to .git/info/exclude as well as .gitignore')
+  ok((await fs.readFile(path.join(lost, '.gitignore'), 'utf8').catch(() => '')).includes(`/${KANBAN_DIR}/`),
+     'and still writes .gitignore, because that is the copy the team gets')
+
+  // The work: one session, one commit, ready to merge.
+  const w3 = await svc3.create({ taskId: 'L1', title: 'Some work' })
+  await fs.writeFile(path.join(w3.path, 'done.txt'), 'done\n')
+  await svc3.commitAll(w3.path, 'Do the work')
+  await gl(['add', '.gitignore']); await gl(['commit', '-m', 'Ignore agent worktrees'])
+
+  // Now lose the rule exactly as the real repository lost it: gone from the
+  // tracked file AND gone from the untracked one.
+  await fs.writeFile(path.join(lost, '.gitignore'), '')
+  await fs.writeFile(excludePath, '')
+  await gl(['commit', '-am', 'Someone removed the rule'])
+  const dirty = (await gl(['status', '--porcelain'])).stdout.split('\n').filter(Boolean)
+  ok(dirty.some((l) => l.includes(KANBAN_DIR)),
+     `with the rule gone the worktree directory dirties the tree: ${JSON.stringify(dirty)}`)
+
+  // THE BUG: this merge used to be refused as 'dirty', forever, with a message
+  // about the user's own changes.
+  const rescued = await svc3.merge(w3.branch, 'main')
+  ok(rescued.ok,
+     `a merge re-asserts the rule and goes through: ${rescued.ok ? 'merged' : JSON.stringify(rescued)}`)
+  ok((await fs.readFile(excludePath, 'utf8').catch(() => '')).includes(`/${KANBAN_DIR}/`),
+     'the rule is back in .git/info/exclude')
+  ok(!(await gl(['status', '--porcelain'])).stdout.includes('.gitignore'),
+     'and .gitignore was NOT touched — an uncommitted edit there is what blocks merges')
+  await svc3.commitMerge()
+
+  // And if it somehow still cannot be ignored, the refusal must name OUR
+  // directory rather than sending the user hunting for an edit they never made.
+  const stuck = new WorktreeService((await findRepoRoot(lost))!)
+  await fs.writeFile(path.join(lost, `${KANBAN_DIR}/stray.txt`), 'x\n')
+  await fs.writeFile(excludePath, '')
+  const msg = await stuck.dirtyMessage()
+  ok(msg.includes(KANBAN_DIR) && msg.includes('Agents Kanban') && !/your own changes/i.test(msg),
+     `the refusal names our own directory: ${msg}`)
+}
+
 // --- the diff's left-hand side must be the FILE, byte for byte --------------
 //
 // `show()` used `git()`, which ends in `stdout.trim()`. It is the sole
