@@ -164,3 +164,4 @@ from `run-…` to the session id when `system/init` arrives, and
 ## Recent changes
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
+- 2026-09-07 · task/S116g8 · dead-code sweep: `parseDecomposition` de-exported — module-private, called only inside `parseMeta`.

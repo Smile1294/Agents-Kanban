@@ -46,7 +46,7 @@ export interface IncomingRequest {
   fail: (message: string, code?: number) => void
 }
 
-export interface RpcEvents {
+interface RpcEvents {
   /** A message with a method and no id. */
   notification: (method: string, params: Record<string, unknown>) => void
   /** A message with a method AND an id: they want an answer. */

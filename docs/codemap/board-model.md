@@ -123,3 +123,4 @@ repository → nothing is required, so the extension stays generic.
 ## Recent changes
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit; `codemap.ts` added with the knowledge-file gate.
+- 2026-09-07 · task/S116g8 · dead-code sweep: `normalisePath` and `knowledgeMessage` de-exported — module-private helpers used only by exported functions' bodies.

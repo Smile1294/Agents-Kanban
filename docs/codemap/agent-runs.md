@@ -191,3 +191,4 @@ started column while the title is still the guess.
 ## Recent changes
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit; `knowledgeCheck` added to `BoardToolContext`, wired in `boardContext()`, and the brief gained the knowledge-file paragraph when a codemap exists.
+- 2026-09-07 · task/S116g8 · dead-code sweep: dictation tuning constants `WHISPER_BIN`, `FFMPEG_BIN`, `DICTATION_MIN_VERSION` de-exported — module-private, referenced only inside dictation.ts.

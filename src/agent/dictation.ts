@@ -40,8 +40,8 @@ export interface VoiceConfig {
   recordDevice: string
 }
 
-export const WHISPER_BIN = 'whisper-cli'
-export const FFMPEG_BIN = 'ffmpeg'
+const WHISPER_BIN = 'whisper-cli'
+const FFMPEG_BIN = 'ffmpeg'
 
 export function defaultVoiceConfig(): VoiceConfig {
   return { whisperPath: '', whisperModel: '', ffmpegPath: '', recordDevice: '' }
@@ -135,7 +135,7 @@ export const VSCODE_DICTATION_START = 'workbench.action.editorDictation.start'
 export const VSCODE_DICTATION_STOP = 'workbench.action.editorDictation.stop'
 
 /** The smallest VS Code version whose release notes promise built-in dictation. */
-export const DICTATION_MIN_VERSION = [1, 131, 0]
+const DICTATION_MIN_VERSION = [1, 131, 0]
 
 export interface BuiltinGate {
   /** `vscode.version`, e.g. '1.131.0' — may carry an `-insider` suffix. */

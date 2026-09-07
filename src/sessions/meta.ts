@@ -167,7 +167,7 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
  * read is dropped, and an unreadable record is no record at all rather than a
  * card claiming something nobody can verify.
  */
-export function parseDecomposition(raw: unknown): DecompositionRecord | undefined {
+function parseDecomposition(raw: unknown): DecompositionRecord | undefined {
   if (!raw || typeof raw !== 'object') return undefined
   const r = raw as Record<string, unknown>
   const level = parseOrchestrationLevel(r.level)
