@@ -91,6 +91,8 @@ src/
     settings.ts         The settings TAB: agents, backends, logins, schedules
     coalesce.ts         The repaint rate limiter, scaled to what a repaint cost
     questions.ts        AskUserQuestion -> a renderable picker
+    codemap.ts          Knowledge files move with the code: the gate on the
+                        review move, over docs/codemap/*.md frontmatter
     decomposition.ts    The orchestration dial, the gates on a split, the record
     subtasks.ts         Parent <-> subtask thread, derived on every render
     schedules.ts        Scheduled runs: next fire time, the catch-up rule
