@@ -105,12 +105,15 @@ Each is also a `--name=value` argument (`node server/server.mjs --port 9000`).
 
 ## The relay: the other, smaller mode
 
-`remote/` also ships a **relay**: a tiny deployable site (Netlify functions,
-Cloudflare Workers, or a zero-dependency Node file) that a running VS Code
-extension *pushes a read-only mirror of the board to*, so a phone or another
-computer can watch it without the extension's machine being reachable at all.
-Its optional write channel queues prompts back, gated by the extension's own
-`remote.writes` switch. See [remote/README.md](../remote/README.md).
+A sibling repository — [agents-kanban-relay](https://github.com/Smile1294/agents-kanban-relay)
+— ships the **relay**: a tiny deployable site (Netlify functions, Cloudflare
+Workers, or a zero-dependency Node file) that a running VS Code extension
+*pushes a read-only mirror of the board to*, so a phone or another computer
+can watch it without the extension's machine being reachable at all. Its
+optional write channel queues prompts back, gated by the extension's own
+`remote.writes` switch. The two repos stay in step through
+`remote-contract.json`, carried verbatim in both and checked by this repo's
+`verify` gate.
 
 The two modes share the pairing-code idea and the same board page, but they
 are different animals: the relay *mirrors a board that runs elsewhere*; this

@@ -118,7 +118,7 @@ Codex — a different process); a **provider** is the backend behind Claude Code
 | [orchestration.md](orchestration.md) | `src/agent/routing.ts`, `spawn-policy.ts`, `src/board/decomposition.ts`, `src/board/subtasks.ts` | splitting, subtasks, the dial, routing a piece to another agent, the roll-up |
 | [scheduling.md](scheduling.md) | `src/board/schedules.ts` | scheduled runs, catch-up, the `schedule_*` tools |
 | [git-worktrees.md](git-worktrees.md) | `src/git/*`, `src/run/recipe.ts` | worktrees, diffs, commit, merge, conflicts, the ignore rule, the Run button |
-| [remote.md](remote.md) | `src/remote/*`, `remote/**`, `server/**` | the relay mirror, prompts from a phone, the headless board |
+| [remote.md](remote.md) | `src/remote/*`, `remote-contract.json`, `server/**` | the relay mirror and its contract, the headless board — the relay SITE lives in the sibling repo agents-kanban-relay |
 | [build-and-test.md](build-and-test.md) | `scripts/**`, `test/**`, `smoke.mjs`, `esbuild.mjs`, `tsconfig.json`, `.vscodeignore`, `.vscode/**` | the gates, the harness, the bundle, packaging, F5 |
 
 Cross-cutting, no ownership: [flows.md](flows.md) (a run, a repaint, a split, a

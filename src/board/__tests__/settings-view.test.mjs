@@ -672,7 +672,7 @@ const state = (over = {}) => ({
   const secF = secOf(freshConnect)
   ok(findButton(secF, 'Save and connect').disabled === true,
      'with no URL either, Save is disabled')
-  ok(freshConnect.text().includes('Deploy the remote/ folder first'),
+  ok(freshConnect.text().includes('Deploy the relay first'),
      'and the page says the deploy comes first, not just that the button is dead')
   const urlF = secF.querySelectorAll('.remote-input')[0]
   urlF.value = 'https://board.example.com'

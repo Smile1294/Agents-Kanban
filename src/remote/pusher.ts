@@ -34,7 +34,9 @@ import type { RemoteIndex, RemoteTail } from './relay.ts'
 
 /** The relay path under the site root. Every host target serves the relay
  *  here — Netlify rewrites it to its function, the Cloudflare worker and the
- *  plain-Node server route it directly (see remote/README.md). */
+ *  plain-Node server route it directly. The route is part of the contract
+ *  with the relay repo (agents-kanban-relay): remote-contract.json's fnPath,
+ *  checked by scripts/check-contract.mjs on every verify. */
 export const FN_PATH = '/board'
 
 /** Fastest allowed push cadence, ms. */

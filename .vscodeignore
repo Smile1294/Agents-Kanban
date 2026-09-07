@@ -20,11 +20,10 @@ docs/screenshots/**
 docs/**
 CLAUDE.md
 PLAN.md
-# The remote/ folder is a LIFT-OUT: the user copies it into its own repository
-# and deploys it to Netlify. It is not part of the extension, and it carries
-# its own package.json — shipping it would pad every install with code that
-# never runs in VS Code.
-remote/**
+# The relay now lives in its own sibling repository (agents-kanban-relay);
+# only its shared-contract copy remains here, and that is a dev-time gate, not
+# runtime state — the extension never reads it.
+remote-contract.json
 **/*.map
 **/*.ts
 **/*.vsix

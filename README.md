@@ -89,10 +89,13 @@ else is secret. See [server/README.md](server/README.md).
 **The relay** mirrors a board running in VS Code to a small site (Netlify,
 Cloudflare Workers, or a plain Node process — the free tiers cover ordinary
 use), so you can watch it from a phone without the extension's machine being
-reachable at all. Deploy the [`remote/`](remote/README.md) folder, paste its
-URL and a pairing code into **settings page → Remote Control**, then open the
-site on any device and enter the same code. Prompts can be sent back too, behind
-a switch that is off by default.
+reachable at all. The relay is not part of this repository — it lives in its
+own, [agents-kanban-relay](https://github.com/Smile1294/agents-kanban-relay):
+deploy that repo, paste its URL and a pairing code into **settings page →
+Remote Control**, then open the site on any device and enter the same code.
+Prompts can be sent back too, behind a switch that is off by default. The two
+repos stay in step through [`remote-contract.json`](remote-contract.json),
+carried verbatim in both and checked by this repo's `verify`.
 
 ---
 

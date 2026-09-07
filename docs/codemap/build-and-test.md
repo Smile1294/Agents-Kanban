@@ -51,6 +51,20 @@ then `code`/`code-insiders`, then per-platform paths). **`scripts/make-icon.mjs`
 — renders `media/icon.png` with Chromium (the activity-bar glyph `board.svg`
 stays monochrome `currentColor`).
 
+**`scripts/check-contract.mjs`** — the relay contract gate, run by `verify`. The
+relay lives in its own sibling repository; the shared rules between the two
+ends are pinned by `remote-contract.json` (at the repo ROOT, carried verbatim
+in both repos). The gate (a) reads the constants this repo duplicates from the
+file — KEY_OK in `src/remote/relay.ts`, NONCE_OK and CMD_TEXT_MAX in
+`src/remote/commands.ts`, FN_PATH in `src/remote/pusher.ts` — by regex over the
+single-line literals, naming the field on drift; (b) compares this copy of the
+JSON against the relay repo's — the sibling `../agents-kanban-relay` on a dev
+machine, else `AGENTS_KANBAN_RELAY_URL` or the package.json `relayRepo` field,
+fetched; (c) when the relay copy is unreachable prints
+`contract UNCHECKED — could not reach the relay repo` and exits 0 — a loud
+skip, never a silent pass. Shown red twice when new (a local `CMD_TEXT_MAX`
+bump; an edit of the relay's copy) and restored.
+
 **`esbuild.mjs`** — two CJS bundles, node20, sourcemaps, minified unless
 `--watch`: `src/extension.ts` → `dist/extension.js` with externals `vscode`,
 `@anthropic-ai/claude-agent-sdk` (ESM-only, resolves a native binary), `zod` (a
@@ -64,9 +78,13 @@ Codex spawned.
 `.ts` suffixes). No parameter properties in constructors — the type stripper
 rejects them.
 
-**`.vscodeignore`** — out of the .vsix: `src/`, `test/`, `docs/`, `remote/`,
+**`.vscodeignore`** — out of the .vsix: `src/`, `test/`, `docs/`,
 `.agentskanban/` (a live worktree is a whole checkout), `CLAUDE.md`, `PLAN.md`,
-`*.map`, `*.ts`, the SDK's per-platform native binary, dev dependencies.
+`remote-contract.json` (a dev-time gate, never runtime state), `*.map`,
+`*.ts`, the SDK's per-platform native binary, dev dependencies. The relay's
+`remote/**` block is gone — the relay lives in its own repo, and the guard in
+`test/package.test.mjs` still refuses a `remote/` prefix in the package in case
+a pre-split branch ever merges back.
 
 **`.vscode/tasks.json`, `launch.json`** — `verify` (what F5 waits for),
 `preflight`, `build`, `watch`, every one through `./scripts/with-node.sh`; "Run
@@ -90,8 +108,10 @@ and a real `attributes` map (`tickAges()` finds counters by `data-since`).
 
 **`test/package.test.mjs`** — runs `vsce package` for real (`npm run
 verify:package`): the two bundles and the webview assets ship; the SDK's
-`sdk.mjs` and `zod/` ship (externals!); the native binary, `docs/`, `remote/`,
-`.agentskanban/` do not; size between 1 and 20 MB.
+`sdk.mjs` and `zod/` ship (externals!); the native binary, `docs/`,
+`.agentskanban/` and a `remote/` prefix do not (the relay lives in its own
+repo — the guard refuses the old directory in case a pre-split branch merges
+back); size between 1 and 20 MB.
 
 **`test/screenshots.mjs`** — renders the real view in Chromium to
 `docs/screenshots/` (`npm run screenshots`), `theme.css` first; fails on a blank
@@ -116,10 +136,11 @@ view does, because the host omits the list when unchanged.
 ## How it works
 
 `npm run verify` = preflight → `tsc --noEmit` → `esbuild` → `scripts/test.mjs`
-→ `smoke.mjs`. Tests are plain scripts printing `ok:` / `FAIL:`. Four gates read
-the built bundle (`executable.test.ts`, `board-bridge.test.ts`, `smoke.mjs`,
-`harness.mjs`), so `verify` builds before it tests. Two need Chromium
-(`layout.test.mjs`, `headless.test.mjs`) and FAIL without one.
+→ `scripts/check-contract.mjs` → `smoke.mjs`. Tests are plain scripts printing
+`ok:` / `FAIL:`. Four gates read the built bundle (`executable.test.ts`,
+`board-bridge.test.ts`, `smoke.mjs`, `harness.mjs`), so `verify` builds before
+it tests. Two need Chromium (`layout.test.mjs`, `headless.test.mjs`) and FAIL
+without one.
 
 ## Change recipes
 
@@ -138,6 +159,9 @@ the built bundle (`executable.test.ts`, `board-bridge.test.ts`, `smoke.mjs`,
   a message blaming the build.
 - **Anything the .vsix must or must not carry.** `.vscodeignore` and an
   assertion in `test/package.test.mjs`.
+- **A shared rule with the relay changes.** Edit `remote-contract.json` in BOTH
+  repos and the constants in both ends; `scripts/check-contract.mjs` names the
+  field that drifted. See [remote.md](remote.md).
 
 ## Invariants
 
@@ -155,4 +179,9 @@ the built bundle (`executable.test.ts`, `board-bridge.test.ts`, `smoke.mjs`,
 
 ## Recent changes
 
+- 2026-09-07 · task/S968q-split-the-relay-repo-out · `remote-contract.json` gate
+  added: `scripts/check-contract.mjs` runs inside `verify`, comparing this
+  repo's constants and JSON copy against the relay repo's sibling copy
+  (loud-skip when unreachable); `.vscodeignore` and `test/package.test.mjs`
+  now reflect the relay living outside this repo.
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit; three test-only bugs fixed (undecoded `import.meta.url`, smoke reading the last frame raw, smoke's teardown crash).

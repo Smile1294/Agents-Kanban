@@ -20,6 +20,7 @@ stream reference, current state, and what to build next.
 | Why is it built this way? | [docs/DECISIONS.md](docs/DECISIONS.md) — decisions and bug postmortems |
 | Which AGENT PROGRAM runs a session — Claude Code, Codex? How do I add a third? | [docs/RUNTIMES.md](docs/RUNTIMES.md) |
 | How do I run agents on Bedrock, Vertex, a gateway or a local model? | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
+| Where is the relay — the deployable site Remote Control pushes to — and its tests? | its own repository, the sibling `../agents-kanban-relay/`; the shared rules are pinned by `remote-contract.json` (checked by `scripts/check-contract.mjs` in `verify`) |
 | How do I run it? | [README.md](README.md) |
 
 ## Commands
