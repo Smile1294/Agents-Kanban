@@ -15,7 +15,7 @@ import {
   sessionFileFor, waitForQuiescent, type CheckpointMap,
 } from './sessions/checkpoints.ts'
 import {
-  agentStatus, parseTaskNotifications, scanBackgroundAgents, type BackgroundAgent,
+  agentStatus, readTaskNotifications, scanBackgroundAgents, type SessionAgents,
 } from './sessions/subagents.ts'
 import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
@@ -147,9 +147,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * asking per session would be the per-repaint cost this project has a
    * postmortem about.
    */
-  let agentScan: { at: number; bySession: Map<string, BackgroundAgent[]> } | undefined
+  let agentScan: { at: number; bySession: Map<string, SessionAgents> } | undefined
   const AGENT_SCAN_TTL_MS = 3000
-  async function backgroundAgents(): Promise<Map<string, BackgroundAgent[]>> {
+  async function backgroundAgents(): Promise<Map<string, SessionAgents>> {
     const now = Date.now()
     if (!agentScan || now - agentScan.at >= AGENT_SCAN_TTL_MS) {
       agentScan = { at: now, bySession: await scanBackgroundAgents(claudeHome()).catch(() => new Map()) }
@@ -2863,20 +2863,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
          postmortem about. The store's parse is cached, so a session already on
          screen costs nothing. */
       const badges = new Map<string, { total: number; running: number; orphaned: number }>()
+      /* LIVE means the process is alive: starting, working, waiting or asking.
+         The manager keeps a FINISHED run in its list so the card can show its
+         result, and "in the list" used to count as live — so an agent whose
+         outcome the parser had not seen read "may still be working" under a
+         run that had already printed "Finished". */
+      const isLive = (a: { state: { kind: string } }) =>
+        ['starting', 'working', 'needsInput', 'waiting'].includes(a.state.kind)
       if (agentsBySession.size) {
-        const liveIds = new Set((ws.manager?.list() ?? []).map((a) => a.sessionId).filter(Boolean))
-        const drawn = new Set<string>([...listed.map((x) => x.id), ...liveIds as Set<string>])
+        const liveIds = new Set((ws.manager?.list() ?? []).filter(isLive).map((a) => a.sessionId).filter(Boolean))
+        const drawn = new Set<string>([...listed.map((x) => x.id), ...(ws.manager?.list() ?? []).map((a) => a.sessionId).filter(Boolean) as string[]])
         for (const [sid, spawned] of agentsBySession) {
           if (!drawn.has(sid)) continue
-          const reported = parseTaskNotifications(await ws.store.transcript(sid).catch(() => []))
+          const reported = await readTaskNotifications(spawned.transcript)
           const live = liveIds.has(sid)
           let running = 0, orphaned = 0
-          for (const a of spawned) {
+          for (const a of spawned.agents) {
             const st = agentStatus(a, reported, live)
             if (st === 'running') running++
             else if (st === 'orphaned') orphaned++
           }
-          badges.set(sid, { total: spawned.length, running, orphaned })
+          badges.set(sid, { total: spawned.agents.length, running, orphaned })
         }
       }
       const agentBadge = (sid: string | undefined) => {
@@ -2890,10 +2897,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       {
         const sid = ws.manager?.byKey(selectedKey ?? '')?.sessionId ?? selectedKey
         const spawned = sid ? agentsBySession.get(sid) : undefined
-        if (sid && spawned?.length) {
-          const live = !!ws.manager?.byKey(selectedKey ?? '')
-          const reported = parseTaskNotifications(await ws.store.transcript(sid).catch(() => []))
-          for (const a of spawned) {
+        if (sid && spawned?.agents.length) {
+          const liveRun = ws.manager?.byKey(selectedKey ?? '')
+          const live = !!liveRun && isLive(liveRun)
+          const reported = await readTaskNotifications(spawned.transcript)
+          for (const a of spawned.agents) {
             selectedAgents.push({
               id: a.id,
               description: a.description,

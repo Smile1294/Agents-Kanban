@@ -236,7 +236,13 @@ run, since each session needs a worktree.
   walks would be O(cards x projects) on the render path); outcomes are parsed
   only for the few sessions that actually spawned one; and the 5s tick exists
   because this is the one readout that moves while nothing is streaming — so
-  nothing would otherwise repaint it.
+  nothing would otherwise repaint it. Three more, found when both agents had
+  finished and the panel said "still working": the outcome is read off the
+  session FILE, not the store's entries — a notification delivered mid-turn is
+  an `attachment` record, not a message, and the SDK's reader returned one of
+  eight; a `TaskStop` writes `killed` where the SDK type says `stopped`, so
+  both spellings are read; and "live" means the PROCESS is alive, never "in the
+  manager's list", which keeps finished runs for their cards.
 - **A card in a started column with no agent running must SAY so.**
   "Implementing" means an agent is changing code; with no live agent it means one
   stopped there without handing the work back, and the board drew both

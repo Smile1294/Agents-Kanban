@@ -317,6 +317,24 @@ the count of turns owed above zero for ever. `background-turns.test.ts` feeds
 the recorded frame order through the real handler and was red before the
 change on exactly the reported case.
 
+The second half, reported straight after: both agents had finished — one
+completed, one stopped by `TaskStop` — and the panel still said "may still be
+working" for both. Two causes, one per agent. The status word a stop writes is
+`killed`; the SDK's type declares `stopped`, the parser read only the
+declared word, and dropped the record as unrecognised. And the completed
+agent's notification never reached the parser at all: read off the file, the
+notification text appeared in eight records in THREE shapes —
+`queue-operation` records, `attachment` records (how the CLI delivers a
+notification that lands while a turn is in flight), and a plain `user` message
+only when one is dequeued at a turn boundary — and the store's entries, built
+from the SDK's message reader, could carry only the last shape: one of eight.
+Outcomes are now read off the session FILE, from every string in a matching
+record whatever key it sits under, cached on the file's size and mtime.
+`killed` reads as stopped. And "live" now means the process is alive — a
+finished run stays in the manager's list so its card can show the result, and
+"in the list" had counted as live, which is what turned "no completion
+recorded" into "may still be working" under a run that had printed "Finished".
+
 ### "The remote is fully white"
 
 The headless board (`server/server.mjs`) served `media/board.css` unchanged, and

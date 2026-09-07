@@ -870,6 +870,7 @@ details.thinking summary::-webkit-details-marker { display: none; }
 .agent-row.running .agent-dot { color: var(--ok); }
 .agent-row.completed .agent-dot { color: var(--ok); }
 .agent-row.orphaned .agent-dot { color: var(--warn); }
+.agent-row.failed .agent-dot, .agent-row.failed .agent-state { color: var(--bad); }
 .agent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .agent-state { color: var(--muted); flex: 0 0 auto; }
 .agent-row.orphaned .agent-state { color: var(--warn); }

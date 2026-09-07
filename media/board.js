@@ -2385,8 +2385,9 @@
       row.append(el('span', 'agent-state',
         a.status === 'completed' ? 'completed'
           : a.status === 'stopped' ? 'stopped'
-            : a.status === 'orphaned' ? 'no completion recorded'
-              : 'working'))
+            : a.status === 'failed' ? 'failed'
+              : a.status === 'orphaned' ? 'no completion recorded'
+                : 'working'))
       if (a.lastFrameAt) row.append(el('span', 'agent-age', 'last wrote ' + ago(a.lastFrameAt)))
       body.append(row)
     }

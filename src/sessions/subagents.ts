@@ -29,8 +29,11 @@ import * as path from 'node:path'
 export type AgentStatus =
   /** The parent transcript reported it finished. */
   | 'completed'
-  /** The parent transcript reported it stopped. */
+  /** The parent transcript reported it stopped — `stopped`, or `killed`,
+   *  which is what a `TaskStop` actually writes. */
   | 'stopped'
+  /** The parent transcript reported it failed. */
+  | 'failed'
   /** No outcome reported, and the session is live — it may still be working. */
   | 'running'
   /** No outcome reported and nothing is live. A background agent is a child of
@@ -48,8 +51,26 @@ export interface BackgroundAgent {
   lastFrameAt?: number
 }
 
+/** An outcome the parent transcript stated. */
+export type ReportedStatus = 'completed' | 'stopped' | 'failed'
 /** A reported outcome, per task id. Only what the transcript actually said. */
-export type ReportedOutcomes = Map<string, 'completed' | 'stopped'>
+export type ReportedOutcomes = Map<string, ReportedStatus>
+
+/**
+ * The status words a notification can carry, each read into an outcome.
+ *
+ * Both spellings, per this project's rule about another program's protocol: the
+ * SDK's type declares `completed | failed | stopped`, and the record a
+ * `TaskStop` actually writes says `killed`. Reading the declared word alone
+ * showed a stopped agent as "still working". Anything not listed is DROPPED,
+ * never guessed — see `parseTaskNotifications`.
+ */
+const REPORTED: Record<string, ReportedStatus> = {
+  completed: 'completed',
+  stopped: 'stopped',
+  killed: 'stopped',
+  failed: 'failed',
+}
 
 const NOTIFICATION = /<task-notification>([\s\S]*?)<\/task-notification>/g
 const TASK_ID = /<task-id>\s*([A-Za-z0-9_-]{1,64})\s*<\/task-id>/g
@@ -78,8 +99,8 @@ export function parseTaskNotifications(
     NOTIFICATION.lastIndex = 0
     for (let block = NOTIFICATION.exec(text); block; block = NOTIFICATION.exec(text)) {
       const body = block[1] ?? ''
-      const status = STATUS.exec(body)?.[1]
-      if (status !== 'completed' && status !== 'stopped') continue
+      const status = REPORTED[STATUS.exec(body)?.[1] ?? '']
+      if (!status) continue
       TASK_ID.lastIndex = 0
       for (let id = TASK_ID.exec(body); id; id = TASK_ID.exec(body)) {
         if (id[1]) out.set(id[1], status)
@@ -87,6 +108,55 @@ export function parseTaskNotifications(
     }
   }
   return out
+}
+
+/**
+ * Outcomes reported in a session's transcript, read off the FILE.
+ *
+ * Not off the parsed transcript, because the notification is only sometimes a
+ * message. Measured on a real session with two agents, one completed and one
+ * killed: eight records carried the notification text, in THREE shapes —
+ * `queue-operation` records (`content`), `attachment` records
+ * (`attachment.prompt`, how the CLI delivers a notification that arrives
+ * while a turn is in flight), and a plain `user` message (`message.content`)
+ * only when one is dequeued at a turn boundary. The SDK's reader returns
+ * messages, so it returned ONE of the eight, and the store's entries could
+ * never carry the rest — which is why both agents read "still working" under a
+ * run that had printed "Finished". So every string in a matching record is
+ * read, whatever key it sits under; the same notification appears up to three
+ * times and collapses in the map, last one in file order winning.
+ *
+ * Cheap and cached: only sessions that spawned an agent are asked, and the
+ * answer is keyed on the file's size and mtime, so a finished session costs one
+ * read and a live one costs a read per change — a line filter, not a parse.
+ */
+const notificationCache = new Map<string, { size: number; mtimeMs: number; outcomes: ReportedOutcomes }>()
+export async function readTaskNotifications(file: string): Promise<ReportedOutcomes> {
+  const st = await fs.stat(file).catch(() => undefined)
+  if (!st) return new Map()
+  const hit = notificationCache.get(file)
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.outcomes
+  const raw = await fs.readFile(file, 'utf8').catch(() => '')
+  const entries: Array<{ kind: string; text: string }> = []
+  for (const line of raw.split('\n')) {
+    if (!line.includes('<task-notification>')) continue
+    // Parsed, not cast: another program's file. A record with no message (the
+    // `last-prompt` marker quotes the text too) is skipped, not crashed on.
+    let rec: unknown
+    try { rec = JSON.parse(line) } catch { continue }
+    // Every string in the record that carries the marker, wherever it sits —
+    // the three shapes above, and whatever the next version files it under.
+    const walk = (x: unknown, depth: number): void => {
+      if (depth > 6) return
+      if (typeof x === 'string') { if (x.includes('<task-notification>')) entries.push({ kind: 'prompt', text: x }) }
+      else if (Array.isArray(x)) x.forEach((v) => walk(v, depth + 1))
+      else if (x && typeof x === 'object') for (const v of Object.values(x as Record<string, unknown>)) walk(v, depth + 1)
+    }
+    walk(rec, 0)
+  }
+  const outcomes = parseTaskNotifications(entries)
+  notificationCache.set(file, { size: st.size, mtimeMs: st.mtimeMs, outcomes })
+  return outcomes
 }
 
 /**
@@ -166,9 +236,17 @@ async function agentsIn(dir: string): Promise<BackgroundAgent[]> {
  * Only sessions that actually spawned an agent get a key, so "no agents" costs
  * a missing lookup rather than an empty array per card.
  */
-export async function scanBackgroundAgents(home: string): Promise<Map<string, BackgroundAgent[]>> {
+/** One session's background agents, and where its own transcript is — the
+ *  file the outcomes are read from, found by the same walk rather than a
+ *  second one. */
+export interface SessionAgents {
+  agents: BackgroundAgent[]
+  transcript: string
+}
+
+export async function scanBackgroundAgents(home: string): Promise<Map<string, SessionAgents>> {
   const projects = path.join(home, 'projects')
-  const out = new Map<string, BackgroundAgent[]>()
+  const out = new Map<string, SessionAgents>()
   for (const project of await fs.readdir(projects).catch(() => [] as string[])) {
     const base = path.join(projects, project)
     // A session's own directory sits BESIDE its `<id>.jsonl`, so the entries
@@ -178,7 +256,7 @@ export async function scanBackgroundAgents(home: string): Promise<Map<string, Ba
       const dir = path.join(base, entry, 'subagents')
       if (!(await fs.stat(dir).then((st) => st.isDirectory(), () => false))) continue
       const agents = await agentsIn(dir)
-      if (agents.length) out.set(entry, agents)
+      if (agents.length) out.set(entry, { agents, transcript: path.join(base, `${entry}.jsonl`) })
     }
   }
   return out

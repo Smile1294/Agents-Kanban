@@ -315,7 +315,7 @@ export interface UiState {
     description: string
     agentType?: string
     lastFrameAt?: number
-    status: 'completed' | 'stopped' | 'running' | 'orphaned'
+    status: 'completed' | 'stopped' | 'failed' | 'running' | 'orphaned'
   }>
   /** Set while a merge is in progress so the view can disable the button. */
   busy?: string
