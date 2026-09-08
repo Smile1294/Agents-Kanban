@@ -15,6 +15,8 @@
  *      sources are TypeScript):
  *        KEY_OK        src/remote/relay.ts
  *        NONCE_OK      src/remote/commands.ts
+ *        SETTING_OK    src/remote/commands.ts
+ *        THINKING_OK   src/remote/commands.ts
  *        CMD_TEXT_MAX  src/remote/commands.ts
  *        FN_PATH       src/remote/pusher.ts
  *      idOk and cmdMax are not duplicated here — the extension never holds
@@ -86,6 +88,8 @@ const pusherSrc = await sourceOf('src/remote/pusher.ts')
 const local = [
   ['keyOk', contract.keyOk, grab(relaySrc, 'KEY_OK'), 'src/remote/relay.ts KEY_OK'],
   ['nonceOk', contract.nonceOk, grab(commandsSrc, 'NONCE_OK'), 'src/remote/commands.ts NONCE_OK'],
+  ['settingOk', contract.settingOk, grab(commandsSrc, 'SETTING_OK'), 'src/remote/commands.ts SETTING_OK'],
+  ['thinkingOk', contract.thinkingOk, grab(commandsSrc, 'THINKING_OK'), 'src/remote/commands.ts THINKING_OK'],
   ['cmdTextMax', contract.cmdTextMax, grabNumber(commandsSrc, 'CMD_TEXT_MAX'), 'src/remote/commands.ts CMD_TEXT_MAX'],
   ['fnPath', contract.fnPath, grabString(pusherSrc, 'FN_PATH'), 'src/remote/pusher.ts FN_PATH'],
 ]

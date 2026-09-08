@@ -956,6 +956,7 @@ export class AgentManager extends EventEmitter {
     text: string,
     images: readonly AttachedImage[] = [],
     providerFor?: LaunchOptions['providerFor'],
+    chosen?: RunSettings,
   ): Promise<void> {
     const live = this.byKey(key)
     if (live) {
@@ -985,6 +986,7 @@ export class AgentManager extends EventEmitter {
       resume: key,
       ...(existing?.title ? { title: existing.title } : {}),
       ...(providerFor ? { providerFor } : {}),
+      ...(chosen ? { chosen } : {}),
     })
   }
 

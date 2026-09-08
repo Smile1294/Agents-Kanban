@@ -10,7 +10,7 @@
  * Neither surface holds state. They render what the host hands them.
  */
 import * as vscode from 'vscode'
-import type { RunningAgent } from '../agent/manager.ts'
+import type { RunningAgent, RunSettings } from '../agent/manager.ts'
 import type { PendingMerge, WorktreeReview } from '../git/worktree.ts'
 import type { Entry } from '../sessions/store.ts'
 import type { TranscriptHit } from '../sessions/search.ts'
@@ -514,8 +514,8 @@ export interface BoardHost {
   openFolder(): Promise<void>
   setMode(mode: Mode): void
   select(id: string | undefined): void
-  newSession(prompt: string, images?: AttachedImage[]): Promise<void>
-  sendMessage(id: string, text: string, images?: AttachedImage[]): Promise<void>
+  newSession(prompt: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
+  sendMessage(id: string, text: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
   move(key: string, phase: string): Promise<void>
   stop(key: string): Promise<void>
   /** End this turn, keep the session. Distinct from stop(), which ends the run. */

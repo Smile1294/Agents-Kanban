@@ -14,6 +14,7 @@ import {
   boardIdOf,
   indexBlob,
   KEY_OK,
+  projectComposer,
   projectIndex,
   projectTail,
   relayBase,
@@ -112,6 +113,59 @@ const CARDS = [
 {
   const idx = projectIndex(1, [], [], () => 0, true)
   ok(idx.writes === true, 'writes: true is carried true')
+}
+
+// The composer is the one place the "no configuration crosses" rule bends, and
+// it bends only as far as the page needs: ids and labels. projectComposer is
+// the filter — the host's composer state carries contexts, prices and providers;
+// only the declared fields above may leave.
+{
+  ok(projectComposer(undefined) === undefined, 'no composer state publishes nothing')
+  ok(projectComposer({}) === undefined, 'an empty composer publishes nothing')
+
+  const c = projectComposer({
+    model: 'claude-sonnet-5',
+    effort: 'high',
+    thinking: 'disabled',
+    thinkingSupported: true,
+    models: [
+      { id: 'claude-sonnet-5', label: 'Sonnet 5', context: 200_000, price: '$3/$15' },
+      { id: 'claude-opus-5', label: 'Opus 5', context: 200_000, price: '$15/$75' },
+    ],
+    efforts: [
+      { key: 'low', label: 'Low' },
+      { key: 'high', label: 'High' },
+    ],
+  })
+  ok(c !== undefined && c.model === 'claude-sonnet-5' && c.effort === 'high'
+    && c.thinking === 'disabled' && c.thinkingSupported === true,
+    'the current model, effort and thinking switch come across')
+  ok(c!.models!.length === 2 && c!.models![0]!.id === 'claude-sonnet-5'
+    && c!.models![0]!.label === 'Sonnet 5',
+    'the model list is ids and labels only')
+  ok(c!.efforts!.length === 2 && c!.efforts![1]!.key === 'high' && c!.efforts![1]!.label === 'High',
+    'the effort list is keys and labels only')
+  const modelKeys = Object.keys(c!.models![0]!).sort().join(',')
+  const effortKeys = Object.keys(c!.efforts![0]!).sort().join(',')
+  ok(modelKeys === 'id,label' && effortKeys === 'key,label',
+    'a model is exactly id+label and an effort exactly key+label')
+  const serial = JSON.stringify(c)
+  ok(!serial.includes('context') && !serial.includes('price') && !serial.includes('$'),
+    'contexts, prices and per-effort model lists do not cross')
+
+  const loose = projectComposer({ thinking: 'sometimes' })
+  ok(loose === undefined, 'a thinking value the remote does not know publishes nothing')
+  const narrow = projectComposer({ thinking: 'enabled' })
+  ok(narrow!.thinking === 'enabled', 'thinking narrows to the two modes the remote understands')
+}
+
+// A composer rides the index only when the host has one to publish.
+{
+  const idx = projectIndex(1, [], [], () => 0, true, {
+    model: 'claude-sonnet-5', models: [{ id: 'claude-sonnet-5', label: 'Sonnet 5' }],
+  })
+  ok(idx.composer?.model === 'claude-sonnet-5' && idx.composer?.models?.length === 1,
+    'a composer rides the index when the host publishes one')
 }
 
 // --- projectTail -------------------------------------------------------------

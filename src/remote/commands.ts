@@ -44,11 +44,23 @@ export interface RemoteCommand {
   /** The board key of the session to message; absent means "start a new
    *  session with this prompt". */
   session?: string
+  /** The model the watcher picked, if any. Ids only — the host decides what it
+   *  means, and a wrong one is dropped rather than acted on. */
+  model?: string
+  /** The effort level the watcher picked, if any. */
+  effort?: string
+  /** The thinking mode the watcher picked, if any. */
+  thinking?: 'enabled' | 'disabled'
 }
 
 /** Same rule as the relay's (board-core.mjs): the nonce is an ack handle,
  *  nothing more, and it must look like one. */
 export const NONCE_OK = /^[A-Za-z0-9._-]{1,64}$/
+/** Same rule as the relay's: a model id / effort key is a short, blob-safe
+ *  string — never a provider or a credential. */
+export const SETTING_OK = /^[A-Za-z0-9._-]{1,120}$/
+/** Same rule as the relay's: the thinking mode is a closed set. */
+export const THINKING_OK = /^(enabled|disabled)$/
 /** Mirrors the relay's cap: the relay refuses longer, and the host must not
  *  accept what the relay would have refused. */
 export const CMD_TEXT_MAX = 20_000
@@ -71,10 +83,16 @@ export function parseCommands(raw: unknown): RemoteCommand[] {
     if (c.session !== undefined) {
       if (typeof c.session !== 'string' || !KEY_OK.test(c.session)) continue
     }
+    if (c.model !== undefined && (typeof c.model !== 'string' || !SETTING_OK.test(c.model))) continue
+    if (c.effort !== undefined && (typeof c.effort !== 'string' || !SETTING_OK.test(c.effort))) continue
+    if (c.thinking !== undefined && (typeof c.thinking !== 'string' || !THINKING_OK.test(c.thinking))) continue
     out.push({
       nonce,
       text,
       ...(typeof c.session === 'string' ? { session: c.session } : {}),
+      ...(typeof c.model === 'string' ? { model: c.model } : {}),
+      ...(typeof c.effort === 'string' ? { effort: c.effort } : {}),
+      ...(typeof c.thinking === 'string' ? { thinking: c.thinking as 'enabled' | 'disabled' } : {}),
     })
   }
   return out

@@ -26,7 +26,7 @@
  * host hands in the arrays its own render path uses — the same entries the
  * local chat draws, in the same order.
  */
-import { projectIndex, projectTail, type RemoteColumn, type RemoteCardSource, type RemoteIndex, type RemoteTail } from './relay.ts'
+import { projectIndex, projectTail, type RemoteColumn, type RemoteCardSource, type RemoteComposer, type RemoteIndex, type RemoteTail } from './relay.ts'
 import type { Entry } from '../sessions/store.ts'
 
 /** One session's transcript, as the host renders it. */
@@ -48,10 +48,20 @@ export class RemoteFeed {
    *  page shows its composer exactly when a command would be acted on. */
   private writes = false
 
+  /** The model / effort catalogue the remote composer offers, carried into
+   *  every index so the page's pickers match what this machine can run. */
+  private composer: RemoteComposer | undefined
+
   /** Set by the host from its own `remote.writes` state — the page's composer
    *  and the host's gate must agree, and both read this one value. */
   setWrites(on: boolean): void {
     this.writes = on
+  }
+
+  /** Set by the host from its own composer state, reduced through
+   *  `projectComposer` — ids and labels only. */
+  setComposer(c: RemoteComposer | undefined): void {
+    this.composer = c
   }
 
   /** Mark a session as already sent, at `totalEntries` — used after the
@@ -95,7 +105,7 @@ export class RemoteFeed {
       if (tail) out.push(tail)
     }
     return {
-      index: projectIndex(at, columns, cards, (k) => this.tvOf(k), this.writes),
+      index: projectIndex(at, columns, cards, (k) => this.tvOf(k), this.writes, this.composer),
       tails: out,
     }
   }

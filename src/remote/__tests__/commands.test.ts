@@ -18,6 +18,8 @@ import {
   NONCE_OK,
   parseCommands,
   RemoteCommandClient,
+  SETTING_OK,
+  THINKING_OK,
   type AcceptCtx,
 } from '../commands.ts'
 
@@ -65,6 +67,30 @@ function ctx(over: Partial<AcceptCtx> = {}): AcceptCtx & { seen: Set<string>; ex
 
   const mixed = parseCommands([{ nonce: 'n8', text: 'ok' }, { nonce: 'bad nonce', text: 'x' }])
   ok(mixed.length === 1 && mixed[0]!.nonce === 'n8', 'one bad row does not poison the batch')
+}
+
+// The composer picks (model / effort / thinking) ride the same command, and are
+// validated by the same rules the relay applies — a model id is a blob-safe
+// string, thinking is the closed enabled|disabled set.
+{
+  const picked = parseCommands([{
+    nonce: 'n1', text: 'go', model: 'claude-sonnet-5', effort: 'high', thinking: 'disabled',
+  }])
+  ok(picked.length === 1 && picked[0]!.model === 'claude-sonnet-5'
+    && picked[0]!.effort === 'high' && picked[0]!.thinking === 'disabled',
+    'model, effort and thinking round-trip verbatim')
+
+  const bad = parseCommands([
+    { nonce: 'n1', text: 'go', model: 'not a model!' }, // space, not setting-shaped
+    { nonce: 'n2', text: 'go', effort: 42 }, // not a string
+    { nonce: 'n3', text: 'go', thinking: 'maybe' }, // not enabled|disabled
+    { nonce: 'n4', text: 'go', model: 'x'.repeat(121) }, // over the length cap
+  ])
+  ok(bad.length === 0, 'a bad model, effort or thinking shape drops the whole row')
+
+  const bare = parseCommands([{ nonce: 'n1', text: 'go' }])
+  ok(bare[0]!.model === undefined && bare[0]!.effort === undefined && bare[0]!.thinking === undefined,
+    'no picks means no fields — the host falls back to its own dials')
 }
 
 // --- the toggle: THE gate ----------------------------------------------------
@@ -168,6 +194,12 @@ function ctx(over: Partial<AcceptCtx> = {}): AcceptCtx & { seen: Set<string>; ex
   ok(CMD_TEXT_MAX === 20_000, 'CMD_TEXT_MAX is 20000 on both ends')
   ok(!NONCE_OK.test('a b') && NONCE_OK.test('n1') && NONCE_OK.test('a'.repeat(64)) && !NONCE_OK.test('a'.repeat(65)),
     'the nonce rule itself: ack-handle-shaped strings only, bounded')
+  ok(SETTING_OK.source === '^[A-Za-z0-9._-]{1,120}$', 'SETTING_OK is the literal both ends carry')
+  ok(THINKING_OK.source === '^(enabled|disabled)$', 'THINKING_OK is the literal both ends carry')
+  ok(SETTING_OK.test('claude-sonnet-5') && !SETTING_OK.test('not a model!') && !SETTING_OK.test('a'.repeat(121)),
+    'a model id / effort key is a short, blob-safe string — never a provider or a credential')
+  ok(THINKING_OK.test('enabled') && THINKING_OK.test('disabled') && !THINKING_OK.test('maybe'),
+    'thinking is the closed enabled|disabled set')
 }
 
 if (fails) {

@@ -19,8 +19,12 @@
  *    for exactly this reason: a Bash row summarises as its COMMAND and an Edit
  *    row as its PATH, because the summary is derived from the tool's input —
  *    see `RemoteEntry`;
- *  - configuration: no providers, no credentials, no composer state, no model
- *    lists, no permission questions (those can name files);
+ *  - configuration: no providers, no credentials, no prices, no permission
+ *    questions (those can name files). The model / effort CATALOGUE is the one
+ *    exception, and it is deliberately bare: `index.composer` carries model ids
+ *    and labels, effort keys and labels, and the thinking switch — the names
+ *    the remote composer needs to offer — and nothing that would cost the user
+ *    if it leaked;
  *  - anything the agent is about to do: no queued prompts, no test plans, no
  *    review data.
  *
@@ -83,6 +87,9 @@ export interface RemoteIndex {
    *  a void would be a dead control, and the value is the HOST's own toggle
    *  (`remote.writes`), never something the relay asserts. */
   writes: boolean
+  /** The model / effort / thinking catalogue the remote composer offers. Absent
+   *  when the host has nothing to publish (no workspace, no catalogue). */
+  composer?: RemoteComposer
 }
 
 /**
@@ -118,6 +125,59 @@ export interface RemoteTail {
   entries: RemoteEntry[]
 }
 
+/**
+ * What the remote composer may offer. Ids and labels only — a model id is a
+ * name, never a provider, an account or a price. This is the one place the
+ * "no configuration crosses" rule bends, and it bends only as far as the page
+ * needs: the names to list, not the choices behind them.
+ */
+export interface RemoteComposer {
+  /** The host's current model id — the picker's default. */
+  model?: string
+  /** The host's current effort key. */
+  effort?: string
+  /** The host's current thinking mode. */
+  thinking?: 'enabled' | 'disabled'
+  /** Whether the model supports a thinking switch at all — absent, the remote
+   *  composer draws no toggle. */
+  thinkingSupported?: boolean
+  /** The models the picker lists. */
+  models?: { id: string; label: string }[]
+  /** The effort levels the picker lists. */
+  efforts?: { key: string; label: string }[]
+}
+
+/** What `projectComposer` accepts: the host's own composer state, which carries
+ *  far more than may leave (contexts, prices, permission modes, providers).
+ *  Only the fields above are picked; everything else is dropped here. `thinking`
+ *  is typed loosely because the host's UI state does; `projectComposer` narrows
+ *  it to the two modes the remote side understands. */
+export interface RemoteComposerSource {
+  model?: string
+  effort?: string
+  thinking?: string
+  thinkingSupported?: boolean
+  /** The host's model list carries context and price per entry (the picker
+   *  needs them to be a CHOICE); `projectComposer` keeps only id + label, so
+   *  the source type admits the richer objects the host actually holds. */
+  models?: readonly { id: string; label: string; [k: string]: unknown }[]
+  efforts?: readonly { key: string; label: string }[]
+}
+
+/** Reduce the host's composer state to what the remote page may see, or
+ *  undefined when there is nothing to publish. The mapping IS the filter. */
+export function projectComposer(c: RemoteComposerSource | undefined): RemoteComposer | undefined {
+  if (!c) return undefined
+  const out: RemoteComposer = {}
+  if (c.model) out.model = c.model
+  if (c.effort) out.effort = c.effort
+  if (c.thinking === 'enabled' || c.thinking === 'disabled') out.thinking = c.thinking
+  if (c.thinkingSupported) out.thinkingSupported = c.thinkingSupported
+  if (c.models && c.models.length) out.models = c.models.map((m) => ({ id: m.id, label: m.label }))
+  if (c.efforts && c.efforts.length) out.efforts = c.efforts.map((e) => ({ key: e.key, label: e.label }))
+  return Object.keys(out).length ? out : undefined
+}
+
 /** How much of a transcript the relay keeps per session. A tail this long is a
  *  readable conversation; any longer and every push of a busy session carries
  *  the same 20k-token prefix over again. */
@@ -149,6 +209,7 @@ export function projectIndex(
   cards: readonly RemoteCardSource[],
   tvOf: (key: string) => number,
   writes: boolean,
+  composer?: RemoteComposer,
 ): RemoteIndex {
   const sessions: Record<string, RemoteCard> = {}
   for (const c of cards) {
@@ -160,6 +221,7 @@ export function projectIndex(
     writes,
     columns: columns.map((c) => ({ id: c.id, name: c.name })),
     sessions,
+    ...(composer ? { composer } : {}),
   }
 }
 

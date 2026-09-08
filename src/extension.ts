@@ -8,7 +8,7 @@
 import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
 import * as vscode from 'vscode'
-import { AgentManager, followKey, type RunningAgent } from './agent/manager.ts'
+import { AgentManager, followKey, type RunningAgent, type RunSettings } from './agent/manager.ts'
 import { loadSdk, type Options as AgentOptions } from './agent/sdk.ts'
 import {
   applyRestore, checkpointMapFor, claudeHome, historyDirFor, planRestore,
@@ -70,7 +70,7 @@ import {
 } from './agent/dictation.ts'
 import { RemoteFeed, type TailSource } from './remote/feed.ts'
 import { RemotePusher, type PushSnapshot } from './remote/pusher.ts'
-import { boardIdOf, projectTail, relayBase, type RemoteTail } from './remote/relay.ts'
+import { boardIdOf, projectComposer, projectTail, relayBase, type RemoteTail } from './remote/relay.ts'
 import { toRemoteCard } from './remote/cards.ts'
 import { acceptCommands, parseCommands, RemoteCommandClient } from './remote/commands.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
@@ -1477,6 +1477,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       history: a.history,
       live: a.live,
     }))
+    remoteFeed.setComposer(projectComposer(ui.composer))
     return remoteFeed.build(Date.now(), columns, cards, tails)
   }
 
@@ -1535,6 +1536,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const flush = async (): Promise<void> => {
       if (!chunk.length) return
       const ui = await host.getState()
+      remoteFeed.setComposer(projectComposer(ui.composer))
       const index = remoteFeed.build(
         Date.now(),
         ui.columns.map((c) => ({ id: c.id, name: c.name })),
@@ -1595,12 +1597,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return
     }
     for (const c of accepted) {
+      // The watcher's model / effort / thinking choice, if it made one. Ids
+      // only — a wrong model is dropped by the launch path, not pre-validated
+      // here, exactly as a wrong id typed in the local composer would be.
+      const chosen: RunSettings | undefined = (c.model || c.effort || c.thinking)
+        ? {
+            ...(c.model ? { model: c.model } : {}),
+            ...(c.effort ? { effort: c.effort as EffortLevel } : {}),
+            ...(c.thinking ? { thinking: c.thinking as ThinkingMode } : {}),
+          }
+        : undefined
       if (c.session !== undefined) {
         log.info(`Remote prompt → ${c.session}: ${c.text.slice(0, 80)}`)
-        await host.sendMessage(c.session, c.text)
+        await host.sendMessage(c.session, c.text, [], chosen)
       } else {
         log.info(`Remote prompt starts a new session: ${c.text.slice(0, 80)}`)
-        await host.newSession(c.text)
+        await host.newSession(c.text, [], chosen)
       }
     }
     await remoteClient.ack(ack).catch((e) => log.error(`Remote ack failed: ${String(e)}`))
@@ -3697,7 +3709,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode, runtime })
     },
 
-    async newSession(prompt, images) {
+    async newSession(prompt, images, chosen) {
       const { images: ok, dropped } = sanitiseImages(images ?? [])
       if (!prompt.trim() && !ok.length) return
       if (dropped.length) reportDroppedImages(dropped)
@@ -3726,12 +3738,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         `Starting session: ${prompt.slice(0, 80)}` +
         (ok.length ? ` (+${describeImages(ok.length)})` : ''),
       )
-      selectedKey = await mgr.start(prompt, ok.length ? { images: ok } : {})
+      selectedKey = await mgr.start(prompt, {
+        ...(ok.length ? { images: ok } : {}),
+        ...(chosen ? { chosen } : {}),
+      })
       mode = 'chat'
       refreshAll()
     },
 
-    async sendMessage(key, text, images) {
+    async sendMessage(key, text, images, chosen) {
       const { images: ok, dropped } = sanitiseImages(images ?? [])
       // An images-only message is a real message: "look at this" with a
       // screenshot says everything it needs to. Only a message with neither
@@ -3742,7 +3757,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // is rather than on whichever profile is active today. `undefined` means
       // "the active one", which the manager already holds.
       const providerFor = await sessionProviderFor(key)
-      await ensureManager().send(key, text, ok, providerFor)
+      await ensureManager().send(key, text, ok, providerFor, chosen)
       selectedKey = key
       refreshAll()
     },
