@@ -38,9 +38,14 @@ with `composer.models` split OUT of the state into a `models` field keyed by
 `mv` (the catalogue changes rarely, the state per token). Two things still never
 leave, and both are asserted in tests rather than trusted to prose: the pairing
 code (only its hash addresses the board) and provider credentials (`UiState`
-carries only `hasCredential` flags, never a credential). Test: `relay.test.ts` —
-the split, the mic, and a serialised frame with no `credential`, `apiKey`,
-`ANTHROPIC_API_KEY`, `AUTH_TOKEN` nor the pairing code.
+carries only `hasCredential` flags, never a credential). The credential half is
+a guarantee about the state's SHAPE and is asserted that way — a provider choice
+carries `id`/`label`/`detail`/`support` and nothing else, and anything
+credential-shaped on one must be a boolean flag, never a string. Scanning the
+payload for token-shaped words cannot work under v2: the frame is the full
+board, so a card titled "Rotate the AUTH_TOKEN" is USER CONTENT and must travel
+verbatim. Test: `relay.test.ts` — the split, the mic, the provider key-set, and
+a serialised frame with no pairing code.
 
 **`src/remote/pusher.ts`**. `RemotePusher` — WHEN a frame leaves: `nudge()` from
 every repaint; at most one attempt per `MIN_INTERVAL` (2 s — the push rides the
@@ -206,6 +211,13 @@ browser because the host half IS the extension.
 
 ## Recent changes
 
+- 2026-09-08 · claude/pr-review-test-fixes · the v1 secret scan in
+  `relay.test.ts` was self-contradictory under v2 and was the one red suite: it
+  put `AUTH_TOKEN` in a CARD TITLE and then asserted both that the card text
+  travels and that the word is absent. One of the two had to be false, and
+  redacting user text to satisfy it would mangle the board to hide a word that
+  is not a secret. Replaced with the structural assertion (the provider
+  key-set), which was shown to go red on a planted `sk-ant-…` value.
 - 2026-09-08 · task/relay-v2-extension · relay v2: the push became the FULL
   webview frame (`remoteFrame`/`forRemote`, `composer.models` split out), the
   command vocabulary became the webview's own messages (`messages.ts` →

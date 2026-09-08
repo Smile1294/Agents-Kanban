@@ -58,7 +58,7 @@ with every other agent).
 |---|---|
 | `node_modules` is **absent** in a fresh worktree | The first `npm run …` runs `scripts/preflight.mjs`, which installs. Needs Node 22.6+. |
 | `npm run verify` = preflight → typecheck → build → tests → `smoke.mjs` | ~13 s once installed. Run it before you move your card to review. |
-| One test: `node --experimental-strip-types --no-warnings src/<dir>/__tests__/<x>.test.ts` | `.mjs` tests run with plain `node`. No framework: `ok:` / `FAIL:` lines, non-zero exit. `scripts/test.mjs` stops at the first failing file. |
+| One test: `node --experimental-strip-types --no-warnings src/<dir>/__tests__/<x>.test.ts` | `.mjs` tests run with plain `node`. No framework: `ok:` / `FAIL:` lines, non-zero exit. `scripts/test.mjs` runs every file and names all the failures. |
 | Some tests read `dist/` | `executable.test.ts`, `board-bridge.test.ts`, `smoke.mjs`, `test/harness.mjs` load the **built bundle**. `verify` builds first; running tests alone, `npm run build` first. |
 | Some tests need **Chromium** | `src/board/__tests__/layout.test.mjs`, `src/remote/__tests__/headless.test.mjs` (and `test/screenshots.mjs`). They FAIL without one, never skip. Install once: `node scripts/run-bin.mjs playwright playwright install chromium`. |
 | `smoke.mjs` is hermetic | It seeds a throwaway `CLAUDE_CONFIG_DIR` and spawns no CLI (`discoverModels: false`). Keep it that way. |

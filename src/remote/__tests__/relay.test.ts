@@ -9,7 +9,9 @@
  * paints, so there is no redaction to enumerate field-by-field the way v1's
  * index was. The assertions that remain are the two boundaries that still
  * matter — `composer.models` is split out (not duplicated inside the state),
- * and no secret is anywhere in the serialised frame.
+ * and the state carries no field a secret could ride in. The second is checked
+ * on the SHAPE of the composer, not by scanning the payload for token-shaped
+ * words: the board's own text is the user's and travels verbatim.
  */
 import {
   boardIdOf,
@@ -117,6 +119,23 @@ const state = (over: Partial<UiState> = {}): UiState => ({
 
 // --- the two things that must never leave -----------------------------------
 
+/**
+ * v1 scanned the whole serialised frame for token-shaped WORDS. That check
+ * cannot survive v2 and was self-contradictory the moment it landed: the frame
+ * is the FULL board, so a card the user titled `Rotate the AUTH_TOKEN` puts
+ * `AUTH_TOKEN` in the payload as USER CONTENT — and the block asserted both
+ * that the text travels and that the word is absent. One of the two had to be
+ * false. Redacting it was never the answer either: a filter that rewrites card
+ * titles mangles the board to hide a word that is not a secret.
+ *
+ * The real guarantee is STRUCTURAL, so that is what is asserted. A credential
+ * lives in `SecretStorage` and reaches only the CLI's environment; `UiState`
+ * carries provider CHOICES (`id`/`label`/`detail`/`support`) and boolean flags,
+ * never a secret value — so a frame built from it cannot carry one. The
+ * key-set check is deliberately strict: any NEW field on a provider choice
+ * fails it, because a field that travels to a phone is worth one deliberate
+ * look before it is allowed through.
+ */
 {
   const pairCode = 'S9f3-qWx7.pairingCode!'
   const withSecretShape = state({
@@ -128,12 +147,19 @@ const state = (over: Partial<UiState> = {}): UiState => ({
   })
   const frame: RemoteFrame = remoteFrame(withSecretShape, MODELS, '7', VOICE_OK)
   const serial = JSON.stringify(frame)
-  ok(!serial.includes('credential') && !serial.includes('apiKey')
-    && !serial.includes('ANTHROPIC_API_KEY') && !serial.includes('AUTH_TOKEN'),
-    'no credential or key token is anywhere in the serialised frame')
+
+  const ALLOWED = ['id', 'label', 'detail', 'support']
+  const providers = frame.state.composer.providers
+  ok(providers.length > 0 && providers.every(p => Object.keys(p).every(k => ALLOWED.includes(k))),
+    `a provider choice carries only ${ALLOWED.join('/')} — no field a secret could ride in`)
+  ok(providers.every(p => Object.entries(p).every(
+    ([k, v]) => !/credential|key|token|secret|password/i.test(k) || typeof v === 'boolean')),
+    'anything credential-shaped on a provider is a FLAG, never a string — a value never leaves')
+
   ok(!serial.includes(pairCode) && !serial.includes('S9f3-qWx7'),
     'the pairing code never appears in the frame — only its hash addresses the board')
-  ok(serial.includes('Rotate the'), 'tool-adjacent card text still travels — the frame is the FULL board')
+  ok(serial.includes('Rotate the AUTH_TOKEN'),
+    'user card text travels VERBATIM, token-shaped words and all — the frame is the FULL board')
   const round: RemoteFrame = JSON.parse(serial)
   ok(round.mv === '7' && round.state.cards[0]!.key === 'abc', 'the frame round-trips through JSON, as over the wire')
 }

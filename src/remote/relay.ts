@@ -13,9 +13,12 @@
  *  - The pairing code. `boardIdOf` hashes it, and the hash is the only address
  *    either end ever holds. The code itself is never in a frame.
  *  - Provider credentials. `UiState` never carries one (only `hasCredential`
- *    flags), so a frame built from it cannot either — a test serialises a
- *    frame and asserts no `credential`, `apiKey`, `ANTHROPIC_API_KEY` or
- *    `AUTH_TOKEN` is in it.
+ *    flags), so a frame built from it cannot either. That is a guarantee about
+ *    the state's SHAPE, and the test asserts it that way — a provider choice
+ *    carries `id`/`label`/`detail`/`support` and nothing else. Scanning the
+ *    payload for token-shaped words cannot work here: the frame is the full
+ *    board, so a card titled "Rotate the AUTH_TOKEN" is user content and must
+ *    travel verbatim.
  *
  * The two transforms here are therefore not filters but SPLITS:
  *
