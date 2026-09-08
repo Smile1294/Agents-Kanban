@@ -10,7 +10,9 @@
  *
  * Relay v2 replaced the redacted index with the FULL webview frame, and the
  * commands vocabulary with the webview's own messages — so the duplicated
- * constants moved from relay.ts/commands.ts to messages.ts/pusher.ts.
+ * constants moved from relay.ts/commands.ts to messages.ts/pusher.ts. v3 added
+ * frame PATCHES (delta.ts here, composePatch there) and `deltasMax`, which the
+ * extension does not duplicate — the ring is the relay's.
  *
  * Three checks, in order:
  *
@@ -26,10 +28,13 @@
  *      never holds them — so they are pinned only by the relay repo's own
  *      tests/contract.test.mjs and by check (b) below.
  *
- *  (b) REMOTE — this copy against the relay repo's copy. The sibling
- *      directory (../agents-kanban-relay) is the answer on a dev machine;
- *      elsewhere AGENTS_KANBAN_RELAY_URL or the package.json `relayRepo`
- *      field is fetched. Drift exits 1 naming the field.
+ *  (b) REMOTE — this copy against the relay repo's copy. A sibling checkout
+ *      is the answer on a dev machine — tried under both spellings, because
+ *      `git clone` produces ../Agents-Kanban-Relay and only the lower-case
+ *      name used to be looked for, which silently sent the gate to GitHub to
+ *      compare a local edit against the default branch. Otherwise
+ *      AGENTS_KANBAN_RELAY_URL or the package.json `relayRepo` field is
+ *      fetched. Drift exits 1 naming the field.
  *
  *  (c) NEITHER reachable — the gate prints
  *      'contract UNCHECKED — could not reach the relay repo' and exits 0.
@@ -62,6 +67,14 @@ const MAIN = gitCommon.status === 0
 
 const sourceOf = async (rel) => readFile(path.join(ROOT, rel), 'utf8')
 
+/** What the relay checkout may be called next to this one. `git clone` names a
+ *  directory after the repository, and that repository is `Agents-Kanban-Relay`;
+ *  the lower-case spelling is what this script has always looked for and is the
+ *  right answer on a case-insensitive filesystem. Both are tried, plus whatever
+ *  is actually there — a fixed list would miss `relay/`, and reading the
+ *  directory is cheap and says what it found. */
+const relayDirNames = () => ['agents-kanban-relay', 'Agents-Kanban-Relay']
+
 // The four duplicated literals are declared on a single line each. Read them
 // by regex rather than importing the TypeScript: this is a plain-node script
 // and the values it guards are exactly the ones a stray import might mask.
@@ -82,7 +95,7 @@ const grabString = (src, name) => {
 console.log('— relay contract')
 const contract = JSON.parse(await readFile(path.join(ROOT, 'remote-contract.json'), 'utf8'))
 
-if (contract.version !== 2) fail(`remote-contract.json version is ${contract.version}, expected 2`)
+if (contract.version !== 3) fail(`remote-contract.json version is ${contract.version}, expected 3`)
 
 // (a) the local duplicates
 const messagesSrc = await sourceOf('src/remote/messages.ts')
@@ -104,11 +117,22 @@ for (const [field, want, got, where] of local) {
 // (b) the relay repo's copy. Sibling directory first; a URL (env var, or the
 // package.json `relayRepo` field) otherwise.
 async function relayCopy() {
-  const sibling = path.join(path.dirname(MAIN), 'agents-kanban-relay', 'remote-contract.json')
-  try {
-    await access(sibling)
-    return { where: '../agents-kanban-relay (sibling)', json: JSON.parse(await readFile(sibling, 'utf8')) }
-  } catch { /* fall through to the URL */ }
+  // The sibling checkout is the answer on a dev machine, and it must be found
+  // whatever the directory is CALLED. Only the lower-case spelling was tried,
+  // so a checkout at ../Agents-Kanban-Relay — what `git clone` of that repo
+  // actually produces — fell through to fetching the file from the default
+  // branch on GitHub. That is not the same question: it compares your local
+  // edit against what is already merged, so a change being made across both
+  // repos at once reads as drift, and a change made only remotely reads as
+  // agreement. Both copies of the pair being edited together is the case this
+  // gate exists for.
+  for (const name of relayDirNames()) {
+    const sibling = path.join(path.dirname(MAIN), name, 'remote-contract.json')
+    try {
+      await access(sibling)
+      return { where: `../${name} (sibling)`, json: JSON.parse(await readFile(sibling, 'utf8')) }
+    } catch { /* try the next spelling, then the URL */ }
+  }
 
   const pkg = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'))
   const url = process.env.AGENTS_KANBAN_RELAY_URL || pkg.relayRepo

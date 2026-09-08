@@ -8,6 +8,7 @@ paths:
 tests:
   - src/remote/__tests__/relay.test.ts
   - src/remote/__tests__/pusher.test.ts
+  - src/remote/__tests__/delta.test.ts
   - src/remote/__tests__/messages.test.ts
   - src/remote/__tests__/headless.test.mjs
   - src/remote/__tests__/headless-auth.test.mjs
@@ -54,8 +55,15 @@ event loop the CLI's stdout is drained on); idle = no push; a heartbeat after
 depend on a process being alive; `BACKOFF_MS`, `FETCH_TIMEOUT_MS`; a frame over
 `FRAME_MAX_BYTES` is cut to its last 100 transcript rows and marked
 `transcriptMore`, never dropped. The body is `{ kind:'frame', at, writes, mv,
-state?, models? }` — `state` absent means heartbeat, `models` present clears the
-models-due flag on success. A blocked tick — inside `MIN_INTERVAL`, mid-flight,
+state?, patch?, models? }` — neither `state` nor `patch` means heartbeat,
+`models` present clears the models-due flag on success. WHICH of state or patch
+is delta.ts's decision, gated on two things the relay SAID and neither assumed:
+`patches: true` (this relay understands them — a v2 relay handed one stores
+nothing and the board silently stops) and `frameSeq` (which frame it is
+holding, the base a patch splices into). `held` is that frame and is dropped on
+`needFrame`, on any failed push (it may have arrived and died on the way back)
+and on `reset()`; `needFrame` also clears `lastStateJson`, because the change
+was NOT delivered and the next tick must not read the board as quiet. A blocked tick — inside `MIN_INTERVAL`, mid-flight,
 or inside the backoff — ARMS a trailing tick rather than returning: the cadence
 decides what leaves, never whether it leaves at all, and a nudge that lands
 100ms after a push (which is exactly when a remote message is delivered, since
@@ -64,6 +72,26 @@ tick at a time, so a streaming firehose still costs one push; `dispose()`
 cancels it, because `syncRemoteEngine` replaces the engine and an old one closes
 over the old relay URL. `fetch`, `now` and the timers injected. Test:
 `pusher.test.ts`.
+
+**`src/remote/delta.ts`**. What a push carries INSTEAD of the whole board.
+`framePatch(prev, next, base)` → `{ base, state, rows?: { from, rows } }`, and
+`applyPatch` for the round trip. Measured on a realistic board (14 cards, a
+review panel, a full composer): a 400-row session is 282 KB a frame and 97.3%
+of that is the transcript; everything else is 7.6 KB at any length. At one push
+per `MIN_INTERVAL` that was 8.7 MB a minute out of the machine and the same into
+every phone, re-sending a conversation that is almost entirely immutable —
+Claude Code fixes history when a run starts and appends after it, the same
+property `board.js`'s own fast path relies on. So `state` is the board minus its
+transcript (sent whole every time — diffing 7.6 KB generically buys 3% and costs
+a merge algorithm that can be wrong invisibly) and `rows` is the transcript from
+the first row whose SERIALISATION differs, which is the streaming row or the end.
+Measured: 812 bytes against 146,304 for one row arriving on a 400-row board.
+A patch is REFUSED — `undefined`, so a whole state goes — where it cannot be
+exact: the transcript appearing or disappearing, a session switch, upward
+pagination (a prepend changes row 0). Three copies of the apply exist and cannot
+import each other; the relay repo's `tests/bridge.test.mjs` drives its two over
+the same inputs and fails if they disagree. Test: `delta.test.ts` round-trips
+every shape and asserts the refusals.
 
 **`src/remote/messages.ts`**. The write half: `parseMessages` (an outsider's
 JSON, parsed defensively — `NONCE_OK`, `TYPE_OK`, `MSG_MAX_BYTES`),
@@ -219,6 +247,19 @@ browser because the host half IS the extension.
 
 ## Recent changes
 
+- 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · contract v3: the
+  transcript travels ONCE. 97% of a frame was a conversation that barely
+  changes, re-sent every 2 s — 8.7 MB a minute each way on a 400-row session.
+  `delta.ts` builds a patch (the board minus its transcript, plus the rows that
+  moved), the pusher sends one only once the relay has said `patches` and named
+  the `frameSeq` it holds, and the relay composes it onto the frame it stores so
+  a page joining mid-stream still gets a whole board. A/B in a browser against
+  the real relay, six seconds of a streaming agent on a 200-row board: the
+  updates cost 16.6 KB instead of 526 KB, and the machine posted 145 KB instead
+  of 655 KB. `remote-contract.json` gained `deltasMax` and `check-contract.mjs`
+  now finds the sibling relay checkout under BOTH spellings — only the
+  lower-case name was tried, so it had been quietly comparing local edits
+  against the default branch on GitHub.
 - 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · the mirror was up to
   45 s behind, and the cause was the cadence gate DROPPING work rather than
   deferring it. Measured on the real engine: a remote click ran on this machine

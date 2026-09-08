@@ -43,11 +43,21 @@
  * is cut to its last 100 transcript rows and marked `transcriptMore` — the page
  * keeps its "load older" pill rather than dropping the frame.
  *
+ * WHAT a changed push carries is delta.ts's decision: a PATCH (the board minus
+ * its transcript, plus the transcript rows that actually changed — 7.6 KB
+ * against 282 KB on a 400-row session) when the relay has said it speaks them
+ * and this end knows which frame it holds, and a whole state otherwise. Both
+ * halves of that condition are things the relay SAID, never things assumed: a
+ * v2 relay handed a patch stores nothing and the board silently stops.
+ *
  * `fetch` and `now` are injected so the cadence rules are testable without a
  * network or a clock.
  */
+import { framePatch } from './delta.ts'
+import type { FramePatch } from './delta.ts'
 import { relayBase } from './relay.ts'
 import type { RemoteFrame } from './relay.ts'
+import type { UiState } from '../board/panel.ts'
 
 /** The relay path under the site root. Every host target serves the relay
  *  here — Netlify rewrites it to its function, the Cloudflare worker and the
@@ -108,6 +118,17 @@ export interface RelayAnswer {
   viewerAt?: number
   /** Queued page→host messages the relay is holding for a busy board. */
   msgs?: unknown
+  /** The seq the stored frame now carries — the base the NEXT patch applies
+   *  to. Absent from a v2 relay, which is one of the two ways this end learns
+   *  it must keep sending whole states. */
+  frameSeq?: number
+  /** This relay understands patch frames. Absent or false means it does not,
+   *  and it is never inferred: a v2 relay handed a patch would store nothing
+   *  and the board would simply stop moving. */
+  patches?: boolean
+  /** The relay could not place the patch — it holds no frame, or a different
+   *  one. Not an error: the next push carries a full state. */
+  needFrame?: boolean
 }
 
 export interface PusherDeps {
@@ -135,6 +156,7 @@ interface PostBody {
   writes: boolean
   mv: string
   state?: unknown
+  patch?: FramePatch
   models?: unknown
 }
 
@@ -146,6 +168,20 @@ export class RemotePusher {
   /** JSON of the STATE as last successfully sent, so a tick can tell a changed
    *  board from a quiet one without the host keeping a copy. */
   private lastStateJson = ''
+  /**
+   * The frame the relay is holding, as far as this end knows: the seq it was
+   * stored under and the state it composed to. A patch is built against THIS,
+   * never against the last state we happened to build — the two differ the
+   * moment a push fails or the relay refuses a patch, and splicing into the
+   * wrong conversation is the one failure worth 282 KB to avoid.
+   *
+   * Cleared whenever the relay says it could not place a patch, whenever a
+   * push fails, and whenever the config changes.
+   */
+  private held: { seq: number; state: UiState } | undefined
+  /** The relay answered a frame POST saying it understands patches. Never
+   *  assumed: a v2 relay handed one stores nothing and the board stops. */
+  private patchesOk = false
   /** The armed trailing tick, when a nudge was blocked by the cadence gate or
    *  by a push in flight. One at a time: a streaming agent nudges ten times a
    *  second and every one of those must collapse into the same trailing run. */
@@ -202,6 +238,10 @@ export class RemotePusher {
   reset(): void {
     this.lastAttempt = 0
     this.lastErrorAt = 0
+    // A repointed relay holds nothing of ours, and a re-enabled one may have
+    // been restarted since. Either way the next push is a full state.
+    this.held = undefined
+    this.lastStateJson = ''
   }
 
   /** One tick. Cheap when there is nothing to do; the host calls it from its
@@ -266,9 +306,20 @@ export class RemotePusher {
       writes: snapshot.writes,
       mv: snapshot.frame.mv,
     }
-    if (stateChanged) body.state = state
+    if (stateChanged) {
+      // A PATCH when the relay has said it speaks them AND we know what it is
+      // holding AND the change is expressible as one. Any of those missing and
+      // a full state goes: this is the field where 97% of the bytes are, and
+      // the wrong 97% is worse than all of it. See delta.ts.
+      const patch = this.patchesOk && this.held
+        ? framePatch(this.held.state, state, this.held.seq)
+        : undefined
+      if (patch) body.patch = patch
+      else body.state = state
+    }
     if (modelsDue) body.models = snapshot.frame.models
-    await this.post(body, stateChanged ? stateJson : this.lastStateJson, !changed)
+    await this.post(body, stateChanged ? stateJson : this.lastStateJson, !changed,
+      stateChanged ? state : undefined)
   }
 
   /** The host calls this when it knows something changed, so a live board does
@@ -277,7 +328,9 @@ export class RemotePusher {
     return this.tick()
   }
 
-  private async post(body: PostBody, stateJson: string, heartbeat: boolean): Promise<boolean> {
+  private async post(
+    body: PostBody, stateJson: string, heartbeat: boolean, sent?: UiState,
+  ): Promise<boolean> {
     this.inFlight = true
     const now = this.deps.now()
     try {
@@ -298,7 +351,27 @@ export class RemotePusher {
       this.lastErrorAt = 0
       // Only a WRITE may update what the relay is recorded to hold: a heartbeat
       // sent no state, so the relay's frame is still the last full push's.
-      if ('state' in body) this.lastStateJson = stateJson
+      if ('state' in body || 'patch' in body) this.lastStateJson = stateJson
+
+      // What the relay is now holding. `patches` and `frameSeq` are the relay
+      // SAYING so — a v2 relay sends neither, and this end then never builds a
+      // patch at all. `needFrame` is the relay saying it could not place the
+      // one it just got, so what it holds is unknown and the next push is
+      // whole.
+      if (answer.patches === true) this.patchesOk = true
+      if (answer.needFrame === true) {
+        this.held = undefined
+        // The relay did not store what we just sent, so our record of what it
+        // holds is stale AND the change is unsent: force the next tick to
+        // treat the board as changed rather than as quiet.
+        this.lastStateJson = ''
+      } else if (sent !== undefined && typeof answer.frameSeq === 'number') {
+        this.held = { seq: answer.frameSeq, state: sent }
+      } else if (sent !== undefined) {
+        // A relay that stored the frame but will not say under which seq
+        // cannot be patched against. Whole states from here.
+        this.held = undefined
+      }
       // The answer drives the host's next move (models-due, poll cadence,
       // queued messages) — the pusher itself does not look at it.
       this.deps.onAnswer?.(answer)
@@ -310,6 +383,10 @@ export class RemotePusher {
       return true
     } catch (err) {
       this.lastErrorAt = now
+      // The push may have reached the relay and failed on the way back, so
+      // what it holds is no longer known. Guessing here is how a patch gets
+      // spliced into a frame that was never stored.
+      this.held = undefined
       this.deps.onStatus({
         at: now, ok: false,
         error: err instanceof Error ? err.message : String(err),

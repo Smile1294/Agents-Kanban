@@ -37,6 +37,15 @@ const frame = (mv: string, title = 'same', models?: RemoteModel[]): RemoteFrame 
   ...(models ? { models } : {}),
 })
 
+/** A state with a transcript, so the patch path has something to leave behind. */
+const chat = (mv: string, rows: string[]): RemoteFrame => ({
+  state: {
+    ready: true, mode: 'chat', selectedKey: 'a', cards: [],
+    transcript: rows.map((t) => ({ kind: 'text', text: t })),
+  } as unknown as UiState,
+  mv,
+})
+
 interface Posted {
   at: number
   url: string
@@ -415,6 +424,111 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
   await r.runTimersTo(1_000_000 + MIN_INTERVAL)
   ok(r.posts.length === 1,
     'dispose() cancels the trailing tick — a replaced engine must not push to the old relay')
+}
+
+// --- patches: the transcript travels once, and only when the relay says so ----
+//
+// 97% of a frame is the transcript, and it is almost entirely immutable — so a
+// push carries the board minus its transcript plus the rows that changed. The
+// whole risk is in the negotiation: a v2 relay handed a patch stores nothing
+// and the board silently stops moving, so BOTH halves — "this relay speaks
+// patches" and "this is the frame it holds" — must be things the relay SAID.
+
+{
+  const r = rig()
+  r.next = { frame: chat('1', ['a', 'b']), writes: true }
+  await r.pusher.tick()
+  ok('state' in r.posts[0]!.body, 'the first push is always a whole state — nothing is held yet')
+
+  // A v2 relay: no `patches`, no `frameSeq`.
+  r.now += MIN_INTERVAL + 1
+  r.next = { frame: chat('1', ['a', 'b', 'c']), writes: true }
+  await r.pusher.tick()
+  ok('state' in r.posts[1]!.body && !('patch' in r.posts[1]!.body),
+    'a relay that never claimed to speak patches keeps getting whole states')
+}
+
+{
+  const r = rig()
+  r.answer = { ok: true, patches: true, frameSeq: 5 }
+  r.next = { frame: chat('1', ['a', 'b']), writes: true }
+  await r.pusher.tick()
+  ok('state' in r.posts[0]!.body, 'even a v3 relay gets a whole state first — it holds nothing yet')
+
+  r.now += MIN_INTERVAL + 1
+  r.answer = { ok: true, patches: true, frameSeq: 6 }
+  r.next = { frame: chat('1', ['a', 'b', 'c']), writes: true }
+  await r.pusher.tick()
+  const body = r.posts[1]!.body as { patch?: { base: number; rows?: { from: number; rows: unknown[] } }; state?: unknown }
+  ok(body.patch !== undefined && body.state === undefined,
+    'once the relay has said `patches` and named a `frameSeq`, the push is a patch')
+  ok(body.patch!.base === 5, 'the patch names the seq the relay reported holding, not our own count')
+  ok(body.patch!.rows!.from === 2 && body.patch!.rows!.rows.length === 1,
+    'and it carries only the row that arrived')
+}
+
+{
+  // The relay could not place it. Not an error — but the change is UNSENT, so
+  // the next push must be a whole state and must not be skipped as "quiet".
+  const r = rig()
+  r.answer = { ok: true, patches: true, frameSeq: 5 }
+  r.next = { frame: chat('1', ['a']), writes: true }
+  await r.pusher.tick()
+
+  r.now += MIN_INTERVAL + 1
+  r.answer = { ok: true, patches: true, needFrame: true }
+  r.next = { frame: chat('1', ['a', 'b']), writes: true }
+  await r.pusher.tick()
+  ok('patch' in r.posts[1]!.body, 'the patch was sent…')
+
+  r.now += MIN_INTERVAL + 1
+  r.answer = { ok: true, patches: true, frameSeq: 9 }
+  await r.pusher.tick()
+  ok(r.posts.length === 3, '…a refused patch is re-sent, not counted as delivered')
+  ok('state' in r.posts[2]!.body && !('patch' in r.posts[2]!.body),
+    '…and it is re-sent as a WHOLE state, because what the relay holds is now unknown')
+}
+
+{
+  // A failed push may have reached the relay and died on the way back, so what
+  // it holds is unknown. A patch built against a guess splices into the wrong
+  // conversation.
+  const r = rig()
+  r.answer = { ok: true, patches: true, frameSeq: 5 }
+  r.next = { frame: chat('1', ['a']), writes: true }
+  await r.pusher.tick()
+
+  r.now += MIN_INTERVAL + 1
+  r.failFetchWith = new Error('connection reset')
+  r.next = { frame: chat('1', ['a', 'b']), writes: true }
+  await r.pusher.tick()
+
+  r.failFetchWith = null
+  r.now += BACKOFF_MS + 1
+  r.next = { frame: chat('1', ['a', 'b', 'c']), writes: true }
+  await r.pusher.tick()
+  ok('state' in r.posts[1]!.body && !('patch' in r.posts[1]!.body),
+    'after a failed push the next one is whole — a half-delivered frame is not a base')
+}
+
+{
+  const r = rig()
+  r.answer = { ok: true, patches: true, frameSeq: 5 }
+  r.next = { frame: chat('1', ['a']), writes: true }
+  await r.pusher.tick()
+  r.now += MIN_INTERVAL + 1
+  // A session switch: delta.ts refuses, so the whole board rides.
+  r.next = {
+    frame: {
+      state: { ready: true, mode: 'chat', selectedKey: 'b', cards: [],
+        transcript: [{ kind: 'text', text: 'z' }] } as unknown as UiState,
+      mv: '1',
+    },
+    writes: true,
+  }
+  await r.pusher.tick()
+  ok('state' in r.posts[1]!.body,
+    'a change a patch cannot express falls back to a whole state, never to an approximation')
 }
 
 // --- reset -------------------------------------------------------------------
