@@ -32,9 +32,12 @@ list of five packages exists; `ENTRIES` resolve through `createRequire`.
 
 **`scripts/test.mjs`** — walks `src/` (skipping `node_modules` and dot
 directories) for `*.test.ts` / `*.test.mjs`, runs each in its own process
-(`.ts` with `--experimental-strip-types --no-warnings`), stops at the first
-failing file, and treats ZERO files as a failure. Replaced a `for f in
-src/**/__tests__/*.test.ts` npm script that ran under `sh`, where `**` is `*`.
+(`.ts` with `--experimental-strip-types --no-warnings`), runs EVERY file even
+after one goes red, names all the failures in its summary, and treats ZERO
+files as a failure. Replaced a `for f in src/**/__tests__/*.test.ts` npm script
+that ran under `sh`, where `**` is `*`. It used to `break` at the first failure
+"as the shell loop did", which made one red file a silent hole — see Recent
+changes.
 
 **`scripts/run-bin.mjs`** — `node scripts/run-bin.mjs <package> <bin> …`
 resolves a dependency's declared `bin` through Node's resolver instead of
@@ -55,14 +58,14 @@ stays monochrome `currentColor`).
 relay lives in its own sibling repository; the shared rules between the two
 ends are pinned by `remote-contract.json` (at the repo ROOT, carried verbatim
 in both repos). The gate (a) reads the constants this repo duplicates from the
-file — KEY_OK in `src/remote/relay.ts`, NONCE_OK and CMD_TEXT_MAX in
-`src/remote/commands.ts`, FN_PATH in `src/remote/pusher.ts` — by regex over the
+file — NONCE_OK, TYPE_OK and MSG_MAX_BYTES in `src/remote/messages.ts`,
+FRAME_MAX_BYTES and FN_PATH in `src/remote/pusher.ts` — by regex over the
 single-line literals, naming the field on drift; (b) compares this copy of the
 JSON against the relay repo's — the sibling `../agents-kanban-relay` on a dev
 machine, else `AGENTS_KANBAN_RELAY_URL` or the package.json `relayRepo` field,
 fetched; (c) when the relay copy is unreachable prints
 `contract UNCHECKED — could not reach the relay repo` and exits 0 — a loud
-skip, never a silent pass. Shown red twice when new (a local `CMD_TEXT_MAX`
+skip, never a silent pass. Shown red twice when new (a local `MSG_MAX_BYTES`
 bump; an edit of the relay's copy) and restored.
 
 **`esbuild.mjs`** — two CJS bundles, node20, sourcemaps, minified unless
@@ -179,6 +182,13 @@ without one.
 
 ## Recent changes
 
+- 2026-09-08 · claude/pr-review-test-fixes · `scripts/test.mjs` no longer stops
+  at the first failing file. The `break` turned one red suite into a silent
+  hole: `relay.test.ts` sorts 42nd of 51, so a single failure there meant nine
+  suites never ran — and because `verify` chains with `&&`, the contract gate
+  and the smoke gate did not run either. "Not run" reads exactly like "passed"
+  in the scrollback above it. Every file now runs and the summary names each
+  failure (`N of 51 test file(s) failed`).
 - 2026-09-07 · task/S968q-split-the-relay-repo-out · `remote-contract.json` gate
   added: `scripts/check-contract.mjs` runs inside `verify`, comparing this
   repo's constants and JSON copy against the relay repo's sibling copy

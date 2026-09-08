@@ -12,7 +12,7 @@ hand when a flow changes shape.
 
 ## A run
 
-The webview posts `newSession` or `send` → `wire()` in `src/board/panel.ts` →
+The webview posts `newSession` or `send` → `dispatchBoardMessage()` in `src/board/panel.ts` →
 `host.newSession()` / `host.sendMessage()` in `src/extension.ts` →
 `AgentManager.start()` mints `run-<n>-<id>` and **freezes** what the run is on —
 `launchSettings()` (model, effort, thinking, ultracode, fast mode), runtime,
@@ -109,16 +109,17 @@ percentage, never dollars.
 ## Remote
 
 Mirror: every repaint nudges `RemotePusher`; at most one push per
-`MIN_INTERVAL`, nothing when idle, a heartbeat after `HEARTBEAT_MS`.
-`RemoteFeed.build()` decides what travels (a tail only when its transcript
-grew); `projectIndex`/`projectTail` in `relay.ts` decide what MAY travel —
-`RemoteCardSource` is the redaction boundary. The relay — its own sibling
+`MIN_INTERVAL`, nothing when idle, a heartbeat after `HEARTBEAT_MS`. The push is
+the FULL webview frame — `remoteFrame()` in `relay.ts` splits `composer.models`
+out of the state and swaps the mic for the whisper path (`forRemote`) — so the
+page IS the board, not a redacted summary. The relay — its own sibling
 repository, `agents-kanban-relay` — stores it under `boardIdOf(code)`; the
-viewer page fetches it. Prompts back:
-`RemoteCommandClient` polls, `acceptCommands()` gates on `remote.writes`
-(default off; enabling flushes the queue), nonces, and a live-session check,
-then routes through the same `host.sendMessage` / `host.newSession` as the local
-webview.
+viewer page fetches it. Actions back:
+`RemoteMessageClient` polls, `acceptMessages()` gates on `remote.writes`
+(default off; enabling flushes the queue), nonces, and dialog-answer routing,
+then runs each accepted message through the same `dispatchBoardMessage` the
+local webview uses — with the dialog sink swapped to the relay
+(`withRemoteDialogSink`), so dialogs and toasts answer on the phone.
 
 Headless: `server/server.mjs` activates the built extension against
 `server/stub.mjs`; the browser gets `server/page.mjs`'s document with

@@ -749,11 +749,12 @@ function dictationSection() {
  *
  * This machine PUSHES the board to a small site the user deploys — the
  * relay, which lives in its own sibling repository (agents-kanban-relay) and
- * runs on Netlify, Cloudflare or any Node server. The redaction happens ONCE,
- * here, in cards.ts: the page never sees more than the board shows. The page is
- * read-only until the user switches ON the write channel below — then
- * prompts typed on it run on THIS machine, so the toggle is an explicit,
- * separately-enabled, honestly described capability.
+ * runs on Netlify, Cloudflare or any Node server. Relay v2 pushes the FULL
+ * board — the very frames this extension posts to its own webview — so the
+ * remote page IS the board, not a redacted summary. The page is read-only
+ * until the user switches ON the write channel below — then every action the
+ * board can do, sent from the remote page, runs on THIS machine, so the
+ * toggle is an explicit, separately-enabled, honestly described capability.
  *
  * Two rules this section must keep:
  *
@@ -766,7 +767,7 @@ function dictationSection() {
  *    status row on this page. A tick that no attempt ever produced is the
  *    page's one forbidden signal.
  *  - The writes toggle is drawn ONLY when a relay URL and a pairing code are
- *    configured: with neither, no command could ever arrive, and a control
+ *    configured: with neither, no action could ever arrive, and a control
  *    that cannot take effect is not drawn (the settings page's own rule).
  */
 const remoteDraft = { url: '', code: '' }
@@ -788,11 +789,12 @@ function remoteSection() {
   head.appendChild(el('span', 'muted small', 'watch this board from any browser'))
   sec.appendChild(head)
   sec.appendChild(el('p', 'blurb',
-    'Streams the board — cards, phases and the chats — to a small page you deploy from ' +
-    'the remote/ folder (Netlify, Cloudflare or any Node server). Only what the board ' +
-    'itself shows ever leaves: no code, no file paths, no credentials. The page is ' +
-    'read-only unless you enable the write channel below; only changes travel, and a ' +
-    'quiet board pushes at most every 90 seconds, so the free tiers cover it.'))
+    'Streams the FULL board — cards, phases, chats, file paths, branch names and diffs — ' +
+    'to a small page you deploy from the agents-kanban-relay repository (Netlify, ' +
+    'Cloudflare or any Node server). What the board shows is what leaves; your pairing ' +
+    'code and provider credentials never do. The page is read-only unless you enable the ' +
+    'write channel below; only changes travel, and a quiet board pushes at most every ' +
+    '90 seconds, so the free tiers cover it.'))
 
   /* The status line. Four states, four texts: paused, connected-but-never-asked,
      last attempt went out, last attempt failed. */
@@ -836,11 +838,11 @@ function remoteSection() {
     wrow.appendChild(wtick)
     const wmain = el('div', 'model-main')
     wmain.appendChild(el('div', 'model-name',
-      r.writesEnabled ? 'Remote prompts are ON' : 'Allow prompts from the remote page'))
+      r.writesEnabled ? 'Remote actions are ON' : 'Allow actions from the remote page'))
     wmain.appendChild(el('div', 'muted small',
-      'A prompt typed on the remote page runs HERE — it can start sessions, create ' +
-      'worktrees and spend tokens. Anyone with the pairing code and the site address ' +
-      'can send one. Off by default; switch it off and the channel closes.'))
+      'An action taken on the remote page runs HERE — it can start sessions, create ' +
+      'worktrees, open diffs and spend tokens. Anyone with the pairing code and the ' +
+      'site address can send one. Off by default; switch it off and the channel closes.'))
     wrow.appendChild(wmain)
     sec.appendChild(wrow)
   }

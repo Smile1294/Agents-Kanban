@@ -7,7 +7,10 @@
  * Windows at all.
  *
  * Walking the tree in Node is shorter, works everywhere, and can say what it
- * found — a suite that runs zero files should never look like a pass.
+ * found — a suite that runs zero files should never look like a pass. For the
+ * same reason it runs EVERY file and reports all of them, rather than stopping
+ * at the first red one: a suite that stops early cannot say how much of it is
+ * green.
  */
 import { readdirSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
@@ -35,7 +38,7 @@ if (!files.length) {
   process.exit(1)
 }
 
-let failed = 0
+const failures = []
 for (const file of files) {
   const rel = path.relative(root, file)
   console.log(`— ${rel}`)
@@ -45,15 +48,21 @@ for (const file of files) {
     : [file]
   const r = spawnSync(process.execPath, args, { cwd: root, stdio: 'inherit' })
   if (r.status !== 0) {
-    failed++
+    failures.push(rel)
     console.error(`  ✗ ${rel} exited ${r.status ?? `on ${r.signal}`}`)
-    break   // stop at the first failure, as the shell loop did
   }
 }
 
+// Every file runs, even after one fails. This used to `break` at the first
+// failure "as the shell loop did", and that turned one red file into a silent
+// hole: relay.test.ts sorts 42nd of 51, so a single failure there meant nine
+// suites never ran at all — and `verify` chains with `&&`, so the contract gate
+// and the smoke gate did not run either. Reported as "some of the tests were
+// not running". A suite that stops early cannot say how much of it is green,
+// and "not run" reads exactly like "passed" in the output above it.
 console.log(
-  failed
-    ? `\n${failed} test file(s) failed`
+  failures.length
+    ? `\n${failures.length} of ${files.length} test file(s) failed:\n${failures.map(f => `  ✗ ${f}`).join('\n')}`
     : `\n${files.length} test files passed`,
 )
-process.exit(failed ? 1 : 0)
+process.exit(failures.length ? 1 : 0)

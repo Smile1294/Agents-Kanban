@@ -137,8 +137,9 @@ src/
     worktree.ts         Worktree lifecycle, review, commit and merge back
   run/
     recipe.ts           What starts the app in a worktree, and on which port
-  remote/               The relay's extension side: what leaves (redacted),
-                        when, and prompts coming back
+  remote/               The relay's extension side: the full board frame
+                        (relay.ts/messages.ts), when it leaves (pusher.ts),
+                        and the queued webview messages that run back
 media/                  Board UI (vanilla JS, native HTML5 drag and drop), the
                         settings page, theme.css for outside the editor
 server/                 The headless board: the built extension on a box
@@ -439,7 +440,7 @@ Working:
   the server against a throwaway repo and drives the whole flow through a real
   Chromium: 401s without the code, state over the stream, the gate, the
   composer, the settings tab, the first-death recovery and the second-death
-  dead end, zero console errors. The relay remains as the smaller mirror
+  dead end, zero console errors. The relay remains as the full-board mirror
   mode — in its own sibling repository, agents-kanban-relay, with
   remote-contract.json pinning the shared rules. See
   [server/README.md](server/README.md)

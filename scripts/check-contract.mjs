@@ -1,26 +1,29 @@
 /* The relay contract gate. The shared rules between this extension and the
  * relay it pushes to are pinned by remote-contract.json, carried VERBATIM in
  * both repository roots. A rule that drifts apart silently — one end accepting
- * ids or prompts the other end will not — breaks pairing in the field and
+ * ids or messages the other end will not — breaks pairing in the field and
  * reads as a dead feature, so `verify` runs this script.
  *
- * Shown red twice when it was new: bumping CMD_TEXT_MAX in commands.ts, and
- * editing the relay repo's copy of remote-contract.json, each exited 1 naming
- * the drift; both were restored before the gate went into `verify`.
+ * Shown red twice when it was new: bumping CMD_TEXT_MAX in commands.ts (v1),
+ * and editing the relay repo's copy of remote-contract.json, each exited 1
+ * naming the drift; both were restored before the gate went into `verify`.
+ *
+ * Relay v2 replaced the redacted index with the FULL webview frame, and the
+ * commands vocabulary with the webview's own messages — so the duplicated
+ * constants moved from relay.ts/commands.ts to messages.ts/pusher.ts.
  *
  * Three checks, in order:
  *
  *  (a) LOCAL — the constants this repo duplicates from the contract file,
  *      against the JSON (single-line literals, read by regex because the
  *      sources are TypeScript):
- *        KEY_OK        src/remote/relay.ts
- *        NONCE_OK      src/remote/commands.ts
- *        SETTING_OK    src/remote/commands.ts
- *        THINKING_OK   src/remote/commands.ts
- *        CMD_TEXT_MAX  src/remote/commands.ts
- *        FN_PATH       src/remote/pusher.ts
- *      idOk and cmdMax are not duplicated here — the extension never holds
- *      them — so they are pinned only by the relay repo's own
+ *        NONCE_OK        src/remote/messages.ts
+ *        TYPE_OK         src/remote/messages.ts
+ *        MSG_MAX_BYTES   src/remote/messages.ts
+ *        FRAME_MAX_BYTES src/remote/pusher.ts
+ *        FN_PATH         src/remote/pusher.ts
+ *      idOk, msgMax and eventsMax are not duplicated here — the extension
+ *      never holds them — so they are pinned only by the relay repo's own
  *      tests/contract.test.mjs and by check (b) below.
  *
  *  (b) REMOTE — this copy against the relay repo's copy. The sibling
@@ -79,18 +82,16 @@ const grabString = (src, name) => {
 console.log('— relay contract')
 const contract = JSON.parse(await readFile(path.join(ROOT, 'remote-contract.json'), 'utf8'))
 
-if (contract.version !== 1) fail(`remote-contract.json version is ${contract.version}, expected 1`)
+if (contract.version !== 2) fail(`remote-contract.json version is ${contract.version}, expected 2`)
 
 // (a) the local duplicates
-const relaySrc = await sourceOf('src/remote/relay.ts')
-const commandsSrc = await sourceOf('src/remote/commands.ts')
+const messagesSrc = await sourceOf('src/remote/messages.ts')
 const pusherSrc = await sourceOf('src/remote/pusher.ts')
 const local = [
-  ['keyOk', contract.keyOk, grab(relaySrc, 'KEY_OK'), 'src/remote/relay.ts KEY_OK'],
-  ['nonceOk', contract.nonceOk, grab(commandsSrc, 'NONCE_OK'), 'src/remote/commands.ts NONCE_OK'],
-  ['settingOk', contract.settingOk, grab(commandsSrc, 'SETTING_OK'), 'src/remote/commands.ts SETTING_OK'],
-  ['thinkingOk', contract.thinkingOk, grab(commandsSrc, 'THINKING_OK'), 'src/remote/commands.ts THINKING_OK'],
-  ['cmdTextMax', contract.cmdTextMax, grabNumber(commandsSrc, 'CMD_TEXT_MAX'), 'src/remote/commands.ts CMD_TEXT_MAX'],
+  ['nonceOk', contract.nonceOk, grab(messagesSrc, 'NONCE_OK'), 'src/remote/messages.ts NONCE_OK'],
+  ['typeOk', contract.typeOk, grab(messagesSrc, 'TYPE_OK'), 'src/remote/messages.ts TYPE_OK'],
+  ['msgMaxBytes', contract.msgMaxBytes, grabNumber(messagesSrc, 'MSG_MAX_BYTES'), 'src/remote/messages.ts MSG_MAX_BYTES'],
+  ['frameMaxBytes', contract.frameMaxBytes, grabNumber(pusherSrc, 'FRAME_MAX_BYTES'), 'src/remote/pusher.ts FRAME_MAX_BYTES'],
   ['fnPath', contract.fnPath, grabString(pusherSrc, 'FN_PATH'), 'src/remote/pusher.ts FN_PATH'],
 ]
 for (const [field, want, got, where] of local) {
