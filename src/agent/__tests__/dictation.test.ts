@@ -4,8 +4,9 @@
  *  test can supply; they are exercised by the real-agent run the card describes. */
 import {
   captureArgs, whisperArgs, verdict, rowsFromChecks, defaultVoiceConfig,
-  atLeast, builtinDictationAvailable,
+  atLeast, builtinDictationAvailable, convertArgs, transcribeUpload, uploadExtension,
 } from '../dictation.ts'
+import { MSG_MAX_BYTES } from '../../remote/messages.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -92,4 +93,38 @@ ok(gate({ platform: 'win32', arch: 'arm64' }).ok === true, 'Windows Arm64 is acc
 ok(!gate({ platform: 'win32', arch: 'ia32' }).ok, '32-bit is refused')
 ok(!gate({ platform: 'linux', arch: 'x64', version: 'no version here' }).ok, 'an unparseable version is refused, not guessed at')
 
-process.exit(fails ? 1 : 0)
+// 7. Remote upload: the browser's recording formats and the convert argv.
+ok(uploadExtension('audio/webm') === 'webm' && uploadExtension('audio/ogg') === 'ogg'
+  && uploadExtension('application/ogg') === 'ogg' && uploadExtension('audio/oga') === 'oga',
+  'the browser recordings map to their file extensions')
+ok(uploadExtension('audio/mp4') === 'mp4' && uploadExtension('video/mp4') === 'mp4'
+  && uploadExtension('audio/m4a') === 'm4a' && uploadExtension('audio/x-m4a') === 'm4a',
+  'Safari mp4/m4a and Chrome webm/ogg all land')
+ok(uploadExtension('audio/wav') === 'wav' && uploadExtension('audio/x-wav') === 'wav'
+  && uploadExtension('audio/wave') === 'wav' && uploadExtension('audio/x-wave') === 'wav',
+  'the wav spellings collapse to wav')
+ok(uploadExtension('audio/mp3') === undefined && uploadExtension('audio/aac') === undefined
+  && uploadExtension('video/webm') === undefined,
+  'a type ffmpeg cannot certainly read is refused, not fed to a failing converter')
+
+const conv = convertArgs('/tmp/up.webm', '/tmp/up.wav')
+ok(conv[conv.indexOf('-i') + 1] === '/tmp/up.webm' && conv[conv.length - 1] === '/tmp/up.wav',
+  'convert writes the input to the output wav')
+ok(conv.includes('-ar') && conv[conv.indexOf('-ar') + 1] === '16000'
+  && conv.includes('-ac') && conv[conv.indexOf('-ac') + 1] === '1'
+  && conv.includes('-c:a') && conv[conv.indexOf('-c:a') + 1] === 'pcm_s16le',
+  'convert targets the 16 kHz mono PCM the whisper path expects')
+
+// 8. transcribeUpload's pure branches — the ones that refuse before any spawn.
+void (async () => {
+  const bad = await transcribeUpload(cfg(), 'audio/mp3', 'YWJj')
+  ok(!bad.ok && bad.error.includes('unsupported audio format'),
+    'an unsupported type refuses with a named reason before any conversion')
+  const huge = await transcribeUpload(cfg(), 'audio/webm', 'a'.repeat(MSG_MAX_BYTES + 1))
+  ok(!huge.ok && huge.error.includes('too large'),
+    'a recording over the message cap is refused, not written to disk')
+  const empty = await transcribeUpload(cfg(), 'audio/webm', '')
+  ok(!empty.ok && empty.error.includes('no audio was received'),
+    'empty bytes refuse before a temp file is written')
+  process.exit(fails ? 1 : 0)
+})()

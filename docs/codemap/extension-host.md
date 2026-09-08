@@ -5,6 +5,7 @@ paths:
   - src/extension.ts
   - src/board/panel.ts
   - src/board/settings.ts
+  - src/board/dialogs.ts
   - src/board/coalesce.ts
   - package.json
 tests:
@@ -51,12 +52,25 @@ Exports `BoardHost` (the ~50-method host contract — the best index of what the
 board can do), `UiState` / `UiCard` (the wire shape), `BoardPanel` (editor,
 `static show`, `postCurrent`, `onClosed`, `onLeft`), `BoardViewProvider` (side
 bar, `viewType = 'agentsKanban.board'`), `applyBoardFocus` / `setBoardFocusMode`
-/ `FocusMode`, `showSideBarView`, `toUiAgent`, `readImages`, `summarise`. Private
-but load-bearing: `wire()` — the board webview's `switch (msg.type)`, shared by
-both surfaces; `html()` — the CSP'd document (`board.css` + `board.js`, nonce,
-`data-layout="board"|"control"`); `forControl()` — what the side bar is sent.
-Test: `smoke.mjs` §live wiring and §view contract; `src/remote/__tests__/cards.test.ts`
-imports `UiCard` as its redaction fixture.
+/ `FocusMode`, `showSideBarView`, `toUiAgent`, `readImages`, `summarise`. Also
+load-bearing: `dispatchBoardMessage()` — the `switch (msg.type)` shared by BOTH
+surfaces AND the remote executor (the relay v2 write channel runs the webview's
+own messages through it), so the board and the remote page can never disagree
+about what a message means; `html()` — the CSP'd document (`board.css` +
+`board.js`, nonce, `data-layout="board"|"control"`); `forControl()` — what the
+side bar is sent. Test: `smoke.mjs` §live wiring and §view contract;
+`src/remote/__tests__/relay.test.ts` builds a `UiState` as its frame fixture.
+
+**`src/board/dialogs.ts`**. The one indirection between "this host message wants
+a dialog" and *where* it is shown: `confirm` / `input` / `pick` / `toast`, with
+an AsyncLocalStorage-held sink so a remote message's dialogs and toasts answer on
+the phone instead of a VS Code window. `setDefaultDialogSink` installs the
+`vscode.window` sink at activation; `withRemoteDialogSink` marks a dispatch remote
+and `isRemoteDialog()` lets `dispatchBoardMessage` turn editor-only actions
+(`openWorktree`, `diff`, `mergeDiff`, `openFolder`, …) into a remote toast rather
+than driving the editor. `makeRelayDialogSink` is the relay sink: it posts a
+`remote` dialog/toast event and resolves the waiting promise when the matching
+`remote.dialog` answer arrives. Test: `src/board/__tests__/dialogs.test.ts`.
 
 **`src/board/settings.ts`**. The settings TAB (an editor webview with
 `retainContextWhenHidden`): `SettingsState`, `SettingsMessage`, `parseMessage`
@@ -85,9 +99,12 @@ no local `../agents-kanban-relay` exists. Test: `smoke.mjs` §manifest (declared
 
 ## How it works
 
-**Board webview → host.** The view posts `{type, …}`; `wire()` in `panel.ts`
-switches on `type` and calls the matching `BoardHost` method, implemented on the
-`host` object in `extension.ts`. Groups: lifecycle (`ready`, `init`,
+**Board webview → host.** The view posts `{type, …}`; `dispatchBoardMessage()`
+in `panel.ts` switches on `type` and calls the matching `BoardHost` method,
+implemented on the `host` object in `extension.ts`. The same switch runs the
+remote page's queued messages, wrapped in `withRemoteDialogSink` so its dialogs
+and toasts answer on the phone and editor-only actions become a toast. Groups:
+lifecycle (`ready`, `init`,
 `openFolder`, `setMode`, `select`, `openBoard`, `closeBoard`, `openSession`,
 `focus`, `openSettings`, `selectProvider`, `newSessionPrompt`); running an agent
 (`newSession`, `send`, `stop`, `interrupt`, `resume`, `clearQueue`,
@@ -137,10 +154,13 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Change recipes
 
-- **A new board message.** `media/board.js` posts it → a `case` in `wire()`
-  (`panel.ts`) → a method on `BoardHost` and on `const host` in `extension.ts`.
-  The smoke gate "every inbound message is handled" sweeps every `post(...)`
-  name in the view against the switch.
+- **A new board message.** `media/board.js` posts it → a `case` in
+  `dispatchBoardMessage()` (`panel.ts`) → a method on `BoardHost` and on
+  `const host` in `extension.ts`. The smoke gate "every inbound message is
+  handled" sweeps every `post(...)` name in the view against the switch. The
+  remote write channel runs the same switch, so the message is reachable from
+  the relay with no further wiring — but its dialogs route through
+  `src/board/dialogs.ts`.
 - **A new setting.** `package.json` `contributes.configuration` (write the
   description as documentation) → read it where it is used in `extension.ts`
   (settings are read on demand, never cached across a change) → the README

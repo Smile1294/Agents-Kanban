@@ -55,14 +55,14 @@ stays monochrome `currentColor`).
 relay lives in its own sibling repository; the shared rules between the two
 ends are pinned by `remote-contract.json` (at the repo ROOT, carried verbatim
 in both repos). The gate (a) reads the constants this repo duplicates from the
-file — KEY_OK in `src/remote/relay.ts`, NONCE_OK and CMD_TEXT_MAX in
-`src/remote/commands.ts`, FN_PATH in `src/remote/pusher.ts` — by regex over the
+file — NONCE_OK, TYPE_OK and MSG_MAX_BYTES in `src/remote/messages.ts`,
+FRAME_MAX_BYTES and FN_PATH in `src/remote/pusher.ts` — by regex over the
 single-line literals, naming the field on drift; (b) compares this copy of the
 JSON against the relay repo's — the sibling `../agents-kanban-relay` on a dev
 machine, else `AGENTS_KANBAN_RELAY_URL` or the package.json `relayRepo` field,
 fetched; (c) when the relay copy is unreachable prints
 `contract UNCHECKED — could not reach the relay repo` and exits 0 — a loud
-skip, never a silent pass. Shown red twice when new (a local `CMD_TEXT_MAX`
+skip, never a silent pass. Shown red twice when new (a local `MSG_MAX_BYTES`
 bump; an edit of the relay's copy) and restored.
 
 **`esbuild.mjs`** — two CJS bundles, node20, sourcemaps, minified unless

@@ -26,9 +26,10 @@
  * ffmpeg's own last words rather than inventing a diagnosis.
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { MSG_MAX_BYTES } from '../remote/messages.ts'
 
 /** How the pieces of the dictation pipeline are configured. Every field is a
  *  settings.json key under `agentsKanban.`; an empty string means "search PATH
@@ -250,6 +251,112 @@ export function rowsFromChecks(cfg: VoiceConfig, checks: VoiceChecks): { key: st
 }
 
 export type VoiceOutcome = { ok: true; text: string } | { ok: false; error: string }
+
+/* ——— Remote upload: the phone records, this machine transcribes ———————————
+ *
+ * The remote page has no built-in dictation (it is not VS Code), so its mic is
+ * the whisper path with the CAPTURE on the phone: the phone records to a webm
+ * (or whatever its browser produces), the bytes ride a `voiceAudio` message,
+ * and whisper on this machine transcribes them. The capture never touches this
+ * machine's microphone; only the transcription does.
+ *
+ * The upload is a file, not a stream: the bytes are base64 in the message, so
+ * they are written to a temp file, converted to the 16 kHz mono WAV the whisper
+ * path already expects, and handed to `transcribeWav` — the SAME pipeline the
+ * local mic uses, so there is one transcription path to trust. */
+
+/** The file extension for an uploaded media type, or undefined when the type is
+ *  refused. The page's browser decides what it records (WebM on Chrome, MP4 on
+ *  Safari, Ogg on Firefox); only the types ffmpeg can certainly read are
+ *  accepted, and everything else is refused with a named reason rather than fed
+ *  to a converter that would fail less helpfully. */
+export function uploadExtension(mediaType: string): string | undefined {
+  const t = mediaType.toLowerCase()
+  if (t === 'audio/webm') return 'webm'
+  if (t === 'audio/ogg' || t === 'application/ogg') return 'ogg'
+  if (t === 'audio/oga') return 'oga'
+  if (t === 'audio/mp4' || t === 'video/mp4') return 'mp4'
+  if (t === 'audio/m4a' || t === 'audio/x-m4a') return 'm4a'
+  if (t === 'audio/wav' || t === 'audio/x-wav' || t === 'audio/wave' || t === 'audio/x-wave') return 'wav'
+  return undefined
+}
+
+/** The ffmpeg argv that turns an uploaded recording into the 16 kHz mono WAV
+ *  the whisper path expects. Same tail as `captureArgs` — the two inputs (mic
+ *  device, uploaded file) meet at the same output format. */
+export function convertArgs(inPath: string, outWav: string): string[] {
+  return [
+    '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+    '-i', inPath,
+    '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
+    outWav,
+  ]
+}
+
+/** Transcribe an uploaded recording. The bytes are base64 in the message, so
+ *  this decodes, writes, converts and transcribes — the local pipeline with a
+ *  file instead of a live capture. Bounded by the message cap (the relay would
+ *  have refused anything larger), and every failure reports the piece that
+ *  failed rather than inventing a diagnosis. */
+export function transcribeUpload(cfg: VoiceConfig, mediaType: string, base64: string): Promise<VoiceOutcome> {
+  const ext = uploadExtension(mediaType)
+  if (!ext) {
+    return Promise.resolve({
+      ok: false,
+      error: `unsupported audio format "${mediaType || '(none)'}" — record webm, ogg, mp4, m4a or wav`,
+    })
+  }
+  if (base64.length > MSG_MAX_BYTES) {
+    return Promise.resolve({ ok: false, error: 'recording is too large to transcribe' })
+  }
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'agentskanban-voice-'))
+  const inPath = path.join(dir, `upload.${ext}`)
+  const wav = path.join(dir, 'upload.wav')
+  let buf: Buffer
+  try {
+    buf = Buffer.from(base64, 'base64')
+  } catch {
+    rmSync(dir, { recursive: true, force: true })
+    return Promise.resolve({ ok: false, error: 'recording data was not valid base64' })
+  }
+  if (buf.length === 0) {
+    rmSync(dir, { recursive: true, force: true })
+    return Promise.resolve({ ok: false, error: 'no audio was received' })
+  }
+  try {
+    writeFileSync(inPath, buf)
+  } catch (e) {
+    rmSync(dir, { recursive: true, force: true })
+    return Promise.resolve({ ok: false, error: e instanceof Error ? e.message : String(e) })
+  }
+  return new Promise<VoiceOutcome>((resolve) => {
+    const cleanup = () => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* best effort */ } }
+    let proc: ChildProcess
+    try {
+      proc = spawn(cfg.ffmpegPath.trim() || FFMPEG_BIN, convertArgs(inPath, wav), { windowsHide: true })
+    } catch (e) {
+      cleanup()
+      resolve({ ok: false, error: `ffmpeg: ${e instanceof Error ? e.message : String(e)}` })
+      return
+    }
+    const err: Buffer[] = []
+    proc.stderr?.on('data', (c: Buffer) => err.push(c))
+    proc.on('error', (e) => {
+      cleanup()
+      resolve({ ok: false, error: `ffmpeg: ${e.message}` })
+    })
+    proc.on('exit', (code) => {
+      if (code !== 0) {
+        const detail = stderrTail(err)
+        cleanup()
+        resolve({ ok: false, error: `ffmpeg failed (exit ${code})${detail ? ' — ' + detail.slice(0, 300) : ''}` })
+        return
+      }
+      // transcribeWav owns the temp dir from here — it cleans it up.
+      void transcribeWav(cfg, wav, dir).then(resolve)
+    })
+  })
+}
 
 /** A running capture. `stopped` resolves once per capture: with the transcript
  *  when the user stopped it, or with ffmpeg's own complaint when the process

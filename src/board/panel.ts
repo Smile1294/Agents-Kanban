@@ -20,6 +20,7 @@ import type { Meter } from '../agent/runtime.ts'
 import type { SlashCommand } from '../sessions/commands.ts'
 import type { ColumnDef } from './config.ts'
 import { parseAskQuestions, type AskQuestion } from './questions.ts'
+import { isRemoteDialog, toast } from './dialogs.ts'
 
 /** One transcript search hit, joined to the session it lives in. */
 export interface SearchRow extends TranscriptHit {
@@ -623,6 +624,11 @@ export interface BoardHost {
    *  built-in path (`builtin: true`) there is no transcript to return: VS Code
    *  typed it into the composer itself. */
   voiceStop(): Promise<{ ok: true; text: string; builtin?: true } | { ok: false; error: string }>
+  /** Transcribe an uploaded recording from the remote page. The phone records
+   *  (its `voice` is the whisper path — there is no built-in dictation on a
+   *  phone), the bytes arrive as a `voiceAudio` message, and whisper on THIS
+   *  machine transcribes them. `text` may be empty — "nothing recognised". */
+  voiceAudio(mediaType: string, data: string): Promise<{ ok: true; text: string } | { ok: false; error: string }>
   /** Open the settings tab: agents, backends and logins. Synchronous because
    *  showing a panel is not something to await — the page fills itself in. */
   openSettings(): void
@@ -636,149 +642,234 @@ export interface BoardHost {
 function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<void>): vscode.Disposable {
   return webview.onDidReceiveMessage(async (msg: Record<string, unknown>) => {
     try {
-      const id = () => String(msg.id ?? '')
-      /* A batch of ids from the webview. PARSED, never cast: this arrives from
-         a page that renders another program's output, and it is about to be
-         handed to a delete. Non-strings are dropped, blanks are dropped,
-         duplicates collapse, and the batch is capped — a runaway list must not
-         become an unbounded loop of file deletions. */
-      const ids = (raw: unknown): string[] =>
-        Array.isArray(raw)
-          ? [...new Set(raw.filter((v): v is string => typeof v === 'string' && !!v.trim()))].slice(0, 500)
-          : []
-      switch (msg.type) {
-        /* A webview saying it has just loaded, so it holds nothing.
-           `onReady` exists for one reason: the state omits anything the view
-           already has — the model catalogue — and a freshly loaded view has
-           none of it. Without this, a reload leaves an empty model picker until
-           the next backend switch. */
-        case 'ready': host.onReady?.(); await refresh(); break
-        case 'init': await host.init(); break
-        case 'openFolder': await host.openFolder(); break
-        case 'setMode': host.setMode(msg.mode === 'chat' ? 'chat' : 'kanban'); refresh(); break
-        case 'select': host.select(msg.id ? String(msg.id) : undefined); await refresh(); break
-        case 'newSession':
-          await host.newSession(String(msg.text ?? ''), readImages(msg.images))
-          break
-        case 'send':
-          await host.sendMessage(id(), String(msg.text ?? ''), readImages(msg.images))
-          break
-        case 'move': await host.move(id(), String(msg.phase)); break
-        case 'stop': await host.stop(id()); break
-        case 'interrupt': await host.interrupt(id()); await refresh(); break
-        case 'resume': await host.resume(id()); await refresh(); break
-        case 'forkAt':
-          await host.forkAt(id(), String(msg.messageId ?? ''))
-          await refresh()
-          break
-        case 'dismissInterrupted': await host.dismissInterrupted(id()); await refresh(); break
-        case 'clearQueue': await host.clearQueue(id()); await refresh(); break
-        case 'openWorktree': await host.openWorktree(id()); break
-        case 'run': await host.runWorktree(id()); break
-        case 'review': await host.refreshReview(id()); await refresh(); break
-        case 'diff': await host.openDiff(id(), String(msg.file ?? '')); break
-        case 'testLink':
-          await host.openTestLink(id(), String(msg.kind ?? ''), String(msg.target ?? ''))
-          break
-        case 'commit': await host.commitWorktree(id()); await refresh(); break
-        case 'merge': await host.mergeWorktree(id(), typeof msg.into === 'string' ? msg.into : undefined); await refresh(); break
-        case 'askTestPlan': await host.askTestPlan(id()); await refresh(); break
-        case 'commitMerge': await host.commitMerge(); await refresh(); break
-        case 'abortMerge': await host.abortMerge(); await refresh(); break
-        case 'mergeDiff': await host.openMergeDiff(String(msg.file ?? '')); break
-        case 'toggleOlder': host.toggleOlder(); await refresh(); break
-        case 'archive': await host.archive(id(), msg.archived !== false); break
-        case 'archiveMany':
-          await host.archiveMany(ids(msg.ids), msg.archived !== false)
-          await refresh()
-          break
-        case 'removeMany': await host.removeMany(ids(msg.ids)); await refresh(); break
-      case 'pin': await host.pin(id(), msg.pinned !== false); break
-        case 'remove': await host.remove(id()); break
-        case 'rename': await host.rename(id(), String(msg.title ?? '')); break
-        case 'disclosure':
-          host.setDisclosure(String(msg.key ?? ''), msg.open !== false)
-          break
-        case 'composer':
-          host.setComposer({
-            ...(msg.model ? { model: String(msg.model) } : {}),
-            ...(msg.effort ? { effort: String(msg.effort) } : {}),
-            ...(msg.thinking ? { thinking: String(msg.thinking) } : {}),
-            ...(msg.permissionMode ? { permissionMode: String(msg.permissionMode) } : {}),
-            ...(msg.provider ? { provider: String(msg.provider) } : {}),
-            ...(msg.runtime ? { runtime: String(msg.runtime) } : {}),
-            ...(msg.agent ? { agent: String(msg.agent) } : {}),
-            ...(msg.orchestration ? { orchestration: String(msg.orchestration) } : {}),
-            ...(msg.ultracode ? { ultracode: String(msg.ultracode) } : {}),
-            ...(msg.fastMode ? { fastMode: String(msg.fastMode) } : {}),
-            ...(msg.id ? { forKey: id() } : {}),
-          })
-          refresh()
-          break
-        case 'toggleArchived': host.toggleArchived(); await refresh(); break
-        case 'focus': await host.toggleFocus(); await refresh(); break
-        case 'openBoard': await host.openBoard(); break
-        case 'closeBoard': await host.closeBoard(); break
-        case 'openSession': await host.openSession(id()); await refresh(); break
-        case 'newSessionPrompt': await host.newSessionPrompt(); break
-        case 'selectProvider': await host.selectProvider(); break
-        case 'openSettings': host.openSettings(); break
-        case 'permission':
-          host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))
-          break
-        case 'mentionFiles': {
-          // One round trip, answered with a post rather than through `refresh`:
-          // the file list is not board state and must not ride the repaint
-          // channel, which would ship it ten times a second.
-          const files = await host.mentionFiles()
-          void webview.postMessage({ type: 'mentions', files })
-          break
-        }
-        case 'search': {
-          // Same one-round-trip rule as mentionFiles: transcript search parses
-          // every session, which is never something a repaint does.
-          const answer = await host.searchTranscript(String(msg.q ?? ''))
-          void webview.postMessage({ type: 'searchResults', ...answer })
-          break
-        }
-        case 'moreTranscript': await host.loadOlderTranscript(id()); await refresh(); break
-        case 'openHit': {
-          // The index is a number the VIEW is echoing back from a search hit,
-          // so it is trusted — except in shape: a NaN would widen the window
-          // to NaN and blank the chat, so the host clamps it and moves on.
-          const idx = Number(msg.idx)
-          await host.openHit(id(), Number.isFinite(idx) ? idx : 0)
-          await refresh()
-          break
-        }
-        case 'voiceStart': {
-          const r = await host.voiceStart()
-          void webview.postMessage(
-            r.ok
-              ? { type: 'voice', started: true, ...(r.builtin ? { builtin: true } : {}) }
-              : { type: 'voice', started: false, error: r.error },
-          )
-          break
-        }
-        case 'voiceStop': {
-          const r = await host.voiceStop()
-          // The built-in path carries no transcript — `builtin: true` tells
-          // the view the dictation typed itself, so it must not run the
-          // "nothing recognised" note on the empty text.
-          void webview.postMessage(
-            r.ok
-              ? r.builtin
-                ? { type: 'voice', started: false, builtin: true }
-                : { type: 'voice', started: false, text: r.text }
-              : { type: 'voice', started: false, error: r.error },
-          )
-          break
-        }
-      }
+      await dispatchBoardMessage(host, msg, (m) => void webview.postMessage(m), refresh)
     } catch (e) {
       vscode.window.showErrorMessage(`Agents Kanban: ${e instanceof Error ? e.message : String(e)}`)
     }
   })
+}
+
+/**
+ * Route one board message to its host method.
+ *
+ * The SINGLE dispatch for every message the webview can send — which is to say,
+ * in relay v2, every message the remote page can send too. The remote executor
+ * runs this exact function inside `withRemoteDialogSink`, so a message is a
+ * message regardless of which side of the wire it came from: permission modes,
+ * model flags, worktree creation and the money all flow through the same host
+ * methods, and only the dialog sink differs (chosen by the AsyncLocalStorage
+ * context the caller installed).
+ *
+ * `reply(m)` is how one-round-trip answers leave (search results, mentions,
+ * voice) — the local webview posts them to itself, the remote executor posts
+ * them to the relay as page events. `refresh` repaints after a message that
+ * changed board state.
+ */
+export async function dispatchBoardMessage(
+  host: BoardHost,
+  msg: Record<string, unknown>,
+  reply: (m: object) => void,
+  refresh: () => Promise<void>,
+): Promise<void> {
+  const id = () => String(msg.id ?? '')
+  /* A batch of ids from the webview. PARSED, never cast: this arrives from a
+     page that renders another program's output, and it is about to be handed to
+     a delete. Non-strings are dropped, blanks are dropped, duplicates collapse,
+     and the batch is capped — a runaway list must not become an unbounded loop
+     of file deletions. */
+  const ids = (raw: unknown): string[] =>
+    Array.isArray(raw)
+      ? [...new Set(raw.filter((v): v is string => typeof v === 'string' && !!v.trim()))].slice(0, 500)
+      : []
+  /* Editor-only actions: a remote page has no editor to open a worktree in,
+     show a diff in, or hand the window to. For those, a remote-origin message
+     toasts on the phone instead of driving VS Code. Returns true when the
+     caller should skip the host action (i.e. the dispatch was remote). */
+  const editorOnly = (text: string, url?: string): boolean => {
+    if (isRemoteDialog()) { toast('info', text, url); return true }
+    return false
+  }
+  switch (msg.type) {
+    /* A webview saying it has just loaded, so it holds nothing.
+       `onReady` exists for one reason: the state omits anything the view
+       already has — the model catalogue — and a freshly loaded view has none of
+       it. Without this, a reload leaves an empty model picker until the next
+       backend switch. */
+    case 'ready': host.onReady?.(); await refresh(); break
+    case 'init': await host.init(); break
+    case 'openFolder':
+      if (editorOnly('Opening a folder happens in the editor.')) break
+      await host.openFolder()
+      break
+    case 'setMode': host.setMode(msg.mode === 'chat' ? 'chat' : 'kanban'); refresh(); break
+    case 'select': host.select(msg.id ? String(msg.id) : undefined); await refresh(); break
+    case 'newSession':
+      await host.newSession(String(msg.text ?? ''), readImages(msg.images))
+      break
+    case 'send':
+      await host.sendMessage(id(), String(msg.text ?? ''), readImages(msg.images))
+      break
+    case 'move': await host.move(id(), String(msg.phase)); break
+    case 'stop': await host.stop(id()); break
+    case 'interrupt': await host.interrupt(id()); await refresh(); break
+    case 'resume': await host.resume(id()); await refresh(); break
+    case 'forkAt':
+      await host.forkAt(id(), String(msg.messageId ?? ''))
+      await refresh()
+      break
+    case 'dismissInterrupted': await host.dismissInterrupted(id()); await refresh(); break
+    case 'clearQueue': await host.clearQueue(id()); await refresh(); break
+    case 'openWorktree':
+      if (editorOnly('Opening a worktree happens in the editor.')) break
+      await host.openWorktree(id())
+      break
+    // `run` runs normally even from the page — starting the app is a real host
+    // action — and the URL it lands on is toasted to the page by the host
+    // (runWorktree), since the browser it opens belongs to this machine.
+    case 'run': await host.runWorktree(id()); break
+    case 'review': await host.refreshReview(id()); await refresh(); break
+    case 'diff':
+      if (editorOnly('Diffs open in the editor.')) break
+      await host.openDiff(id(), String(msg.file ?? ''))
+      break
+    case 'testLink': {
+      const target = String(msg.target ?? '')
+      if (msg.kind === 'url') {
+        // A URL is openable on the phone too — toast it so the user can tap it.
+        if (editorOnly(target, target)) break
+        await host.openTestLink(id(), 'url', target)
+      } else {
+        // A file or a command only means something in the editor.
+        if (editorOnly('This link opens in the editor.')) break
+        await host.openTestLink(id(), String(msg.kind ?? ''), target)
+      }
+      break
+    }
+    case 'commit': await host.commitWorktree(id()); await refresh(); break
+    case 'merge': await host.mergeWorktree(id(), typeof msg.into === 'string' ? msg.into : undefined); await refresh(); break
+    case 'askTestPlan': await host.askTestPlan(id()); await refresh(); break
+    case 'commitMerge': await host.commitMerge(); await refresh(); break
+    case 'abortMerge': await host.abortMerge(); await refresh(); break
+    case 'mergeDiff':
+      if (editorOnly('Diffs open in the editor.')) break
+      await host.openMergeDiff(String(msg.file ?? ''))
+      break
+    case 'toggleOlder': host.toggleOlder(); await refresh(); break
+    case 'archive': await host.archive(id(), msg.archived !== false); break
+    case 'archiveMany':
+      await host.archiveMany(ids(msg.ids), msg.archived !== false)
+      await refresh()
+      break
+    case 'removeMany': await host.removeMany(ids(msg.ids)); await refresh(); break
+    case 'pin': await host.pin(id(), msg.pinned !== false); break
+    case 'remove': await host.remove(id()); break
+    case 'rename': await host.rename(id(), String(msg.title ?? '')); break
+    case 'disclosure':
+      host.setDisclosure(String(msg.key ?? ''), msg.open !== false)
+      break
+    case 'composer':
+      host.setComposer({
+        ...(msg.model ? { model: String(msg.model) } : {}),
+        ...(msg.effort ? { effort: String(msg.effort) } : {}),
+        ...(msg.thinking ? { thinking: String(msg.thinking) } : {}),
+        ...(msg.permissionMode ? { permissionMode: String(msg.permissionMode) } : {}),
+        ...(msg.provider ? { provider: String(msg.provider) } : {}),
+        ...(msg.runtime ? { runtime: String(msg.runtime) } : {}),
+        ...(msg.agent ? { agent: String(msg.agent) } : {}),
+        ...(msg.orchestration ? { orchestration: String(msg.orchestration) } : {}),
+        ...(msg.ultracode ? { ultracode: String(msg.ultracode) } : {}),
+        ...(msg.fastMode ? { fastMode: String(msg.fastMode) } : {}),
+        ...(msg.id ? { forKey: id() } : {}),
+      })
+      refresh()
+      break
+    case 'toggleArchived': host.toggleArchived(); await refresh(); break
+    case 'focus':
+      if (editorOnly('Focus happens in the editor.')) break
+      await host.toggleFocus()
+      await refresh()
+      break
+    case 'openBoard':
+      if (editorOnly('The board is already open here.')) break
+      await host.openBoard()
+      break
+    case 'closeBoard':
+      if (editorOnly('Closing the board happens in the editor.')) break
+      await host.closeBoard()
+      break
+    case 'openSession': await host.openSession(id()); await refresh(); break
+    case 'newSessionPrompt': await host.newSessionPrompt(); break
+    case 'selectProvider':
+      if (editorOnly('Choose a provider in the editor.')) break
+      await host.selectProvider()
+      break
+    case 'openSettings':
+      if (editorOnly('Settings open in the editor.')) break
+      host.openSettings()
+      break
+    case 'permission':
+      host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))
+      break
+    case 'mentionFiles': {
+      // One round trip, answered with a reply rather than through `refresh`: the
+      // file list is not board state and must not ride the repaint channel,
+      // which would ship it ten times a second.
+      const files = await host.mentionFiles()
+      reply({ type: 'mentions', files })
+      break
+    }
+    case 'search': {
+      // Same one-round-trip rule as mentionFiles: transcript search parses every
+      // session, which is never something a repaint does.
+      const answer = await host.searchTranscript(String(msg.q ?? ''))
+      reply({ type: 'searchResults', ...answer })
+      break
+    }
+    case 'moreTranscript': await host.loadOlderTranscript(id()); await refresh(); break
+    case 'openHit': {
+      // The index is a number the VIEW is echoing back from a search hit, so it
+      // is trusted — except in shape: a NaN would widen the window to NaN and
+      // blank the chat, so the host clamps it and moves on.
+      const idx = Number(msg.idx)
+      await host.openHit(id(), Number.isFinite(idx) ? idx : 0)
+      await refresh()
+      break
+    }
+    case 'voiceStart': {
+      const r = await host.voiceStart()
+      reply(
+        r.ok
+          ? { type: 'voice', started: true, ...(r.builtin ? { builtin: true } : {}) }
+          : { type: 'voice', started: false, error: r.error },
+      )
+      break
+    }
+    case 'voiceStop': {
+      const r = await host.voiceStop()
+      // The built-in path carries no transcript — `builtin: true` tells the view
+      // the dictation typed itself, so it must not run the "nothing recognised"
+      // note on the empty text.
+      reply(
+        r.ok
+          ? r.builtin
+            ? { type: 'voice', started: false, builtin: true }
+            : { type: 'voice', started: false, text: r.text }
+          : { type: 'voice', started: false, error: r.error },
+      )
+      break
+    }
+    case 'voiceAudio': {
+      // The remote mic: the phone recorded, the bytes rode a message, whisper on
+      // this machine transcribes. Same voice event the local mic emits.
+      const r = await host.voiceAudio(String(msg.mediaType ?? ''), String(msg.data ?? ''))
+      reply(
+        r.ok
+          ? { type: 'voice', started: false, text: r.text }
+          : { type: 'voice', started: false, error: r.error },
+      )
+      break
+    }
+  }
 }
 
 function html(webview: vscode.Webview, extensionUri: vscode.Uri, layout: 'board' | 'control' = 'board'): string {

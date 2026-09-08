@@ -87,9 +87,9 @@ export interface RemoteState {
   url: string
   /** True when a pairing code is in the keychain. The code never renders. */
   hasCode: boolean
-  /** The write channel: prompts sent from the remote page run on THIS machine
+  /** The write channel: actions taken on the remote page run on THIS machine
    *  when true. The host's own toggle, default OFF — and the page renders the
-   *  control only when a relay URL is set, because without one no command
+   *  control only when a relay URL is set, because without one no action
    *  could ever arrive. */
   writesEnabled: boolean
   /**

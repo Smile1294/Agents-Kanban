@@ -19,7 +19,7 @@ import {
 } from './sessions/subagents.ts'
 import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
-  setBoardFocusMode, showSideBarView, toUiAgent,
+  dispatchBoardMessage, setBoardFocusMode, showSideBarView, toUiAgent,
   type BoardHost, type FocusMode, type Mode, type SearchAnswer, type SearchRow,
   type UiCard, type UiState,
 } from './board/panel.ts'
@@ -64,15 +64,17 @@ import {
   type Schedule,
 } from './board/schedules.ts'
 import {
-  builtinDictationAvailable, checkVoice, rowsFromChecks, startCapture, verdict,
+  builtinDictationAvailable, checkVoice, rowsFromChecks, startCapture, transcribeUpload, verdict,
   VSCODE_DICTATION_START, VSCODE_DICTATION_STOP,
   type Capture, type VoiceChecks, type VoiceConfig,
 } from './agent/dictation.ts'
-import { RemoteFeed, type TailSource } from './remote/feed.ts'
 import { RemotePusher, type PushSnapshot } from './remote/pusher.ts'
-import { boardIdOf, projectComposer, projectTail, relayBase, type RemoteTail } from './remote/relay.ts'
-import { toRemoteCard } from './remote/cards.ts'
-import { acceptCommands, parseCommands, RemoteCommandClient } from './remote/commands.ts'
+import { boardIdOf, remoteFrame, relayBase, type RemoteModel, type RemoteVoice } from './remote/relay.ts'
+import { acceptMessages, parseMessages, RemoteMessageClient } from './remote/messages.ts'
+import {
+  confirm, input, isRemoteDialog, makeRelayDialogSink, pick, setDefaultDialogSink, toast,
+  withRemoteDialogSink, type DialogSink, type RelayDialogHandle,
+} from './board/dialogs.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
 // See agent/runtimes/index.ts for why registration is explicit rather than
 // happening wherever an implementation happens to be imported first.
@@ -122,6 +124,59 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   _resetBoardFocus()
   log = vscode.window.createOutputChannel('Agents Kanban', { log: true })
   context.subscriptions.push(log)
+
+  // The DEFAULT dialog sink: vscode.window. Installed once, here, because this
+  // module is the only one that may import `vscode` as a value — dialogs.ts is
+  // plain Node and must stay runnable by the tests and the headless board. The
+  // remote executor installs a relay sink on top for the messages it runs.
+  const vscodeDialogSink: DialogSink = {
+    async confirm(text, opts) {
+      const choices = opts.choices ?? []
+      if (opts.level === 'error') {
+        const p = await vscode.window.showErrorMessage(text, ...choices)
+        return typeof p === 'string' ? p : undefined
+      }
+      if (opts.level === 'warning' || opts.modal) {
+        const p = opts.modal
+          ? await vscode.window.showWarningMessage(text, { modal: true }, ...choices)
+          : await vscode.window.showWarningMessage(text, ...choices)
+        return typeof p === 'string' ? p : undefined
+      }
+      const p = await vscode.window.showInformationMessage(text, ...choices)
+      return typeof p === 'string' ? p : undefined
+    },
+    async input(opts) {
+      return vscode.window.showInputBox({
+        prompt: opts.prompt,
+        value: opts.value,
+        password: opts.password,
+        placeHolder: opts.placeHolder,
+        ignoreFocusOut: true,
+      })
+    },
+    async pick(items, opts) {
+      const chosen = await vscode.window.showQuickPick(
+        items.map((i) => ({ label: i.label, detail: i.detail, kind: i.kind })),
+        { canPickMany: opts.many === true, placeHolder: opts.placeHolder },
+      )
+      if (!chosen) return undefined
+      const list = Array.isArray(chosen) ? chosen : [chosen]
+      return list.map((c) => ({ label: c.label, detail: c.detail, kind: c.kind }))
+    },
+    toast(level, text, url) {
+      const show = level === 'error' ? vscode.window.showErrorMessage
+        : level === 'warning' ? vscode.window.showWarningMessage
+        : vscode.window.showInformationMessage
+      if (url) {
+        void Promise.resolve(show(text, 'Open')).then((c) => {
+          if (c === 'Open') void vscode.env.openExternal(vscode.Uri.parse(url))
+        }).catch((e: unknown) => log.error(`Toast action failed: ${String(e)}`))
+      } else {
+        void show(text)
+      }
+    },
+  }
+  setDefaultDialogSink(vscodeDialogSink)
 
   const cfg = () => vscode.workspace.getConfiguration('agentsKanban')
   const state = context.workspaceState
@@ -403,6 +458,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * identical to the one the webview already has.
    */
   let catalogueVersion = 0
+  /** The relay may be holding a stale model catalogue: true until the next
+   *  models-carrying push succeeds. Set on every catalogue change (the mv
+   *  key), on a new board, and on a page `ready`; cleared by the pusher's
+   *  status when a push that carried models is confirmed. */
+  let modelsDue = true
   /** The list this webview was last sent, as `<version>:<profile>`. Reset on
    *  `ready`, which is a webview saying it has just loaded and has nothing. */
   let sentCatalogue: string | undefined
@@ -455,6 +515,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   function recomputeCatalogue(discovered?: readonly ModelChoice[], problem?: string): void {
     perProfileCatalogue.clear()
     catalogueVersion++
+    modelsDue = true
     const p = currentProvider()
     const cached = discovered ?? cachedChoices(p.id)
     catalogue = catalogueFor(p, cached, builtinChoices(),
@@ -1444,56 +1505,75 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let remoteBoardId = ''
   let remoteStatus: { at: number; ok: boolean; note?: string; error?: string } | undefined
   let remotePusher: RemotePusher | undefined
-  const remoteFeed = new RemoteFeed()
   // The WRITE channel. The pairing code is a capability for the mirror; the
   // code alone must never run anything on this machine, so `remote.writes` is
-  // a separate toggle, default OFF, and the gate lives here — commands.ts
+  // a separate toggle, default OFF, and the gate lives here — messages.ts
   // pins the policy and its tests pin the gate. The nonce memory is
   // in-process, so a host restart forgets it: the one re-delivery window is
-  // the host dying between running a command and acking it.
+  // the host dying between running a message and acking it.
   let remoteWrites = state.get<unknown>('remote.writes') === true
-  let remoteClient: RemoteCommandClient | undefined
+  let remoteClient: RemoteMessageClient | undefined
   const remoteNonces = new Set<string>()
+  /** The relay sink for dialogs asked by a remote-origin message. Rebuilt on
+   *  every `syncRemoteEngine` so it always posts through the current client. */
+  let remoteDialogHandle: RelayDialogHandle | undefined
+  /** When the relay last saw a page poll, for the message-poll cadence. */
+  let remoteViewerAt = 0
 
-  /** How fresh a stored session's last update must be to ride the one-time
-   *  backfill, and how big one backfill POST may be (a tail is at most
-   *  TAIL_MAX rows; bytes are what actually bounds a POST). */
-  const REMOTE_FRESH_MS = 14 * 24 * 60 * 60 * 1000
-  const REMOTE_CHUNK_BYTES = 150_000
+  /** The mv key the frame carries: the catalogue version. Bumped on every
+   *  catalogue change (see recomputeCatalogue), so the relay can tell the page
+   *  "refetch the model list" the moment it changes. */
+  const remoteMv = (): string => String(catalogueVersion)
+
+  /** The FULL model list the frame splits out — the active catalogue, not the
+   *  memoised one the state omits when unchanged. The page fetches this once
+   *  and re-attaches it, so it must be the whole list every time it rides. */
+  function remoteModelsList(): RemoteModel[] {
+    return catalogue.choices.map((m) => {
+      const price = priceLabel(m.rate)
+      return {
+        id: m.id, label: m.label, context: m.context,
+        ...(m.detail ? { detail: m.detail } : {}),
+        ...(m.contextTokens ? { contextTokens: m.contextTokens } : {}),
+        ...(price ? { price } : {}),
+      }
+    })
+  }
+
+  /** The remote mic story: always whisper (the phone records, THIS machine
+   *  transcribes — there is no built-in VS Code dictation on a phone), so the
+   *  availability is the whisper pipeline's verdict alone. */
+  function remoteVoice(): RemoteVoice {
+    if (!voiceResult) return { available: false }
+    const v = verdict(voiceResult.checks)
+    return v.ok ? { available: true } : { available: false, ...(v.why ? { why: v.why } : {}) }
+  }
 
   /** The snapshot one push carries: the CURRENT board from the host's own
-   *  getState — the same state the window paints — with each card mapped
-   *  through `toRemoteCard`, the one place a card is filtered. Tails come from
-   *  live runs only: a run that is not live cannot grow, so it has nothing new
-   *  to send; sessions that ended while the relay was unreachable are
-   *  re-synced by `remoteBackfill` at enable time. With no folder open the
-   *  board IS empty, so an empty snapshot is the truth, not a bug. */
+   *  getState — the same state the window paints — with `composer.models`
+   *  split out into a `models` field (relay.ts `remoteFrame`). Models ride
+   *  only when they are due: a changed catalogue, a new board, a page `ready`,
+   *  or a relay that reported a differing mv. */
   async function buildRemoteSnapshot(): Promise<PushSnapshot> {
     const ui = await host.getState()
-    const columns = ui.columns.map((c) => ({ id: c.id, name: c.name }))
-    const cards = ui.cards.map((c) => toRemoteCard(c))
-    const tails: TailSource[] = (ws?.manager?.list() ?? []).map((a) => ({
-      key: a.sessionId ?? a.runId,
-      history: a.history,
-      live: a.live,
-    }))
-    remoteFeed.setComposer(projectComposer(ui.composer))
-    return remoteFeed.build(Date.now(), columns, cards, tails)
+    const frame = remoteFrame(ui, modelsDue ? remoteModelsList() : undefined, remoteMv(), remoteVoice())
+    return { frame, writes: remoteWrites }
   }
 
   /** (Re)build the engine from the CURRENT settings. Called at activation and
    *  after every change from the settings page, so enabling, repointing or
    *  clearing the code takes effect immediately. Cadence state is dropped on
    *  purpose: a fresh engine's first tick compares against nothing and pushes,
-   *  which is exactly what a config change should do. `remoteFeed` is NOT
-   *  dropped — what the relay already holds is still true until the code
-   *  changes, and the reset for that lives in the saveRemote case. */
+   *  which is exactly what a config change should do. */
   function syncRemoteEngine(): void {
     const baseUrl = remoteUrl ? relayBase(remoteUrl) : undefined
-    remoteFeed.setWrites(remoteWrites)
     remoteClient = baseUrl
-      ? new RemoteCommandClient({ baseUrl, boardId: remoteBoardId, fetch })
+      ? new RemoteMessageClient({ baseUrl, boardId: remoteBoardId, fetch })
       : undefined
+    const postEvent = (event: object): void => {
+      remoteClient?.postEvents([event]).catch((e) => log.error(`Remote event post failed: ${String(e)}`))
+    }
+    remoteDialogHandle = makeRelayDialogSink(postEvent)
     remotePusher = new RemotePusher({
       now: Date.now,
       baseUrl,
@@ -1503,142 +1583,92 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       build: buildRemoteSnapshot,
       onStatus: (s) => {
         remoteStatus = s
+        // A push that CARRIED models and succeeded means the relay now holds
+        // our catalogue — clear the due flag. A heartbeat sent no models, so
+        // it must NOT clear it; that is why the flag rides the status, not the
+        // relay's answer.
+        if (s.ok && s.models) modelsDue = false
         // The settings page's status line must move on success too — a green
         // tick that no attempt ever produced is the page's own forbidden
         // signal, and so is a red one that a later success never clears.
         void SettingsPanel.refreshIfOpen()
       },
-      // Commands ride push answers back. The callback does not run them
-      // itself: acceptCommands in commands.ts is the gate, and its tests
-      // pin that a disabled toggle drops everything.
-      onCommands: (raw) => {
-        void handleRemoteCommands(raw).catch((e) => log.error(`Remote command failed: ${String(e)}`))
+      // Queued messages and the page's last poll ride push answers back. The
+      // callback does not run them itself: acceptMessages in messages.ts is
+      // the gate, and its tests pin that a disabled toggle drops everything.
+      onAnswer: (answer) => {
+        if (answer.viewerAt !== undefined) remoteViewerAt = answer.viewerAt
+        if (answer.msgs !== undefined) {
+          void handleRemoteMessages(answer.msgs).catch((e) => log.error(`Remote message failed: ${String(e)}`))
+        }
       },
     })
-  }
-
-  /** Push the recent board to the relay in one bounded pass: the sync when a
-   *  relay is first configured, and again at activation, because counts live
-   *  only in memory and the relay may hold a board from days ago. Sessions the
-   *  board shows whose last update is fresh enough each send their transcript
-   *  tail; chunks keep one POST bounded, and every chunk carries its own
-   *  freshly built index, so the relay is never left claiming a tail it does
-   *  not have. A chunk that did not go out rolls its sessions' counts back, so
-   *  the next backfill sends them again. */
-  async function remoteBackfill(): Promise<void> {
-    if (!remotePusher || !ws) return
-    const live = new Set((ws.manager?.list() ?? []).map((a) => a.sessionId ?? a.runId))
-    const stored = await ws.store.list({ includeArchived: false })
-    const fresh = stored.filter((s) =>
-      !live.has(s.id) && Date.now() - s.updated < REMOTE_FRESH_MS && remoteFeed.tvOf(s.id) === 0)
-    let chunk: RemoteTail[] = []
-    let bytes = 0
-    const flush = async (): Promise<void> => {
-      if (!chunk.length) return
-      const ui = await host.getState()
-      remoteFeed.setComposer(projectComposer(ui.composer))
-      const index = remoteFeed.build(
-        Date.now(),
-        ui.columns.map((c) => ({ id: c.id, name: c.name })),
-        ui.cards.map((c) => toRemoteCard(c)),
-        [],
-      ).index
-      const pushed = remotePusher ? await remotePusher.pushRaw(index, chunk) : false
-      if (!pushed) {
-        for (const t of chunk) remoteFeed.setCount(t.key, 0)
-      }
-      chunk = []
-      bytes = 0
-    }
-    for (const s of fresh) {
-      const hist = await ws.store.transcript(s.id)
-      if (!hist.length) continue
-      const tail = projectTail(Date.now(), s.id, hist, [])
-      if (!tail) continue
-      // Marked BEFORE the index is built: the chunk's own index must claim the
-      // tail it carries, or the page would never fetch it.
-      remoteFeed.setCount(s.id, hist.length)
-      bytes += JSON.stringify(tail).length
-      chunk.push(tail)
-      if (bytes >= REMOTE_CHUNK_BYTES) await flush()
-    }
-    await flush()
   }
 
   /* --- Remote Control: the WRITE half ---------------------------------------
    *
-   * Prompts from the remote page, picked up here. `acceptCommands` (commands.ts)
-   * is the gate — the toggle, the nonce, the live session re-check — and what
-   * it accepts runs through the SAME host paths the local webview uses:
-   * `sendMessage` into a session, `newSession` for a prompt without one. Those
-   * paths carry the provider checks, the permission mode, the worktree
-   * creation and the money; nothing here reaches around them. A command naming
-   * a session this board no longer has is dropped, never re-targeted.
+   * Messages from the remote page, picked up here. `acceptMessages` (messages.ts)
+   * is the gate — the toggle, the nonce, the dialog-answer routing — and what
+   * it accepts runs through the SAME `dispatchBoardMessage` the local webview
+   * uses, wrapped in `withRemoteDialogSink` so the dialogs a remote message
+   * asks answer on the phone. Those paths carry the provider checks, the
+   * permission mode, the worktree creation and the money; nothing here reaches
+   * around them.
    */
-  async function handleRemoteCommands(raw: unknown): Promise<void> {
-    if (!remoteClient) return
-    const { accepted, ack } = await acceptCommands(raw, {
+  async function handleRemoteMessages(raw: unknown): Promise<void> {
+    if (!remoteClient || !remoteDialogHandle) return
+    const client = remoteClient
+    const handle = remoteDialogHandle
+    const { accepted, ack } = acceptMessages(raw, {
       writesEnabled: remoteWrites,
       seenNonce: (n) => remoteNonces.has(n),
       rememberNonce: (n) => remoteNonces.add(n),
-      sessionExists: async (key) => {
-        if (!ws) return false
-        if (ws.manager?.byKey(key)) return true
-        return !!(await ws.store.get(key))
-      },
+      resolveDialog: (id, answer) => handle.resolve(id, answer),
     })
-    // Ack AFTER acting: a host that dies mid-command may run it once more on
+    // Ack AFTER acting: a host that dies mid-message may run it once more on
     // the next delivery, a host that acked first would lose it silently.
     // Re-delivery while this host is alive is a nonce no-op either way.
-    if (!accepted.length) {
-      if (ack.length) {
-        await remoteClient.ack(ack).catch((e) => log.error(`Remote ack failed: ${String(e)}`))
-      }
-      return
+    if (ack.length) {
+      await client.ack(ack).catch((e) => log.error(`Remote ack failed: ${String(e)}`))
     }
-    for (const c of accepted) {
-      // The watcher's model / effort / thinking choice, if it made one. Ids
-      // only — a wrong model is dropped by the launch path, not pre-validated
-      // here, exactly as a wrong id typed in the local composer would be.
-      const chosen: RunSettings | undefined = (c.model || c.effort || c.thinking)
-        ? {
-            ...(c.model ? { model: c.model } : {}),
-            ...(c.effort ? { effort: c.effort as EffortLevel } : {}),
-            ...(c.thinking ? { thinking: c.thinking as ThinkingMode } : {}),
-          }
-        : undefined
-      if (c.session !== undefined) {
-        log.info(`Remote prompt → ${c.session}: ${c.text.slice(0, 80)}`)
-        await host.sendMessage(c.session, c.text, [], chosen)
-      } else {
-        log.info(`Remote prompt starts a new session: ${c.text.slice(0, 80)}`)
-        await host.newSession(c.text, [], chosen)
+    for (const m of accepted) {
+      // The page loaded fresh and holds no model list — the next push must
+      // carry one, whatever the relay's mv says.
+      if (m.msg.type === 'ready') modelsDue = true
+      try {
+        await withRemoteDialogSink(handle.sink, () =>
+          dispatchBoardMessage(host, m.msg, (ev) => {
+            client.postEvents([ev]).catch((e) => log.error(`Remote event post failed: ${String(e)}`))
+          }, async () => { refreshAll() }),
+        )
+      } catch (e) {
+        log.error(`Remote message failed: ${String(e)}`)
       }
     }
-    await remoteClient.ack(ack).catch((e) => log.error(`Remote ack failed: ${String(e)}`))
-    // The board changed (a prompt row, or a whole new card): let the relay
-    // show it without waiting out a heartbeat.
-    void remotePusher?.nudge()
+    // The board changed (a prompt row, a whole new card): let the relay show it
+    // without waiting out a heartbeat.
+    if (accepted.length) void remotePusher?.nudge()
   }
 
-  /** Poll the relay for commands. Runs on the remote timer only while writes
+  /** Poll the relay for messages. Runs on the remote timer only while writes
    *  are enabled — with the toggle off, the queue is not even read. */
-  async function pollRemoteCommands(): Promise<void> {
+  async function pollRemoteMessages(): Promise<void> {
     if (!remoteClient?.ready || !remoteWrites) return
-    const raw = await remoteClient.poll()
-    if (raw !== undefined) await handleRemoteCommands(raw)
+    const { msgs, viewerAt } = await remoteClient.poll()
+    if (viewerAt !== undefined) remoteViewerAt = viewerAt
+    if (msgs !== undefined) await handleRemoteMessages(msgs)
   }
 
   /** Enabling writes flushes whatever piled up while the channel was closed:
-   *  commands sent while writes were OFF are discarded, never run — "only
-   *  commands sent while the channel is on ever run" is the honest contract,
+   *  messages sent while writes were OFF are discarded, never run — "only
+   *  messages sent while the channel is on ever run" is the honest contract,
    *  and a queue that runs at some later moment is a time bomb, not a feature. */
-  async function flushRemoteCommands(): Promise<void> {
+  async function flushRemoteMessages(): Promise<void> {
     if (!remoteClient?.ready) return
-    const raw = await remoteClient.poll()
-    const cmds = parseCommands(raw ?? [])
-    if (cmds.length) {
-      await remoteClient.ack(cmds.map((c) => c.nonce))
+    const { msgs } = await remoteClient.poll()
+    const parsed = parseMessages(msgs ?? [])
+    if (parsed.length) {
+      await remoteClient.ack(parsed.map((m) => m.nonce))
         .catch((e) => log.error(`Remote flush ack failed: ${String(e)}`))
     }
   }
@@ -1654,21 +1684,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   syncRemoteEngine()
   if (remoteEnabled && remoteHasCode && remoteUrl) {
-    log.info('Remote Control is on — syncing the board to the relay site')
-    void remoteBackfill().catch((e) => log.error(`Remote backfill failed: ${String(e)}`))
+    log.info('Remote Control is on — pushing the board to the relay site')
   }
 
   // The engine's own ticker. Repaints nudge it too (see `paint`), but a board
   // with no agent running produces no repaints, so this is what keeps the
   // idle heartbeat honest. Cheap when there is nothing to do: tick() checks
-  // its gates before building anything. The command poll rides the same timer
-  // and the same gate — an idle board is exactly when a remote prompt arrives,
-  // and the poll only runs while the write channel is enabled.
+  // its gates before building anything.
   const remoteTimer = setInterval(() => {
     void remotePusher?.tick().catch((e) => log.error(`Remote tick failed: ${String(e)}`))
-    void pollRemoteCommands().catch((e) => log.error(`Remote command poll failed: ${String(e)}`))
   }, 30_000)
   context.subscriptions.push({ dispose: () => clearInterval(remoteTimer) })
+
+  // The message poll. Fast while a page is watching (the relay's viewerAt is
+  // fresh), slow otherwise — an idle board with no watcher must not hit the
+  // relay every two seconds, but a watcher tapping a prompt must not wait 30
+  // seconds for the board to notice. Self-rescheduling because the delay
+  // changes with viewerAt.
+  const REMOTE_POLL_FAST_MS = 2_000
+  const REMOTE_POLL_SLOW_MS = 30_000
+  const REMOTE_POLL_WATCH_MS = 60_000
+  let pollTimer: ReturnType<typeof setTimeout> | undefined
+  const schedulePoll = (): void => {
+    const watching = remoteEnabled && remoteWrites && Date.now() - remoteViewerAt < REMOTE_POLL_WATCH_MS
+    pollTimer = setTimeout(() => {
+      void pollRemoteMessages().catch((e) => log.error(`Remote message poll failed: ${String(e)}`))
+      schedulePoll()
+    }, watching ? REMOTE_POLL_FAST_MS : REMOTE_POLL_SLOW_MS)
+  }
+  schedulePoll()
+  context.subscriptions.push({ dispose: () => clearTimeout(pollTimer) })
 
   async function refreshRuntimeStatus(only?: RuntimeId): Promise<void> {
     settingsBusy = only ? `Checking ${only}…` : 'Checking which agents are installed…'
@@ -2068,8 +2113,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             void SettingsPanel.refreshIfOpen()
             // A fresh engine compares against nothing, so the first tick
             // pushes the current board — re-enabling after a pause needs no
-            // backfill, because the relay still holds everything the feed
-            // counts describe.
+            // special handling, the tick sends the full frame again.
             void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
           }
           return
@@ -2091,40 +2135,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             remoteHasCode = true
             remoteBoardId = boardIdOf(msg.code!)
           }
+          // A new code names a NEW board on the relay: the models-due flag is
+          // set so the first push carries the catalogue, whatever the old
+          // board held.
+          if (relayChanged) modelsDue = true
           syncRemoteEngine()
           if (relayChanged) {
-            // A new code names a NEW board on the relay: counts describe what
-            // the old board held, so they must not claim the new one.
-            remoteFeed.reset()
-            settingsBusy = 'Copying recent sessions to the relay…'
-            try {
-              await remoteBackfill()
-              void vscode.window.showInformationMessage(
-                'Remote Control connected. Open the relay page on another device and enter the code.')
-            } catch (e) {
-              log.error(`Remote backfill failed: ${e instanceof Error ? e.message : String(e)}`)
-            } finally {
-              settingsBusy = undefined
-              void SettingsPanel.refreshIfOpen()
-            }
+            // The fresh engine compares against nothing, so the first tick
+            // pushes the full board — no backfill, a frame is the whole board.
+            void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+            void vscode.window.showInformationMessage(
+              'Remote Control connected. Open the relay page on another device and enter the code.')
           }
           return
         }
         case 'setRemoteWrites': {
-          // The write channel: prompts from the remote page may run on THIS
+          // The write channel: messages from the remote page may run on THIS
           // machine. Off by default, persisted, and the gate that matters is
-          // in commands.ts — this case only flips the switch.
+          // in messages.ts — this case only flips the switch.
           remoteWrites = msg.enabled
           await state.update('remote.writes', remoteWrites)
           syncRemoteEngine()
           log.info(remoteWrites
-            ? 'Remote writes ENABLED — prompts from the remote page will run on this machine'
+            ? 'Remote writes ENABLED — messages from the remote page will run on this machine'
             : 'Remote writes disabled')
           if (remoteWrites) {
             // Anything queued while the channel was closed is discarded, not
-            // run: only commands sent while writes are ON are ever acted on.
-            void flushRemoteCommands().catch((e) => log.error(`Remote flush failed: ${String(e)}`))
-            // The index's `writes` flag changed — push it now so the remote
+            // run: only messages sent while writes are ON are ever acted on.
+            void flushRemoteMessages().catch((e) => log.error(`Remote flush failed: ${String(e)}`))
+            // The frame's `writes` flag changed — push it now so the remote
             // page shows its composer without waiting out the cadence.
             void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
           }
@@ -3533,6 +3572,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         : { ok: false, error: outcome.error }
     },
 
+    /** Transcribe an uploaded recording from the remote page. The phone records
+     *  (its mic is the whisper path — there is no built-in dictation on a
+     *  phone), the bytes arrive as a `voiceAudio` message, and whisper on THIS
+     *  machine transcribes them. `text` may be empty — "nothing recognised". */
+    async voiceAudio(mediaType: string, data: string): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+      return transcribeUpload(voiceConfig(), mediaType, data)
+    },
+
     async newSessionPrompt() {
       const text = await vscode.window.showInputBox({
         prompt: 'What should the agent do?', ignoreFocusOut: true,
@@ -4127,7 +4174,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return
       }
       const url = recipe.url && recipe.port === found ? recipe.url : `http://localhost:${found}`
-      await vscode.env.openExternal(vscode.Uri.parse(url, true))
+      // From the remote page, the browser this machine opens is not the browser
+      // the user is holding — toast the URL instead so they can open it from
+      // wherever they are.
+      if (isRemoteDialog()) {
+        toast('info', `The app is running at ${url}`, url)
+      } else {
+        await vscode.env.openExternal(vscode.Uri.parse(url, true))
+      }
       log.info(`Run app: opened ${url}`)
     },
 

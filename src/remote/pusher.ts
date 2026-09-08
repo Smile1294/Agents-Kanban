@@ -1,36 +1,41 @@
 /**
- * Remote Control — the engine that decides WHEN a snapshot leaves this
- * machine. The SHAPE of what leaves is pinned by relay.ts and its tests; here
- * is the cadence: never more often than it must, never so rarely that the
- * remote page cannot tell a live board from a dead one.
+ * Remote Control — the engine that decides WHEN a frame leaves this machine.
+ * The SHAPE of what leaves is pinned by relay.ts and its tests; here is the
+ * cadence: never more often than it must, never so rarely that the remote page
+ * cannot tell a live board from a dead one.
  *
- * Three rules, all load-bearing and all tested here:
+ * Relay v2 pushes the FULL webview frame (`{ type:'state', state }`, with
+ * `composer.models` split out) instead of a redacted index. The rules are the
+ * same ones v1 had, re-stated for a frame:
  *
  *  1. CADENCE — at most one attempt per MIN_INTERVAL, ever. A streaming agent
  *     would otherwise push on every frame, and a push rides the same event
- *     loop as the CLI child's stdout (there is a postmortem about that loop).
- *  2. IDLE = NO PUSH — when the index is byte-identical to the last one sent
- *     and `build()` reported no new tails, nothing goes out. A board that is
- *     not moving must not burn relay invocations announcing that.
- *  3. HEARTBEAT — but a board that never announces itself is
- *     indistinguishable from one whose machine went to sleep. So when the last
- *     successful send is HEARTBEAT_MS old, the index alone goes out even
- *     though nothing changed, rewriting its `at` — that number is what the
- *     remote page's "live Ns ago" reads, and the house rule "a number the
- *     board shows must not depend on a process being alive" is exactly why it
- *     lives in the push, not in the page.
+ *     loop as the CLI child's stdout.
+ *  2. IDLE = NO PUSH — when the serialised state is byte-identical to the last
+ *     one sent and no models are due, nothing goes out. A board that is not
+ *     moving must not burn relay invocations announcing that.
+ *  3. HEARTBEAT — but a board that never announces itself is indistinguishable
+ *     from one whose machine went to sleep. So when the last successful send
+ *     is HEARTBEAT_MS old, a frame goes out even though nothing changed — with
+ *     NO state, just `at`/`writes`/`mv` — rewriting the live number the page
+ *     reads.
  *
  * A failed attempt backs off (BACKOFF_MS) instead of retrying every tick, and
  * `onStatus` fires on every attempt — success and failure both, so "silently
- * not connected" cannot happen. Nothing here knows what a session or a
- * transcript is: the host's `build()` decides what a changed tail is and
- * returns ONLY those. This module only decides the when.
+ * not connected" cannot happen. `onAnswer` carries the relay's answer back
+ * (`mv` for the models-due decision, `viewerAt` for the poll cadence, `msgs`
+ * for the queued page messages), so the pusher stays a transport and every
+ * decision about what to do next lives in the host.
+ *
+ * A frame over `FRAME_MAX_BYTES` (the transcript is the only unbounded field)
+ * is cut to its last 100 transcript rows and marked `transcriptMore` — the page
+ * keeps its "load older" pill rather than dropping the frame.
  *
  * `fetch` and `now` are injected so the cadence rules are testable without a
  * network or a clock.
  */
 import { relayBase } from './relay.ts'
-import type { RemoteIndex, RemoteTail } from './relay.ts'
+import type { RemoteFrame } from './relay.ts'
 
 /** The relay path under the site root. Every host target serves the relay
  *  here — Netlify rewrites it to its function, the Cloudflare worker and the
@@ -42,7 +47,7 @@ export const FN_PATH = '/board'
 /** Fastest allowed push cadence, ms. */
 export const MIN_INTERVAL = 2_000
 
-/** How long silence may last before the index alone is pushed as a heartbeat. */
+/** How long silence may last before a state-less frame is pushed as a heartbeat. */
 export const HEARTBEAT_MS = 90_000
 
 /** Wait after a failed attempt before trying again. */
@@ -51,11 +56,21 @@ export const BACKOFF_MS = 30_000
 /** Per-attempt network timeout, ms. */
 export const FETCH_TIMEOUT_MS = 10_000
 
+/** The largest a frame's JSON may be (the contract's frameMaxBytes). The relay
+ *  refuses larger with 413, so the host must not send one. */
+export const FRAME_MAX_BYTES = 4_000_000
+
+/** The largest transcript a frame keeps when it would otherwise exceed the
+ *  bound: the last 100 rows, with `transcriptMore` set so the page still knows
+ *  there is history above. */
+const FRAME_TRANSCRIPT_ROWS = 100
+
+/** What one push carries, built by the host: the frame (state with models
+ *  split out) plus the write-channel toggle, carried in the body so the page
+ *  shows its composer exactly when a message would be acted on. */
 export interface PushSnapshot {
-  /** Everything the board looks like, minus the transcripts. */
-  index: RemoteIndex
-  /** Only sessions whose transcript GREW since the host's previous build. */
-  tails: RemoteTail[]
+  frame: RemoteFrame
+  writes: boolean
 }
 
 export interface PushStatus {
@@ -64,6 +79,23 @@ export interface PushStatus {
   /** A human line for the settings page: what went out, or why not. */
   note?: string
   error?: string
+  /** True when this successful push CARRIED models — the host clears its
+   *  models-due flag on it. Absent on a heartbeat (which sends no models), so
+   *  a heartbeat can never clear the flag. */
+  models?: boolean
+}
+
+/** The relay's answer to a frame POST, parsed. */
+export interface RelayAnswer {
+  ok?: boolean
+  error?: string
+  /** The catalogue version the relay is holding — the host compares it to its
+   *  own `mv` to decide whether models must ride the next push. */
+  mv?: string
+  /** When a page last polled, for the host's poll cadence. */
+  viewerAt?: number
+  /** Queued page→host messages the relay is holding for a busy board. */
+  msgs?: unknown
 }
 
 export interface PusherDeps {
@@ -77,22 +109,17 @@ export interface PusherDeps {
   fetch: typeof fetch
   build(): PushSnapshot | Promise<PushSnapshot>
   onStatus(s: PushStatus): void
-  /** Commands the relay is holding, delivered on a push's answer so a busy
-   *  board picks them up without an extra poll. Optional: the host may prefer
-   *  to poll only. */
-  onCommands?(raw: unknown): void
+  /** The relay's answer, handed to the host on every successful POST. */
+  onAnswer?(a: RelayAnswer): void
 }
 
 interface PostBody {
-  kind: 'update'
-  index: RemoteIndex
-  tails: RemoteTail[]
-}
-
-interface RelayAnswer {
-  ok?: boolean
-  error?: string
-  cmds?: unknown
+  kind: 'frame'
+  at: number
+  writes: boolean
+  mv: string
+  state?: unknown
+  models?: unknown
 }
 
 export class RemotePusher {
@@ -100,11 +127,9 @@ export class RemotePusher {
   private lastSent = 0
   private lastErrorAt = 0
   private inFlight = false
-  /** JSON of the index's CONTENT as last successfully sent (`at` zeroed — the
-   *  write stamp is applied at post time, so a rebuilt-but-unchanged board must
-   *  compare equal), so a tick can tell a changed board from a quiet one
-   *  without the host keeping a copy. */
-  private lastContentJson = ''
+  /** JSON of the STATE as last successfully sent, so a tick can tell a changed
+   *  board from a quiet one without the host keeping a copy. */
+  private lastStateJson = ''
 
   private readonly deps: PusherDeps
 
@@ -124,8 +149,7 @@ export class RemotePusher {
   }
 
   /** One tick. Cheap when there is nothing to do; the host calls it from its
-   *  own timer and from its repaint path — both, because a board with no agent
-   *  running produces no repaints for the second path to ride on. */
+   *  own timer and from its repaint path. */
   async tick(): Promise<void> {
     if (!this.connected || this.inFlight) return
     const now = this.deps.now()
@@ -145,20 +169,39 @@ export class RemotePusher {
       return
     }
 
-    // `at` is the write stamp, and only a WRITE may carry one — compare the
-    // board's content with the stamp zeroed, or every rebuilt-but-unchanged
-    // index would read as a change and the heartbeat rule could never hold.
-    const content = { ...snapshot.index, at: 0 }
-    const contentJson = JSON.stringify(content)
-    const changed = contentJson !== this.lastContentJson || snapshot.tails.length > 0
+    // A state over the bound is cut, never dropped: the transcript is the one
+    // field that grows without limit, so trim it to the last rows and mark
+    // "more" — the page keeps its "load older" pill.
+    let state = snapshot.frame.state
+    if (state.transcript && JSON.stringify(state).length > FRAME_MAX_BYTES
+        && state.transcript.length > FRAME_TRANSCRIPT_ROWS) {
+      const dropped = state.transcript.length - FRAME_TRANSCRIPT_ROWS
+      state = {
+        ...state,
+        transcript: state.transcript.slice(-FRAME_TRANSCRIPT_ROWS),
+        transcriptMore: true,
+        transcriptHead: (state.transcriptHead ?? 0) + dropped,
+      }
+    }
+
+    const stateJson = JSON.stringify(state)
+    const stateChanged = stateJson !== this.lastStateJson
+    // Models ride the frame when the host says they are due (an mv mismatch on
+    // the relay's answer, or a `ready` message) — that is a reason to push all
+    // on its own, because the relay is holding a stale catalogue.
+    const modelsDue = snapshot.frame.models !== undefined
+    const changed = stateChanged || modelsDue
     if (!changed && now - this.lastSent < HEARTBEAT_MS) return // quiet, not due yet
 
     const body: PostBody = {
-      kind: 'update',
-      index: { ...snapshot.index, at: now },
-      tails: snapshot.tails,
+      kind: 'frame',
+      at: now,
+      writes: snapshot.writes,
+      mv: snapshot.frame.mv,
     }
-    await this.post(body, !changed)
+    if (stateChanged) body.state = state
+    if (modelsDue) body.models = snapshot.frame.models
+    await this.post(body, stateChanged ? stateJson : this.lastStateJson, !changed)
   }
 
   /** The host calls this when it knows something changed, so a live board does
@@ -167,26 +210,7 @@ export class RemotePusher {
     return this.tick()
   }
 
-  /**
-   * A host-driven push OUTSIDE the tick rules: the one-time backfill when a
-   * relay is first enabled. The host hands a fresh index and a chunk of
-   * backfilled tails and this pushes exactly that, once, honouring only
-   * in-flight and the connected gate. A bounded, explicit operation — the
-   * cadence exists to protect the event loop from a streaming agent, and a
-   * backfill is neither streaming nor repeating.
-   *
-   * The pushed index refreshes `lastContentJson`, so the next tick compares
-   * against what is actually on the relay. Returns whether the POST actually
-   * went out — the host rolls its counts back when it did not, or a session
-   * the relay never heard of would be marked as sent.
-   */
-  async pushRaw(index: RemoteIndex, tails: RemoteTail[]): Promise<boolean> {
-    if (!this.connected || this.inFlight) return false
-    this.lastAttempt = this.deps.now()
-    return this.post({ kind: 'update', index, tails }, false)
-  }
-
-  private async post(body: PostBody, heartbeat: boolean): Promise<boolean> {
+  private async post(body: PostBody, stateJson: string, heartbeat: boolean): Promise<boolean> {
     this.inFlight = true
     const now = this.deps.now()
     try {
@@ -203,23 +227,19 @@ export class RemotePusher {
       if (!res.ok || answer.ok === false) {
         throw new Error(answer.error || `relay answered ${res.status}`)
       }
-      // Commands ride the answer back. The pusher stays a transport: it does
-      // not look at them, the host's callback does — which keeps the decision
-      // about running anything in the one place that owns the gate.
-      if (answer.cmds !== undefined && this.deps.onCommands) {
-        this.deps.onCommands(answer.cmds)
-      }
       this.lastSent = now
       this.lastErrorAt = 0
-      // Store the CONTENT with its own write stamp zeroed, so the next tick's
-      // comparison is against what is actually on the relay.
-      this.lastContentJson = JSON.stringify({ ...body.index, at: 0 })
-      const note = heartbeat
-        ? 'heartbeat — the board is idle but alive'
-        : body.tails.length
-          ? `pushed the board and ${body.tails.length} new chat tail${body.tails.length === 1 ? '' : 's'}`
-          : 'pushed the board'
-      this.deps.onStatus({ at: now, ok: true, note })
+      // Only a WRITE may update what the relay is recorded to hold: a heartbeat
+      // sent no state, so the relay's frame is still the last full push's.
+      if ('state' in body) this.lastStateJson = stateJson
+      // The answer drives the host's next move (models-due, poll cadence,
+      // queued messages) — the pusher itself does not look at it.
+      this.deps.onAnswer?.(answer)
+      this.deps.onStatus({
+        at: now, ok: true,
+        note: heartbeat ? 'heartbeat — the board is idle but alive' : 'pushed the board',
+        ...('models' in body ? { models: true } : {}),
+      })
       return true
     } catch (err) {
       this.lastErrorAt = now

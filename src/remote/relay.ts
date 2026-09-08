@@ -1,288 +1,74 @@
-/**
- * Remote Control — the shape of what leaves this machine.
+/** Remote Control — the shape of what leaves this machine.
  *
- * The board is streamed to a relay the user deploys — its own sibling
- * repository, agents-kanban-relay (the shared rules are pinned in
- * remote-contract.json) — so it can be watched from anywhere. What may leave
- * is the question this module answers, and the answer is narrower than the
- * board itself:
+ * Relay v2 is the FULL board, not a redacted index. The extension pushes the
+ * very frames it posts to its own webview (`{ type:'state', state }`), and the
+ * page is `media/board.js` verbatim behind a bridge — so there is no second
+ * render path and no second redaction boundary. Worktree paths, branch names,
+ * tool summaries (commands), review file lists and test-plan links all travel:
+ * the owner has chosen that knowingly, and it is the point of the feature.
  *
- *  - the COLUMNS and the CARDS — title, phase, tags, runtime, when it was last
- *    updated, and a one-line "what the agent is doing" (kind and tool name,
- *    never a command's text);
- *  - the TRANSCRIPTS — what the user asked and what the agent answered,
- *    capped to a tail. That is the "and the chats" half of the request.
+ * Two things still never leave, and both are asserted in tests rather than
+ * trusted to prose:
  *
- * What never leaves:
- *  - the repo itself: no workspace paths, no worktree paths, no branch names,
- *    no file names, no diffs, no code. Tool rows are stripped of their summary
- *    for exactly this reason: a Bash row summarises as its COMMAND and an Edit
- *    row as its PATH, because the summary is derived from the tool's input —
- *    see `RemoteEntry`;
- *  - configuration: no providers, no credentials, no prices, no permission
- *    questions (those can name files). The model / effort CATALOGUE is the one
- *    exception, and it is deliberately bare: `index.composer` carries model ids
- *    and labels, effort keys and labels, and the thinking switch — the names
- *    the remote composer needs to offer — and nothing that would cost the user
- *    if it leaked;
- *  - anything the agent is about to do: no queued prompts, no test plans, no
- *    review data.
+ *  - The pairing code. `boardIdOf` hashes it, and the hash is the only address
+ *    either end ever holds. The code itself is never in a frame.
+ *  - Provider credentials. `UiState` never carries one (only `hasCredential`
+ *    flags), so a frame built from it cannot either — a test serialises a
+ *    frame and asserts no `credential`, `apiKey`, `ANTHROPIC_API_KEY` or
+ *    `AUTH_TOKEN` is in it.
  *
- * Conversation is carried as-is otherwise: a prompt is whatever the user
- * typed, and that is the point of the feature.
+ * The two transforms here are therefore not filters but SPLITS:
  *
- * The caller (extension.ts) hands over ONLY the fields declared here; this
- * module never reaches into a card for something it did not declare. The
- * `RemoteCardSource` input type is the redaction boundary — anything not in it
- * cannot be transmitted because it is not in the payload type. Tests assert the
- * output contains exactly these fields and nothing else.
+ *  - `forRemote` swaps the composer's mic for the remote story (the phone
+ *    records, whisper on this machine transcribes) — the one place the remote
+ *    state legitimately differs from the local state.
+ *  - `remoteFrame` splits `composer.models` out of the state into a `models`
+ *    field, keyed by `mv` — the catalogue changes rarely and the state changes
+ *    per token, so the page fetches models once and re-attaches them.
  *
  * All matching, hashing and shape logic is here and is pure; the transport
  * (what to POST, when) is pusher.ts.
  */
 import { createHash } from 'node:crypto'
-import type { Entry } from '../sessions/store.ts'
+import type { UiState } from '../board/panel.ts'
 
-/** What the relay knows about one column. */
-export interface RemoteColumn {
+/** The model catalogue the relay stores, split out of the frame. The same
+ *  shape the webview composer already carries for one entry — ids, labels,
+ *  context and price — because the remote picker needs exactly what the local
+ *  one draws. */
+export interface RemoteModel {
   id: string
-  name: string
+  label: string
+  context: string
+  detail?: string
+  contextTokens?: number
+  price?: string
 }
 
-/** Everything about a session that may leave this machine. The extension maps
- *  its own cards onto this shape — the mapping is the filter, and it happens
- *  in one place. */
-export interface RemoteCardSource {
-  key: string
-  title: string
-  phase: string
-  tags: string[]
-  archived: boolean
-  updated: number
-  runtime?: string
-  /** What the agent is doing RIGHT NOW, if a run is live. `tool` is the tool's
-   *  NAME (Bash, Edit, Task) — a tool name is not a command, and a command can
-   *  carry a secret. */
-  agent?: { kind: string; tool?: string; since?: number }
+/** The frame the relay stores under `f:<id>`: the webview state (with
+ *  `composer.models` split out) and, when it rides along, the split-out model
+ *  list. `mv` is the catalogue version key — the page refetches `models` when
+ *  it changes. */
+export interface RemoteFrame {
+  state: UiState
+  mv: string
+  models?: RemoteModel[]
 }
 
-/** One session's card as the relay stores it. */
-export interface RemoteCard extends RemoteCardSource {
-  /** Bumped by the host each time the session's tail is rewritten, so the
-   *  remote page knows when to fetch it again without polling every session. */
-  tv: number
+/** The whisper verdict the remote mic needs — the same `verdict(checkVoice())`
+ *  the local whisper path uses, folded to just what the frame carries. */
+export interface RemoteVoice {
+  available: boolean
+  why?: string
 }
 
-/** The index: everything the board looks like, minus every transcript. Small,
- *  and pushed whenever anything on it changes. */
-export interface RemoteIndex {
-  v: 1
-  /** When this index was WRITTEN (push time), so the page can say "live Ns
-   *  ago" — and, when the number stops moving, "the extension went away". */
-  at: number
-  columns: RemoteColumn[]
-  sessions: Record<string, RemoteCard>
-  /** Whether the host will act on commands sent from the remote page. The page
-   *  shows its composer exactly when this is true — a composer that posts into
-   *  a void would be a dead control, and the value is the HOST's own toggle
-   *  (`remote.writes`), never something the relay asserts. */
-  writes: boolean
-  /** The model / effort / thinking catalogue the remote composer offers. Absent
-   *  when the host has nothing to publish (no workspace, no catalogue). */
-  composer?: RemoteComposer
-}
-
-/**
- * One transcript row as the relay may carry it. `Entry` is already reduced to
- * what the local chat draws, but one field still cannot cross: a TOOL row's
- * `summary` is derived from the tool's INPUT — a Bash row summarises as its
- * command, an Edit row as its path — so it is code, not conversation. The
- * redaction drops fields, never ROWS: the remote page's per-session `tv` is
- * the row count, and a row count must mean the same thing on both ends.
- */
-export type RemoteEntry =
-  | { kind: 'prompt'; at: number; text: string; images?: number }
-  | { kind: 'text'; at: number; text: string }
-  | { kind: 'thinking'; at: number; text: string }
-  | {
-      kind: 'tool'; at: number; name: string; status: 'running' | 'ok' | 'error'
-      runningSince?: number
-      durationMs?: number
-      /** The subagent's own transcript, filtered by the same rule. */
-      children?: RemoteEntry[]
-    }
-  | { kind: 'phase'; at: number; from: string; to: string; note?: string }
-  | { kind: 'result'; at: number; summary: string; durationMs?: number }
-  | { kind: 'notice'; at: number; message: string; urgency: 'info' | 'blocked' }
-  | { kind: 'error'; at: number; message: string }
-
-/** A session's transcript tail as the relay stores it — conversation, not
- *  code. */
-export interface RemoteTail {
-  key: string
-  /** When this tail was written. */
-  at: number
-  entries: RemoteEntry[]
-}
-
-/**
- * What the remote composer may offer. Ids and labels only — a model id is a
- * name, never a provider, an account or a price. This is the one place the
- * "no configuration crosses" rule bends, and it bends only as far as the page
- * needs: the names to list, not the choices behind them.
- */
-export interface RemoteComposer {
-  /** The host's current model id — the picker's default. */
-  model?: string
-  /** The host's current effort key. */
-  effort?: string
-  /** The host's current thinking mode. */
-  thinking?: 'enabled' | 'disabled'
-  /** Whether the model supports a thinking switch at all — absent, the remote
-   *  composer draws no toggle. */
-  thinkingSupported?: boolean
-  /** The models the picker lists. */
-  models?: { id: string; label: string }[]
-  /** The effort levels the picker lists. */
-  efforts?: { key: string; label: string }[]
-}
-
-/** What `projectComposer` accepts: the host's own composer state, which carries
- *  far more than may leave (contexts, prices, permission modes, providers).
- *  Only the fields above are picked; everything else is dropped here. `thinking`
- *  is typed loosely because the host's UI state does; `projectComposer` narrows
- *  it to the two modes the remote side understands. */
-export interface RemoteComposerSource {
-  model?: string
-  effort?: string
-  thinking?: string
-  thinkingSupported?: boolean
-  /** The host's model list carries context and price per entry (the picker
-   *  needs them to be a CHOICE); `projectComposer` keeps only id + label, so
-   *  the source type admits the richer objects the host actually holds. */
-  models?: readonly { id: string; label: string; [k: string]: unknown }[]
-  efforts?: readonly { key: string; label: string }[]
-}
-
-/** Reduce the host's composer state to what the remote page may see, or
- *  undefined when there is nothing to publish. The mapping IS the filter. */
-export function projectComposer(c: RemoteComposerSource | undefined): RemoteComposer | undefined {
-  if (!c) return undefined
-  const out: RemoteComposer = {}
-  if (c.model) out.model = c.model
-  if (c.effort) out.effort = c.effort
-  if (c.thinking === 'enabled' || c.thinking === 'disabled') out.thinking = c.thinking
-  if (c.thinkingSupported) out.thinkingSupported = c.thinkingSupported
-  if (c.models && c.models.length) out.models = c.models.map((m) => ({ id: m.id, label: m.label }))
-  if (c.efforts && c.efforts.length) out.efforts = c.efforts.map((e) => ({ key: e.key, label: e.label }))
-  return Object.keys(out).length ? out : undefined
-}
-
-/** How much of a transcript the relay keeps per session. A tail this long is a
- *  readable conversation; any longer and every push of a busy session carries
- *  the same 20k-token prefix over again. */
-export const TAIL_MAX = 120
-
-/** The sha-256 of a pairing code, hex. The relay derives its storage names
- *  from this, so a board is addressable only by someone who knows the code —
- *  and the code itself is never stored anywhere except this machine's keychain
- *  and the head of the remote viewer. */
+/** The sha-256 of a pairing code, hex, cut to the first 24 chars. The relay
+ *  derives its storage names from this, so a board is addressable only by
+ *  someone who knows the code — and the code itself is never stored anywhere
+ *  except this machine's keychain and the head of the remote viewer. */
 export function boardIdOf(code: string): string {
   return createHash('sha256').update(code, 'utf8').digest('hex').slice(0, 24)
 }
-
-/** The relay's blob name for a board's index. */
-export const indexBlob = (id: string): string => `i:${id}`
-
-/** The relay's blob name for one session's tail. */
-export const tailBlob = (id: string, key: string): string => `t:${id}:${key}`
-
-/**
- * Build the index payload. `tvOf` supplies each session's tail version — the
- * host owns the counter, because it owns the pushes that bump it. `writes` is
- * the host's own write-channel toggle, carried so the page knows whether a
- * command would be acted on.
- */
-export function projectIndex(
-  at: number,
-  columns: readonly RemoteColumn[],
-  cards: readonly RemoteCardSource[],
-  tvOf: (key: string) => number,
-  writes: boolean,
-  composer?: RemoteComposer,
-): RemoteIndex {
-  const sessions: Record<string, RemoteCard> = {}
-  for (const c of cards) {
-    sessions[c.key] = { ...c, tv: tvOf(c.key) }
-  }
-  return {
-    v: 1,
-    at,
-    writes,
-    columns: columns.map((c) => ({ id: c.id, name: c.name })),
-    sessions,
-    ...(composer ? { composer } : {}),
-  }
-}
-
-/**
- * The tail of a transcript that may be sent: the LAST `TAIL_MAX` top-level
- * entries. `history` is everything the run had when it began, `live` is what
- * it has produced since — the same two arrays the local chat renders, so the
- * remote shows the same conversation the window shows, in the same order.
- * Each kept row passes through `redactEntry`, and the redaction drops fields
- * never rows, so a row count means the same thing on both ends of the wire.
- * Returns null when the tail is empty — an empty tail is nothing to store.
- */
-export function projectTail(
-  at: number,
-  key: string,
-  history: readonly Entry[],
-  live: readonly Entry[],
-): RemoteTail | null {
-  const all = live.length >= TAIL_MAX
-    ? live.slice(live.length - TAIL_MAX)
-    : [...history, ...live].slice(-TAIL_MAX)
-  if (!all.length) return null
-  return { key, at, entries: all.map(redactEntry) }
-}
-
-/** One row of a transcript, reduced to what may leave this machine. The type
- *  says it, but the one field a reader would trust is asserted here too: a
- *  tool row loses `summary` and `id`, keeping its name and how it went. */
-export function redactEntry(e: Entry): RemoteEntry {
-  switch (e.kind) {
-    case 'prompt':
-      return e.images
-        ? { kind: 'prompt', at: e.at, text: e.text, images: e.images }
-        : { kind: 'prompt', at: e.at, text: e.text }
-    case 'text':
-      return { kind: 'text', at: e.at, text: e.text }
-    case 'thinking':
-      return { kind: 'thinking', at: e.at, text: e.text }
-    case 'tool': {
-      const out: RemoteEntry = {
-        kind: 'tool', at: e.at, name: e.name, status: e.status,
-        ...(e.runningSince !== undefined ? { runningSince: e.runningSince } : {}),
-        ...(e.durationMs !== undefined ? { durationMs: e.durationMs } : {}),
-      }
-      if (e.children?.length) out.children = e.children.map(redactEntry)
-      return out
-    }
-    case 'phase':
-      return { kind: 'phase', at: e.at, from: e.from, to: e.to, ...(e.note ? { note: e.note } : {}) }
-    case 'result':
-      return { kind: 'result', at: e.at, summary: e.summary, ...(e.durationMs !== undefined ? { durationMs: e.durationMs } : {}) }
-    case 'notice':
-      return { kind: 'notice', at: e.at, message: e.message, urgency: e.urgency }
-    case 'error':
-      return { kind: 'error', at: e.at, message: e.message }
-  }
-}
-
-/** A session key is user data as far as the relay is concerned (it rides in a
- *  blob name). Keys are run or session ids; anything else is refused. */
-export const KEY_OK = /^[A-Za-z0-9._-]{1,80}$/
 
 /** A scheme prefix, so `ftp://x.com` is refused instead of being turned into
  *  the nonsense URL `https://ftp://x.com` (which PARSES, as host `ftp:`). */
@@ -304,4 +90,39 @@ export function relayBase(raw: string): string | undefined {
   if (atFn >= 0) u.pathname = u.pathname.slice(0, atFn)
   else if (u.pathname.endsWith('/board')) u.pathname = u.pathname.slice(0, -'/board'.length)
   return u.toString().replace(/\/$/, '')
+}
+
+/** The remote view of a state: identical, except the composer's mic is the
+ *  phone's. Remotely there is no built-in VS Code dictation — the phone
+ *  records, the bytes come over as a `voiceAudio` message, and whisper on THIS
+ *  machine transcribes — so `voice` is always `{ mode:'whisper', available,
+ *  why? }`, whatever the built-in path would have said locally. */
+export function forRemote(state: UiState, voice: RemoteVoice): UiState {
+  const voiceBlock = {
+    mode: 'whisper' as const,
+    available: voice.available,
+    ...(voice.why ? { why: voice.why } : {}),
+  }
+  return { ...state, composer: { ...state.composer, voice: voiceBlock } }
+}
+
+/** Build the frame one push carries: the remote state with `composer.models`
+ *  split out, and the split-out list in `models` when it is due to ride along.
+ *  `models` is passed EXPLICITLY — the webview state omits the catalogue when
+ *  it has not changed since the last repaint (a memo the remote must never
+ *  read through), so the host hands the full list independently. */
+export function remoteFrame(
+  state: UiState,
+  models: RemoteModel[] | undefined,
+  mv: string,
+  voice: RemoteVoice,
+): RemoteFrame {
+  const remoted = forRemote(state, voice)
+  const { models: _splitOut, ...composer } = remoted.composer
+  void _splitOut
+  return {
+    state: { ...remoted, composer },
+    mv,
+    ...(models && models.length ? { models } : {}),
+  }
 }

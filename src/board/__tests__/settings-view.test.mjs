@@ -697,7 +697,7 @@ const state = (over = {}) => ({
 }
 
 // --- Remote Control: the write-channel toggle ---------------------------------
-// A second capability, separately enabled: prompts sent from the remote page
+// A second capability, separately enabled: actions taken on the remote page
 // run on THIS machine. The toggle is drawn only when it could take effect (a
 // URL and a pairing code exist), and its description names the risk.
 {
@@ -712,9 +712,9 @@ const state = (over = {}) => ({
   const tick = wrow && wrow.querySelector('.model-tick')
   ok(!!tick && tick.checked === false,
      'with a relay configured, the writes toggle renders — OFF, because it is opt-in')
-  ok(off.text().includes('Allow prompts from the remote page')
+  ok(off.text().includes('Allow actions from the remote page')
        && off.text().includes('can start sessions'),
-     'and the description names what ON means: prompts run HERE, and can start sessions')
+     'and the description names what ON means: actions run HERE, and can start sessions')
   tick.checked = true // a real click flips the box, then fires change
   tick.onchange()
   ok(off.posted.some((m) => m.type === 'setRemoteWrites' && m.enabled === true),
@@ -724,7 +724,7 @@ const state = (over = {}) => ({
   const onTick = secOf(on).querySelector('.remote-writes').querySelector('.model-tick')
   ok(onTick.checked === true,
      'the host’s ON state renders checked')
-  ok(on.text().includes('Remote prompts are ON'), 'and the row says so outright')
+  ok(on.text().includes('Remote actions are ON'), 'and the row says so outright')
   onTick.checked = false
   onTick.onchange()
   ok(on.posted.some((m) => m.type === 'setRemoteWrites' && m.enabled === false),
