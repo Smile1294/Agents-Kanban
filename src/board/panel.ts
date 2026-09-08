@@ -510,7 +510,18 @@ export interface UiState {
 }
 
 export interface BoardHost {
-  getState(): Promise<UiState>
+  /**
+   * The board as it is now.
+   *
+   * `audience` exists because the state carries ONE memoised field — the model
+   * catalogue, omitted when the caller has already been sent it — and the memo
+   * is per audience, not global. Relay pushes used to share the webview's:
+   * a push that landed between a catalogue change and the next repaint marked
+   * the list as sent, and the composer kept the old backend's models for good.
+   * `'remote'` never consumes it, because a remote frame splits the catalogue
+   * out and carries it on its own version key (`mv`).
+   */
+  getState(audience?: 'webview' | 'remote'): Promise<UiState>
   init(): Promise<void>
   openFolder(): Promise<void>
   setMode(mode: Mode): void

@@ -13,7 +13,7 @@ tests:
   - src/board/__tests__/coalesce.test.ts
   - src/board/__tests__/settings-view.test.mjs
   - test/package.test.mjs
-last_verified: 2026-09-07
+last_verified: 2026-09-08
 ---
 # The extension host
 
@@ -126,7 +126,14 @@ a silent blank.
 nothing"; `host.onReady` resets `sentCatalogue`, so the next state carries the
 full model list. Every later frame OMITS `composer.models` when the list is the
 one the view already has (`sendModels`), because a 431-entry catalogue was
-161 KB of a 326 KB frame posted ten times a second.
+161 KB of a 326 KB frame posted ten times a second. The memo is per AUDIENCE —
+`getState(audience)`, `'webview'` or `'remote'` — because it is a claim about
+who has been told, and the relay's own `getState()` was consuming the webview's:
+a push that landed between a catalogue change and the next repaint marked the
+list sent, and the local composer then held the old backend's models with
+nothing on screen to say why. `'remote'` never consumes it and never carries
+the list, because a remote frame splits the catalogue out onto its own version
+key (`mv`).
 
 **Settings webview → host.** `media/settings.js` posts; `parseMessage` in
 `settings.ts` validates; the `switch` in `extension.ts` acts. Groups: page
@@ -139,7 +146,13 @@ dictation (`checkVoice`); schedules (`saveSchedule`, `removeSchedule`,
 `setRemoteWrites`, `clearRemoteCode`).
 
 **The repaint.** Any event → `refreshAll()` → `paint.schedule()` → one
-`getState()` → posted to both surfaces → `remotePusher.nudge()`. `getState()`
+`getState()` → recorded as `painted` → posted to both surfaces →
+`remotePusher.nudge()`. `painted` is what the relay push reuses while it is
+fresher than `MIN_INTERVAL`: `buildRemoteSnapshot` used to call `getState()` a
+second time, so with Remote Control on, every push re-ran the session-index scan
+the repaint had just finished, on the event loop the CLI's stdout is drained on.
+Past that freshness it asks for its own, because a mirror one cadence behind is
+the bug, not the saving. `getState()`
 runs up to ten times a second while an agent streams and is therefore the render
 path: the model catalogue is formatted once per state, the review data is
 loaded on events (select, commit, merge, the selected agent finishing) and not
@@ -203,6 +216,14 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · the push path stopped
+  paying twice and stopped stealing the webview's catalogue. `paint` records the
+  state it built (`painted`) and `buildRemoteSnapshot` reuses it inside
+  `MIN_INTERVAL` instead of running a second `getState()`; `getState(audience)`
+  keys the model memo per audience so a relay push can no longer mark the
+  catalogue sent on the local composer's behalf. `syncRemoteEngine` and the
+  activation subscription now `dispose()` the pusher, because it can hold an
+  armed trailing tick closed over the OLD relay URL.
 - 2026-09-07 · task/S968q-split-the-relay-repo-out · package.json grew the
   `relayRepo` field and `verify` gained the relay-contract step
   (scripts/check-contract.mjs) between the tests and smoke.

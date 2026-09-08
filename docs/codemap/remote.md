@@ -11,7 +11,7 @@ tests:
   - src/remote/__tests__/messages.test.ts
   - src/remote/__tests__/headless.test.mjs
   - src/remote/__tests__/headless-auth.test.mjs
-last_verified: 2026-09-07
+last_verified: 2026-09-08
 ---
 # Remote — the board away from the editor
 
@@ -55,7 +55,15 @@ depend on a process being alive; `BACKOFF_MS`, `FETCH_TIMEOUT_MS`; a frame over
 `FRAME_MAX_BYTES` is cut to its last 100 transcript rows and marked
 `transcriptMore`, never dropped. The body is `{ kind:'frame', at, writes, mv,
 state?, models? }` — `state` absent means heartbeat, `models` present clears the
-models-due flag on success. `fetch` and `now` injected. Test: `pusher.test.ts`.
+models-due flag on success. A blocked tick — inside `MIN_INTERVAL`, mid-flight,
+or inside the backoff — ARMS a trailing tick rather than returning: the cadence
+decides what leaves, never whether it leaves at all, and a nudge that lands
+100ms after a push (which is exactly when a remote message is delivered, since
+it rides the push ANSWER) used to wait for the host's 30 s ticker. One trailing
+tick at a time, so a streaming firehose still costs one push; `dispose()`
+cancels it, because `syncRemoteEngine` replaces the engine and an old one closes
+over the old relay URL. `fetch`, `now` and the timers injected. Test:
+`pusher.test.ts`.
 
 **`src/remote/messages.ts`**. The write half: `parseMessages` (an outsider's
 JSON, parsed defensively — `NONCE_OK`, `TYPE_OK`, `MSG_MAX_BYTES`),
@@ -210,6 +218,23 @@ browser because the host half IS the extension.
 - None recorded beyond the general "run a real agent before believing the suite".
 
 ## Recent changes
+
+- 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · the mirror was up to
+  45 s behind, and the cause was the cadence gate DROPPING work rather than
+  deferring it. Measured on the real engine: a remote click ran on this machine
+  at t=100ms and reached the relay at t=30s. A remote message is delivered by a
+  push answer, so the repaint it causes nudges while `lastAttempt` is at its
+  freshest — the one moment the gate is guaranteed to be shut. `tick()` now arms
+  a trailing tick (`arm`/`dispose`, injected timers) for the moment the gate
+  opens. Two more in the same push path: `buildRemoteSnapshot` did a SECOND full
+  `getState()` per push, so every push re-ran the session-index scan the repaint
+  had just done, on the event loop that drains the CLI — it now reuses the state
+  `paint` built when that state is fresher than `MIN_INTERVAL`; and that call
+  consumed the WEBVIEW's model-catalogue memo, so a push landing between a
+  catalogue change and the next repaint left the local composer holding the old
+  backend's models for good. `getState(audience)` keys the memo per audience and
+  `'remote'` never consumes it — a remote frame splits the catalogue out onto
+  `mv` and never wanted it in the state.
 
 - 2026-09-08 · claude/pr-review-test-fixes · the v1 secret scan in
   `relay.test.ts` was self-contradictory under v2 and was the one red suite: it

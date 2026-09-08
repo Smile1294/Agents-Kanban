@@ -68,7 +68,7 @@ import {
   VSCODE_DICTATION_START, VSCODE_DICTATION_STOP,
   type Capture, type VoiceChecks, type VoiceConfig,
 } from './agent/dictation.ts'
-import { RemotePusher, type PushSnapshot } from './remote/pusher.ts'
+import { MIN_INTERVAL as REMOTE_MIN_INTERVAL, RemotePusher, type PushSnapshot } from './remote/pusher.ts'
 import { boardIdOf, remoteFrame, relayBase, type RemoteModel, type RemoteVoice } from './remote/relay.ts'
 import { acceptMessages, parseMessages, RemoteMessageClient } from './remote/messages.ts'
 import {
@@ -478,8 +478,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * so a 431-model catalogue was formatted twice per repaint and posted in full
    * ten times a second. Measured: 161KB of a 326KB state.
    */
-  function sendModels(cat: ModelCatalogue, profileId: string):
+  function sendModels(cat: ModelCatalogue, profileId: string, audience: 'webview' | 'remote'):
       { id: string; label: string; context: string; detail?: string; contextTokens?: number; price?: string }[] | undefined {
+    // A remote frame splits the catalogue out and carries it on its own version
+    // key, so the list in the state is dead weight there — and, worse, marking
+    // it sent would consume the WEBVIEW's memo. A push that landed between a
+    // catalogue change and the next repaint did exactly that, and the local
+    // composer then kept the old backend's models with nothing to say why.
+    if (audience === 'remote') return undefined
     const key = `${catalogueVersion}:${profileId}:${cat.source}`
     if (key === sentCatalogue) return undefined
     sentCatalogue = key
@@ -1549,13 +1555,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return v.ok ? { available: true } : { available: false, ...(v.why ? { why: v.why } : {}) }
   }
 
-  /** The snapshot one push carries: the CURRENT board from the host's own
-   *  getState — the same state the window paints — with `composer.models`
-   *  split out into a `models` field (relay.ts `remoteFrame`). Models ride
-   *  only when they are due: a changed catalogue, a new board, a page `ready`,
-   *  or a relay that reported a differing mv. */
+  /**
+   * The state the last repaint built, and when.
+   *
+   * `getState()` is the expensive one — a session-index scan and a transcript
+   * parse, ~40ms on a 20-session store and growing with it — and the rule is
+   * that nothing expensive may run per streamed token. The relay had its own
+   * call, so every push did the whole job a SECOND time, on the same event
+   * loop that drains the CLI child's stdout. A push rides a repaint (`paint`
+   * nudges), so the state it wants was computed microseconds earlier and is
+   * still on the screen the user is looking at.
+   *
+   * It is used only while it is FRESHER than the push cadence: past that, the
+   * relay would be describing a board that has moved on, and a mirror one
+   * cadence behind is the bug this whole file is about, not a saving.
+   */
+  let painted: { state: UiState; at: number } | undefined
+
+  /** The snapshot one push carries: the CURRENT board — the same state the
+   *  window paints, reused when the repaint that nudged us just built it —
+   *  with `composer.models` split out into a `models` field (relay.ts
+   *  `remoteFrame`). Models ride only when they are due: a changed catalogue,
+   *  a new board, a page `ready`, or a relay that reported a differing mv. */
   async function buildRemoteSnapshot(): Promise<PushSnapshot> {
-    const ui = await host.getState()
+    const fresh = painted && Date.now() - painted.at < REMOTE_MIN_INTERVAL
+    const ui = fresh ? painted!.state : await host.getState('remote')
     const frame = remoteFrame(ui, modelsDue ? remoteModelsList() : undefined, remoteMv(), remoteVoice())
     return { frame, writes: remoteWrites }
   }
@@ -1566,6 +1590,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *  purpose: a fresh engine's first tick compares against nothing and pushes,
    *  which is exactly what a config change should do. */
   function syncRemoteEngine(): void {
+    // The engine being replaced may hold an armed trailing tick, and it closes
+    // over the OLD baseUrl and board id — so an un-disposed one would push this
+    // board to the relay the user has just moved away from.
+    remotePusher?.dispose()
     const baseUrl = remoteUrl ? relayBase(remoteUrl) : undefined
     remoteClient = baseUrl
       ? new RemoteMessageClient({ baseUrl, boardId: remoteBoardId, fetch })
@@ -1694,7 +1722,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const remoteTimer = setInterval(() => {
     void remotePusher?.tick().catch((e) => log.error(`Remote tick failed: ${String(e)}`))
   }, 30_000)
-  context.subscriptions.push({ dispose: () => clearInterval(remoteTimer) })
+  context.subscriptions.push({
+    dispose: () => { clearInterval(remoteTimer); remotePusher?.dispose() },
+  })
 
   // The message poll. Fast while a page is watching (the relay's viewerAt is
   // fresh), slow otherwise — an idle board with no watcher must not hit the
@@ -2284,6 +2314,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    */
   const paint = coalesce(async () => {
     const state = await host.getState()
+    // The relay wants this exact state; see `painted`. Recorded BEFORE the
+    // posts, so a slow webview does not make it look stale to the push that
+    // this same repaint is about to nudge.
+    painted = { state, at: Date.now() }
     await provider.post(state).catch((e) => log.error(`Side bar refresh failed: ${String(e)}`))
     await BoardPanel.postCurrent(state).catch((e) => log.error(`Panel refresh failed: ${String(e)}`))
     refreshStatus()
@@ -2825,7 +2859,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // A webview has reloaded and holds nothing, so the next state must carry
     // the model catalogue in full again.
     onReady: forgetSentCatalogue,
-    async getState(): Promise<UiState> {
+    async getState(audience: 'webview' | 'remote' = 'webview'): Promise<UiState> {
       const active = currentProvider()
       // The effort levels are the SELECTED MODEL's, not a global list. Haiku 4.5
       // accepts none, and was being offered all five — a control that could not
@@ -2902,7 +2936,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(voiceState()),
       }
       if (!ws) {
-        composer.models = sendModels(catalogue, active.id)
+        composer.models = sendModels(catalogue, active.id, audience)
         return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
       }
 
@@ -3303,7 +3337,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       // ONE call, after everything that can decide which list is in force.
-      composer.models = sendModels(effectiveCatalogue, effectiveProfile)
+      composer.models = sendModels(effectiveCatalogue, effectiveProfile, audience)
 
       const kind = (k: string) => live.filter((a) => a.state.kind === k).length
       return {

@@ -44,12 +44,29 @@ interface Posted {
   body: { kind: string; at: number; writes: boolean; mv: string; state?: unknown; models?: unknown }
 }
 
+/** One armed timer. Held rather than run, so a test decides when the trailing
+ *  tick fires — the same reason `now` is a number this file writes. */
+interface Timer {
+  at: number
+  fn: () => void
+  cancelled: boolean
+}
+
 interface Rig {
   pusher: RemotePusher
   now: number
   statuses: PushStatus[]
   posts: Posted[]
   answers: RelayAnswer[]
+  /** Timers the pusher armed, in the order it armed them. */
+  timers: Timer[]
+  /** Advance the clock to `ms` and run whatever was due, once. */
+  runTimersTo(ms: number): Promise<void>
+  /** Let real time pass to `ms`: run every timer that comes due, INCLUDING the
+   *  ones the earlier ones arm. A trailing tick that re-arms (it opened the
+   *  cadence gate only to find the backoff still running) is a real sequence,
+   *  and a helper that stopped at the first round could not see it through. */
+  settleTo(ms: number): Promise<void>
   /** What build() answers. Callers replace this before a tick. */
   next: PushSnapshot
   /** What the relay answers (defaults to { ok: true }). */
@@ -64,6 +81,7 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     statuses: [] as PushStatus[],
     posts: [] as Posted[],
     answers: [] as RelayAnswer[],
+    timers: [] as Timer[],
     next: { frame: frame('1'), writes: false } as PushSnapshot,
     answer: { ok: true } as RelayAnswer,
     failFetchWith: null as Error | null,
@@ -80,6 +98,34 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
   }
   const rig: Rig = {
     ...state,
+    timers: state.timers,
+    async runTimersTo(ms: number): Promise<void> {
+      state.now = ms
+      // A trailing tick may arm another; run only what was already due, so a
+      // test that asserts "exactly one deferred push" cannot be satisfied by a
+      // loop the pusher would never run in real time either.
+      const due = state.timers.filter((t) => !t.cancelled && t.at <= ms)
+      for (const t of due) { t.cancelled = true; t.fn() }
+      // Let the awaited tick inside the timer settle before the assertion.
+      await new Promise((r) => setImmediate(r))
+      await new Promise((r) => setImmediate(r))
+    },
+    async settleTo(ms: number): Promise<void> {
+      for (let round = 0; round < 20; round++) {
+        const due = state.timers.filter((t) => !t.cancelled && t.at <= ms)
+        if (!due.length) break
+        // Each timer fires at ITS moment, not at the end of the window — a
+        // pusher that reads the clock decides on the time it actually ran.
+        for (const t of due.sort((a, b) => a.at - b.at)) {
+          state.now = Math.max(state.now, t.at)
+          t.cancelled = true
+          t.fn()
+          await new Promise((r) => setImmediate(r))
+          await new Promise((r) => setImmediate(r))
+        }
+      }
+      state.now = Math.max(state.now, ms)
+    },
     build: async (): Promise<PushSnapshot> => state.next,
     pusher: undefined as unknown as RemotePusher,
     get now(): number { return state.now },
@@ -100,6 +146,12 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     build: async () => rig.build(),
     onStatus: (s) => state.statuses.push(s),
     onAnswer: (a) => state.answers.push(a),
+    setTimeout: (fn, ms) => {
+      const t: Timer = { at: state.now + ms, fn, cancelled: false }
+      state.timers.push(t)
+      return t
+    },
+    clearTimeout: (h) => { (h as Timer).cancelled = true },
   })
   return rig
 }
@@ -265,6 +317,104 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
   ok(sent.transcript.length === 100, 'a frame over FRAME_MAX_BYTES is cut to its last 100 transcript rows')
   ok(sent.transcriptMore === true && sent.transcriptHead === 1,
     '…and marked `transcriptMore` so the page keeps its "load older" pill')
+}
+
+// --- a throttled nudge is DEFERRED, never dropped -----------------------------
+//
+// The bug this pins, measured against the real engine: a remote click is
+// delivered BY a push answer, so the host runs it, repaints, and nudges within
+// milliseconds of the last attempt. The cadence gate `return`ed and nothing
+// rescheduled — the change reached the relay on the host's 30s ticker. Every
+// "I pressed it and the page just sat there" is this.
+
+{
+  const r = rig()
+  await r.pusher.tick()
+  ok(r.posts.length === 1, 'the first push goes out')
+
+  // 100ms later the board changed (a remote message ran on this machine).
+  r.now += 100
+  r.next = { frame: frame('1', 'after the click'), writes: false }
+  await r.pusher.nudge()
+  ok(r.posts.length === 1, 'a nudge inside MIN_INTERVAL does not push immediately')
+  ok(r.timers.filter((t) => !t.cancelled).length === 1,
+    '…it ARMS a trailing tick instead of dropping the change')
+
+  // Nothing else nudges — the agent is not streaming, the user is waiting.
+  await r.runTimersTo(1_000_000 + MIN_INTERVAL)
+  ok(r.posts.length === 2, 'the trailing tick pushes when the cadence gate opens')
+  ok((r.posts[1]!.body.state as { title: string }).title === 'after the click',
+    '…carrying the state as it is NOW, not as it was when the nudge was blocked')
+}
+
+{
+  const r = rig()
+  await r.pusher.tick()
+  // A streaming agent nudges on every frame it produces.
+  r.now += 100
+  r.next = { frame: frame('1', 'streaming'), writes: false }
+  for (let i = 0; i < 20; i++) await r.pusher.nudge()
+  ok(r.timers.filter((t) => !t.cancelled).length === 1,
+    'twenty blocked nudges arm exactly ONE trailing tick — a firehose costs one push')
+  await r.runTimersTo(1_000_000 + MIN_INTERVAL)
+  ok(r.posts.length === 2, '…and exactly one push leaves')
+}
+
+{
+  const r = rig()
+  await r.pusher.tick()
+  r.now += MIN_INTERVAL + 1
+  await r.pusher.tick()
+  ok(r.posts.length === 1, 'an unchanged board still pushes nothing')
+  ok(r.timers.filter((t) => !t.cancelled).length === 0,
+    '…and arms nothing: the gate was open, there was simply no news')
+}
+
+{
+  // A change that arrives while a push is in flight is newer than that push.
+  const r = rig()
+  let release: (() => void) | undefined
+  r.build = async (): Promise<PushSnapshot> => {
+    await new Promise<void>((res) => { release = res })
+    return r.next
+  }
+  const first = r.pusher.tick()
+  await new Promise((res) => setImmediate(res))
+  await r.pusher.nudge()
+  ok(r.timers.filter((t) => !t.cancelled).length === 1,
+    'a nudge during an in-flight push arms a trailing tick rather than vanishing')
+  release?.()
+  await first
+}
+
+{
+  // Backing off is not forgetting. On an idle board nothing nudges again, so a
+  // relay that came back up would never be retried.
+  const r = rig()
+  r.failFetchWith = new Error('relay down')
+  await r.pusher.tick()
+  ok(r.statuses.at(-1)?.ok === false, 'a failed push reports the failure')
+  ok(r.timers.filter((t) => !t.cancelled).length === 0, 'the failure itself arms nothing')
+  r.now += 100
+  await r.pusher.nudge()
+  ok(r.timers.filter((t) => !t.cancelled).length === 1,
+    'a nudge inside the backoff arms a retry, rather than leaving an idle board to nudge again')
+  r.failFetchWith = null
+  await r.settleTo(1_000_000 + BACKOFF_MS)
+  ok(r.posts.length === 1,
+    '…the retry chain reaches the relay by itself once the backoff expires')
+}
+
+{
+  const r = rig()
+  await r.pusher.tick()
+  r.now += 100
+  r.next = { frame: frame('1', 'changed'), writes: false }
+  await r.pusher.nudge()
+  r.pusher.dispose()
+  await r.runTimersTo(1_000_000 + MIN_INTERVAL)
+  ok(r.posts.length === 1,
+    'dispose() cancels the trailing tick — a replaced engine must not push to the old relay')
 }
 
 // --- reset -------------------------------------------------------------------

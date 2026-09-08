@@ -20,6 +20,18 @@
  *     NO state, just `at`/`writes`/`mv` — rewriting the live number the page
  *     reads.
  *
+ *  4. A THROTTLED NUDGE IS DEFERRED, NEVER DROPPED. Rules 1 and 2 are about
+ *     what leaves; neither may decide that a change never leaves at all. The
+ *     cadence gate used to `return` on a nudge that landed inside
+ *     MIN_INTERVAL, and nothing rescheduled it — so a board change that
+ *     arrived within two seconds of the last push waited for the host's own
+ *     30s ticker. Measured: a remote click ran on this machine at t=100ms and
+ *     reached the relay at t=30s, because the message was delivered BY a push
+ *     answer, which is precisely when the last attempt is at its freshest.
+ *     That is the "I press something and the page sits there" report. So a
+ *     blocked tick — by the cadence gate or by a push already in flight —
+ *     arms a trailing tick at the moment the gate opens, coalesced to one.
+ *
  * A failed attempt backs off (BACKOFF_MS) instead of retrying every tick, and
  * `onStatus` fires on every attempt — success and failure both, so "silently
  * not connected" cannot happen. `onAnswer` carries the relay's answer back
@@ -111,6 +123,10 @@ export interface PusherDeps {
   onStatus(s: PushStatus): void
   /** The relay's answer, handed to the host on every successful POST. */
   onAnswer?(a: RelayAnswer): void
+  /** Injected so the trailing tick is testable without waiting out real time —
+   *  the same reason `now` and `fetch` are injected. */
+  setTimeout?(fn: () => void, ms: number): unknown
+  clearTimeout?(handle: unknown): void
 }
 
 interface PostBody {
@@ -130,11 +146,51 @@ export class RemotePusher {
   /** JSON of the STATE as last successfully sent, so a tick can tell a changed
    *  board from a quiet one without the host keeping a copy. */
   private lastStateJson = ''
+  /** The armed trailing tick, when a nudge was blocked by the cadence gate or
+   *  by a push in flight. One at a time: a streaming agent nudges ten times a
+   *  second and every one of those must collapse into the same trailing run. */
+  private trailing: unknown
+  private disposed = false
 
   private readonly deps: PusherDeps
 
   constructor(deps: PusherDeps) {
     this.deps = deps
+  }
+
+  private setT(fn: () => void, ms: number): unknown {
+    return this.deps.setTimeout
+      ? this.deps.setTimeout(fn, ms)
+      : setTimeout(fn, ms)
+  }
+
+  private clearT(handle: unknown): void {
+    if (this.deps.clearTimeout) this.deps.clearTimeout(handle)
+    else clearTimeout(handle as ReturnType<typeof setTimeout>)
+  }
+
+  /**
+   * Arm the trailing tick for the moment the gate opens.
+   *
+   * `ms` is clamped to at least 1 so a zero-delay timer cannot re-enter the
+   * gate in the same turn of the loop, and only ONE is ever outstanding — the
+   * whole point is that a firehose of nudges costs one deferred push, not one
+   * per nudge.
+   */
+  private arm(ms: number): void {
+    if (this.disposed || this.trailing !== undefined) return
+    this.trailing = this.setT(() => {
+      this.trailing = undefined
+      void this.tick().catch(() => { /* onStatus already carries the failure */ })
+    }, Math.max(1, ms))
+  }
+
+  /** Drop the armed trailing tick. The host owns the pusher's lifetime, and a
+   *  timer that outlives the extension host is a leak that fires into a
+   *  disposed world. */
+  dispose(): void {
+    this.disposed = true
+    if (this.trailing !== undefined) { this.clearT(this.trailing); this.trailing = undefined }
   }
 
   get connected(): boolean {
@@ -151,10 +207,21 @@ export class RemotePusher {
   /** One tick. Cheap when there is nothing to do; the host calls it from its
    *  own timer and from its repaint path. */
   async tick(): Promise<void> {
-    if (!this.connected || this.inFlight) return
+    if (!this.connected || this.disposed) return
     const now = this.deps.now()
-    if (now - this.lastAttempt < MIN_INTERVAL) return
-    if (this.lastErrorAt && now - this.lastErrorAt < BACKOFF_MS) return
+    // A push is already going out. Whatever prompted this tick is NEWER than
+    // what that push carries, so it must be retried once that one lands —
+    // dropping it here is how a board goes stale one frame behind itself.
+    if (this.inFlight) { this.arm(MIN_INTERVAL); return }
+    const sinceAttempt = now - this.lastAttempt
+    if (sinceAttempt < MIN_INTERVAL) { this.arm(MIN_INTERVAL - sinceAttempt); return }
+    if (this.lastErrorAt && now - this.lastErrorAt < BACKOFF_MS) {
+      // Backing off is not the same as forgetting: the relay is unreachable,
+      // not uninteresting. Come back when the backoff expires rather than
+      // waiting for whatever nudges next, which on an idle board is nothing.
+      this.arm(BACKOFF_MS - (now - this.lastErrorAt))
+      return
+    }
     this.lastAttempt = now
 
     let snapshot: PushSnapshot
