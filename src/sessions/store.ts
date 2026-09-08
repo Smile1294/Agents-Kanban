@@ -8,10 +8,12 @@
  * The payoff is that the board is a view over your real work: a session started
  * in the terminal appears here, and a session started here resumes in the CLI.
  */
+import { promises as fs } from 'node:fs'
 import { loadSdk, type SDKSessionInfo } from '../agent/sdk.ts'
 import { CLEAR_TEST_PLAN, MetaStore, type SessionMeta, type TestPlan } from './meta.ts'
 import { emptyTotals, summariseUsage, type ModelBook, type UsageMessage, type UsageTotals } from './usage.ts'
 import { allRuntimes, getRuntime, type HistoricSession, type Meter, type RuntimeHistory, type RuntimeId } from '../agent/runtime.ts'
+import { claudeHome, sessionFileFor } from './checkpoints.ts'
 
 export interface BoardSession {
   id: string
@@ -75,6 +77,137 @@ export function interruptedSessions(
     if (s.running && !live.has(s.id)) out.set(s.id, s.running)
   }
   return out
+}
+
+/**
+ * The opening line Claude Code writes on the message it substitutes for a
+ * compacted conversation's earlier messages. It is the one feature of the
+ * summary the SDK's reader preserves — it strips the `isCompactSummary` and
+ * `isVisibleInTranscriptOnly` markers — so it is what the board keys on when
+ * the raw file is unreadable.
+ */
+const COMPACT_SUMMARY_PREFIX =
+  'This session is being continued from a previous conversation that ran out of context.'
+
+/** The shape `readTranscript`'s loop and `summariseUsage` both read — a subset
+ *  of what the SDK's `getSessionMessages` returns. */
+interface SdkLikeMessage {
+  type: string
+  uuid: string
+  message?: unknown
+  parent_tool_use_id?: string | null
+  /** On a system record only; the SDK's reader strips it, recovered records
+   *  keep it so `summariseUsage` can see a `compact_boundary` again. */
+  subtype?: string
+}
+
+/** One record parsed out of the raw session JSONL, for the fields compaction
+ *  recovery reads. Everything else a record carries is irrelevant here. */
+interface RawTranscriptRecord {
+  type?: unknown
+  uuid?: unknown
+  message?: unknown
+  subtype?: unknown
+  isCompactSummary?: unknown
+  isSidechain?: unknown
+  isMeta?: unknown
+  teamName?: unknown
+  parentUuid?: unknown
+}
+
+/** The text of a message's first text block, if any — the summary check runs
+ *  on messages whose content is a bare string as often as on block arrays. */
+function firstText(message: unknown): string {
+  if (!message || typeof message !== 'object') return ''
+  const content = (message as { content?: unknown }).content
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    for (const b of content) {
+      if (typeof b === 'object' && b !== null && (b as { type?: unknown }).type === 'text'
+        && typeof (b as { text?: unknown }).text === 'string') {
+        return (b as { text: string }).text
+      }
+    }
+  }
+  return ''
+}
+
+/** Is this message the compacted conversation's summary? By the raw file's
+ *  marker where it was read, by its opening line where it was not. */
+function isCompactSummary(m: SdkLikeMessage, compactUuids: ReadonlySet<string>): boolean {
+  if (m.type !== 'user') return false
+  if (compactUuids.has(m.uuid)) return true
+  return firstText(m.message).startsWith(COMPACT_SUMMARY_PREFIX)
+}
+
+/** A shared empty set, for the common case of a session that never compacted. */
+const NO_COMPACT_UUIDS: ReadonlySet<string> = new Set()
+
+/**
+ * The messages `getSessionMessages` throws away at a compaction, read back off
+ * the raw file.
+ *
+ * The SDK's reader keeps only the ancestry chain of the newest message — it
+ * walks `parentUuid` links, and the CLI severs that chain at a compaction: the
+ * `compact_boundary` record's own `parentUuid` is null, so everything before it
+ * is unreachable, although every line is still in the file. The recovered
+ * records are shaped like the messages the SDK DID return — same fields, plus
+ * `subtype` on system records, which the SDK's reader also strips and
+ * `summariseUsage` reads for its boundary reset — and merged back in FRONT,
+ * which is where they were.
+ *
+ * Same rule as checkpoints.ts: prefer the SDK's session API, read the raw
+ * JSONL only for what the API projects away. The read happens only for a
+ * session whose SDK list contains a compact summary (the one message the API
+ * cannot hide), so an uncompacted session — the common case — never pays for
+ * it. A file that cannot be read degrades to the SDK's list: the summary is
+ * still hidden by its opening line, only the older messages stay missing.
+ */
+async function recoverPreCompaction(
+  id: string,
+  all: readonly SdkLikeMessage[],
+): Promise<{ recovered: SdkLikeMessage[]; compactUuids: Set<string> } | undefined> {
+  const hasSummary = all.some((m) => m.type === 'user'
+    && firstText(m.message).startsWith(COMPACT_SUMMARY_PREFIX))
+  if (!hasSummary) return undefined
+  const found = await sessionFileFor(claudeHome(), id)
+  if (!found) return undefined
+  let lines: string[]
+  try {
+    lines = (await fs.readFile(found.file, 'utf8')).split('\n')
+  } catch {
+    return undefined
+  }
+  const compactUuids = new Set<string>()
+  const sdkUuids = new Set(all.map((m) => m.uuid))
+  const recovered: SdkLikeMessage[] = []
+  for (const line of lines) {
+    if (!line.trim()) continue
+    let r: RawTranscriptRecord
+    try {
+      r = JSON.parse(line) as RawTranscriptRecord
+    } catch {
+      continue
+    }
+    if (r.isCompactSummary === true && typeof r.uuid === 'string') {
+      compactUuids.add(r.uuid)
+      continue
+    }
+    if (typeof r.uuid !== 'string' || sdkUuids.has(r.uuid)) continue
+    if (r.type !== 'user' && r.type !== 'assistant' && r.type !== 'system') continue
+    if (r.isMeta === true || r.teamName) continue
+    recovered.push({
+      type: r.type,
+      uuid: r.uuid,
+      message: r.message ?? {},
+      // Subagent frames keep their parent link, exactly as the live stream
+      // hands them over — the renderer nests them under their Task. The SDK's
+      // reader drops these records whole; it has nothing to say about them.
+      parent_tool_use_id: r.isSidechain === true && typeof r.parentUuid === 'string' ? r.parentUuid : null,
+      ...(typeof r.subtype === 'string' ? { subtype: r.subtype } : {}),
+    })
+  }
+  return { recovered, compactUuids }
 }
 
 /** A transcript entry, already reduced to what the chat view draws. */
@@ -628,10 +761,24 @@ export class SessionStore {
     } catch {
       return { total: 0, entries: [], usage: emptyTotals() }
     }
+    // A compaction is the one place the SDK's reader does not give the
+    // transcript that is on disk. It keeps only the ancestry chain of the
+    // newest message, walking `parentUuid` links — and the CLI severs that
+    // chain at a compaction, so every message before the boundary is dropped
+    // while still being in the file. It also returns the compact summary
+    // itself as an ordinary user message, with its `isCompactSummary` marker
+    // stripped — which rendered as a giant "This session is being continued…"
+    // prompt. Recover the dropped messages off the raw JSONL (the
+    // checkpoints.ts technique — the raw file is read only for what the API
+    // projects away) and turn each summary into a small divider instead.
+    const recovery = await recoverPreCompaction(id, all)
+    const msgs = recovery ? [...recovery.recovered, ...all] : all
+    const compactUuids = recovery?.compactUuids ?? NO_COMPACT_UUIDS
     // Spend and context fill are totalled over the WHOLE session, including the
-    // messages too old to render.
-    const usage = summariseUsage(all as readonly UsageMessage[], this.book)
-    const msgs = all.length > limit ? all.slice(all.length - limit) : all
+    // messages too old to render — which now includes the pre-compaction ones:
+    // the spend before a compaction was still spent.
+    const usage = summariseUsage(msgs as readonly UsageMessage[], this.book)
+    const windowed = msgs.length > limit ? msgs.slice(msgs.length - limit) : msgs
     const entries: Entry[] = []
     const toolNames = new Map<string, { list: Entry[]; idx: number }>()
     /** Subagent work, keyed by the id of the Task tool_use that started it.
@@ -645,9 +792,18 @@ export class SessionStore {
      *  looks like it has stopped when it has not. */
     const bySubagent = new Map<string, Entry[]>()
 
-    for (const m of msgs) {
+    for (const m of windowed) {
       const body = (m.message ?? {}) as { content?: unknown }
       const at = Date.now()
+      // The compact summary is the model's own recap, not something anyone
+      // said. Claude Code's CLI never shows it as a chat message, and neither
+      // does this board: it renders as one muted divider, the same one the
+      // Codex store draws on `context_compacted` — which also explains why the
+      // context meter can appear to jump backwards there.
+      if (isCompactSummary(m, compactUuids)) {
+        entries.push({ kind: 'notice', at, urgency: 'info', message: 'Claude compacted the conversation here.' })
+        continue
+      }
       const blocks = Array.isArray(body.content)
         ? (body.content as Array<Record<string, unknown>>)
         : typeof body.content === 'string'
@@ -721,8 +877,8 @@ export class SessionStore {
     }
     // The total is the whole file's message count — older than the rendered
     // window — and is the pagination answer: more can be loaded when the window
-    // is shorter than this. It costs nothing extra; `all` is in hand.
-    return { total: all.length, entries, usage }
+    // is shorter than this. It costs nothing extra; the merged list is in hand.
+    return { total: msgs.length, entries, usage }
   }
 
   async setPhase(id: string, phase: string): Promise<void> {
