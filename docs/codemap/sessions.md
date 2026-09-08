@@ -17,7 +17,7 @@ tests:
   - src/sessions/__tests__/search.test.ts
   - src/sessions/__tests__/checkpoints.test.ts
   - src/sessions/__tests__/commands.test.ts
-last_verified: 2026-09-07
+last_verified: 2026-09-08
 ---
 # Sessions — what is on disk
 
@@ -37,7 +37,8 @@ transcript. Codex's store is read by `codex-store.ts`, owned by
 with our metadata: `list({includeArchived})` (cached index scan; the render
 path), `get`, `card` (a `BoardSession` with phase, tags, test plan, parent,
 fanout), `transcript` / `fullTranscript` (windowed to `TRANSCRIPT_LIMIT` = 400
-from the tail, upward pagination by the host), `usage`, `meter`, `adoptKey(from,
+from the tail, upward pagination by the host, the total counting RECOVERED
+pre-compaction messages too), `usage`, `meter`, `adoptKey(from,
 to)` (carries metadata from a `run-…` key to the real session id), `patch`,
 `setPhase`, `setTestPlan` / `clearTestPlan`, `archive`, `delete` (verified
 against the OWNING runtime's listing), `rename`, `childrenOf`, `setModelBook`,
@@ -47,9 +48,22 @@ transcript row kind: `prompt | text | thinking | tool | phase | result | notice
 and `durationMs` on live tool rows only. `summariseTool(name, input)` is the
 one-line row text (also used by the Codex store); `shortenPath`;
 `retryWhileMissing` (the session file does not exist yet when its id is
-announced); `interruptedSessions`. Test: `store.test.ts` — seeds Claude Code's
-real format into a throwaway `CLAUDE_CONFIG_DIR`, including the project
-directory encoding (realpath of the cwd with every non-alphanumeric → `-`).
+announced); `interruptedSessions`. Compaction: the CLI severs the ancestry
+chain at a `compact_boundary`, and the SDK's reader returns only what is
+chained to the newest message — so a compacted session used to show nothing
+from before the boundary while the summary ("This session is being
+continued…") rendered as a giant user prompt. `readTranscript` therefore
+checks for a compact-summary-shaped message, and only then reads the raw JSONL
+(`recoverPreCompaction`, the `checkpoints.ts` pattern), merges the recovered
+records in front (deduped by uuid), and renders each summary as a muted
+`notice` — the same divider the Codex store draws. Usage and spend run over the
+MERGED list (spend includes the pre-compaction turns), while the context fill
+stays correct by sequence order (`lastMain` is the highest seq, which is
+post-compaction). Test: `store.test.ts` — seeds Claude Code's real format into
+a throwaway `CLAUDE_CONFIG_DIR`, including the project directory encoding
+(realpath of the cwd with every non-alphanumeric → `-`) and a compacted
+session in the real on-disk shape; both halves of the compaction guard go red
+when reverted.
 
 **`src/sessions/meta.ts`**. `MetaStore` — the sidecar in `globalStorageUri`,
 keyed by workspace root: `get`, `getAll`, `update`, `rename`, `remove`;
@@ -151,6 +165,8 @@ from `run-…` to the session id when `system/init` arrives, and
 - A foreign session's delete is verified against ITS runtime's listing.
 - Anthropic's `input_tokens` and `cache_read_input_tokens` are disjoint and
   summed; Codex's cached tokens are a subset (see runtimes.md).
+- A compacted session keeps its older messages (raw-JSONL recovery) and the
+  compact summary renders as a notice, never as a message.
 
 ## Open work
 
@@ -165,3 +181,4 @@ from `run-…` to the session id when `system/init` arrives, and
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S116g8 · dead-code sweep: `parseDecomposition` de-exported — module-private, called only inside `parseMeta`.
+- 2026-09-08 · task/S2cdw-implement-this-new-thing · compacted sessions: pre-compaction messages recovered from the raw JSONL, the compact summary hidden behind a muted notice; usage and spend run over the merged list.

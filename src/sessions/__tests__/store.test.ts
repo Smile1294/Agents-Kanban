@@ -28,6 +28,7 @@ process.env.CLAUDE_CONFIG_DIR = claudeHome
 await import('../../agent/runtimes/index.ts')
 const { MetaStore } = await import('../meta.ts')
 const { SessionStore, interruptedSessions, summariseTool } = await import('../store.ts')
+const { costOfUsage } = await import('../usage.ts')
 type BoardSession = import('../store.ts').BoardSession
 
 let fails = 0
@@ -55,6 +56,46 @@ const SEEDED_ID = '99999999-8888-7777-6666-555555555555'
         id: 'msg_store', model: 'claude-opus-5', role: 'assistant', type: 'message',
         content: [{ type: 'text', text: 'Looking at the routes.' }],
         usage: { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      } },
+  ].map((l) => JSON.stringify(l)).join('\n') + '\n')
+}
+
+// A second Claude session in the same project: the SAME seed after an
+// auto-compaction, in the real on-disk shape. Every pre-compaction message is
+// STILL IN THE FILE; the CLI then appends a `compact_boundary` system record
+// whose `parentUuid` is null — the severing of the ancestry chain that makes
+// everything before it invisible to the SDK's reader — and the compact summary
+// as a user message carrying `isCompactSummary: true`. Verified against a real
+// compacted session on this machine.
+const COMPACTED_ID = 'aaaaaaaa-0000-0000-0000-000000000001'
+{
+  const projectDir = path.join(claudeHome, 'projects', repo.replace(/[^a-zA-Z0-9]/g, '-'))
+  const common = {
+    sessionId: COMPACTED_ID, cwd: repo,
+    isSidechain: false, userType: 'external', version: '2.0.0', gitBranch: 'main',
+  }
+  const boundary = 'bbbbbbbb-0000-0000-0000-000000000002'
+  const summary = 'cccccccc-0000-0000-0000-000000000003'
+  const t = (n: number) => new Date(2e12 + n * 1000).toISOString()
+  await fs.writeFile(path.join(projectDir, `${COMPACTED_ID}.jsonl`), [
+    { ...common, type: 'user', uuid: 'cu1', parentUuid: null, timestamp: t(1),
+      message: { role: 'user', content: 'the original brief: build a thing' } },
+    { ...common, type: 'assistant', uuid: 'ca1', parentUuid: 'cu1', timestamp: t(2),
+      message: {
+        id: 'msg_pre_compaction', model: 'claude-opus-5', role: 'assistant', type: 'message',
+        content: [{ type: 'text', text: 'Early design notes.' }],
+        usage: { input_tokens: 30, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      } },
+    { ...common, type: 'system', uuid: boundary, subtype: 'compact_boundary',
+      parentUuid: null, timestamp: t(3), compactMetadata: { pre_tokens: 40 }, content: '' },
+    { ...common, type: 'user', uuid: summary, parentUuid: boundary, timestamp: t(4),
+      isCompactSummary: true, isVisibleInTranscriptOnly: true,
+      message: { role: 'user', content: 'This session is being continued from a previous conversation that ran out of context.\n\nSummary: 1. Build a thing.' } },
+    { ...common, type: 'assistant', uuid: 'ca2', parentUuid: summary, timestamp: t(5),
+      message: {
+        id: 'msg_post_compaction', model: 'claude-opus-5', role: 'assistant', type: 'message',
+        content: [{ type: 'text', text: 'Continuing the work.' }],
+        usage: { input_tokens: 5, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
       } },
   ].map((l) => JSON.stringify(l)).join('\n') + '\n')
 }
@@ -96,8 +137,8 @@ const list = await store.list()
 ok(Array.isArray(list), 'list() returns sessions from Claude Code without throwing')
 // An ASSERTION, not a guard. If the SDK ever changes where it looks, this goes
 // red and names it rather than skipping the rest of the file.
-ok(list.filter((s) => !s.runtime || s.runtime === 'claude').length === 1,
-   `the seeded Claude session is found — the SDK's project-directory encoding still holds (${list.length})`)
+ok(list.filter((s) => !s.runtime || s.runtime === 'claude').length === 2,
+   `the seeded Claude sessions are found — the SDK's project-directory encoding still holds (${list.length})`)
 ok(list.some((s) => s.id === SEEDED_ID), 'and it is the one that was seeded')
 
 {
@@ -139,7 +180,10 @@ ok(list.some((s) => s.id === SEEDED_ID), 'and it is the one that was seeded')
 // data, because the whole point is that they are read back off disk after the
 // process that produced them is gone.
 if (list.length) {
-  const id = list[0]!.id
+  // Pinned to the UNcompacted seed, not list[0]: a compacted session's usage
+  // deliberately totals MORE than the SDK returns (the recovery below), so the
+  // frame sanity check would compare two different populations on it.
+  const id = list.find((s) => s.id === SEEDED_ID)!.id
   const u = await store.usage(id)
   ok(u.responses > 0, `usage() finds API responses in a real transcript (${u.responses})`)
   ok(u.costUsd > 0, `and prices them: $${u.costUsd.toFixed(4)} over ${u.responses} responses`)
@@ -227,6 +271,43 @@ ok((await store.transcript('00000000-0000-0000-0000-000000000000')).length === 0
 const noUsage = await store.usage('00000000-0000-0000-0000-000000000000')
 ok(noUsage.costUsd === 0 && noUsage.responses === 0, 'and an unknown session costs nothing rather than throwing')
 ok((await store.get('nope')) === undefined, 'unknown session id returns undefined')
+
+// --- a compacted session keeps its older messages, hides the summary ---------
+//
+// The SDK's reader keeps only the ancestry chain of the newest message, and
+// the CLI severs that chain at a compaction — so a session that auto-compacted
+// used to show NOTHING from before the boundary while the compact summary
+// itself ("This session is being continued…") rendered as a giant user prompt.
+// Both halves were reported against the real board, and each gate here goes
+// red when its half is reverted: the first three when the recovery is skipped,
+// the fourth when the summary renders as a message.
+{
+  const t = await store.transcript(COMPACTED_ID)
+  const texts = t.filter((e) => e.kind === 'prompt' || e.kind === 'text')
+    .map((e) => (e as { text: string }).text).join('\n')
+  ok(texts.includes('the original brief: build a thing'),
+     'messages from before the compaction are still shown')
+  ok(texts.includes('Early design notes.'),
+     'including the assistant answers the SDK\'s reader drops')
+  ok(!texts.includes('being continued from a previous conversation'),
+     'the compact summary never renders as a message')
+  const notices = t.filter((e) => e.kind === 'notice')
+  ok(notices.length === 1
+     && notices[0]!.kind === 'notice'
+     && notices[0]!.message === 'Claude compacted the conversation here.',
+     `one muted divider marks the compaction, not the summary text (${notices.length} notice)`)
+  ok((await store.transcriptTotal(COMPACTED_ID)) === 5,
+     'and the total counts the older messages, so upward pagination can reach them')
+  const u = await store.usage(COMPACTED_ID)
+  const pre = costOfUsage('claude-opus-5',
+    { input_tokens: 30, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
+  const post = costOfUsage('claude-opus-5',
+    { input_tokens: 5, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
+  ok(u.costUsd === (pre! + post!),
+     `spend includes the pre-compaction turns ($${u.costUsd.toFixed(4)})`)
+  ok(u.contextTokens === 5,
+     `and the context fill is the POST-compaction figure (${u.contextTokens} tokens)`)
+}
 
 // --- what a tool row actually says -------------------------------------------
 //
