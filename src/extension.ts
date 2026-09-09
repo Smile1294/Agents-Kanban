@@ -211,6 +211,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     return agentScan.bySession
   }
+  /* LIVE means the process is alive: starting, working, waiting or asking.
+     The manager keeps a FINISHED run in its list so the card can show its
+     result, and "in the list" used to count as live — so an agent whose
+     outcome the parser had not seen read "may still be working" under a
+     run that had already printed "Finished". */
+  const isLive = (a: { state: { kind: string } }) =>
+    ['starting', 'working', 'needsInput', 'waiting'].includes(a.state.kind)
   let busy: string | undefined
   let commands: SlashCommand[] = []
 
@@ -2911,6 +2918,582 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       })
   }
 
+  /**
+   * The workspace-DEFAULT composer: what the NEXT new session would run on.
+   *
+   * A slice overwrites the halves that belong to the session it is about
+   * (`sessionSlice`), so this is only ever the floor. Built once per repaint
+   * and shallow-copied per watcher — the session branch REPLACES fields, it
+   * never mutates the arrays, so a copy is enough and a deep clone would be
+   * the per-token cost this file already has a postmortem about.
+   */
+  function baseComposer(active: ProviderProfile) {
+    // The effort levels are the SELECTED MODEL's, not a global list. Haiku 4.5
+    // accepts none, and was being offered all five — a control that could not
+    // say no, which is the same class of bug as a spinner over a wedged
+    // process.
+    const levels = effortsFor(catalogue.choices, model)
+    /* Built by `sendModels` below, ONCE per state and only when the list has
+       actually changed. It used to be mapped inline here — and then AGAIN in
+       the selected-session branch, so a 431-model catalogue was formatted
+       twice and serialised in full on every repaint. */
+    return {
+      model, effort, thinking,
+      // Filled in once, at the end: which catalogue is in force depends on
+      // whether a session is selected, and asking twice would send the list
+      // on every repaint — the exact cost this is here to avoid.
+      models: undefined as undefined | ReturnType<typeof sendModels>,
+      // Ultracode owns effort — it IS xhigh — so the effort picker steps aside
+      // rather than showing a level that is being overridden.
+      efforts: ultracode ? [] : EFFORT_LEVELS.filter((e) => levels.includes(e.key)),
+      thinkingSupported: thinkingFor(catalogue.choices, model),
+      ultracode, fastMode,
+      ultracodeSupported: ultracodeFor(catalogue.choices, model),
+      fastModeSupported: fastModeFor(catalogue.choices, model),
+      modelSource: catalogue.source,
+      ...(catalogue.problem ? { modelNote: catalogue.problem } : {}),
+      agent: agentKey(runtime, active.id),
+      agents: agentChoices(),
+      agentLocked: false,
+      // Set only when the selected session is a live run whose backend is
+      // still switchable: the note says the one thing that choice changes
+      // while the process is running.
+      backendNote: undefined as undefined | string,
+      runtime,
+      runtimes: allRuntimes().map((rt) => ({
+        id: rt.id,
+        label: rt.label,
+        detail: rt.vendor,
+        providerProfiles: rt.capabilities.providerProfiles,
+      })),
+      provider: active.id,
+      providers: providers.map((p) => ({
+        id: p.id,
+        label: profileLabel(p),
+        detail: describeProfile(p),
+        support: kindDef(p.kind).support,
+      })),
+      // The mismatch wins over the configuration problem: a profile that
+      // cannot start is a warning about the future, a profile the CLI already
+      // overrode is a statement about the run on screen.
+      ...(() => {
+        const note = providerMismatch ?? providerProblem()
+        return note ? { providerNote: note } : {}
+      })(),
+      contextTokens: 0 as number,
+      contextWindow: undefined as number | undefined,
+      meter: undefined as Meter | undefined,
+      permissionMode: permissionMode as string,
+      permissionModes: PERMISSION_MODES,
+      orchestration: orchestration as string,
+      /* ABSENT, not empty, where the control cannot take effect. A workspace
+         with no git repository has no worktrees and therefore no
+         `split_task` at all, so offering a dial over it would be a control
+         that cannot say no — the same rule that hides the backend picker on a
+         runtime with no provider concept. The view draws nothing when this is
+         missing. */
+      orchestrationLevels: undefined as { key: string; label: string; detail: string }[] | undefined,
+      orchestrationNote: undefined as string | undefined,
+      // Filled in below when the selected session has a conversation and the
+      // picker moved off the model that conversation was on.
+      modelSwitchNote: undefined as string | undefined,
+      // The mic's gate: absent until some path answered — the built-in
+      // gate, or the lazy whisper probe. The first paint of the board never
+      // waits on two `--version` spawns.
+      ...(voiceState()),
+    }
+  }
+
+  /**
+   * EVERYTHING THAT IS THE SAME FOR EVERY WATCHER, built ONCE per repaint.
+   *
+   * The board — cards, columns, counts, composer defaults — is identical for
+   * the side bar, the panel and every remote page. What is NOT identical is
+   * the session each of them is looking at, and that is `sessionSlice`.
+   *
+   * The split exists so two surfaces can be open on two different chats at
+   * once without the board scan happening twice. This function is the
+   * expensive half — a session-index scan, a sidecar read and a
+   * background-agent walk — and it runs ten times a second while an agent
+   * streams, so it must never be called per watcher, per card, or twice for
+   * one frame.
+   */
+  async function boardPass() {
+    const active = currentProvider()
+    const composer = baseComposer(active)
+    if (!ws) {
+      return {
+        ws: undefined as Workspace | undefined,
+        activeProfile: active.id,
+        composer,
+        cards: [] as UiCard[],
+        keys: [] as string[],
+        metas: {} as Record<string, SessionMeta>,
+        agentsBySession: new Map<string, SessionAgents>(),
+        live: [] as RunningAgent[],
+        olderHidden: 0,
+      }
+    }
+
+    const listed = await ws.store.list({ includeArchived: showArchived })
+    const agentsBySession = await backgroundAgents()
+    /* Outcomes are read ONLY for sessions that actually spawned an agent —
+       typically none or a handful — because the only authoritative statement
+       is the `<task-notification>` in that session's own transcript, and
+       parsing one per card would be the per-repaint cost this project has a
+       postmortem about. The store's parse is cached, so a session already on
+       screen costs nothing. */
+    const badges = new Map<string, { total: number; running: number; orphaned: number }>()
+    if (agentsBySession.size) {
+      const liveIds = new Set((ws.manager?.list() ?? []).filter(isLive).map((a) => a.sessionId).filter(Boolean))
+      const drawn = new Set<string>([...listed.map((x) => x.id), ...(ws.manager?.list() ?? []).map((a) => a.sessionId).filter(Boolean) as string[]])
+      for (const [sid, spawned] of agentsBySession) {
+        if (!drawn.has(sid)) continue
+        const reported = await readTaskNotifications(spawned.transcript)
+        const live = liveIds.has(sid)
+        let running = 0, orphaned = 0
+        for (const a of spawned.agents) {
+          const st = agentStatus(a, reported, live)
+          if (st === 'running') running++
+          else if (st === 'orphaned') orphaned++
+        }
+        badges.set(sid, { total: spawned.agents.length, running, orphaned })
+      }
+    }
+    const agentBadge = (sid: string | undefined) => {
+      const b = sid ? badges.get(sid) : undefined
+      return b ? { agents: b } : {}
+    }
+    // A run has no Claude Code session for its first moment, and may never get
+    // one if its id collided. Its board state lives in the sidecar under the
+    // run id, so read that too or the card renders as a default with whatever
+    // the agent recorded — phase, tags, test plan — invisible.
+    const metas = await ws.store.allMeta()
+    // The age bound is applied HERE and never inside `store.list()`, because
+    // `searchTranscript` reads the same list: a session you cannot find is
+    // worse than one you cannot see. See `splitByAge`.
+    const aged = splitByAge(listed, {
+      metas,
+      days: cfg().get<number>('hideSessionsOlderThanDays') ?? 30,
+      ...(showOlder ? { showOlder: true } : {}),
+    })
+    const stored = aged.shown
+    const live = ws.manager?.list() ?? []
+    const cards: UiCard[] = []
+    const seen = new Set<string>()
+
+    for (const a of live) {
+      const key = a.sessionId ?? a.runId
+      seen.add(key)
+      const s = a.sessionId ? stored.find((x) => x.id === a.sessionId) : undefined
+      const m = metas[key]
+      const phase = s?.phase ?? m?.phase
+      const testPlan = s?.testPlan ?? m?.testPlan
+      cards.push({
+        key,
+        ...(a.sessionId ? { sessionId: a.sessionId } : {}),
+        runtime: m?.runtime ?? a.runtime,
+        title: s?.title ?? a.title,
+        phase: phase ?? ws.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing',
+        tags: s?.tags ?? m?.tags ?? [],
+        /* The session's own last-modified time, or when the run started —
+           never the wall clock. Stamping `Date.now()` here made every live
+           card claim it had just changed on EVERY repaint, which is ten
+           times a second while an agent streams, and that was wrong twice.
+
+           It is a signal that cannot say bad: a wedged run reads "just now"
+           for as long as it stays wedged, which is the rule this board has
+           a postmortem about.
+
+           And the view puts `updated` in `chromeSig()`, so the signature
+           changed on every frame and the streaming fast path could never
+           match — the whole DOM was rebuilt ten times a second, which
+           cancels any click, drag or wheel gesture in flight. Reported as
+           "I can't switch to other chats or scroll up or even change to the
+           kanban board while it is running". See docs/DECISIONS.md. */
+        updated: s?.updated ?? a.startedAt,
+        branch: a.branch,
+        worktree: a.worktreePath,
+        ...(a.parent ?? m?.parent ? { parent: (a.parent ?? m?.parent)! } : {}),
+        ...(testPlan ? { testPlan } : {}),
+        ...(a.queued?.length ? { queued: a.queued } : {}),
+        ...agentBadge(a.sessionId),
+        agent: toUiAgent(a),
+      })
+    }
+    // Runs that were still marked running with no agent to account for them:
+    // the host went away mid-turn and killed them. Their processes cannot be
+    // re-attached, so the honest thing is to say so on the card rather than
+    // let a cut-off run look exactly like a finished one.
+    const cutOff = interruptedSessions(stored, seen)
+    for (const s of stored) {
+      if (seen.has(s.id)) continue
+      cards.push({
+        key: s.id, sessionId: s.id,
+        ...(s.runtime ? { runtime: s.runtime } : {}),
+        title: s.title, phase: s.phase, tags: s.tags,
+        updated: s.updated, archived: s.archived, pinned: s.pinned,
+      ...(() => {
+        const d = metas[s.id]?.decomposition
+        if (!d) return {}
+        return {
+          decomposition: {
+            line: decompositionLine(d, metas[s.id]?.fanout),
+            ...(d.stated ? { stated: d.stated } : {}),
+            refused: d.outcome === 'refused',
+          },
+        }
+      })(),
+        ...(s.branch ? { branch: s.branch } : {}),
+        ...(s.worktree ? { worktree: s.worktree } : {}),
+        ...(s.parent ? { parent: s.parent } : {}),
+        ...(s.testPlan ? { testPlan: s.testPlan } : {}),
+        ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
+        ...agentBadge(s.id),
+        // Only reachable in THIS loop, and that is the point: these are the
+        // sessions with no live agent. A card in a started column with
+        // nothing running is an agent that stopped without handing the work
+        // back, and it used to draw identically to one still working.
+        ...(() => {
+          const at = stalledSince(ws.board, {
+            phase: s.phase, updated: s.updated, archived: s.archived,
+            ...(s.worktree ? { worktree: s.worktree } : {}),
+            ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
+          })
+          return at ? { stalled: at } : {}
+        })(),
+      })
+    }
+
+    // Join the subtasks to the card they were split out of, both ways. Stored
+    // on the child alone — see SessionMeta.parent — so the parent's half is
+    // derived here rather than kept as a second copy that can disagree.
+    linkSubtasks(cards, ws.board)
+
+    /* Board-level: the same three levels whatever is selected. The RESOLVED
+       level is per session, so it is set in the slice. */
+    if (ws.repoRoot) composer.orchestrationLevels = ORCHESTRATION_CHOICES.map((c) => ({ ...c }))
+
+    return {
+      ws: ws as Workspace | undefined,
+      activeProfile: active.id,
+      composer,
+      cards,
+      keys: cards.map((c) => c.key),
+      metas,
+      agentsBySession,
+      live,
+      olderHidden: aged.hidden,
+    }
+  }
+
+  type BoardPass = Awaited<ReturnType<typeof boardPass>>
+
+  /**
+   * EVERYTHING ABOUT ONE SESSION, over a board pass that is already built.
+   *
+   * Built only for a key somebody is actually WATCHING — never one per card.
+   * A watcher names its own key, so the side bar, the panel and a phone can
+   * each be on a different chat and none of them is a mirror of the host.
+   *
+   * `followKey` runs HERE rather than over a host global, because the redirect
+   * is per watcher: a run whose id becomes a session id must carry the
+   * surface that is watching THAT run across, and leave the others alone.
+   */
+  async function sessionSlice(
+    pass: BoardPass,
+    key: string | undefined,
+    audience: 'webview' | 'remote',
+  ): Promise<UiState> {
+    // A copy per watcher: the session branch below overwrites model, effort,
+    // agent, meters and the model LIST, and two watchers on two backends must
+    // not write those into one shared object.
+    const composer = { ...pass.composer }
+    const ws = pass.ws
+    if (!ws) {
+      composer.models = sendModels(catalogue, pass.activeProfile, audience)
+      return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
+    }
+    const { metas, agentsBySession, cards, live } = pass
+    // Follow the selection across the run-id -> session-id swap rather than
+    // dropping it. Losing it here sent the open chat back to the new-session
+    // screen a few seconds into every first turn.
+    const selectedKey = followKey(key, pass.keys, (k) => ws.manager?.byKey(k)?.sessionId)
+
+    /* The WATCHED session's agents in full, with what can honestly be said
+       about each. Only for the watched one: a badge per card comes off the
+       counts above, and this is the render path. AFTER `followKey` rather
+       than before it — the two resolve a run id to its session id the same
+       way, so this is the same answer from the one place that decides it. */
+    const selectedAgents: NonNullable<UiState['backgroundAgents']> = []
+    {
+      const sid = ws.manager?.byKey(selectedKey ?? '')?.sessionId ?? selectedKey
+      const spawned = sid ? agentsBySession.get(sid) : undefined
+      if (sid && spawned?.agents.length) {
+        const liveRun = ws.manager?.byKey(selectedKey ?? '')
+        const live = !!liveRun && isLive(liveRun)
+        const reported = await readTaskNotifications(spawned.transcript)
+        for (const a of spawned.agents) {
+          selectedAgents.push({
+            id: a.id,
+            description: a.description,
+            ...(a.agentType ? { agentType: a.agentType } : {}),
+            ...(a.lastFrameAt ? { lastFrameAt: a.lastFrameAt } : {}),
+            status: agentStatus(a, reported, live),
+          })
+        }
+      }
+    }
+
+    let transcript: Entry[] | undefined
+    let transcriptMore: boolean | undefined
+    let transcriptHead: number | undefined
+    let streaming: string | undefined
+    if (selectedKey) {
+      const a = ws.manager?.byKey(selectedKey)
+      if (a) {
+        // Claude Code writes this run into the same transcript as it goes, so
+        // reading it back would contain this run too — and `a.live` is the
+        // same run as this extension observed it, with streaming text,
+        // resolved tool statuses and per-call timings. `a.history` is the
+        // transcript as it stood when the run began, captured once, so
+        // everything before it is genuine history and everything after it is
+        // the copy we already have. That boundary is what stops the whole
+        // conversation being rendered twice — and holding it rather than
+        // re-reading it is what stops a full transcript parse per token.
+        transcript = [...a.history, ...a.live]
+        streaming = a.streaming
+        composer.contextTokens = a.contextTokens
+        // The window the run reported, then the one this session reported
+        // last time. Without the fallback a resumed session shows no meter at
+        // all until its first frame arrives, which can be a minute in.
+        composer.contextWindow = a.contextWindow ?? metas[selectedKey]?.contextWindow
+        // The meter the run has published, already including anything the
+        // session spent before this run started (`settleMeter`). A run whose
+        // runtime has not reported yet has no reading, and that must stay
+        // undefined rather than becoming a zero.
+        composer.meter = a.meter
+      } else {
+        // Not running — so both numbers come from the transcript, off one
+        // parse that is cached on the session file's identity. This is the
+        // path a restart lands on, and the reason the context meter and the
+        // spend readout are still there afterwards: they used to exist only
+        // inside the live run, and died with the extension host.
+        //
+        // The window is the user's upward-pagination state: `undefined` lets
+        // the store's own default stand, and `loadOlderTranscript` widens it.
+        // `transcriptMore` says whether older messages exist beyond it. It is
+        // ABSENT (not false) while the session is running — history is
+        // captured at launch, so "more above" cannot become true mid-run —
+        // and for runtimes whose transcript has no limit the comparison is
+        // equal and it reads false on its own.
+        transcript = await ws.store.transcript(selectedKey, transcriptWindows.get(selectedKey))
+        const total = await ws.store.transcriptTotal(selectedKey)
+        transcriptMore = transcript.length < total
+        // Messages above the rendered window. A search hit carries an index
+        // into the FULL transcript; the view subtracts this from it to land
+        // the flash on the row actually drawn.
+        transcriptHead = Math.max(0, total - transcript.length)
+        const totals = await ws.store.usage(selectedKey)
+        composer.contextTokens = totals.contextTokens
+        composer.contextWindow = metas[selectedKey]?.contextWindow ?? totals.contextWindow
+        // `store.meter()` rather than `totals.costUsd`, and this is the only
+        // caller it has ever had. It routes on the session's own recorded
+        // runtime, so a finished Codex session reports the rate-limit window
+        // it actually spent instead of the `$0.00` that `usage()` correctly
+        // returns for a runtime that bills nothing per request. For a Claude
+        // session it comes off the same cached parse as `totals`, so it costs
+        // nothing extra — and there is one place that knows how spend is
+        // derived, not two.
+        composer.meter = await ws.store.meter(selectedKey)
+      }
+    }
+
+    /* The level for the card in front of you, resolved the same way effort is:
+       the session's own choice, then the workspace default. A card that has
+       already launched keeps the level its BRIEF was written with, so the
+       note says what a change would actually do rather than letting the
+       picker imply it takes effect now. */
+    /* THE COMPOSER FOLLOWS THE SELECTED SESSION.
+     *
+     * Everything above is the workspace DEFAULT — what the next new session
+     * would run on. For a session that already exists, that is somebody
+     * else's setting: open a card that has been on `deepseek-v4-pro` all
+     * morning and the bar said "Claude Code · Opus 5", because the composer
+     * had never read what the session was launched with. Reported as
+     * "it shows as if Claude was working on it, not deepseek", and it is
+     * exactly that.
+     *
+     * The fields were on `SessionMeta` and were parsed on the way back in.
+     * Nothing wrote them and nothing read them — a whole feature that existed
+     * only as types. `durablePatch` now records them at launch; this reads
+     * them back.
+     */
+    /* Which model list this state is about. The ACTIVE backend's by default;
+       the SELECTED SESSION's when there is one, because a card that ran on a
+       gateway must not be shown the models of whatever is selected now. Sent
+       once, below, and only when it differs from what the view already has. */
+    let effectiveCatalogue = catalogue
+    let effectiveProfile = pass.activeProfile
+    const sessionMeta = selectedKey ? metas[selectedKey] : undefined
+    if (sessionMeta) {
+      const ranOn = sessionMeta.provider
+        ? providers.find((p) => p.id === sessionMeta.provider)
+        : undefined
+      // A profile that has since been deleted still names itself, because the
+      // session did run on it. Silently showing the ACTIVE one instead is the
+      // bug this whole block is about, in a smaller place.
+      const cat = ranOn ? catalogueForProfile(ranOn) : catalogue
+      effectiveCatalogue = cat
+      effectiveProfile = ranOn?.id ?? pass.activeProfile
+      composer.modelSource = cat.source
+      if (cat.problem) composer.modelNote = cat.problem
+      if (sessionMeta.model) composer.model = sessionMeta.model
+      if (sessionMeta.effort) composer.effort = sessionMeta.effort
+      if (sessionMeta.thinking) composer.thinking = sessionMeta.thinking
+      if (sessionMeta.runtime) composer.runtime = sessionMeta.runtime
+      if (ranOn) composer.provider = ranOn.id
+      composer.agent = agentKey(
+        (sessionMeta.runtime ?? runtime) as RuntimeId,
+        ranOn?.id ?? ((sessionMeta.provider ?? pass.activeProfile)),
+      )
+      /* The RUNTIME half is decided — its transcript lives in that runtime's
+         own store, so the agent chip is a readout. The BACKEND half is not:
+         the view offers a same-runtime backend picker, and the note below
+         says the one thing that choice changes while the run is live. */
+      composer.agentLocked = true
+      if (selectedKey && ws.manager?.byKey(selectedKey)) {
+        composer.backendNote =
+          'The agent is running — a backend change applies when it stops and the conversation resumes.'
+      }
+      // Everything derived from "which model", recomputed against the list
+      // this session actually has.
+      const levels = effortsFor(cat.choices, composer.model)
+      composer.efforts = composer.ultracode ? [] : EFFORT_LEVELS.filter((e) => levels.includes(e.key))
+      composer.thinkingSupported = thinkingFor(cat.choices, composer.model)
+      composer.ultracodeSupported = ultracodeFor(cat.choices, composer.model)
+      composer.fastModeSupported = fastModeFor(cat.choices, composer.model)
+    }
+
+    /* THE MODEL-SWITCH WARNING.
+     *
+     * Switching a session's model makes the NEXT turn re-read the whole
+     * conversation at the new model's input price — nothing for a fresh
+     * card, real money for a long one, and nothing else in the bar says so.
+     * The view does no arithmetic on money (board.js rule), so the note is
+     * built HERE, host-side: the token count is the context fill the bar
+     * already shows, and the price is the same `rateFor` the meters use.
+     *
+     * "Different" is judged against the model the conversation was actually
+     * ON, which is NOT `sessionMeta.model` — the picker writes its own
+     * choice straight back to that field, so it could never disagree with
+     * itself and no warning would ever appear. The live run knows the model
+     * it started on; a finished transcript names the model on each answer
+     * block, so the last answer's writer is what a switch actually moves
+     * away from. When neither can be read, no claim is made: a warning that
+     * could be wrong is worse than none, and a fresh session has nothing to
+     * re-read anyway. */
+    /* A BACKEND switch on a started session is the same re-read as a model
+       switch — the whole conversation is re-uploaded at the new backend's
+       input price — so it warns through the same note. `switchedFrom` is
+       written by `switchSessionBackend` and cleared by the launch that
+       performs the switch, so the warning lasts exactly as long as the
+       re-read is still in the future. */
+    if (selectedKey && (transcript?.length || sessionMeta?.switchedFrom)) {
+      // A provider-only switch has no transcript yet; the model the
+      // conversation was on is then unreadable, and no claim is made.
+      const tx = transcript ?? []
+      const ranModel = (() => {
+        for (let i = tx.length - 1; i >= 0; i--) {
+          const e = tx[i]
+          if (!e || e.kind !== 'text') continue
+          if (e.model) return e.model
+        }
+        return undefined
+      })()
+      const switched = sessionMeta?.switchedFrom
+      const providerChanged = !!switched && switched !== composer.provider
+      const modelChanged = !!ranModel && !!composer.model && ranModel !== composer.model
+      if (providerChanged || modelChanged) {
+        const newModel = composer.model
+        const labelOf = (id: string) => effectiveCatalogue.choices.find((c) => c.id === id)?.label ?? id
+        const choice = effectiveCatalogue.choices.find((c) => c.id === newModel)
+        const rate = choice?.rate ?? rateFor(newModel, modelBook())
+        const costNote = (() => {
+          if (!(composer.contextTokens > 0)) return undefined
+          const count = `~${composer.contextTokens >= 1000
+            ? `${Math.round(composer.contextTokens / 1000)}k`
+            : String(composer.contextTokens)} tokens`
+          if (!rate) {
+            return `${count}; no input price is published for ${labelOf(newModel)}, so the cost cannot be estimated`
+          }
+          const cost = (composer.contextTokens * rate.input) / 1e6
+          const costStr = cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`
+          return `${count} ≈ ${costStr} at ${labelOf(newModel)}'s input price`
+        })()
+        let note: string
+        if (providerChanged) {
+          const from = providers.find((p) => p.id === switched)
+          const fromLabel = from ? profileLabel(from) : String(switched)
+          note =
+            `This conversation ran on ${fromLabel}. ` +
+            `The next turn re-reads it all on the new backend` +
+            (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
+        } else {
+          note =
+            // modelChanged being true means the transcript named a writer.
+            `This conversation last ran on ${labelOf(ranModel!)}. ` +
+            `Switching to ${labelOf(newModel)} re-reads it all` +
+            (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
+        }
+        // A live run's environment is fixed on its process: the re-read
+        // happens when it stops and the conversation resumes, not now.
+        if (selectedKey && ws.manager?.byKey(selectedKey)) {
+          note += ' The agent is running — this applies when it stops and the conversation resumes.'
+        }
+        composer.modelSwitchNote = note
+      }
+    }
+
+    if (ws.repoRoot) {
+      composer.orchestrationLevels = ORCHESTRATION_CHOICES.map((c) => ({ ...c }))
+      const meta = sessionMeta
+      composer.orchestration = resolveOrchestration(meta?.orchestration, orchestration)
+      const live = selectedKey ? ws.manager?.byKey(selectedKey) : undefined
+      if (live?.orchestration && live.orchestration !== composer.orchestration) {
+        composer.orchestrationNote =
+          `This session started at "${live.orchestration}". Its brief is already written, so a ` +
+          'change here applies to the next session.'
+      }
+    }
+
+    // ONE call, after everything that can decide which list is in force.
+    composer.models = sendModels(effectiveCatalogue, effectiveProfile, audience)
+
+    const kind = (k: string) => live.filter((a) => a.state.kind === k).length
+    return {
+      ready: true, mode, columns: ws.board.columns, cards, composer, showArchived,
+      ...(pass.olderHidden ? { olderHidden: pass.olderHidden } : {}),
+      ...(showOlder ? { showOlder: true } : {}),
+      ...(ws.repoRoot ? {} : { noRepo: true }),
+      ...(selectedKey ? { selectedKey } : {}),
+      ...(transcript ? { transcript } : {}),
+      ...(transcriptMore ? { transcriptMore } : {}),
+      ...(transcriptHead ? { transcriptHead } : {}),
+      ...(streaming ? { streaming } : {}),
+      ...(commands.length ? { commands } : {}),
+      ...(Object.keys(disclosures).length ? { disclosures } : {}),
+      ...(review && review.key === selectedKey ? { review: review.data } : {}),
+      ...(pendingMerge ? { pendingMerge } : {}),
+      ...(selectedAgents.length ? { backgroundAgents: selectedAgents } : {}),
+      ...(busy ? { busy } : {}),
+      ...(boardFocusApplied() ? { focused: true } : {}),
+      ...(BoardPanel.isOpen ? { boardOpen: true } : {}),
+      running: kind('working') + kind('starting') + kind('waiting'),
+      waiting: kind('needsInput'),
+    }
+  }
+
   const host: BoardHost = {
     // A webview has reloaded and holds nothing, so the next state must carry
     // the model catalogue in full again.
@@ -2924,507 +3507,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         .catch((e) => log.error(`Remote push failed: ${String(e)}`))
     },
     async getState(audience: 'webview' | 'remote' = 'webview'): Promise<UiState> {
-      const active = currentProvider()
-      // The effort levels are the SELECTED MODEL's, not a global list. Haiku 4.5
-      // accepts none, and was being offered all five — a control that could not
-      // say no, which is the same class of bug as a spinner over a wedged
-      // process.
-      const levels = effortsFor(catalogue.choices, model)
-      /* Built by `sendModels` below, ONCE per state and only when the list has
-         actually changed. It used to be mapped inline here — and then AGAIN in
-         the selected-session branch, so a 431-model catalogue was formatted
-         twice and serialised in full on every repaint. */
-      const composer = {
-        model, effort, thinking,
-        // Filled in once, at the end: which catalogue is in force depends on
-        // whether a session is selected, and asking twice would send the list
-        // on every repaint — the exact cost this is here to avoid.
-        models: undefined as undefined | ReturnType<typeof sendModels>,
-        // Ultracode owns effort — it IS xhigh — so the effort picker steps aside
-        // rather than showing a level that is being overridden.
-        efforts: ultracode ? [] : EFFORT_LEVELS.filter((e) => levels.includes(e.key)),
-        thinkingSupported: thinkingFor(catalogue.choices, model),
-        ultracode, fastMode,
-        ultracodeSupported: ultracodeFor(catalogue.choices, model),
-        fastModeSupported: fastModeFor(catalogue.choices, model),
-        modelSource: catalogue.source,
-        ...(catalogue.problem ? { modelNote: catalogue.problem } : {}),
-        agent: agentKey(runtime, active.id),
-        agents: agentChoices(),
-        agentLocked: false,
-        // Set only when the selected session is a live run whose backend is
-        // still switchable: the note says the one thing that choice changes
-        // while the process is running.
-        backendNote: undefined as undefined | string,
-        runtime,
-        runtimes: allRuntimes().map((rt) => ({
-          id: rt.id,
-          label: rt.label,
-          detail: rt.vendor,
-          providerProfiles: rt.capabilities.providerProfiles,
-        })),
-        provider: active.id,
-        providers: providers.map((p) => ({
-          id: p.id,
-          label: profileLabel(p),
-          detail: describeProfile(p),
-          support: kindDef(p.kind).support,
-        })),
-        // The mismatch wins over the configuration problem: a profile that
-        // cannot start is a warning about the future, a profile the CLI already
-        // overrode is a statement about the run on screen.
-        ...(() => {
-          const note = providerMismatch ?? providerProblem()
-          return note ? { providerNote: note } : {}
-        })(),
-        contextTokens: 0 as number,
-        contextWindow: undefined as number | undefined,
-        meter: undefined as Meter | undefined,
-        permissionMode: permissionMode as string,
-        permissionModes: PERMISSION_MODES,
-        orchestration: orchestration as string,
-        /* ABSENT, not empty, where the control cannot take effect. A workspace
-           with no git repository has no worktrees and therefore no
-           `split_task` at all, so offering a dial over it would be a control
-           that cannot say no — the same rule that hides the backend picker on a
-           runtime with no provider concept. The view draws nothing when this is
-           missing. */
-        orchestrationLevels: undefined as { key: string; label: string; detail: string }[] | undefined,
-        orchestrationNote: undefined as string | undefined,
-        // Filled in below when the selected session has a conversation and the
-        // picker moved off the model that conversation was on.
-        modelSwitchNote: undefined as string | undefined,
-        // The mic's gate: absent until some path answered — the built-in
-        // gate, or the lazy whisper probe. The first paint of the board never
-        // waits on two `--version` spawns.
-        ...(voiceState()),
-      }
-      if (!ws) {
-        composer.models = sendModels(catalogue, active.id, audience)
-        return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
-      }
-
-      const listed = await ws.store.list({ includeArchived: showArchived })
-      const agentsBySession = await backgroundAgents()
-      /* Outcomes are read ONLY for sessions that actually spawned an agent —
-         typically none or a handful — because the only authoritative statement
-         is the `<task-notification>` in that session's own transcript, and
-         parsing one per card would be the per-repaint cost this project has a
-         postmortem about. The store's parse is cached, so a session already on
-         screen costs nothing. */
-      const badges = new Map<string, { total: number; running: number; orphaned: number }>()
-      /* LIVE means the process is alive: starting, working, waiting or asking.
-         The manager keeps a FINISHED run in its list so the card can show its
-         result, and "in the list" used to count as live — so an agent whose
-         outcome the parser had not seen read "may still be working" under a
-         run that had already printed "Finished". */
-      const isLive = (a: { state: { kind: string } }) =>
-        ['starting', 'working', 'needsInput', 'waiting'].includes(a.state.kind)
-      if (agentsBySession.size) {
-        const liveIds = new Set((ws.manager?.list() ?? []).filter(isLive).map((a) => a.sessionId).filter(Boolean))
-        const drawn = new Set<string>([...listed.map((x) => x.id), ...(ws.manager?.list() ?? []).map((a) => a.sessionId).filter(Boolean) as string[]])
-        for (const [sid, spawned] of agentsBySession) {
-          if (!drawn.has(sid)) continue
-          const reported = await readTaskNotifications(spawned.transcript)
-          const live = liveIds.has(sid)
-          let running = 0, orphaned = 0
-          for (const a of spawned.agents) {
-            const st = agentStatus(a, reported, live)
-            if (st === 'running') running++
-            else if (st === 'orphaned') orphaned++
-          }
-          badges.set(sid, { total: spawned.agents.length, running, orphaned })
-        }
-      }
-      const agentBadge = (sid: string | undefined) => {
-        const b = sid ? badges.get(sid) : undefined
-        return b ? { agents: b } : {}
-      }
-      /* The selected session's agents in full, with what can honestly be said
-         about each. Only for the selected one: the panel is the only place that
-         draws them, and this is the render path. */
-      const selectedAgents: NonNullable<UiState['backgroundAgents']> = []
-      {
-        const sid = ws.manager?.byKey(selectedKey ?? '')?.sessionId ?? selectedKey
-        const spawned = sid ? agentsBySession.get(sid) : undefined
-        if (sid && spawned?.agents.length) {
-          const liveRun = ws.manager?.byKey(selectedKey ?? '')
-          const live = !!liveRun && isLive(liveRun)
-          const reported = await readTaskNotifications(spawned.transcript)
-          for (const a of spawned.agents) {
-            selectedAgents.push({
-              id: a.id,
-              description: a.description,
-              ...(a.agentType ? { agentType: a.agentType } : {}),
-              ...(a.lastFrameAt ? { lastFrameAt: a.lastFrameAt } : {}),
-              status: agentStatus(a, reported, live),
-            })
-          }
-        }
-      }
-      // A run has no Claude Code session for its first moment, and may never get
-      // one if its id collided. Its board state lives in the sidecar under the
-      // run id, so read that too or the card renders as a default with whatever
-      // the agent recorded — phase, tags, test plan — invisible.
-      const metas = await ws.store.allMeta()
-      // The age bound is applied HERE and never inside `store.list()`, because
-      // `searchTranscript` reads the same list: a session you cannot find is
-      // worse than one you cannot see. See `splitByAge`.
-      const aged = splitByAge(listed, {
-        metas,
-        days: cfg().get<number>('hideSessionsOlderThanDays') ?? 30,
-        ...(showOlder ? { showOlder: true } : {}),
-      })
-      const stored = aged.shown
-      const live = ws.manager?.list() ?? []
-      const cards: UiCard[] = []
-      const seen = new Set<string>()
-
-      for (const a of live) {
-        const key = a.sessionId ?? a.runId
-        seen.add(key)
-        const s = a.sessionId ? stored.find((x) => x.id === a.sessionId) : undefined
-        const m = metas[key]
-        const phase = s?.phase ?? m?.phase
-        const testPlan = s?.testPlan ?? m?.testPlan
-        cards.push({
-          key,
-          ...(a.sessionId ? { sessionId: a.sessionId } : {}),
-          runtime: m?.runtime ?? a.runtime,
-          title: s?.title ?? a.title,
-          phase: phase ?? ws.board.columns.find((c) => c.category === 'started')?.id ?? 'implementing',
-          tags: s?.tags ?? m?.tags ?? [],
-          /* The session's own last-modified time, or when the run started —
-             never the wall clock. Stamping `Date.now()` here made every live
-             card claim it had just changed on EVERY repaint, which is ten
-             times a second while an agent streams, and that was wrong twice.
-
-             It is a signal that cannot say bad: a wedged run reads "just now"
-             for as long as it stays wedged, which is the rule this board has
-             a postmortem about.
-
-             And the view puts `updated` in `chromeSig()`, so the signature
-             changed on every frame and the streaming fast path could never
-             match — the whole DOM was rebuilt ten times a second, which
-             cancels any click, drag or wheel gesture in flight. Reported as
-             "I can't switch to other chats or scroll up or even change to the
-             kanban board while it is running". See docs/DECISIONS.md. */
-          updated: s?.updated ?? a.startedAt,
-          branch: a.branch,
-          worktree: a.worktreePath,
-          ...(a.parent ?? m?.parent ? { parent: (a.parent ?? m?.parent)! } : {}),
-          ...(testPlan ? { testPlan } : {}),
-          ...(a.queued?.length ? { queued: a.queued } : {}),
-          ...agentBadge(a.sessionId),
-          agent: toUiAgent(a),
-        })
-      }
-      // Runs that were still marked running with no agent to account for them:
-      // the host went away mid-turn and killed them. Their processes cannot be
-      // re-attached, so the honest thing is to say so on the card rather than
-      // let a cut-off run look exactly like a finished one.
-      const cutOff = interruptedSessions(stored, seen)
-      for (const s of stored) {
-        if (seen.has(s.id)) continue
-        cards.push({
-          key: s.id, sessionId: s.id,
-          ...(s.runtime ? { runtime: s.runtime } : {}),
-          title: s.title, phase: s.phase, tags: s.tags,
-          updated: s.updated, archived: s.archived, pinned: s.pinned,
-        ...(() => {
-          const d = metas[s.id]?.decomposition
-          if (!d) return {}
-          return {
-            decomposition: {
-              line: decompositionLine(d, metas[s.id]?.fanout),
-              ...(d.stated ? { stated: d.stated } : {}),
-              refused: d.outcome === 'refused',
-            },
-          }
-        })(),
-          ...(s.branch ? { branch: s.branch } : {}),
-          ...(s.worktree ? { worktree: s.worktree } : {}),
-          ...(s.parent ? { parent: s.parent } : {}),
-          ...(s.testPlan ? { testPlan: s.testPlan } : {}),
-          ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
-          ...agentBadge(s.id),
-          // Only reachable in THIS loop, and that is the point: these are the
-          // sessions with no live agent. A card in a started column with
-          // nothing running is an agent that stopped without handing the work
-          // back, and it used to draw identically to one still working.
-          ...(() => {
-            const at = stalledSince(ws.board, {
-              phase: s.phase, updated: s.updated, archived: s.archived,
-              ...(s.worktree ? { worktree: s.worktree } : {}),
-              ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
-            })
-            return at ? { stalled: at } : {}
-          })(),
-        })
-      }
-
-      // Join the subtasks to the card they were split out of, both ways. Stored
-      // on the child alone — see SessionMeta.parent — so the parent's half is
-      // derived here rather than kept as a second copy that can disagree.
-      linkSubtasks(cards, ws.board)
-
-      // Follow the selection across the run-id -> session-id swap rather than
-      // dropping it. Losing it here sent the open chat back to the new-session
-      // screen a few seconds into every first turn.
-      const manager = ws.manager
-      selectedKey = followKey(
-        selectedKey,
-        cards.map((c) => c.key),
-        (k) => manager?.byKey(k)?.sessionId,
-      )
-
-      let transcript: Entry[] | undefined
-      let transcriptMore: boolean | undefined
-      let transcriptHead: number | undefined
-      let streaming: string | undefined
-      if (selectedKey) {
-        const a = ws.manager?.byKey(selectedKey)
-        if (a) {
-          // Claude Code writes this run into the same transcript as it goes, so
-          // reading it back would contain this run too — and `a.live` is the
-          // same run as this extension observed it, with streaming text,
-          // resolved tool statuses and per-call timings. `a.history` is the
-          // transcript as it stood when the run began, captured once, so
-          // everything before it is genuine history and everything after it is
-          // the copy we already have. That boundary is what stops the whole
-          // conversation being rendered twice — and holding it rather than
-          // re-reading it is what stops a full transcript parse per token.
-          transcript = [...a.history, ...a.live]
-          streaming = a.streaming
-          composer.contextTokens = a.contextTokens
-          // The window the run reported, then the one this session reported
-          // last time. Without the fallback a resumed session shows no meter at
-          // all until its first frame arrives, which can be a minute in.
-          composer.contextWindow = a.contextWindow ?? metas[selectedKey]?.contextWindow
-          // The meter the run has published, already including anything the
-          // session spent before this run started (`settleMeter`). A run whose
-          // runtime has not reported yet has no reading, and that must stay
-          // undefined rather than becoming a zero.
-          composer.meter = a.meter
-        } else {
-          // Not running — so both numbers come from the transcript, off one
-          // parse that is cached on the session file's identity. This is the
-          // path a restart lands on, and the reason the context meter and the
-          // spend readout are still there afterwards: they used to exist only
-          // inside the live run, and died with the extension host.
-          //
-          // The window is the user's upward-pagination state: `undefined` lets
-          // the store's own default stand, and `loadOlderTranscript` widens it.
-          // `transcriptMore` says whether older messages exist beyond it. It is
-          // ABSENT (not false) while the session is running — history is
-          // captured at launch, so "more above" cannot become true mid-run —
-          // and for runtimes whose transcript has no limit the comparison is
-          // equal and it reads false on its own.
-          transcript = await ws.store.transcript(selectedKey, transcriptWindows.get(selectedKey))
-          const total = await ws.store.transcriptTotal(selectedKey)
-          transcriptMore = transcript.length < total
-          // Messages above the rendered window. A search hit carries an index
-          // into the FULL transcript; the view subtracts this from it to land
-          // the flash on the row actually drawn.
-          transcriptHead = Math.max(0, total - transcript.length)
-          const totals = await ws.store.usage(selectedKey)
-          composer.contextTokens = totals.contextTokens
-          composer.contextWindow = metas[selectedKey]?.contextWindow ?? totals.contextWindow
-          // `store.meter()` rather than `totals.costUsd`, and this is the only
-          // caller it has ever had. It routes on the session's own recorded
-          // runtime, so a finished Codex session reports the rate-limit window
-          // it actually spent instead of the `$0.00` that `usage()` correctly
-          // returns for a runtime that bills nothing per request. For a Claude
-          // session it comes off the same cached parse as `totals`, so it costs
-          // nothing extra — and there is one place that knows how spend is
-          // derived, not two.
-          composer.meter = await ws.store.meter(selectedKey)
-        }
-      }
-
-      /* The level for the card in front of you, resolved the same way effort is:
-         the session's own choice, then the workspace default. A card that has
-         already launched keeps the level its BRIEF was written with, so the
-         note says what a change would actually do rather than letting the
-         picker imply it takes effect now. */
-      /* THE COMPOSER FOLLOWS THE SELECTED SESSION.
-       *
-       * Everything above is the workspace DEFAULT — what the next new session
-       * would run on. For a session that already exists, that is somebody
-       * else's setting: open a card that has been on `deepseek-v4-pro` all
-       * morning and the bar said "Claude Code · Opus 5", because the composer
-       * had never read what the session was launched with. Reported as
-       * "it shows as if Claude was working on it, not deepseek", and it is
-       * exactly that.
-       *
-       * The fields were on `SessionMeta` and were parsed on the way back in.
-       * Nothing wrote them and nothing read them — a whole feature that existed
-       * only as types. `durablePatch` now records them at launch; this reads
-       * them back.
-       */
-      /* Which model list this state is about. The ACTIVE backend's by default;
-         the SELECTED SESSION's when there is one, because a card that ran on a
-         gateway must not be shown the models of whatever is selected now. Sent
-         once, below, and only when it differs from what the view already has. */
-      let effectiveCatalogue = catalogue
-      let effectiveProfile = active.id
-      const sessionMeta = selectedKey ? metas[selectedKey] : undefined
-      if (sessionMeta) {
-        const ranOn = sessionMeta.provider
-          ? providers.find((p) => p.id === sessionMeta.provider)
-          : undefined
-        // A profile that has since been deleted still names itself, because the
-        // session did run on it. Silently showing the ACTIVE one instead is the
-        // bug this whole block is about, in a smaller place.
-        const cat = ranOn ? catalogueForProfile(ranOn) : catalogue
-        effectiveCatalogue = cat
-        effectiveProfile = ranOn?.id ?? active.id
-        composer.modelSource = cat.source
-        if (cat.problem) composer.modelNote = cat.problem
-        if (sessionMeta.model) composer.model = sessionMeta.model
-        if (sessionMeta.effort) composer.effort = sessionMeta.effort
-        if (sessionMeta.thinking) composer.thinking = sessionMeta.thinking
-        if (sessionMeta.runtime) composer.runtime = sessionMeta.runtime
-        if (ranOn) composer.provider = ranOn.id
-        composer.agent = agentKey(
-          (sessionMeta.runtime ?? runtime) as RuntimeId,
-          ranOn?.id ?? ((sessionMeta.provider ?? active.id)),
-        )
-        /* The RUNTIME half is decided — its transcript lives in that runtime's
-           own store, so the agent chip is a readout. The BACKEND half is not:
-           the view offers a same-runtime backend picker, and the note below
-           says the one thing that choice changes while the run is live. */
-        composer.agentLocked = true
-        if (selectedKey && ws.manager?.byKey(selectedKey)) {
-          composer.backendNote =
-            'The agent is running — a backend change applies when it stops and the conversation resumes.'
-        }
-        // Everything derived from "which model", recomputed against the list
-        // this session actually has.
-        const levels = effortsFor(cat.choices, composer.model)
-        composer.efforts = composer.ultracode ? [] : EFFORT_LEVELS.filter((e) => levels.includes(e.key))
-        composer.thinkingSupported = thinkingFor(cat.choices, composer.model)
-        composer.ultracodeSupported = ultracodeFor(cat.choices, composer.model)
-        composer.fastModeSupported = fastModeFor(cat.choices, composer.model)
-      }
-
-      /* THE MODEL-SWITCH WARNING.
-       *
-       * Switching a session's model makes the NEXT turn re-read the whole
-       * conversation at the new model's input price — nothing for a fresh
-       * card, real money for a long one, and nothing else in the bar says so.
-       * The view does no arithmetic on money (board.js rule), so the note is
-       * built HERE, host-side: the token count is the context fill the bar
-       * already shows, and the price is the same `rateFor` the meters use.
-       *
-       * "Different" is judged against the model the conversation was actually
-       * ON, which is NOT `sessionMeta.model` — the picker writes its own
-       * choice straight back to that field, so it could never disagree with
-       * itself and no warning would ever appear. The live run knows the model
-       * it started on; a finished transcript names the model on each answer
-       * block, so the last answer's writer is what a switch actually moves
-       * away from. When neither can be read, no claim is made: a warning that
-       * could be wrong is worse than none, and a fresh session has nothing to
-       * re-read anyway. */
-      /* A BACKEND switch on a started session is the same re-read as a model
-         switch — the whole conversation is re-uploaded at the new backend's
-         input price — so it warns through the same note. `switchedFrom` is
-         written by `switchSessionBackend` and cleared by the launch that
-         performs the switch, so the warning lasts exactly as long as the
-         re-read is still in the future. */
-      if (selectedKey && (transcript?.length || sessionMeta?.switchedFrom)) {
-        // A provider-only switch has no transcript yet; the model the
-        // conversation was on is then unreadable, and no claim is made.
-        const tx = transcript ?? []
-        const ranModel = (() => {
-          for (let i = tx.length - 1; i >= 0; i--) {
-            const e = tx[i]
-            if (!e || e.kind !== 'text') continue
-            if (e.model) return e.model
-          }
-          return undefined
-        })()
-        const switched = sessionMeta?.switchedFrom
-        const providerChanged = !!switched && switched !== composer.provider
-        const modelChanged = !!ranModel && !!composer.model && ranModel !== composer.model
-        if (providerChanged || modelChanged) {
-          const newModel = composer.model
-          const labelOf = (id: string) => effectiveCatalogue.choices.find((c) => c.id === id)?.label ?? id
-          const choice = effectiveCatalogue.choices.find((c) => c.id === newModel)
-          const rate = choice?.rate ?? rateFor(newModel, modelBook())
-          const costNote = (() => {
-            if (!(composer.contextTokens > 0)) return undefined
-            const count = `~${composer.contextTokens >= 1000
-              ? `${Math.round(composer.contextTokens / 1000)}k`
-              : String(composer.contextTokens)} tokens`
-            if (!rate) {
-              return `${count}; no input price is published for ${labelOf(newModel)}, so the cost cannot be estimated`
-            }
-            const cost = (composer.contextTokens * rate.input) / 1e6
-            const costStr = cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`
-            return `${count} ≈ ${costStr} at ${labelOf(newModel)}'s input price`
-          })()
-          let note: string
-          if (providerChanged) {
-            const from = providers.find((p) => p.id === switched)
-            const fromLabel = from ? profileLabel(from) : String(switched)
-            note =
-              `This conversation ran on ${fromLabel}. ` +
-              `The next turn re-reads it all on the new backend` +
-              (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
-          } else {
-            note =
-              // modelChanged being true means the transcript named a writer.
-              `This conversation last ran on ${labelOf(ranModel!)}. ` +
-              `Switching to ${labelOf(newModel)} re-reads it all` +
-              (costNote ? ` — ${costNote}.` : '; its size is unknown yet, so the cost cannot be estimated.')
-          }
-          // A live run's environment is fixed on its process: the re-read
-          // happens when it stops and the conversation resumes, not now.
-          if (selectedKey && ws.manager?.byKey(selectedKey)) {
-            note += ' The agent is running — this applies when it stops and the conversation resumes.'
-          }
-          composer.modelSwitchNote = note
-        }
-      }
-
-      if (ws.repoRoot) {
-        composer.orchestrationLevels = ORCHESTRATION_CHOICES.map((c) => ({ ...c }))
-        const meta = sessionMeta
-        composer.orchestration = resolveOrchestration(meta?.orchestration, orchestration)
-        const live = selectedKey ? ws.manager?.byKey(selectedKey) : undefined
-        if (live?.orchestration && live.orchestration !== composer.orchestration) {
-          composer.orchestrationNote =
-            `This session started at "${live.orchestration}". Its brief is already written, so a ` +
-            'change here applies to the next session.'
-        }
-      }
-
-      // ONE call, after everything that can decide which list is in force.
-      composer.models = sendModels(effectiveCatalogue, effectiveProfile, audience)
-
-      const kind = (k: string) => live.filter((a) => a.state.kind === k).length
-      return {
-        ready: true, mode, columns: ws.board.columns, cards, composer, showArchived,
-        ...(aged.hidden ? { olderHidden: aged.hidden } : {}),
-        ...(showOlder ? { showOlder: true } : {}),
-        ...(ws.repoRoot ? {} : { noRepo: true }),
-        ...(selectedKey ? { selectedKey } : {}),
-        ...(transcript ? { transcript } : {}),
-        ...(transcriptMore ? { transcriptMore } : {}),
-        ...(transcriptHead ? { transcriptHead } : {}),
-        ...(streaming ? { streaming } : {}),
-        ...(commands.length ? { commands } : {}),
-        ...(Object.keys(disclosures).length ? { disclosures } : {}),
-        ...(review && review.key === selectedKey ? { review: review.data } : {}),
-        ...(pendingMerge ? { pendingMerge } : {}),
-        ...(selectedAgents.length ? { backgroundAgents: selectedAgents } : {}),
-        ...(busy ? { busy } : {}),
-        ...(boardFocusApplied() ? { focused: true } : {}),
-        ...(BoardPanel.isOpen ? { boardOpen: true } : {}),
-        running: kind('working') + kind('starting') + kind('waiting'),
-        waiting: kind('needsInput'),
-      }
+      /* The host's own selection is still a real thing — it is what a brand-new
+         client is told to open first, and what every command that acts on "the
+         selected card" means. `followKey` may move it, so the slice's answer is
+         written back here rather than inside a function that runs once per
+         watcher. */
+      const pass = await boardPass()
+      const state = await sessionSlice(pass, selectedKey, audience)
+      selectedKey = state.selectedKey
+      return state
     },
 
     async openFolder() { await vscode.commands.executeCommand('vscode.openFolder') },
