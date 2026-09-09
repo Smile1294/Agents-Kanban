@@ -159,4 +159,25 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · step 1 of
+  docs/REMOTE-REWORK.md §9: **the view owns `mode` and `selectedKey`**. They
+  were two variables in the HOST shared by the side bar, the panel and every
+  remote page at once, so no two surfaces could show different sessions and a
+  click could not draw anything until a whole state came back. Now `view` is
+  module-level beside `draft` and `disclosed`, `setView()` renders FIRST and
+  tells the host after, and `adoptView()` folds a fresh state in: seed once,
+  then adopt only what the host changed on its OWN — `viewPending` drops the
+  stale frame naming the session we just left, which is precisely the frame the
+  old code waited for. Step 4 replaces the host's redirects (a run getting its
+  id, a fork, an archive) with something it announces; until then that bridge
+  keeps every one working.
+  The trap found while building it: moving first means the state's
+  SESSION-SCOPED half — transcript, streaming, review, backgroundAgents, the
+  composer meters — still describes the session we LEFT. Drawing it under the
+  new title is not a slower board, it is a wrong one, and a search jump proved
+  it (the flash landed on the old transcript's row and was spent before the
+  right rows arrived). `sliceIsOurs()` gates every use of it, `syncApply`
+  refuses to patch from a foreign slice, and it is IN `chromeSig()` or the fast
+  path would hold "Loading this conversation…" over rows that had arrived.
+
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.

@@ -2174,5 +2174,73 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
      'with nothing live and a follow-up turn owed, it says that instead of a count of zero')
 }
 
+/* --- the view owns what it is looking at ------------------------------------
+   `mode` and `selectedKey` used to be two variables in the HOST, shared by the
+   side bar, the editor panel and every remote page at once. A click could not
+   draw anything until a message reached the host and a whole state came back,
+   and no two surfaces could ever show different sessions. These pin the
+   inversion: the view decides and renders, THEN tells the host. */
+
+const TWO = [
+  { ...CARD, key: 'a-1', sessionId: 'a-1', title: 'First session' },
+  { ...CARD, key: 'b-2', sessionId: 'b-2', title: 'Second session', agent: undefined },
+]
+const railRow = (v, title) => walkAll(v.root).find((n) =>
+  (n.className || '').includes('rail-item') && n.textContent.includes(title))
+/* The CHAT's title, not the page's text. Every session's title is also in the
+   rail, so `v.text().includes(...)` is true whichever session is open — three
+   of these assertions passed against a deliberately broken view before that
+   was noticed. */
+const chatTitle = (v) => walkAll(v.root).find((n) => n.className === 'chat-title')?.textContent ?? ''
+
+{
+  const v = run({ ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO,
+                  transcript: [{ kind: 'text', at: Date.now(), text: 'first session answer' }] })
+  ok(chatTitle(v) === 'First session', 'the chat opens on the host-seeded session')
+
+  const before = v.posted.length
+  const row = railRow(v, 'Second session')
+  ok(!!row, 'the other session has a rail row')
+  row.onclick({})
+
+  // THE gate: no state message has been delivered, and the board has moved.
+  ok(chatTitle(v) === 'Second session',
+    'clicking a rail row redraws on that session with NO state message at all')
+  ok(v.posted.slice(before).some((m) => m.type === 'select' && m.id === 'b-2'),
+    'and the host is told afterwards, not asked first')
+
+  // The session-scoped half of the state still describes the session we left,
+  // so it must not be drawn under the new one's title.
+  ok(!v.text().includes('first session answer'),
+    'the session we left does NOT have its transcript drawn under the new title')
+  ok(v.text().includes('Loading this conversation'),
+    'the board says it is still fetching rather than showing the wrong rows')
+
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'b-2', cards: TWO,
+              transcript: [{ kind: 'text', at: Date.now(), text: 'second session answer' }] })
+  ok(v.text().includes('second session answer'), 'and the real transcript lands when it arrives')
+  ok(!v.text().includes('Loading this conversation'), '…replacing the waiting state')
+}
+
+{
+  // The host still redirects the selection on its own — a new session, a fork,
+  // an archive. Those must still move this view.
+  const three = [TWO[0], { ...CARD, key: 'c-3', sessionId: 'c-3', title: 'Freshly started', agent: undefined }]
+  const v = run({ ...base, mode: 'chat', selectedKey: 'a-1', cards: three })
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'c-3', cards: three })
+  ok(chatTitle(v) === 'Freshly started',
+    'a selection the host changed on its own is still adopted — a new session opens')
+}
+
+{
+  // …but a STALE frame, still naming the session we just left, must not drag
+  // the view back. That frame is exactly what the old code waited for.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO })
+  railRow(v, 'Second session').onclick({})
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO })
+  ok(chatTitle(v) === 'Second session',
+    'a frame still naming the old session does not drag the view back')
+}
+
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)
