@@ -404,6 +404,15 @@
     const host = { mode: s.mode || 'kanban', selectedKey: s.selectedKey || '' }
     if (!viewSeeded) { view = host; viewSeeded = true; return }
     const same = (a, b) => a.mode === b.mode && a.selectedKey === b.selectedKey
+    /* The host has ANSWERED about the key we are on: the card is no longer on
+       the board. Stay put so the board can say so under the title it has,
+       rather than sliding to the new-session screen and leaving "where did my
+       chat go?" as the only reading available. It is also the answer to a
+       change of ours if one was in flight, so that stops waiting. */
+    if (s.vanished && s.vanished === view.selectedKey) {
+      if (viewPending && viewPending.selectedKey === s.vanished) viewPending = null
+      return
+    }
     if (viewPending) {
       // Ours has landed; anything after this that differs is the host's doing.
       if (same(host, viewPending)) viewPending = null
@@ -441,7 +450,17 @@
    */
   function ourTranscript() {
     if (sliceIsOurs()) return s.transcript || []
-    return cachedTranscripts.get(view.selectedKey) || []
+    const hit = cachedTranscripts.get(view.selectedKey)
+    return hit ? hit.rows : []
+  }
+
+  /** What to call the session on screen when its card is no longer on the
+   *  board. "New session" would be a lie — this is a conversation that exists
+   *  and was open a moment ago — so the last title we drew for it stands, and
+   *  the neutral word only when we never drew one. */
+  function ourTitle() {
+    const hit = cachedTranscripts.get(view.selectedKey)
+    return (hit && hit.title) || 'Session'
   }
 
   /** Keep what we have just drawn, so coming back to it is instant. Called on
@@ -454,7 +473,9 @@
     // Re-inserted rather than updated in place: the Map's insertion order IS
     // the recency order, and that is what makes eviction a one-liner.
     cachedTranscripts.delete(key)
-    cachedTranscripts.set(key, s.transcript)
+    // The title rides along: it is drawn from the CARD, and the moment a card
+    // leaves the board there is nothing left on screen to name the session by.
+    cachedTranscripts.set(key, { rows: s.transcript, title: (card(key) || {}).title })
     while (cachedTranscripts.size > TRANSCRIPT_CACHE) {
       cachedTranscripts.delete(cachedTranscripts.keys().next().value)
     }
@@ -649,7 +670,7 @@
       // constantly, and raw milliseconds would differ on every frame.
       (s.backgroundAgents || []).map((a) => [a.id, a.status, Math.floor((a.lastFrameAt || 0) / 60000)]),
       !!searching, !!control, s.running || 0, s.waiting || 0,
-      !!s.transcriptMore, sliceIsOurs(),
+      !!s.transcriptMore, sliceIsOurs(), s.vanished || '',
       cards, composer, s.columns || [], s.commands || [],
       s.disclosures || {}, s.review || null, s.pendingMerge || null,
     ])
@@ -1939,7 +1960,7 @@
       up.onclick = () => setView({ selectedKey: c.parent })
       titles.append(up)
     }
-    titles.append(el('div', 'chat-title', c ? c.title : 'New session'))
+    titles.append(el('div', 'chat-title', c ? c.title : (view.selectedKey ? ourTitle() : 'New session')))
     if (c) {
       const tags = el('div', 'labels')
       tags.append(phaseChip(c.phase))
@@ -2029,7 +2050,16 @@
     syncEmptyNode = null
     syncHintNode = null
     const rows = ourTranscript()
-    if (!c) {
+    if (!c && view.selectedKey) {
+      /* A card we were watching and can no longer find. `vanished` says the
+         host agrees it is gone; without it this is the same frame as one where
+         the cards simply have not arrived, so it stays a statement about the
+         BOARD and never a claim about what happened to the session. */
+      syncEmptyNode = el('div', 'empty', s.vanished === view.selectedKey
+        ? 'This session is no longer on the board. It may have been deleted, archived, or hidden by the age filter.'
+        : 'Loading this conversation…')
+      scroll.append(syncEmptyNode)
+    } else if (!c) {
       syncHintNode = renderNewSessionHint()
       scroll.append(syncHintNode)
     } else if (!rows.length) {

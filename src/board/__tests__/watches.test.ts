@@ -82,10 +82,23 @@ const make = () => new Watches(() => ({ ...defaults }))
   const w = make()
   w.set('panel', { key: 'gone' })
   w.followAll((k) => (k === 'gone' ? undefined : k))
-  ok(w.of('panel').key === undefined,
-     'a watch on a card that no longer exists is CLEARED, not left pointing at nothing')
-  ok(w.sinks().includes('panel'),
-     'the surface itself stays — it is still there, it is just looking at no session')
+  ok(w.of('panel').key === 'gone',
+     'a watch on a card that no longer exists is KEPT, so the surface can be told it is gone')
+  ok(w.sinks().includes('panel'), 'the surface itself is untouched')
+}
+
+{
+  // A fork RE-KEYS a card: it adopts the old one's phase, tags and worktree
+  // under a new id, and the old id stops existing.
+  const w = make()
+  w.set('panel', { key: 'old' })
+  w.set('sidebar', { key: 'elsewhere' })
+  w.set('remote', { key: 'old' })
+  w.retarget('old', 'fork-1')
+  ok(w.of('panel').key === 'fork-1' && w.of('remote').key === 'fork-1',
+     'every surface watching the old key follows the fork, wherever it was asked for')
+  ok(w.of('sidebar').key === 'elsewhere',
+     'and a surface that was looking at something else is not dragged along')
 }
 
 {

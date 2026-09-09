@@ -74,7 +74,9 @@ its rules are the ones the type system cannot state. `StateSink`
 `of(sink)` (falls back to the host's defaults, which IS how a brand-new surface
 is seeded), `set(sink, patch)`, `keys()` (the bound on cached review data),
 `followAll(follow)` (each watch crosses the run-id -> session-id swap on its
-own), `hostSelect(key, remote, current)` (the host opening something itself:
+own, and KEEPS a key that resolves to nothing so the surface can be told),
+`retarget(from, to)` (a fork re-keys a card; everyone watching the old id
+follows), `hostSelect(key, remote, current)` (the host opening something itself:
 answers what its own selection becomes and moves the local surfaces with it —
 one function rather than a reset beside an `if` at ten call sites) and
 `resetLocal()`. Test: `src/board/__tests__/watches.test.ts`; the wiring end-to-end is
@@ -245,6 +247,13 @@ bar is handed back to `agentsKanban.sideBarHome`.
   at" are the same sentence — a menu item, the status bar and every deletion
   mean the former. On a phone they are not, and a page opening a chat must not
   retarget what somebody at the keyboard is about to click.
+- **A surface left watching a card that is gone is TOLD.** `UiState.vanished`
+  carries the key. The surface it happens to is usually not the one that did it
+  — a phone left open on a card somebody deleted at the desk — and a selection
+  that quietly becomes nothing is a chat disappearing with no explanation
+  available anywhere on the board. A statement, never a reason: deleted,
+  archived out of view and past the age bound are three different causes the
+  host cannot always tell apart.
 - **A state is built only for a surface that will receive it.** Building one
   spends that sink's catalogue memo, so a slice computed for a view that is not
   there marks 161 KB as delivered to nobody.
@@ -272,6 +281,14 @@ bar is handed back to `agentsKanban.sideBarHome`.
   one, nothing implements it (see PLAN.md §9).
 
 ## Recent changes
+
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · the host's redirects
+  became announcements. `UiState.vanished` names the key a surface is watching
+  that has no card, instead of `followAll` silently clearing the watch; a fork
+  moves every watcher of the old key (`Watches.retarget`) rather than only the
+  host's own selection, which missed a remote page that asked for a fork of a
+  card the editor was not on. Gates: `watches.test.ts`, `webview.test.mjs` and
+  smoke's "the host names the key that has no card", each shown to fail.
 
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `getState()` split into
   `boardPass()` (once per repaint, identical for everyone) and

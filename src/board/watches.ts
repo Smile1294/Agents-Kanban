@@ -108,15 +108,35 @@ export class Watches {
    *
    * `follow` is the caller's own resolver — `followKey` in the manager, the one
    * place that knows how a run becomes a session — so this holds the policy of
-   * WHOSE key moves and none of the policy of what it moves to. A key that
-   * resolves to nothing is dropped: its card is gone, and a surface pointed at
-   * a card that no longer exists draws the new-session screen, which is the
-   * honest answer.
+   * WHOSE key moves and none of the policy of what it moves to.
+   *
+   * A key that resolves to NOTHING is kept, not dropped. Its card is gone, and
+   * a surface pointed at a card that no longer exists has to be TOLD: a watch
+   * quietly reset to nothing draws the new-session screen, which is "my chat
+   * disappeared" with no explanation available anywhere on the board. The slice
+   * announces it instead (`vanished`), and the watch stays until the surface
+   * chooses something else.
    */
   followAll(follow: (key: string | undefined) => string | undefined): void {
     for (const [sink, w] of this.bySink) {
+      if (!w.key) continue
       const key = follow(w.key)
-      if (key !== w.key) this.bySink.set(sink, { ...w, key })
+      if (key && key !== w.key) this.bySink.set(sink, { ...w, key })
+    }
+  }
+
+  /**
+   * A card was RE-KEYED: a fork adopts the old card's phase, tags and worktree
+   * under a new id, and the old key stops existing.
+   *
+   * Every surface watching the old one follows, wherever the fork was asked
+   * for, because it is the same work under a new name — not a redirect a client
+   * could derive, and not a reason to drag surfaces that were looking at
+   * something else.
+   */
+  retarget(from: string, to: string): void {
+    for (const [sink, w] of this.bySink) {
+      if (w.key === from) this.bySink.set(sink, { ...w, key: to })
     }
   }
 

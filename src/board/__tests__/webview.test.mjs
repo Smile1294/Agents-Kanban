@@ -2311,5 +2311,42 @@ const chatTitle = (v) => walkAll(v.root).find((n) => n.className === 'chat-title
      "nor the other session's background agents, whose ages are drawn")
 }
 
+/* --- a card that goes away under a surface watching it ----------------------
+   Step 4 of docs/REMOTE-REWORK.md §9. Every surface now watches its own
+   session, so the one a card vanishes under is usually NOT the one that did it
+   — a phone left open on a card somebody deleted at the desk. A selection that
+   quietly becomes nothing is "my chat disappeared" with no explanation
+   available anywhere on the board. */
+{
+  const v = run({ ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO,
+                  transcript: [{ kind: 'text', at: 1, text: 'first session answer' }] })
+  ok(chatTitle(v) === 'First session', 'the chat is open on a session')
+
+  // Somebody else deleted it. The host answers with the key it was about.
+  v.deliver({ ...base, mode: 'chat', cards: [TWO[1]], vanished: 'a-1' })
+  ok(chatTitle(v) === 'First session',
+     'the view stays on it rather than sliding to the new-session screen')
+  ok(v.text().includes('no longer on the board'),
+     'and the board SAYS the card is gone')
+  ok(v.text().includes('It may have been deleted, archived'),
+     'naming the three things it could be, because the host cannot tell them apart')
+  ok(!v.text().includes('New session — describe'),
+     'it is not drawn as a brand-new session, which is what "nothing selected" looks like')
+
+  // And it is still a board: picking another session works from there.
+  railRow(v, 'Second session').onclick({})
+  ok(chatTitle(v) === 'Second session', 'and the way out is an ordinary click')
+}
+
+{
+  // The same frame WITHOUT the announcement is a different thing: cards that
+  // have not arrived yet. It must not claim anything about the session.
+  const v = run({ ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO,
+                  transcript: [{ kind: 'text', at: 1, text: 'first session answer' }] })
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'a-1', cards: [] })
+  ok(!v.text().includes('no longer on the board'),
+     'a missing card the host has NOT said is gone is not reported as gone')
+}
+
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

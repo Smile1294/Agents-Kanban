@@ -859,7 +859,24 @@ console.log('\n— the side bar and the panel can be on two different sessions')
   ok(ctl.boardPanel.state()?.mode === 'chat',
      'and onto the chat screen, which is what openSession asks for')
 
+  /* A surface left watching a card that is no longer on the board is TOLD
+     which key it was about, rather than having its selection quietly become
+     nothing. Now that each surface watches its own session, the one this
+     happens to is usually not the one that did it — a phone left open on a
+     card somebody archived at the desk. `nope` stands in for any key with no
+     card: deleted, archived out of view, or past the age bound, which the host
+     cannot tell apart and therefore does not claim to. */
+  await ctl.boardPanel.send({ type: 'select', id: 'no-such-session' })
+  ok(ctl.boardPanel.state()?.vanished === 'no-such-session',
+     `the host names the key that has no card (${ctl.boardPanel.state()?.vanished})`)
+  ok(ctl.boardPanel.state()?.selectedKey === undefined,
+     'and reports nothing selected, because there is nothing there to select')
+  await ctl.sideBar.send({ type: 'ready' })
+  ok(ctl.sideBar.state()?.vanished === undefined,
+     'while the surface that is watching a real card is told nothing of the sort')
+
   // Put the board back where the rest of this file expects to find it.
+  await ctl.boardPanel.send({ type: 'select', id: '' })
   await ctl.sideBar.send({ type: 'select', id: '' })
   await send({ type: 'select', id: '' })
   await send({ type: 'setMode', mode: 'kanban' })

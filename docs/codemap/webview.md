@@ -159,6 +159,16 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · a card that goes away
+  under this surface is drawn as such: `adoptView()` holds the view on a key the
+  host announced as `vanished` instead of sliding to the new-session screen, the
+  transcript area says "no longer on the board" naming the three things it could
+  be, and the title falls back to the last one this view drew for that session
+  (cached beside its rows) rather than to "New session", which would be a lie
+  about a conversation that exists. Without the announcement the same frame is
+  read as cards that have not arrived and claims nothing. Gates in
+  `webview.test.mjs`, shown to fail.
+
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · the view keeps the last
   THREE conversations it drew (`cachedTranscripts`, `TRANSCRIPT_CACHE`,
   `rememberTranscript()`), so switching back to a chat you were just in draws

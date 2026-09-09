@@ -3320,6 +3320,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // dropping it. Losing it here sent the open chat back to the new-session
     // screen a few seconds into every first turn.
     const selectedKey = followKey(watch.key, pass.keys, (k) => ws.manager?.byKey(k)?.sessionId)
+    /* The watcher named a card that is no longer on the board. ANNOUNCED, not
+       silently cleared: the surface this happens to is usually not the one that
+       did it — a phone left open on a card somebody deleted at the desk — and a
+       selection that quietly becomes nothing is a chat disappearing with no
+       explanation anywhere. `followKey` already answered `undefined`, so this
+       says WHICH key it was about. */
+    const vanished = !selectedKey && watch.key ? watch.key : undefined
     /* The side bar draws names and counts. It used to be handed the whole
        conversation and have it stripped on the way out (`forControl`), which
        saved the bytes and not the work — free while one state served every
@@ -3590,6 +3597,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ...(showOlder ? { showOlder: true } : {}),
       ...(ws.repoRoot ? {} : { noRepo: true }),
       ...(selectedKey ? { selectedKey } : {}),
+      ...(vanished ? { vanished } : {}),
       ...(transcript ? { transcript } : {}),
       ...(transcriptMore ? { transcriptMore } : {}),
       ...(transcriptHead ? { transcriptHead } : {}),
@@ -4373,7 +4381,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // mapping, and clear the run mark: the fork has never run.
         await w.store.adoptKey(card.id, forkId)
         await w.store.patch(forkId, { running: 0 })
-        if (selectedKey === key) selectHere(forkId)
+        /* Every surface watching the old key follows, wherever the fork was
+           asked for: the card was RE-KEYED, so the old id stops existing and it
+           is the same work under a new name. Not `selectHere`, which would drag
+           surfaces that were looking at something else along with it. */
+        watches.retarget(key, forkId)
+        if (selectedKey === key) selectedKey = forkId
         log.info(`Forked session ${card.id} at ${messageId} -> ${forkId}; restored ${restored.length} file(s)`)
         refreshAll()
 

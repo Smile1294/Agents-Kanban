@@ -280,6 +280,21 @@ export interface UiState {
   noRepo?: boolean
   mode: Mode
   selectedKey?: string
+  /**
+   * THIS SURFACE IS WATCHING A CARD THAT IS NO LONGER ON THE BOARD.
+   *
+   * Deleted, archived out of view, or aged past the bound — carrying the key
+   * it named, so the view can say so under the title it still has rather than
+   * sliding to the new-session screen. A watch quietly reset to nothing is
+   * "my chat disappeared" with no explanation available anywhere on the board,
+   * and the surface it happens to is usually NOT the one that did it: a phone
+   * left open on a card somebody deleted at the desk.
+   *
+   * A statement, not a reason: "no longer on the board" is true of all three
+   * causes, and the host cannot always tell them apart — an archived card is
+   * hidden rather than gone, and the age bound hides without deleting.
+   */
+  vanished?: string
   showArchived?: boolean
   /** How many sessions the age bound is holding back. Drawn as a count the user
    *  can click — hiding without saying how much is losing things, not
