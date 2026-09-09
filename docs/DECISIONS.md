@@ -1683,6 +1683,14 @@ are small and static and `composer.models` is already omitted by the host when
 unchanged. The harness gives the side bar its own mailbox so a test can tell the
 two surfaces apart; they are handed different payloads now.
 
+*Since (2026-09-09):* `forControl()` is gone. Stripping saved the bytes and not
+the work, which cost nothing while ONE state served every surface — and became a
+full transcript built and thrown away on every frame once each surface got its
+own (`sessionSlice`). The side bar's state is now BUILT without a conversation,
+`drawsTranscript(sink)` in `board/watches.ts` being the one place that says so.
+Two functions that both know is one bug, and this was on its way to being the
+second.
+
 **Lesson:** a fast path gated on a signature is only as good as the worst field
 in it, and the field that kills it will be the one nobody thinks of as data — a
 timestamp, a counter, a formatted string. Any fixture that holds such a field

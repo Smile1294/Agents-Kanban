@@ -41,12 +41,17 @@ owed and none comes.
 ## A repaint
 
 Any host event → `refreshAll()` → `paint.schedule()`; `paint` is `coalesce()`
-around one `host.getState()` — leading edge immediate, one trailing run for a
-burst, never overlapping, interval scaled to what the last repaint cost (floor
-`REPAINT_INTERVAL_MS`, cap 500 ms). The one `UiState` goes to the side bar
-(`provider.post`, through `forControl()`, which DROPS `transcript`, `streaming`,
-`review`) and the editor panel (`BoardPanel.postCurrent`), then
-`remotePusher.nudge()`. In the webview, `state` arrives; if `chromeSig()` equals
+around ONE `boardPass()` — leading edge immediate, one trailing run for a burst,
+never overlapping, interval scaled to what the last repaint cost (floor
+`REPAINT_INTERVAL_MS`, cap 500 ms). `boardPass()` is the expensive half (session
+index, sidecar, background-agent walk, the cards) and is identical for everyone;
+`applyRedirects(pass)` then moves every watch across the run-id -> session-id
+swap; then a `sessionSlice(pass, sink, watch)` per surface that is actually
+there — the side bar (`provider.post`, built without a transcript because it
+draws none: `drawsTranscript`), the editor panel (`BoardPanel.postCurrent`), and
+the relay's own (recorded as `painted`). Each surface names the session IT is
+watching (`Watches`, `board/watches.ts`), so two of them can be on two different
+chats. Then `remotePusher.nudge()`. In the webview, `state` arrives; if `chromeSig()` equals
 the recorded signature, `syncFrame()` patches in place (one branch per screen);
 otherwise `render()` rebuilds and restores every `data-scroll`, every
 `data-open`, focus and the caret. `composer.models` is omitted when the list is

@@ -7,13 +7,15 @@ paths:
   - src/board/settings.ts
   - src/board/dialogs.ts
   - src/board/coalesce.ts
+  - src/board/watches.ts
   - package.json
 tests:
   - smoke.mjs
   - src/board/__tests__/coalesce.test.ts
+  - src/board/__tests__/watches.test.ts
   - src/board/__tests__/settings-view.test.mjs
   - test/package.test.mjs
-last_verified: 2026-09-08
+last_verified: 2026-09-09
 ---
 # The extension host
 
@@ -33,9 +35,11 @@ everything is a closure inside it, so grep for names rather than looking for
 exports. Inside it: the `Workspace` (`root`, `store`, `repoRoot`, `worktrees`,
 `board`, `manager`), rebuilt by `rebuild()` whenever workspace folders change;
 `const host: BoardHost = {…}` — the implementation of every board message;
-`host.getState()`; `paint` = `coalesce(async () => {getState → provider.post →
-BoardPanel.postCurrent → refreshStatus}, REPAINT_INTERVAL_MS)` and `refreshAll =
-() => paint.schedule()` — the ONLY repaint entry point; the settings-page
+`boardPass()` / `sessionSlice()` / `host.getState(sink)`; `paint` =
+`coalesce(async () => {boardPass → applyRedirects → a slice per live surface →
+provider.post / BoardPanel.postCurrent / painted → refreshStatus},
+REPAINT_INTERVAL_MS)` and `refreshAll = () => paint.schedule()` — the ONLY
+repaint entry point; the settings-page
 `switch (msg.type)`; `fireDueSchedules()` / `fireScheduleNow()` and the catch-up
 pass at activation; `rollUpToParent()`; the review/merge handlers; a
 `TextDocumentContentProvider` for the left side of every diff (`git show` at the
@@ -57,18 +61,36 @@ load-bearing: `dispatchBoardMessage()` — the `switch (msg.type)` shared by BOT
 surfaces AND the remote executor (the relay v2 write channel runs the webview's
 own messages through it), so the board and the remote page can never disagree
 about what a message means; `html()` — the CSP'd document (`board.css` +
-`board.js`, nonce, `data-layout="board"|"control"`); `forControl()` — what the
-side bar is sent. Test: `smoke.mjs` §live wiring and §view contract;
+`board.js`, nonce, `data-layout="board"|"control"`). `forControl()` is GONE —
+what the side bar is sent is now decided where it is built (`drawsTranscript`),
+not stripped on the way out. Test: `smoke.mjs` §live wiring and §view contract;
 `src/remote/__tests__/relay.test.ts` builds a `UiState` as its frame fixture.
+
+**`src/board/watches.ts`**. WHO IS LOOKING AT WHAT — the registry that replaced
+the `mode`/`selectedKey` pair of host globals. Pure and vscode-free on purpose:
+its rules are the ones the type system cannot state. `StateSink`
+(`'sidebar' | 'panel' | 'remote'`), `Mode` (declared here, re-exported by
+`panel.ts`), `Watch` (`{key, mode}`), `isLocalSink()`, `drawsTranscript()`, and `Watches` —
+`of(sink)` (falls back to the host's defaults, which IS how a brand-new surface
+is seeded), `set(sink, patch)`, `keys()` (the bound on cached review data),
+`followAll(follow)` (each watch crosses the run-id -> session-id swap on its
+own), `hostSelect(key, remote, current)` (the host opening something itself:
+answers what its own selection becomes and moves the local surfaces with it —
+one function rather than a reset beside an `if` at ten call sites) and
+`resetLocal()`. Test: `src/board/__tests__/watches.test.ts`; the wiring end-to-end is
+smoke's "the side bar and the panel can be on two different sessions".
 
 **`src/board/dialogs.ts`**. The one indirection between "this host message wants
 a dialog" and *where* it is shown: `confirm` / `input` / `pick` / `toast`, with
 an AsyncLocalStorage-held sink so a remote message's dialogs and toasts answer on
 the phone instead of a VS Code window. `setDefaultDialogSink` installs the
 `vscode.window` sink at activation; `withRemoteDialogSink` marks a dispatch remote
-and `isRemoteDialog()` lets `dispatchBoardMessage` turn editor-only actions
+and `isRemoteDispatch()` lets `dispatchBoardMessage` turn editor-only actions
 (`openWorktree`, `diff`, `mergeDiff`, `openFolder`, …) into a remote toast rather
-than driving the editor. `makeRelayDialogSink` is the relay sink: it posts a
+than driving the editor — and lets `selectHere` in `extension.ts` know that a
+message came from the page, so a phone opening a chat does not retarget the
+editor's own selection. It is a fact about the DISPATCH, which is why it is not
+called `isRemoteDialog` any more. `makeRelayDialogSink` is the relay sink: it posts a
 `remote` dialog/toast event and resolves the waiting promise when the matching
 `remote.dialog` answer arrives. Test: `src/board/__tests__/dialogs.test.ts`.
 
@@ -123,17 +145,18 @@ instead of a repaint, on purpose: `mentionFiles` → `mentions`, `search` →
 a silent blank.
 
 **`ready` and the catalogue.** `ready` means "a webview just loaded and holds
-nothing"; `host.onReady` resets `sentCatalogue`, so the next state carries the
-full model list. Every later frame OMITS `composer.models` when the list is the
-one the view already has (`sendModels`), because a 431-entry catalogue was
-161 KB of a 326 KB frame posted ten times a second. The memo is per AUDIENCE —
-`getState(audience)`, `'webview'` or `'remote'` — because it is a claim about
-who has been told, and the relay's own `getState()` was consuming the webview's:
-a push that landed between a catalogue change and the next repaint marked the
-list sent, and the local composer then held the old backend's models with
-nothing on screen to say why. `'remote'` never consumes it and never carries
-the list, because a remote frame splits the catalogue out onto its own version
-key (`mv`).
+nothing"; `host.onReady(sink)` resets THAT surface's `sentCatalogue` entry, so
+its next state carries the full model list. Every later frame OMITS
+`composer.models` when the list is the one the view already has (`sendModels`),
+because a 431-entry catalogue was 161 KB of a 326 KB frame posted ten times a
+second. The memo is per SINK — because it is a claim about who has been told,
+and one shared token is spent by whoever paints next: the relay's own
+`getState()` used to consume the webview's (a push landing between a catalogue
+change and the next repaint marked the list sent, and the local composer held
+the old backend's models with nothing on screen to say why), and with two
+surfaces on two backends one memo re-sends the whole list on every frame.
+`'remote'` never consumes it and never carries the list, because a remote frame
+splits the catalogue out onto its own version key (`mv`).
 
 **Settings webview → host.** `media/settings.js` posts; `parseMessage` in
 `settings.ts` validates; the `switch` in `extension.ts` acts. Groups: page
@@ -145,18 +168,36 @@ dictation (`checkVoice`); schedules (`saveSchedule`, `removeSchedule`,
 `toggleSchedule`, `runSchedule`); remote (`setRemote`, `saveRemote`,
 `setRemoteWrites`, `clearRemoteCode`).
 
-**The repaint.** Any event → `refreshAll()` → `paint.schedule()` → one
-`getState()` → recorded as `painted` → posted to both surfaces →
-`remotePusher.nudge()`. `painted` is what the relay push reuses while it is
-fresher than `MIN_INTERVAL`: `buildRemoteSnapshot` used to call `getState()` a
-second time, so with Remote Control on, every push re-ran the session-index scan
-the repaint had just finished, on the event loop the CLI's stdout is drained on.
-Past that freshness it asks for its own, because a mirror one cadence behind is
-the bug, not the saving. `getState()`
-runs up to ten times a second while an agent streams and is therefore the render
-path: the model catalogue is formatted once per state, the review data is
-loaded on events (select, commit, merge, the selected agent finishing) and not
-recomputed here, keychain reads and the microphone facts are memoised.
+**The repaint, and the state split.** Any event → `refreshAll()` →
+`paint.schedule()` → ONE `boardPass()` → `applyRedirects(pass)` → a
+`sessionSlice(pass, sink, watch)` per surface that is actually there →
+`provider.post` / `BoardPanel.postCurrent` / `painted` → `remotePusher.nudge()`.
+
+`boardPass()` is the expensive half — the session-index scan, `allMeta()`, the
+background-agent walk, the card list — and it is identical for every surface, so
+it runs ONCE however many are open. `sessionSlice()` is everything about one
+session: transcript, streaming, meters, the composer's session overrides, that
+session's model list, its review data. It is built only for a key somebody is
+WATCHING, never one per card, and it shallow-copies the composer because the
+session branch overwrites model, effort, agent and the model list.
+
+A slice is built only for a surface that will actually receive it, and that is
+load-bearing rather than tidy: building one consumes that sink's catalogue memo,
+so a slice nobody receives marks a 431-entry list as sent to a view that never
+saw it. `provider.live` and `BoardPanel.isOpen` are the guards.
+
+`painted` is what the relay push reuses while it is fresher than `MIN_INTERVAL`:
+`buildRemoteSnapshot` used to call `getState()` a second time, so with Remote
+Control on, every push re-ran the session-index scan the repaint had just
+finished, on the event loop the CLI's stdout is drained on. Past that freshness
+it asks for its own, because a mirror one cadence behind is the bug, not the
+saving.
+
+The whole path runs up to ten times a second while an agent streams and is
+therefore the render path: the model catalogue is formatted once per state, the
+review data is loaded on events (select, commit, merge, a watched agent
+finishing) and not recomputed here, keychain reads and the microphone facts are
+memoised.
 
 **Focus mode.** `applyBoardFocus` closes the bottom panel and the secondary
 side bar while the board is in front and restores them when it leaves.
@@ -195,14 +236,30 @@ bar is handed back to `agentsKanban.sideBarHome`.
   provider register unconditionally; smoke activates once with no folder open.
 - **`getState()` is the render path.** Nothing expensive per token; nothing
   that cannot have changed since the run started is re-read.
+- **The board pass runs ONCE per repaint, a slice runs once per WATCHER.** Not
+  once per surface and never once per card. Two surfaces on two chats must not
+  double the session-index scan, and the number of open chats is bounded by the
+  number of surfaces while the number of cards is not.
+- **A remote surface's choice never moves the editor's selection.**
+  `isLocalSink()`. In the editor "the selected card" and "the card I am looking
+  at" are the same sentence — a menu item, the status bar and every deletion
+  mean the former. On a phone they are not, and a page opening a chat must not
+  retarget what somebody at the keyboard is about to click.
+- **A state is built only for a surface that will receive it.** Building one
+  spends that sink's catalogue memo, so a slice computed for a view that is not
+  there marks 161 KB as delivered to nobody.
 - **Never swallow a rejection with a bare `void`.** A broken `getState()` once
   became a silently blank panel.
 - **An editor opened from the board opens BESIDE it, inside `ownLayoutChange`.**
   A file opened into the board's group evicts the webview, and that is the very
   event the click-away rule closes on.
 - **A refusal on a path the user clicked is modal, never a toast.**
-- **The side bar is sent nothing it does not draw.** `forControl()` drops
-  `transcript`, `streaming`, `review` — drops, never empties.
+- **The side bar is sent nothing it does not draw, and is not BUILT one
+  either.** `drawsTranscript(sink)` in `board/watches.ts`, read by
+  `sessionSlice`. Stripping it on the way out (`forControl`, now gone) saved the
+  bytes and not the work — which was free while one state served every surface,
+  and is a full transcript built and thrown away ten times a second now that
+  each surface gets its own. Absent, never emptied.
 - **A merge that starts mid-turn must repaint.** `s.pendingMerge` is in
   `chromeSig()` for that reason.
 
@@ -215,6 +272,25 @@ bar is handed back to `agentsKanban.sideBarHome`.
   one, nothing implements it (see PLAN.md §9).
 
 ## Recent changes
+
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `getState()` split into
+  `boardPass()` (once per repaint, identical for everyone) and
+  `sessionSlice(pass, sink, watch)` (per WATCHER, never per card), and the
+  `mode`/`selectedKey` pair of host globals replaced by `Watches`
+  (`src/board/watches.ts`) keyed by `StateSink`. The side bar, the editor panel
+  and a remote page can now be on three different sessions at once; before this
+  every surface was a mirror of one pair of globals, so opening a chat anywhere
+  retargeted everywhere. `followKey` moved into the slice and into
+  `applyRedirects`, because the run-id -> session-id swap is per watcher. The
+  catalogue memo (`sentCatalogue`) is now a Map keyed by sink, and `onReady`
+  clears one entry rather than all of them. The host's own selection survives as
+  what a brand-new surface opens first and what a command acts on, and a REMOTE
+  sink never moves it (`isLocalSink`). Review data is keyed by session
+  (`reviews`), bounded by `watches.keys()`. Gates: `watches.test.ts` and smoke's
+  "the side bar and the panel can be on two different sessions"; all shown to
+  fail with each fix reverted. `isRemoteDialog` renamed to `isRemoteDispatch`:
+  it always answered "did this dispatch come from the page", and the host now
+  reads it for selection as well as for dialogs.
 
 - 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · `BoardHost.onUserAction`
   — the one signal that a PERSON did something, as opposed to a board moving on

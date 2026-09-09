@@ -101,11 +101,17 @@ export function makeVscodeStub(ctl) {
   const errors = []
   const folders = [{ uri: { fsPath: ctl.repo ?? '' }, name: 'proj', index: 0 }]
 
-  const makeWebview = () => ({
+  /* `own`, when given, ALSO collects this surface's handler.
+     The host now answers each surface with its own state — the side bar, the
+     editor panel and a remote page can be looking at three different sessions
+     — so a test has to be able to speak AS one surface rather than to all of
+     them at once. `handlers` keeps every one, because `send()` fanning out to
+     both webviews is what most of the suite means by "the user did this". */
+  const makeWebview = (own) => ({
     html: '',
     cspSource: 'vscode-webview://x',
     asWebviewUri: (u) => ({ toString: () => `vscode-webview://x${u.fsPath}`, fsPath: u.fsPath }),
-    onDidReceiveMessage: (fn) => { handlers.push(fn); return disposable },
+    onDidReceiveMessage: (fn) => { handlers.push(fn); own?.push(fn); return disposable },
     postMessage: async (m) => { posted.push(m); return true },
   })
 
@@ -183,8 +189,14 @@ export function makeVscodeStub(ctl) {
           return panel
         }
         ctl.boardPanelOpen = true
+        const panelHandlers = []
+        const panelOut = []
+        const panelWebview = makeWebview(panelHandlers)
         const panel = {
-          webview: makeWebview(),
+          webview: {
+            ...panelWebview,
+            postMessage: async (m) => { posted.push(m); panelOut.push(m); return true },
+          },
           reveal() { calls.push('reveal:' + id) },
           dispose() { calls.push('disposePanel:' + id); ctl.boardPanelOpen = false },
           visible: true,
@@ -200,6 +212,12 @@ export function makeVscodeStub(ctl) {
         }
         // The X on the board's tab, which is one of only two ways it closes.
         ctl.disposeBoardPanel = () => { for (const fn of disposeListeners) fn() }
+        /** Speak AS the editor panel, and read what only it was handed. */
+        ctl.boardPanel = {
+          posted: panelOut,
+          send: async (msg) => { for (const fn of panelHandlers) await fn(msg) },
+          state: () => [...panelOut].reverse().find((m) => m?.type === 'state')?.state,
+        }
         return panel
       },
       createOutputChannel: () => ({
@@ -223,10 +241,11 @@ export function makeVscodeStub(ctl) {
            other — `latestState()` reads the newest post, and which surface
            that came from is a race. */
         const sideBarOut = []
+        const sideBarHandlers = []
         const view = {
           visible: layout.sideBar && layout.sideBarView === KANBAN_CONTAINER,
           webview: {
-            ...makeWebview(),
+            ...makeWebview(sideBarHandlers),
             postMessage: async (m) => { posted.push(m); sideBarOut.push(m); return true },
           },
           onDidChangeVisibility: (fn) => { listeners.push(fn); return disposable },
@@ -261,6 +280,8 @@ export function makeVscodeStub(ctl) {
         /** What the SIDE BAR was handed, as opposed to the editor panel. */
         ctl.sideBar = {
           posted: sideBarOut,
+          /** Speak AS the side bar. See makeWebview's `own`. */
+          send: async (msg) => { for (const fn of sideBarHandlers) await fn(msg) },
           state: () => [...sideBarOut].reverse().find((m) => m?.type === 'state')?.state,
         }
         return disposable

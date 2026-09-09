@@ -790,6 +790,82 @@ console.log('\n— the side bar is not sent what it does not draw')
   await send({ type: 'ready' })
 }
 
+// --- two surfaces, two sessions --------------------------------------------
+//
+// `mode` and `selectedKey` were ONE pair of host globals shared by every
+// surface, so a second surface could only ever be a mirror of the first:
+// opening a chat anywhere retargeted everywhere, and a remote page was a
+// picture of the editor rather than a client of it. Reported as wanting "a
+// different chat on the browser and on the computer simultaneously".
+//
+// The registry that replaces the pair is unit-tested in board/watches.test.ts.
+// THIS is the wiring: the built host, the real message dispatch, two real
+// webviews, each answered with its own state. The harness gives each surface
+// its own `send`, because "the user did this IN THE SIDE BAR" is now a
+// different sentence from "the user did this".
+console.log('\n— the side bar and the panel can be on two different sessions')
+{
+  await send({ type: 'openBoard' })
+  await ctl.boardPanel.send({ type: 'select', id: STORED_SESSION })
+  await ctl.boardPanel.send({ type: 'setMode', mode: 'chat' })
+  await ctl.sideBar.send({ type: 'select', id: ON_GATEWAY })
+  // The panel repaints itself AFTER the side bar has chosen something else.
+  // Without this the assertion below would pass over a stale post and prove
+  // nothing at all.
+  await ctl.boardPanel.send({ type: 'ready' })
+
+  const panel = ctl.boardPanel.state()
+  const bar = ctl.sideBar.state()
+  ok(panel?.selectedKey === STORED_SESSION,
+     `the panel is still on the session IT opened after the side bar moved (${panel?.selectedKey})`)
+  ok(bar?.selectedKey === ON_GATEWAY,
+     `and the side bar is on its own (${bar?.selectedKey})`)
+  const text = (panel?.transcript ?? []).map((e) => e.text ?? '').join(' ')
+  ok(text.includes('seeded answer'),
+     'the panel is sent the transcript of the session it is watching')
+  ok(!text.includes('working on it'),
+     "and not the other surface's — the slice is per watcher, not per host global")
+  // The composer follows the WATCHED session, and these two sessions were
+  // launched on different backends. Same state message, two different answers,
+  // is what proves the slice is really being built twice.
+  ok(bar?.composer?.model === 'deepseek-v4-pro',
+     `the side bar's composer describes the side bar's session (${bar?.composer?.model})`)
+  ok(panel?.composer?.model !== bar?.composer?.model,
+     `and the panel's describes the panel's, which is a different one (${panel?.composer?.model})`)
+  /* The model catalogue is memoised PER SURFACE. It is 431 entries with a
+     paragraph each — 161KB, measured — and it is omitted once the view has it.
+     One shared memo and the two surfaces spend each other's: a reload on one
+     re-sends the whole list to the other, on every frame, for a picker that
+     already had it. */
+  await ctl.boardPanel.send({ type: 'select', id: STORED_SESSION })
+  ok(ctl.boardPanel.state()?.composer?.models === undefined,
+     'the panel has the catalogue and a repaint does not re-send it')
+  await ctl.sideBar.send({ type: 'ready' })
+  ok(Array.isArray(ctl.sideBar.state()?.composer?.models),
+     'a side bar that has just reloaded IS sent one — it holds nothing')
+  await ctl.boardPanel.send({ type: 'select', id: STORED_SESSION })
+  ok(ctl.boardPanel.state()?.composer?.models === undefined,
+     'and the panel still is not: one surface reloading does not spend the other surface memo')
+
+  /* But the HOST opening a session is a different sentence, and the editor's
+     surfaces follow it. Clicking a row in the side bar's session list posts
+     `openSession`, which means "open this in the board" — a panel that kept
+     its own choice would read as the click doing nothing at all. */
+  await ctl.boardPanel.send({ type: 'select', id: STORED_SESSION })
+  await ctl.sideBar.send({ type: 'openSession', id: ON_GATEWAY })
+  await ctl.boardPanel.send({ type: 'ready' })
+  ok(ctl.boardPanel.state()?.selectedKey === ON_GATEWAY,
+     `the side bar opening a session moves the PANEL to it (${ctl.boardPanel.state()?.selectedKey})`)
+  ok(ctl.boardPanel.state()?.mode === 'chat',
+     'and onto the chat screen, which is what openSession asks for')
+
+  // Put the board back where the rest of this file expects to find it.
+  await ctl.sideBar.send({ type: 'select', id: '' })
+  await send({ type: 'select', id: '' })
+  await send({ type: 'setMode', mode: 'kanban' })
+  await send({ type: 'ready' })
+}
+
 // The side bar renders a control, not a board.
 const boardSrc = await fs.readFile(path.join(repoRoot, 'media', 'board.js'), 'utf8')
 ok(!boardSrc.includes('compact'), 'the squeezed "compact" board layout is gone')

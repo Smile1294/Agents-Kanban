@@ -7,7 +7,7 @@
 import {
   confirm,
   input,
-  isRemoteDialog,
+  isRemoteDispatch,
   makeRelayDialogSink,
   pick,
   setDefaultDialogSink,
@@ -60,14 +60,14 @@ const recordSink = (calls: string[]): DialogSink => ({
   // Read through an object so TS does not narrow the flag to its initialiser:
   // the mutation happens inside a callback TS cannot see ran.
   const remote = { v: true }
-  await withRemoteDialogSink(recordSink([]), async () => { remote.v = isRemoteDialog() })
+  await withRemoteDialogSink(recordSink([]), async () => { remote.v = isRemoteDispatch() })
   ok(remote.v === true, 'withRemoteDialogSink marks the dispatch remote')
 
   const local = { v: true }
-  await withDialogSink(recordSink([]), async () => { local.v = isRemoteDialog() })
+  await withDialogSink(recordSink([]), async () => { local.v = isRemoteDispatch() })
   ok(local.v === false, 'withDialogSink marks the dispatch local')
 
-  ok(isRemoteDialog() === false, 'outside any context is not remote')
+  ok(isRemoteDispatch() === false, 'outside any context is not remote')
 }
 
 // --- the relay sink: post, wait, resolve -------------------------------------

@@ -182,6 +182,14 @@ without one.
 
 ## Recent changes
 
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `test/harness.mjs`:
+  the side bar and the editor panel each get their own message handler list and
+  outbox, reachable as `ctl.sideBar.send/state` and
+  `ctl.boardPanel.send/posted/state`. The host now answers each surface with its
+  own state, so "the user did this IN THE SIDE BAR" is a different sentence from
+  "the user did this" — `send()` still fans out to every handler, which is what
+  the rest of the suite means.
+
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `test/switch-latency.mjs`
   — a BENCHMARK, not a gate: it prints numbers and exits 0, and the runner only
   collects `src/**/*.test.*` so it never runs in `verify`. It drives the BUILT

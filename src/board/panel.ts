@@ -20,7 +20,7 @@ import type { Meter } from '../agent/runtime.ts'
 import type { SlashCommand } from '../sessions/commands.ts'
 import type { ColumnDef } from './config.ts'
 import { parseAskQuestions, type AskQuestion } from './questions.ts'
-import { isRemoteDialog, toast } from './dialogs.ts'
+import { isRemoteDispatch, toast } from './dialogs.ts'
 
 /** One transcript search hit, joined to the session it lives in. */
 export interface SearchRow extends TranscriptHit {
@@ -47,7 +47,12 @@ export interface SearchAnswer {
   more: number
 }
 
-export type Mode = 'kanban' | 'chat'
+/* Declared in board/watches.ts, which is vscode-free, and re-exported here
+   because that is where every caller already reaches for them. The registry
+   they belong to is the one thing in this rework that must be unit-testable
+   without an editor. */
+export { isLocalSink, type Mode, type StateSink, type Watch } from './watches.ts'
+import type { Mode, StateSink } from './watches.ts'
 
 /**
  * How much of the window the board takes when it is open.
@@ -510,22 +515,24 @@ export interface UiState {
 }
 
 export interface BoardHost {
-  /**
-   * The board as it is now.
-   *
-   * `audience` exists because the state carries ONE memoised field — the model
-   * catalogue, omitted when the caller has already been sent it — and the memo
-   * is per audience, not global. Relay pushes used to share the webview's:
-   * a push that landed between a catalogue change and the next repaint marked
-   * the list as sent, and the composer kept the old backend's models for good.
-   * `'remote'` never consumes it, because a remote frame splits the catalogue
-   * out and carries it on its own version key (`mv`).
-   */
-  getState(audience?: 'webview' | 'remote'): Promise<UiState>
+  /** The board as it is now, for ONE surface — its watched session, its model
+   *  memo. See StateSink. */
+  getState(sink?: StateSink): Promise<UiState>
   init(): Promise<void>
   openFolder(): Promise<void>
-  setMode(mode: Mode): void
-  select(id: string | undefined): void
+  /** Which screen THIS surface is on. Per sink: the panel showing a chat does
+   *  not put the side bar into one. */
+  setMode(mode: Mode, sink?: StateSink): void
+  /**
+   * Which session THIS surface is looking at.
+   *
+   * There is deliberately no second `watch` message. `select` already IS the
+   * statement "I am looking at this", it already flows through the one dispatch
+   * funnel every surface shares, and a separate message for the same gesture
+   * would add a round trip to the path this whole rework exists to shorten.
+   * The sink is what makes it per surface.
+   */
+  select(id: string | undefined, sink?: StateSink): void
   newSession(prompt: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
   sendMessage(id: string, text: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
   move(key: string, phase: string): Promise<void>
@@ -646,7 +653,7 @@ export interface BoardHost {
   /** A webview has (re)loaded and holds no cached state. Optional: the side bar
    *  and the panel both send it, and a host that carries nothing across states
    *  need not care. */
-  onReady?(): void
+  onReady?(sink?: StateSink): void
   /**
    * A message from a webview has been handled — which is to say a PERSON just
    * did something, on either side of the wire.
@@ -662,10 +669,15 @@ export interface BoardHost {
 }
 
 /** Shared message plumbing for both the sidebar view and the editor panel. */
-function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<void>): vscode.Disposable {
+function wire(
+  webview: vscode.Webview,
+  host: BoardHost,
+  refresh: () => Promise<void>,
+  sink: StateSink,
+): vscode.Disposable {
   return webview.onDidReceiveMessage(async (msg: Record<string, unknown>) => {
     try {
-      await dispatchBoardMessage(host, msg, (m) => void webview.postMessage(m), refresh)
+      await dispatchBoardMessage(host, msg, (m) => void webview.postMessage(m), refresh, sink)
     } catch (e) {
       vscode.window.showErrorMessage(`Agents Kanban: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -693,9 +705,14 @@ export async function dispatchBoardMessage(
   msg: Record<string, unknown>,
   reply: (m: object) => void,
   refresh: () => Promise<void>,
+  /* WHICH SURFACE this message came from. Required rather than defaulted: the
+     one thing that must never happen is a phone's choice of chat silently
+     becoming the editor's, and a default would make that the failure mode of
+     forgetting to pass it. */
+  sink: StateSink,
 ): Promise<void> {
   try {
-    await routeBoardMessage(host, msg, reply, refresh)
+    await routeBoardMessage(host, msg, reply, refresh, sink)
   } finally {
     // AFTER the action, and on the failure path too: the board may well have
     // changed before whatever threw, and a watcher waiting 30 s to find out is
@@ -711,6 +728,7 @@ async function routeBoardMessage(
   msg: Record<string, unknown>,
   reply: (m: object) => void,
   refresh: () => Promise<void>,
+  sink: StateSink,
 ): Promise<void> {
   const id = () => String(msg.id ?? '')
   /* A batch of ids from the webview. PARSED, never cast: this arrives from a
@@ -727,7 +745,7 @@ async function routeBoardMessage(
      toasts on the phone instead of driving VS Code. Returns true when the
      caller should skip the host action (i.e. the dispatch was remote). */
   const editorOnly = (text: string, url?: string): boolean => {
-    if (isRemoteDialog()) { toast('info', text, url); return true }
+    if (isRemoteDispatch()) { toast('info', text, url); return true }
     return false
   }
   switch (msg.type) {
@@ -736,14 +754,14 @@ async function routeBoardMessage(
        already has — the model catalogue — and a freshly loaded view has none of
        it. Without this, a reload leaves an empty model picker until the next
        backend switch. */
-    case 'ready': host.onReady?.(); await refresh(); break
+    case 'ready': host.onReady?.(sink); await refresh(); break
     case 'init': await host.init(); break
     case 'openFolder':
       if (editorOnly('Opening a folder happens in the editor.')) break
       await host.openFolder()
       break
-    case 'setMode': host.setMode(msg.mode === 'chat' ? 'chat' : 'kanban'); refresh(); break
-    case 'select': host.select(msg.id ? String(msg.id) : undefined); await refresh(); break
+    case 'setMode': host.setMode(msg.mode === 'chat' ? 'chat' : 'kanban', sink); refresh(); break
+    case 'select': host.select(msg.id ? String(msg.id) : undefined, sink); await refresh(); break
     case 'newSession':
       await host.newSession(String(msg.text ?? ''), readImages(msg.images))
       break
@@ -959,11 +977,7 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri, layout: 'board'
  * nothing and costs the side bar the only coverage it has. Fields are DROPPED,
  * never emptied: an empty array is a real state elsewhere in this protocol.
  */
-function forControl(state: UiState): UiState {
-  const { transcript, streaming, review, ...rest } = state
-  void transcript; void streaming; void review
-  return rest
-}
+
 
 export class BoardViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'agentsKanban.board'
@@ -987,7 +1001,7 @@ export class BoardViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
     }
     view.webview.html = html(view.webview, this.extensionUri, 'control')
-    this.disposables.push(wire(view.webview, this.host, () => this.refresh()))
+    this.disposables.push(wire(view.webview, this.host, () => this.refresh(), 'sidebar'))
     view.onDidChangeVisibility(() => {
       if (view.visible) void this.refresh()
       this.onVisibility?.(view.visible)
@@ -1000,8 +1014,16 @@ export class BoardViewProvider implements vscode.WebviewViewProvider {
     // return here is how the view ends up blank when the state message is the
     // only thing that ever paints it.
     if (!this.view) return
-    await this.post(await this.host.getState())
+    await this.post(await this.host.getState('sidebar'))
   }
+
+  /** Is there a webview to paint at all?
+   *
+   *  Asked BEFORE a state is built for this sink, never after: building one has
+   *  a side effect — it consumes this sink's model-catalogue memo — so a slice
+   *  computed for a side bar that is not resolved would mark a 431-entry list
+   *  as sent to a view that never saw it. */
+  get live(): boolean { return !!this.view }
 
   /** Paint a state someone else has already computed.
    *
@@ -1010,7 +1032,12 @@ export class BoardViewProvider implements vscode.WebviewViewProvider {
    *  index. One state, two views. */
   async post(state: UiState): Promise<void> {
     if (!this.view) return
-    await this.view.webview.postMessage({ type: 'state', state: forControl(state) })
+    /* Posted as it is. The side bar's state is BUILT without the conversation
+       — see `drawsTranscript` in board/watches.ts — rather than built with one
+       and stripped here. Stripping saved the bytes and not the work, and now
+       that every surface gets its own state, the work is per surface too. Two
+       functions that both know is one bug: this used to be `forControl()`. */
+    await this.view.webview.postMessage({ type: 'state', state })
   }
 }
 
@@ -1074,7 +1101,7 @@ export class BoardPanel {
     this.panel = panel
     this.host = host
     panel.webview.html = html(panel.webview, extensionUri)
-    this.disposables.push(wire(panel.webview, host, () => this.refresh()))
+    this.disposables.push(wire(panel.webview, host, () => this.refresh(), 'panel'))
     panel.onDidChangeViewState(() => {
       if (panel.visible) { void this.refresh(); return }
       // Clicking away — a file, another tab — closes the board, the same as the
@@ -1087,7 +1114,7 @@ export class BoardPanel {
   }
 
   async refresh(): Promise<void> {
-    await this.post(await this.host.getState())
+    await this.post(await this.host.getState('panel'))
   }
 
   async post(state: UiState): Promise<void> {

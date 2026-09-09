@@ -20,9 +20,10 @@ import {
 import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
   dispatchBoardMessage, setBoardFocusMode, showSideBarView, toUiAgent,
-  type BoardHost, type FocusMode, type Mode, type SearchAnswer, type SearchRow,
+  type BoardHost, type FocusMode, type SearchAnswer, type SearchRow,
   type UiCard, type UiState,
 } from './board/panel.ts'
+import { Watches, drawsTranscript, isLocalSink, type Mode, type StateSink, type Watch } from './board/watches.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type PendingMerge, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type SessionMeta, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts } from './sessions/usage.ts'
@@ -72,7 +73,7 @@ import { MIN_INTERVAL as REMOTE_MIN_INTERVAL, RemotePusher, type PushSnapshot } 
 import { boardIdOf, remoteFrame, relayBase, type RemoteModel, type RemoteVoice } from './remote/relay.ts'
 import { acceptMessages, parseMessages, RemoteMessageClient } from './remote/messages.ts'
 import {
-  confirm, input, isRemoteDialog, makeRelayDialogSink, pick, setDefaultDialogSink, toast,
+  confirm, input, isRemoteDispatch, makeRelayDialogSink, pick, setDefaultDialogSink, toast,
   withRemoteDialogSink, type DialogSink, type RelayDialogHandle,
 } from './board/dialogs.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
@@ -181,15 +182,58 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const cfg = () => vscode.workspace.getConfiguration('agentsKanban')
   const state = context.workspaceState
   let ws: Workspace | undefined
+  /* THE HOST'S OWN SELECTION IS NO LONGER THE TRUTH, only the default.
+     `mode` and `selectedKey` are what a brand-new surface is told to open
+     first, and what every command that acts on "the selected card" means —
+     a menu item, the status bar, the card that a deletion has to deselect.
+     What a surface is LOOKING AT lives in `watches`, below. */
   let mode: Mode = 'kanban'
   let selectedKey: string | undefined
+  /**
+   * WHAT EACH SURFACE IS LOOKING AT.
+   *
+   * The board is the same for all of them; the session is not. A sink with no
+   * entry falls back to the host's defaults above, which is exactly what "a
+   * brand-new client is told to open first" means — so this map is empty until
+   * somebody actually chooses something, and nothing has to seed it.
+   *
+   * A REMOTE page's choice never moves the host's own selection: a phone
+   * opening a chat must not retarget the menu item the person at the keyboard
+   * is about to click. Local surfaces do move it, because there "the selected
+   * card" and "the card I am looking at" are the same sentence.
+   */
+  const watches = new Watches(() => ({ key: selectedKey, mode }))
+  const watchOf = (sink: StateSink) => watches.of(sink)
+  const watchedKeys = () => watches.keys()
+  /**
+   * THE HOST moved the selection itself — `openSession` off the side bar list,
+   * a search hit, a new run, a fork, a card that has just been deleted.
+   *
+   * Not `host.select`: that is a surface saying what IT is looking at. This is
+   * the editor acting on itself, so every local surface follows and the
+   * per-sink entries are dropped back to the defaults.
+   *
+   * Which side of the wire the dispatch came from is read from the ambient
+   * context (`isRemoteDispatch`), the same one that already decides whether a
+   * dialog opens in VS Code or on the phone — because a remote page sending a
+   * message to another session must not retarget the editor either, and a
+   * `sink` parameter on fifty host methods is the shape that goes stale the day
+   * a fifty-first is added.
+   */
+  const selectHere = (key: string | undefined): void => {
+    selectedKey = watches.hostSelect(key, isRemoteDispatch(), selectedKey)
+  }
   let showArchived = false
   /** The user asked to see sessions the age bound is holding back. Session
    *  state, never a setting: it is "show me now", not "change the rule". */
   let showOlder = false
   /** Review data is four git calls, and refreshAll() fires on every streamed
-   *  token — so it is computed on demand and cached against its own card. */
-  let review: { key: string; data: WorktreeReview } | undefined
+   *  token — so it is computed on demand and cached against its own card.
+   *  KEYED, because two surfaces can be watching two different cards and the
+   *  one that is not the host's selection would otherwise draw no review panel
+   *  at all. Bounded by `watchedKeys()`: an entry nobody is looking at any
+   *  more is dropped on the next load, so this cannot grow with the store. */
+  const reviews = new Map<string, WorktreeReview>()
   /** A merge sitting on the user's branch, uncommitted, waiting to be read.
    *  Repo-level rather than per-card: it blocks every card's Merge button. */
   let pendingMerge: PendingMerge | undefined
@@ -470,11 +514,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *  key), on a new board, and on a page `ready`; cleared by the pusher's
    *  status when a push that carried models is confirmed. */
   let modelsDue = true
-  /** The list this webview was last sent, as `<version>:<profile>`. Reset on
-   *  `ready`, which is a webview saying it has just loaded and has nothing. */
-  let sentCatalogue: string | undefined
+  /** The list each SINK was last sent, as `<version>:<profile>`. Per sink and
+   *  not global: the side bar and the panel can be on two sessions with two
+   *  backends, so one memo would hand whichever painted second nothing. Reset
+   *  on `ready`, which is a webview saying it has just loaded and has nothing. */
+  const sentCatalogue = new Map<StateSink, string>()
 
-  const forgetSentCatalogue = (): void => { sentCatalogue = undefined }
+  /** Forget one surface's memo, or all of them when no sink is named (a new
+   *  board: every view is about to reload). */
+  const forgetSentCatalogue = (sink?: StateSink): void => {
+    if (sink) sentCatalogue.delete(sink)
+    else sentCatalogue.clear()
+  }
 
   /**
    * The model list for a state message, or `undefined` when the view already
@@ -485,17 +536,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * so a 431-model catalogue was formatted twice per repaint and posted in full
    * ten times a second. Measured: 161KB of a 326KB state.
    */
-  function sendModels(cat: ModelCatalogue, profileId: string, audience: 'webview' | 'remote'):
+  function sendModels(cat: ModelCatalogue, profileId: string, sink: StateSink):
       { id: string; label: string; context: string; detail?: string; contextTokens?: number; price?: string }[] | undefined {
     // A remote frame splits the catalogue out and carries it on its own version
     // key, so the list in the state is dead weight there — and, worse, marking
-    // it sent would consume the WEBVIEW's memo. A push that landed between a
+    // it sent would consume a WEBVIEW's memo. A push that landed between a
     // catalogue change and the next repaint did exactly that, and the local
     // composer then kept the old backend's models with nothing to say why.
-    if (audience === 'remote') return undefined
+    if (sink === 'remote') return undefined
     const key = `${catalogueVersion}:${profileId}:${cat.source}`
-    if (key === sentCatalogue) return undefined
-    sentCatalogue = key
+    if (key === sentCatalogue.get(sink)) return undefined
+    sentCatalogue.set(sink, key)
     return cat.choices.map((m) => {
       // Formatted once, here, so the composer and the settings page cannot
       // disagree about how a price reads. Absent when nothing published one —
@@ -1674,7 +1725,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await withRemoteDialogSink(handle.sink, () =>
           dispatchBoardMessage(host, m.msg, (ev) => {
             client.postEvents([ev]).catch((e) => log.error(`Remote event post failed: ${String(e)}`))
-          }, async () => { refreshAll() }),
+          }, async () => { refreshAll() }, 'remote'),
         )
       } catch (e) {
         log.error(`Remote message failed: ${String(e)}`)
@@ -2376,13 +2427,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * paints), and never lets two repaints overlap. See board/coalesce.ts.
    */
   const paint = coalesce(async () => {
-    const state = await host.getState()
-    // The relay wants this exact state; see `painted`. Recorded BEFORE the
-    // posts, so a slow webview does not make it look stale to the push that
-    // this same repaint is about to nudge.
-    painted = { state, at: Date.now() }
-    await provider.post(state).catch((e) => log.error(`Side bar refresh failed: ${String(e)}`))
-    await BoardPanel.postCurrent(state).catch((e) => log.error(`Panel refresh failed: ${String(e)}`))
+    // ONE board pass for every surface — the session index, the sidecar and the
+    // background-agent walk, which is the whole reason this function exists.
+    const pass = await boardPass()
+    applyRedirects(pass)
+    /* A slice per surface that is actually THERE, and never one otherwise:
+       building a state consumes that sink's model-catalogue memo, so a slice
+       nobody receives would mark a 431-entry list as sent to a view that never
+       saw it — the bug the memo was split per sink to avoid, arriving by the
+       other door. */
+    if (provider.live) {
+      await provider.post(await sessionSlice(pass, 'sidebar', watchOf('sidebar')))
+        .catch((e) => log.error(`Side bar refresh failed: ${String(e)}`))
+    }
+    if (BoardPanel.isOpen) {
+      await BoardPanel.postCurrent(await sessionSlice(pass, 'panel', watchOf('panel')))
+        .catch((e) => log.error(`Panel refresh failed: ${String(e)}`))
+    }
+    /* The relay watches its OWN key, so it gets its own slice — off the same
+       board pass, which is the whole point of `painted`: a push rides a repaint
+       rather than redoing the expensive half on the event loop that drains the
+       CLI's stdout. Only when there is a relay at all; nothing else reads it. */
+    if (remotePusher) {
+      painted = { state: await sessionSlice(pass, 'remote', watchOf('remote')), at: Date.now() }
+    }
     refreshStatus()
     // Something changed or the board would not be repainting — let the relay
     // cadence know without waiting for its own timer, which exists for the
@@ -2762,15 +2830,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // and the event was emitted by both runtimes and heard by nobody.
       w.manager.on('committed', (agent: RunningAgent) => {
         const key = agent.sessionId ?? agent.runId
-        if (key !== selectedKey && agent.sessionId !== selectedKey) return
-        loadReview(selectedKey).then(() => refreshAll())
+        const watched = watchedKeys()
+        if (!watched.has(key) && !(agent.sessionId && watched.has(agent.sessionId))) return
+        loadWatchedReviews().then(() => refreshAll())
           .catch((e) => log.error(`Review reload after a commit failed: ${String(e)}`))
       })
       // Keep the review panel truthful without paying for it on every token.
       w.manager.on('finished', (agent: RunningAgent) => {
         const key = agent.sessionId ?? agent.runId
-        if (key !== selectedKey && agent.sessionId !== selectedKey) return
-        loadReview(selectedKey).then(() => refreshAll())
+        const watched = watchedKeys()
+        if (!watched.has(key) && !(agent.sessionId && watched.has(agent.sessionId))) return
+        loadWatchedReviews().then(() => refreshAll())
           .catch((e) => log.error(`Review reload failed: ${String(e)}`))
       })
     }
@@ -2796,21 +2866,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   async function loadReview(key: string | undefined): Promise<void> {
-    review = undefined
     // Before the early returns and deliberately not keyed to the selection: a
     // waiting merge is a fact about the REPOSITORY, and it stays true when no
     // card is selected or the selected one has no worktree at all.
     pendingMerge = ws?.worktrees
       ? await ws.worktrees.pendingMerge().catch(() => undefined)
       : undefined
-    if (!key || !ws?.worktrees) return
+    // Drop what nobody is looking at any more. Done here rather than on every
+    // deselection because a surface can go away without saying so.
+    const watched = watchedKeys()
+    for (const k of [...reviews.keys()]) if (!watched.has(k)) reviews.delete(k)
+    if (!key) return
+    // Cleared FIRST: a card whose worktree has gone must draw no review panel,
+    // not the previous answer for the same key.
+    reviews.delete(key)
+    if (!ws?.worktrees) return
     const wt = await worktreeOf(key).catch(() => undefined)
     if (!wt) return
     try {
-      review = { key, data: await ws.worktrees.review(wt.dir, wt.base) }
+      reviews.set(key, await ws.worktrees.review(wt.dir, wt.base))
     } catch (e) {
       log.warn(`Could not read the worktree for ${key}: ${String(e)}`)
     }
+  }
+
+  /** Every WATCHED card's review, not just the host's own selection: after a
+   *  commit or a finished run, a surface looking at that card needs the panel
+   *  to be true whether or not it is the one the menu would act on. */
+  async function loadWatchedReviews(): Promise<void> {
+    for (const k of watchedKeys()) await loadReview(k)
+    if (!watchedKeys().size) await loadReview(undefined)
   }
 
   /** A finished session's worktree is dead weight, but it may still hold
@@ -3190,6 +3275,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   type BoardPass = Awaited<ReturnType<typeof boardPass>>
 
   /**
+   * Move every watch across the run-id -> session-id swap, once per pass.
+   *
+   * `sessionSlice` runs `followKey` too and that is not a duplicate: the slice
+   * must answer with the key it actually rendered whether or not anyone has
+   * updated the registry, and this keeps the registry from going stale for
+   * everything that reads it OUTSIDE a repaint — review loading, the bound on
+   * what is cached, the commands that mean "the selected card". Idempotent:
+   * a key that has already been followed resolves to itself.
+   */
+  function applyRedirects(pass: BoardPass): void {
+    const resolve = (k: string) => pass.ws?.manager?.byKey(k)?.sessionId
+    selectedKey = followKey(selectedKey, pass.keys, resolve)
+    watches.followAll((k) => followKey(k, pass.keys, resolve))
+  }
+
+  /**
    * EVERYTHING ABOUT ONE SESSION, over a board pass that is already built.
    *
    * Built only for a key somebody is actually WATCHING — never one per card.
@@ -3202,8 +3303,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    */
   async function sessionSlice(
     pass: BoardPass,
-    key: string | undefined,
-    audience: 'webview' | 'remote',
+    sink: StateSink,
+    watch: Watch,
   ): Promise<UiState> {
     // A copy per watcher: the session branch below overwrites model, effort,
     // agent, meters and the model LIST, and two watchers on two backends must
@@ -3211,14 +3312,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const composer = { ...pass.composer }
     const ws = pass.ws
     if (!ws) {
-      composer.models = sendModels(catalogue, pass.activeProfile, audience)
-      return { ready: false, noWorkspace: true, mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
+      composer.models = sendModels(catalogue, pass.activeProfile, sink)
+      return { ready: false, noWorkspace: true, mode: watch.mode, columns: [], cards: [], composer, running: 0, waiting: 0 }
     }
     const { metas, agentsBySession, cards, live } = pass
     // Follow the selection across the run-id -> session-id swap rather than
     // dropping it. Losing it here sent the open chat back to the new-session
     // screen a few seconds into every first turn.
-    const selectedKey = followKey(key, pass.keys, (k) => ws.manager?.byKey(k)?.sessionId)
+    const selectedKey = followKey(watch.key, pass.keys, (k) => ws.manager?.byKey(k)?.sessionId)
+    /* The side bar draws names and counts. It used to be handed the whole
+       conversation and have it stripped on the way out (`forControl`), which
+       saved the bytes and not the work — free while one state served every
+       surface, and a full transcript built and thrown away ten times a second
+       now that each surface gets its own. See `drawsTranscript`. */
+    const wantsSession = drawsTranscript(sink)
 
     /* The WATCHED session's agents in full, with what can honestly be said
        about each. Only for the watched one: a badge per card comes off the
@@ -3226,7 +3333,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
        than before it — the two resolve a run id to its session id the same
        way, so this is the same answer from the one place that decides it. */
     const selectedAgents: NonNullable<UiState['backgroundAgents']> = []
-    {
+    if (wantsSession) {
       const sid = ws.manager?.byKey(selectedKey ?? '')?.sessionId ?? selectedKey
       const spawned = sid ? agentsBySession.get(sid) : undefined
       if (sid && spawned?.agents.length) {
@@ -3261,8 +3368,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // the copy we already have. That boundary is what stops the whole
         // conversation being rendered twice — and holding it rather than
         // re-reading it is what stops a full transcript parse per token.
-        transcript = [...a.history, ...a.live]
-        streaming = a.streaming
+        if (wantsSession) {
+          transcript = [...a.history, ...a.live]
+          streaming = a.streaming
+        }
         composer.contextTokens = a.contextTokens
         // The window the run reported, then the one this session reported
         // last time. Without the fallback a resumed session shows no meter at
@@ -3287,13 +3396,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // captured at launch, so "more above" cannot become true mid-run —
         // and for runtimes whose transcript has no limit the comparison is
         // equal and it reads false on its own.
-        transcript = await ws.store.transcript(selectedKey, transcriptWindows.get(selectedKey))
-        const total = await ws.store.transcriptTotal(selectedKey)
-        transcriptMore = transcript.length < total
-        // Messages above the rendered window. A search hit carries an index
-        // into the FULL transcript; the view subtracts this from it to land
-        // the flash on the row actually drawn.
-        transcriptHead = Math.max(0, total - transcript.length)
+        if (wantsSession) {
+          transcript = await ws.store.transcript(selectedKey, transcriptWindows.get(selectedKey))
+          const total = await ws.store.transcriptTotal(selectedKey)
+          transcriptMore = transcript.length < total
+          // Messages above the rendered window. A search hit carries an index
+          // into the FULL transcript; the view subtracts this from it to land
+          // the flash on the row actually drawn.
+          transcriptHead = Math.max(0, total - transcript.length)
+        }
+        // The METERS are for every surface: they come off the same cached parse
+        // and they are two numbers, not a conversation.
         const totals = await ws.store.usage(selectedKey)
         composer.contextTokens = totals.contextTokens
         composer.contextWindow = metas[selectedKey]?.contextWindow ?? totals.contextWindow
@@ -3468,11 +3581,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 
     // ONE call, after everything that can decide which list is in force.
-    composer.models = sendModels(effectiveCatalogue, effectiveProfile, audience)
+    composer.models = sendModels(effectiveCatalogue, effectiveProfile, sink)
 
     const kind = (k: string) => live.filter((a) => a.state.kind === k).length
     return {
-      ready: true, mode, columns: ws.board.columns, cards, composer, showArchived,
+      ready: true, mode: watch.mode, columns: ws.board.columns, cards, composer, showArchived,
       ...(pass.olderHidden ? { olderHidden: pass.olderHidden } : {}),
       ...(showOlder ? { showOlder: true } : {}),
       ...(ws.repoRoot ? {} : { noRepo: true }),
@@ -3483,7 +3596,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ...(streaming ? { streaming } : {}),
       ...(commands.length ? { commands } : {}),
       ...(Object.keys(disclosures).length ? { disclosures } : {}),
-      ...(review && review.key === selectedKey ? { review: review.data } : {}),
+      ...(() => {
+        const r = selectedKey && wantsSession ? reviews.get(selectedKey) : undefined
+        return r ? { review: r } : {}
+      })(),
       ...(pendingMerge ? { pendingMerge } : {}),
       ...(selectedAgents.length ? { backgroundAgents: selectedAgents } : {}),
       ...(busy ? { busy } : {}),
@@ -3497,7 +3613,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const host: BoardHost = {
     // A webview has reloaded and holds nothing, so the next state must carry
     // the model catalogue in full again.
-    onReady: forgetSentCatalogue,
+    onReady: (sink) => forgetSentCatalogue(sink),
     /* A person just did something — in the panel or on the phone, this is the
        one funnel both go through. The relay push is held to the short floor
        for it: the 2 s one exists to keep a streaming agent's ten frames a
@@ -3506,16 +3622,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       remotePusher?.nudge({ urgent: true })
         .catch((e) => log.error(`Remote push failed: ${String(e)}`))
     },
-    async getState(audience: 'webview' | 'remote' = 'webview'): Promise<UiState> {
-      /* The host's own selection is still a real thing — it is what a brand-new
-         client is told to open first, and what every command that acts on "the
-         selected card" means. `followKey` may move it, so the slice's answer is
-         written back here rather than inside a function that runs once per
-         watcher. */
+    /* ONE surface's state. `paint` is what repaints everything, and it does
+       the board pass once for all of them; this is the single-surface path a
+       webview takes when it resolves, reloads or becomes visible. */
+    async getState(sink: StateSink = 'panel'): Promise<UiState> {
       const pass = await boardPass()
-      const state = await sessionSlice(pass, selectedKey, audience)
-      selectedKey = state.selectedKey
-      return state
+      applyRedirects(pass)
+      return sessionSlice(pass, sink, watchOf(sink))
     },
 
     async openFolder() { await vscode.commands.executeCommand('vscode.openFolder') },
@@ -3538,12 +3651,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
 
-    setMode(next) { mode = next },
-    select(id) {
-      selectedKey = id || undefined
+    setMode(next, sink) {
+      watches.set(sink, { mode: next })
+      // The default a brand-new surface is seeded with. A remote page's screen
+      // is its own; it must not decide what the next editor window opens on.
+      if (isLocalSink(sink)) mode = next
+    },
+    select(id, sink) {
+      const key = id || undefined
+      watches.set(sink, { key })
+      /* The EDITOR's selection — what a command acts on — follows a LOCAL
+         surface only. A phone opening a chat retargeting the menu item the
+         person at the keyboard is about to click is the whole reason a remote
+         page had to be a mirror in the first place. */
+      if (isLocalSink(sink)) selectedKey = key
       // Fire and forget, but never bare: a swallowed rejection here is how the
       // panel ends up showing stale changes with no clue why.
-      loadReview(selectedKey).catch((e) => log.error(`Review load failed: ${String(e)}`))
+      loadReview(key).catch((e) => log.error(`Review load failed: ${String(e)}`))
     },
     toggleArchived() { showArchived = !showArchived },
     toggleOlder() { showOlder = !showOlder },
@@ -3555,7 +3679,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     async closeBoard() { leaveBoard() },
 
     async openSession(key) {
-      selectedKey = key || undefined
+      selectHere(key || undefined)
       mode = 'chat'
       loadReview(selectedKey).catch((e) => log.error(`Review load failed: ${String(e)}`))
       enterBoard()
@@ -3677,7 +3801,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      * which is the array the search read, so its indices already line up.
      */
     async openHit(key: string, entryIndex: number): Promise<void> {
-      selectedKey = key
+      selectHere(key)
       if (!ws) return
       const a = ws.manager?.byKey(key)
       if (a) return
@@ -3974,10 +4098,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         `Starting session: ${prompt.slice(0, 80)}` +
         (ok.length ? ` (+${describeImages(ok.length)})` : ''),
       )
-      selectedKey = await mgr.start(prompt, {
+      selectHere(await mgr.start(prompt, {
         ...(ok.length ? { images: ok } : {}),
         ...(chosen ? { chosen } : {}),
-      })
+      }))
       mode = 'chat'
       refreshAll()
     },
@@ -3994,7 +4118,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // "the active one", which the manager already holds.
       const providerFor = await sessionProviderFor(key)
       await ensureManager().send(key, text, ok, providerFor, chosen)
-      selectedKey = key
+      // The surface that just sent it is on this card by definition; this is
+      // for the paths that are not a composer — a resume, a stalled card's
+      // recovery button, a schedule firing. Remote-safe through `selectHere`.
+      selectHere(key)
       refreshAll()
     },
 
@@ -4246,7 +4373,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // mapping, and clear the run mark: the fork has never run.
         await w.store.adoptKey(card.id, forkId)
         await w.store.patch(forkId, { running: 0 })
-        if (selectedKey === key) selectedKey = forkId
+        if (selectedKey === key) selectHere(forkId)
         log.info(`Forked session ${card.id} at ${messageId} -> ${forkId}; restored ${restored.length} file(s)`)
         refreshAll()
 
@@ -4366,7 +4493,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // From the remote page, the browser this machine opens is not the browser
       // the user is holding — toast the URL instead so they can open it from
       // wherever they are.
-      if (isRemoteDialog()) {
+      if (isRemoteDispatch()) {
         toast('info', `The app is running at ${url}`, url)
       } else {
         await vscode.env.openExternal(vscode.Uri.parse(url, true))
@@ -4428,7 +4555,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (id.startsWith('run-')) { vscode.window.showInformationMessage('Wait for the session to start before archiving it.'); return }
       w.manager?.release(key)
       await w.store.archive(id, archived)
-      if (archived && selectedKey === key) selectedKey = undefined
+      if (archived && selectedKey === key) selectHere(undefined)
       refreshAll()
     },
 
@@ -4462,7 +4589,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           )
         }
       }
-      if (selectedKey === key) selectedKey = undefined
+      if (selectedKey === key) selectHere(undefined)
       refreshAll()
     },
 
@@ -4489,7 +4616,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           'written — see the Agents Kanban log.',
         )
       }
-      if (selectedKey && keys.includes(selectedKey) && archived) selectedKey = undefined
+      if (selectedKey && keys.includes(selectedKey) && archived) selectHere(undefined)
       refreshAll()
     },
 
@@ -4533,7 +4660,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         } catch (e) {
           failed.push(e instanceof Error ? e.message : String(e))
         }
-        if (selectedKey === key) selectedKey = undefined
+        if (selectedKey === key) selectHere(undefined)
       }
       if (failed.length) {
         // Named, not counted. "3 failed" sends the user looking; the reason is
@@ -4558,7 +4685,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const wt = await worktreeOf(key)
       if (!wt) { vscode.window.showInformationMessage('This session has no worktree to diff.'); return }
       const right = vscode.Uri.file(path.join(wt.dir, file))
-      const entry = review?.data.files.find((f) => f.path === file)
+      const entry = reviews.get(key)?.files.find((f) => f.path === file)
       // Beside the board, for the same reason as openTestLink: an editor opened
       // into the board's own group closes the board.
       const beside = { viewColumn: vscode.ViewColumn.Beside }
@@ -4569,7 +4696,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // The fork point, not the base branch tip: the file list was computed
       // against the merge-base, so diffing against a base that has moved on
       // shows other people's commits as the agent's deletions.
-      const ref = review?.data.baseRef ?? (await w.worktrees.mergeBase(wt.dir, wt.base)) ?? wt.base
+      const ref = reviews.get(key)?.baseRef ?? (await w.worktrees.mergeBase(wt.dir, wt.base)) ?? wt.base
       const left = vscode.Uri.from({
         scheme: BASE_SCHEME,
         path: '/' + file,

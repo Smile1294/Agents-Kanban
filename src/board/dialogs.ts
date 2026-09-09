@@ -102,8 +102,16 @@ export function withRemoteDialogSink<T>(sink: DialogSink, fn: () => T | Promise<
   return storage.run({ sink, remote: true }, fn)
 }
 
-/** Whether the running dispatch came from the remote page. */
-export function isRemoteDialog(): boolean {
+/**
+ * Whether the running dispatch came from the remote page.
+ *
+ * A fact about the DISPATCH, not about dialogs — it started here because
+ * editor-only actions needed to know, and the host reads it for the same
+ * reason: a remote surface's message must not move the EDITOR's own selection.
+ * One ambient answer rather than a `sink` parameter threaded through fifty host
+ * methods, which is the shape that goes stale the day one of them is added.
+ */
+export function isRemoteDispatch(): boolean {
   return storage.getStore()?.remote === true
 }
 
