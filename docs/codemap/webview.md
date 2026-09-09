@@ -159,6 +159,21 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · the view keeps the last
+  THREE conversations it drew (`cachedTranscripts`, `TRANSCRIPT_CACHE`,
+  `rememberTranscript()`), so switching back to a chat you were just in draws
+  immediately instead of showing "Loading this conversation…" about a
+  conversation that was on screen ten seconds ago. `ourTranscript()` answers
+  from it while the host's own slice is in flight, and the slice replaces it the
+  moment it lands. Only the ROWS are cached: they are append-only and carry
+  their own timestamps, so an old copy is an old copy of something true.
+  `streaming`, `review` and `backgroundAgents` are readings — a half-written
+  line, a file list, an age — and are now gated on `sliceIsOurs()` rather than
+  drawn under whichever session the view has moved to. A search jump is
+  translated by `transcriptHead` only against the HOST's rows, never a cached
+  copy: another session's head lands the flash on the wrong row and spends it.
+  Gates in `webview.test.mjs`, all shown to fail.
+
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · step 1 of
   docs/REMOTE-REWORK.md §9: **the view owns `mode` and `selectedKey`**. They
   were two variables in the HOST shared by the side bar, the panel and every

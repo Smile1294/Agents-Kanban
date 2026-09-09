@@ -52,6 +52,31 @@
    * keeps every one of them working.
    */
   let viewPending = null
+  /**
+   * THE LAST FEW CONVERSATIONS THIS SURFACE HAS DRAWN.
+   *
+   * Switching to a chat you were just in should cost nothing, and without this
+   * it costs a round trip: the view moves first (see `setView`), so between the
+   * click and the host's answer there is nothing to draw and the panel says
+   * "Loading this conversation…" — for a conversation that was on this screen
+   * ten seconds ago and has not changed since.
+   *
+   * BOUNDED, and the bound is small on purpose: a transcript is the big object
+   * in this file and the webview holds it in memory. Three is enough for what
+   * people actually do — flick between two cards, glance back at the one they
+   * came from. The Map's own insertion order is the recency order, so eviction
+   * is `delete` the oldest key.
+   *
+   * What is NOT cached is as deliberate as what is. Only the rows: never
+   * `streaming` (a half-written line from a minute ago reads as an agent typing
+   * NOW, which is a signal that cannot say bad), never `review` (its file list
+   * is a claim about the worktree as it is), never `backgroundAgents` (their
+   * ages are drawn and would be wrong), and never the meters. Rows carry their
+   * own timestamps and are append-only, so an old copy of them is an old copy
+   * of something true; the rest are readings, and a stale reading is a lie.
+   */
+  const TRANSCRIPT_CACHE = 3
+  const cachedTranscripts = new Map()
 
   let dragKey = null
   let filter = ''
@@ -289,6 +314,7 @@
     if (d.type === 'state') {
       s = d.state
       adoptView()
+      rememberTranscript()
       // A "load earlier" request is consumed by the frame whose transcript is
       // LONGER than what is on screen — the widened window — or by a frame for
       // a different session. Clearing on every frame would defeat the debounce:
@@ -405,9 +431,33 @@
     return (s.selectedKey || '') === view.selectedKey
   }
 
-  /** The transcript, but only when it belongs to the session on screen. */
+  /**
+   * The rows to draw: the host's, or the last copy WE drew of this same
+   * conversation while its own slice is in flight.
+   *
+   * A cache hit is not a guess about the host's answer — it is this session's
+   * own rows, a moment old, replaced the instant the real slice lands. The
+   * alternative is a spinner over a conversation the reader was just in.
+   */
   function ourTranscript() {
-    return sliceIsOurs() ? (s.transcript || []) : []
+    if (sliceIsOurs()) return s.transcript || []
+    return cachedTranscripts.get(view.selectedKey) || []
+  }
+
+  /** Keep what we have just drawn, so coming back to it is instant. Called on
+   *  every state, after `adoptView()` — only for rows the host says are this
+   *  session's, or the cache would fill with other sessions' conversations
+   *  under this one's key. */
+  function rememberTranscript() {
+    const key = view.selectedKey
+    if (!key || !sliceIsOurs() || !Array.isArray(s.transcript)) return
+    // Re-inserted rather than updated in place: the Map's insertion order IS
+    // the recency order, and that is what makes eviction a one-liner.
+    cachedTranscripts.delete(key)
+    cachedTranscripts.set(key, s.transcript)
+    while (cachedTranscripts.size > TRANSCRIPT_CACHE) {
+      cachedTranscripts.delete(cachedTranscripts.keys().next().value)
+    }
   }
 
   /**
@@ -1956,9 +2006,15 @@
     // Above the review panel and NOT gated on `c.worktree`: the merge is on the
     // user's own branch, so it is true of the repository whatever card happens
     // to be open, including one that never had a worktree.
-    if (s.backgroundAgents && s.backgroundAgents.length) main.append(renderBackgroundAgents())
+    /* `backgroundAgents` and `review` describe the session the HOST has for
+       this surface, so they are drawn only when that is the one on screen.
+       Unlike the rows, they are readings — an age, a file list — and an old
+       reading under a new title is a signal that cannot say bad. `pendingMerge`
+       is not gated: it is a fact about the REPOSITORY and stays true whatever
+       card is open. */
+    if (sliceIsOurs() && s.backgroundAgents && s.backgroundAgents.length) main.append(renderBackgroundAgents())
     if (s.pendingMerge) main.append(renderPendingMerge())
-    if (c && c.worktree) main.append(renderReview(c))
+    if (c && c.worktree && sliceIsOurs()) main.append(renderReview(c))
 
     syncKey = c ? c.key : null
     const scroll = el('div', 'transcript-scroll')
@@ -1972,18 +2028,17 @@
     syncAskNode = null
     syncEmptyNode = null
     syncHintNode = null
+    const rows = ourTranscript()
     if (!c) {
       syncHintNode = renderNewSessionHint()
       scroll.append(syncHintNode)
-    } else if (!sliceIsOurs()) {
-      // The view has moved and the host has not caught up: what `s` carries is
-      // the session we just left. Say so rather than draw it — a board showing
-      // one session's title over another's conversation is worse than a board
-      // that admits it is still fetching.
-      syncEmptyNode = el('div', 'empty', 'Loading this conversation…')
-      scroll.append(syncEmptyNode)
-    } else if (!s.transcript || !s.transcript.length) {
-      syncEmptyNode = el('div', 'empty', 'No transcript yet.')
+    } else if (!rows.length) {
+      /* Nothing to draw, and WHY decides what it says. Either the host's answer
+         for this session is still in flight and we have no copy of our own (see
+         `ourTranscript`) — a board showing one session's title over another's
+         conversation is worse than one that admits it is still fetching — or
+         this session genuinely has no conversation yet. */
+      syncEmptyNode = el('div', 'empty', sliceIsOurs() ? 'No transcript yet.' : 'Loading this conversation…')
       scroll.append(syncEmptyNode)
     } else {
       // The row a search hit pointed at, when this session finally rendered —
@@ -1994,16 +2049,24 @@
       // actually on screen. Using that offset instead of shifting `jump.idx`
       // when a load-earlier prepends is what keeps a jump immune to a window
       // widening between the click and the render.
-      const want = jump && jump.key === c.key ? jump.idx - (s.transcriptHead || 0) : -1
-      for (let i = 0; i < s.transcript.length; i++) {
-        const e = s.transcript[i]
+      /* Only against the HOST's own rows. `transcriptHead` describes the
+         window the host cut, and a cached copy is not that window — a jump
+         translated by another session's head lands on the wrong row and is
+         spent doing it, which is the bug this offset exists to prevent. It
+         waits for its slice instead (JUMP_TTL). */
+      const want = sliceIsOurs() && jump && jump.key === c.key ? jump.idx - (s.transcriptHead || 0) : -1
+      for (let i = 0; i < rows.length; i++) {
+        const e = rows[i]
         const node = renderEntry(e, c)
         if (i === want) node.classList.add('hit-jump')
         syncRows.push({ node, sig: rowSig(e) })
         scroll.append(node)
       }
     }
-    if (s.streaming) {
+    // The same rule, and the sharpest case of it: a half-written line from the
+    // session we just left, drawn under this one's title, reads as an agent
+    // typing right now.
+    if (s.streaming && sliceIsOurs()) {
       syncStreamNode = renderStreaming(s.streaming)
       scroll.append(syncStreamNode)
     }

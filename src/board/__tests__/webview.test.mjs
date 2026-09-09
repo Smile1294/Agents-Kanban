@@ -2242,5 +2242,74 @@ const chatTitle = (v) => walkAll(v.root).find((n) => n.className === 'chat-title
     'a frame still naming the old session does not drag the view back')
 }
 
+/* --- the last few conversations stay in the view ----------------------------
+   Step 3 of docs/REMOTE-REWORK.md §9. Switching to a chat you were just in
+   should cost nothing; without a cache it costs a round trip, and the panel
+   says "Loading this conversation…" about a conversation that was on this
+   screen ten seconds ago. */
+{
+  const A = [{ kind: 'text', at: 1, text: 'first session answer' }]
+  const B = [{ kind: 'text', at: 2, text: 'second session answer' }]
+  const v = run({ ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO, transcript: A })
+  ok(v.text().includes('first session answer'), 'the first session is drawn and therefore seen')
+
+  railRow(v, 'Second session').onclick({})
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'b-2', cards: TWO, transcript: B })
+  ok(v.text().includes('second session answer'), 'the second is opened and drawn')
+
+  // Back again — and this is the whole step: no state message is delivered.
+  railRow(v, 'First session').onclick({})
+  ok(chatTitle(v) === 'First session', 'clicking back reopens the first session')
+  ok(v.text().includes('first session answer'),
+     'and its conversation is there IMMEDIATELY, off the last copy this view drew')
+  ok(!v.text().includes('Loading this conversation'),
+     'so there is no waiting state for a conversation we already have')
+  ok(!v.text().includes('second session answer'),
+     "and none of the session we just left — a cache hit is this session's own rows")
+
+  // The host's own answer still lands on top of it.
+  v.deliver({ ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO,
+              transcript: [...A, { kind: 'text', at: 3, text: 'newer first answer' }] })
+  ok(v.text().includes('newer first answer'),
+     'and the real slice replaces the cached copy the moment it arrives')
+}
+
+{
+  // Bounded, and small: a transcript is the big object this file holds. Four
+  // sessions visited, and the first one is gone.
+  const cards = ['a', 'b', 'c', 'd', 'e'].map((k) => ({
+    ...CARD, key: k, sessionId: k, title: `S ${k}`, agent: undefined,
+  }))
+  const rows = (k) => [{ kind: 'text', at: 1, text: `answer for ${k}` }]
+  const v = run({ ...base, mode: 'chat', selectedKey: 'a', cards, transcript: rows('a') })
+  for (const k of ['b', 'c', 'd']) {
+    railRow(v, `S ${k}`).onclick({})
+    v.deliver({ ...base, mode: 'chat', selectedKey: k, cards, transcript: rows(k) })
+  }
+  railRow(v, 'S a').onclick({})
+  ok(v.text().includes('Loading this conversation'),
+     'the fourth session visited evicts the first — the cache is BOUNDED, not a leak')
+  railRow(v, 'S d').onclick({})
+  ok(v.text().includes('answer for d'), 'while the three most recent are still instant')
+}
+
+{
+  // What is NOT cached is as deliberate as what is. A streaming line, a review
+  // panel and a background-agent age are READINGS, and a stale reading under a
+  // new session's title is a signal that cannot say bad.
+  const v = run({
+    ...base, mode: 'chat', selectedKey: 'a-1', cards: TWO,
+    transcript: [{ kind: 'text', at: 1, text: 'first session answer' }],
+    streaming: 'half a sentence being typed',
+    backgroundAgents: [{ id: 'ag-1', description: 'Counting files', status: 'running', lastFrameAt: Date.now() }],
+  })
+  ok(v.text().includes('half a sentence being typed'), 'the streaming line is drawn for its own session')
+  railRow(v, 'Second session').onclick({})
+  ok(!v.text().includes('half a sentence being typed'),
+     'and is gone the instant the view moves — it would read as an agent typing NOW')
+  ok(!v.text().includes('Counting files'),
+     "nor the other session's background agents, whose ages are drawn")
+}
+
 console.log(fails === 0 ? 'PASS — the webview renders in every state' : `${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)
