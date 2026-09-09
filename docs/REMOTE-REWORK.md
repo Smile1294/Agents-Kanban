@@ -215,6 +215,132 @@ bothers you on a real phone on real mobile data.
    thing from a board that polls a relay, and February's CVE is what it looks
    like when that is got wrong.
 
+## 9. The build order for piece 1
+
+What follows is the actual plan, in the order it would be done, with the
+checkpoint where the difference becomes visible. Read §8 first: this is only
+piece 1. Nothing here opens a port or changes the security posture.
+
+### What reconnaissance changed
+
+Three things found in the code make this smaller than §6 assumed, and one makes
+it fiddlier:
+
+- **Actions are already addressed by id.** `dispatchBoardMessage` reads
+  `String(msg.id ?? '')` — 26 call sites — so *send, merge, approve, move,
+  delete* never consult the host's selection. **The write path does not change
+  at all.** Only reading does.
+- **The view's coupling is 17 lines.** `board.js` reads `s.selectedKey` 11 times
+  and `s.mode` 6 times, and posts them back from about ten click handlers,
+  almost always as the pair `post('select') + post('setMode','chat')` — "open
+  this card in chat". That pair is the seam.
+- **`followKey` is already pure.** `(selected, cardKeys, sessionIdFor)` in
+  `manager.ts`, no host state — so a client can apply it itself.
+- **The fiddly one:** the host currently *redirects* the selection on your
+  behalf — a run getting its session id, a fork, an archive, a delete. Each of
+  those has to become something the host TELLS clients rather than does to them.
+
+### Step 0 — branch, and measure the local panel too · ½ day
+
+Baseline what switching chats costs **in the editor**, not just on the phone.
+Every number so far has been about the remote page; the round trip is the same
+one locally and nobody has measured it. Without this there is no before/after
+for the thing being changed.
+
+### Step 1 — the view owns `mode` and `selectedKey` · 1½ days
+
+The whole of the perceived win, and it touches one file.
+
+- Add module-level `view = { mode, selectedKey }` in `board.js` — the same
+  pattern `draft`, `disclosed` and `catalogue` already use, and for the same
+  reason: state the user put there must survive a repaint.
+- Seed it from the first state message, then own it. The host keeps sending its
+  own `mode`/`selectedKey` for now and the view ignores them after the seed.
+- Each of the ~10 click handlers sets `view` and calls `render()` **first**,
+  then posts. That inversion is the entire point.
+- `chromeSig()` reads `view.mode` / `view.selectedKey` instead of `s.mode` /
+  `s.selectedKey`. This makes the signature *less* volatile, not more — a
+  frame from another card's agent no longer perturbs it.
+- **New gate:** clicking a rail item changes what is drawn with **no state
+  message at all**. That test fails today by construction.
+
+**Checkpoint.** Stop here and look. Switching to a session whose transcript the
+host is already sending is now instant, in the editor and on the phone. Sessions
+the host is *not* sending still wait — that is step 2, and seeing exactly which
+ones lag is the best possible input to it.
+
+### Step 2 — the host serves a slice per WATCHER · 2½–3 days
+
+The structural piece.
+
+- A `watch { id }` message: a client says what it is looking at. The host keeps
+  `Map<surface, key>` — side bar, panel, and one per remote page.
+- Split `getState()` in two, keeping one code path each:
+  - `boardState()` — cards, columns, counts, composer defaults. Shared, cheap,
+    identical for everyone.
+  - `sessionSlice(key)` — `transcript`, `streaming`, `review`,
+    `backgroundAgents`, and the three `composer` meters. Per watcher.
+- `paint` stops sending one object to two surfaces and composes per surface.
+  **This is where the "expensive per streamed token" rule has to be honoured
+  again**: `boardState()` is built ONCE per repaint, and a slice is built only
+  for keys somebody is actually watching — never one per card.
+- The host's own `selectedKey` survives only as *what a brand-new client is
+  told to open first*. It stops being the truth.
+
+### Step 3 — the view keeps the last few transcripts · ½ day
+
+Bounded to about three sessions, because a transcript is the big object and the
+webview holds it in memory. Switching *back* to a session then costs nothing at
+all. This is the step that makes flicking between two chats feel native.
+
+### Step 4 — the redirects the host used to do for you · 1 day
+
+Each becomes an announcement rather than an action, and each needs a test:
+
+| Event | Now | After |
+|---|---|---|
+| A run gets its session id | host rewrites `selectedKey` | host sends the mapping; each client applies `followKey` itself |
+| Fork | host selects the fork | host names the new key; the client that asked follows it, others do not |
+| Archive / delete | host clears the selection | host says the key is gone; every client watching it falls back |
+
+The failure mode to write tests against is a client left watching a key that no
+longer exists — it must land somewhere sensible rather than on a blank panel.
+
+### Step 5 — the relay carries per-page slices · 1–1½ days
+
+The relay stores ONE frame per board, so two phones on different chats need
+more than that. Cheapest correct shape: `boardState` stays the shared frame, and
+each page's `watch` rides the existing message queue so the host pushes the
+slices anyone is actually watching, keyed by session id; each page takes its
+own. Frame patches (`delta.ts`) apply to a slice unchanged.
+
+Contract v4, and both repos move together as before.
+
+### Step 6 — gates, docs, re-measure · 1 day
+
+Every new gate shown to fail. `codemap/` areas updated (`webview`,
+`extension-host`, `remote`). A `DECISIONS.md` entry for why view state moved
+client-side. Then re-run the §7 harness and put real numbers back into §6 —
+including the local panel baseline from step 0.
+
+**Total: 7–8 days**, against the 5–8 estimated in §6 for piece 1 plus the relay
+work that estimate did not include.
+
+### What I expect to go wrong
+
+- **`smoke.mjs` and `layout.test.mjs` assert on the current state shape.** They
+  will break in step 2 and that is correct; the work is updating them honestly
+  rather than loosening them.
+- **The side bar and the panel can now show different sessions.** That is the
+  feature working, but it IS a behaviour change for anyone who relied on them
+  moving together. Both seed from the same default, so it only diverges once
+  you deliberately move one.
+- **Step 2 is where a per-token cost could sneak back in.** One `boardState()`
+  per repaint, slices only for watched keys. If a profile shows otherwise, that
+  is the bug.
+- **The estimate assumes nothing else lands in `board.js` meanwhile.** It is
+  3,800 untyped lines and step 1 touches its spine.
+
 ## Sources
 
 - [Reverse-engineering Linear's sync engine](https://github.com/wzhudev/reverse-linear-sync-engine)
