@@ -1,7 +1,11 @@
 # The remote board's latency — where the time actually goes, and what to do
 
-Research and a staged plan. Nothing in §4 and §5 is built yet; §3 is the
-measurement everything here rests on. Written after the report *"it is still
+**Status: §4 A and B are BUILT.** Re-measured after them, the same tap is
+41, 41, 42, 42, 49, 52, 54, 58, 523, 526 ms over ten runs — a median of 50 ms
+against the 370–2729 ms in §3, and eight runs in ten under 60 ms. §6 records
+what is left. C and D are still research.
+
+§3 is the measurement everything here rests on. Written after the report *"it is still
 very slow — why can't it just request the data and receive it as a string,
 encrypted, instead of rendering the screen?"*, which is half a misreading and
 half exactly right, and the half that is right is the important one.
@@ -87,7 +91,7 @@ Ordered by (win ÷ risk). **A and B together are ~10× for a day's work and add
 no new attack surface.** C and D are architecture changes and should not be
 started before A and B are measured in the field.
 
-### A. The extension long-polls for messages — removes 0–2000 ms
+### A. The extension long-polls for messages — removes 0–2000 ms · **BUILT**
 
 The page already long-polls for frames; the machine does not long-poll for
 taps. It should.
@@ -105,7 +109,7 @@ taps. It should.
 - Cost: one held connection from the machine to the relay. Bound it, back it
   off on failure, and never let a held poll block the push path.
 
-### B. A user-caused change pushes on a lower floor — removes 0–2000 ms
+### B. A user-caused change pushes on a lower floor — removes 0–2000 ms · **BUILT**
 
 `MIN_INTERVAL` exists for streaming. A tap produces exactly ONE state change,
 so it can go almost immediately.
@@ -181,15 +185,39 @@ separating.
   ~34 ms and `board.js`'s own fast path is already engaged. It is not the
   bottleneck and was measured not to be.
 
-## 6. Recommendation
+## 6. What A and B actually did, and what is left
 
-Do **A and B**. They are small, they are testable against the harness in §7,
-they remove ~2 s of a ~2.2 s problem, and they change no boundary. Re-measure
-on the real deployment.
+Built as described, plus one thing the plan did not foresee. Ten runs of the
+same tap, sorted: **41, 41, 42, 42, 49, 52, 54, 58, 523, 526 ms**. Median 50 ms
+against 370–2729 ms before, and the hop breakdown now reads:
 
-Then decide C2 versus nothing on evidence — if 250 ms is fine on a phone, the
-relay stays and D becomes a privacy question you can answer on its own merits
-rather than a performance one.
+```
+  +    0ms   1. tap on the phone
+  +   14ms   2. relay HAS the click
+  +   20ms   3. extension PICKED UP the click   <- was 0..2000ms
+  +   26ms   4. extension PUSHED the new board  <- was 0..2000ms
+  +   49ms   5. the phone SHOWS it
+```
+
+**The thing the plan missed.** A nudge arriving while a push was in flight armed
+a whole fresh floor of its own, so the change waited that floor and THEN the
+gate's — two floors for one tap. It now retries when the flight ENDS, and the
+gate is re-evaluated from that push's own attempt time, so one floor is one
+floor. Writing the test for it found a second bug in the same place: the
+in-flight push was CLEARING the urgency of a tap that arrived during it, which
+demoted that tap to the 2 s streaming floor after it had already waited out the
+flight. Urgency is now spent only by a push that actually carried it.
+
+**What is left.** Two runs in ten still come out ~525 ms, consistently enough to
+be a mechanism rather than jitter, and it has not been chased down — it is worth
+one session with the §7 harness before anything larger is contemplated. Beyond
+that: on a real deployment add four internet round trips (~200 ms at 50 ms RTT),
+which is then the dominant term and only **C** removes it.
+
+So the decision C2 versus nothing is now an evidence question you can actually
+answer: run it on your phone. If ~250 ms feels fine, the relay stays and D
+becomes a privacy question to answer on its own merits rather than a
+performance one.
 
 ## 7. The harness
 

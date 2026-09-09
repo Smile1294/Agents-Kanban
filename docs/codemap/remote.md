@@ -54,7 +54,16 @@ event loop the CLI's stdout is drained on); idle = no push; a heartbeat after
 `HEARTBEAT_MS` (90 s) rewriting `at`, because a number the board shows must not
 depend on a process being alive; `BACKOFF_MS`, `FETCH_TIMEOUT_MS`; a frame over
 `FRAME_MAX_BYTES` is cut to its last 100 transcript rows and marked
-`transcriptMore`, never dropped. The body is `{ kind:'frame', at, writes, mv,
+`transcriptMore`, never dropped. TWO cadence floors, and which one applies is
+the difference between a laggy remote board and a live one: `MIN_INTERVAL` (2 s)
+is about a STREAMING AGENT — a push rides the event loop the CLI's stdout is
+drained on — and `URGENT_INTERVAL` (200 ms) is for a change a PERSON caused,
+asked for by `nudge({urgent:true})` from `host.onUserAction`. Urgency is sticky
+until a push that CARRIES it succeeds, so a tap is not demoted by the next
+token's ordinary nudge nor by a push already in flight when it arrived; a
+mid-flight nudge sets `againAfterFlight` and is retried by `post`'s `finally`
+rather than arming a floor of its own, or one tap waits two floors. The body is
+`{ kind:'frame', at, writes, mv,
 state?, patch?, models? }` — neither `state` nor `patch` means heartbeat,
 `models` present clears the models-due flag on success. WHICH of state or patch
 is delta.ts's decision, gated on two things the relay SAID and neither assumed:
@@ -246,6 +255,21 @@ browser because the host half IS the extension.
 - None recorded beyond the general "run a real agent before believing the suite".
 
 ## Recent changes
+
+- 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · §4 A and B of
+  docs/REMOTE-LATENCY.md, built: tap on the phone to the board moving went from
+  370–2729 ms to a 50 ms median (ten runs: 41, 41, 42, 42, 49, 52, 54, 58, 523,
+  526). The two things making up nearly all of it were both polling windows and
+  neither was chosen for a tap. The extension now HOLDS the message poll open
+  (`poll(waitSecs)`, `&wait=`, learned from the relay's `longPoll:true` and
+  never assumed — Netlify and the worker answer at once), and a change a person
+  caused pushes on `URGENT_INTERVAL` instead of the streaming floor.
+  `BoardHost.onUserAction` is the single funnel that separates a discrete action
+  from a board moving on its own: everything else that repaints arrives through
+  the manager, not through `dispatchBoardMessage`. Two bugs found while testing
+  the mid-flight case, both fixed: a nudge arriving during a push armed a whole
+  fresh floor and so waited two, and the push in flight CLEARED the urgency of a
+  tap it had not carried.
 
 - 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · contract v3: the
   transcript travels ONCE. 97% of a frame was a conversation that barely

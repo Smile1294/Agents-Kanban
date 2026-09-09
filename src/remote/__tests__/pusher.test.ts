@@ -13,6 +13,7 @@ import {
   BACKOFF_MS,
   HEARTBEAT_MS,
   MIN_INTERVAL,
+  URGENT_INTERVAL,
   RemotePusher,
   type PushSnapshot,
   type PushStatus,
@@ -81,6 +82,9 @@ interface Rig {
   /** What the relay answers (defaults to { ok: true }). */
   answer: RelayAnswer
   failFetchWith: Error | null
+  /** Set to hold the FETCH open — the only way to be inside `post`, which is
+   *  what sets `inFlight`. */
+  holdFetch: (() => Promise<void>) | undefined
   build(): Promise<PushSnapshot>
 }
 
@@ -94,8 +98,10 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     next: { frame: frame('1'), writes: false } as PushSnapshot,
     answer: { ok: true } as RelayAnswer,
     failFetchWith: null as Error | null,
+    holdFetch: undefined as (() => Promise<void>) | undefined,
   }
   const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    if (state.holdFetch) await state.holdFetch()
     if (state.failFetchWith) throw state.failFetchWith
     const body = JSON.parse(String(init?.body)) as Posted['body']
     state.posts.push({
@@ -145,6 +151,8 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     set answer(v: RelayAnswer) { state.answer = v },
     get failFetchWith(): Error | null { return state.failFetchWith },
     set failFetchWith(v: Error | null) { state.failFetchWith = v },
+    get holdFetch(): (() => Promise<void>) | undefined { return state.holdFetch },
+    set holdFetch(v: (() => Promise<void>) | undefined) { state.holdFetch = v },
   }
   rig.pusher = new RemotePusher({
     now: () => state.now,
@@ -380,20 +388,34 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
 }
 
 {
-  // A change that arrives while a push is in flight is newer than that push.
+  // A change that arrives while a push is in flight is newer than that push, so
+  // it must be retried — but when that flight ENDS, not on a timer of its own.
+  // A whole fresh floor here meant the change waited this floor and THEN the
+  // gate's: measured end to end, one tap in seven came out ~536 ms where the
+  // rest were ~45 ms, and this was the whole difference.
+  // The FETCH is what has to hang, not `build` — `inFlight` is set by `post`,
+  // so hanging the build tests the cadence gate and calls it the in-flight one.
+  // The original test did exactly that and passed for the wrong reason.
   const r = rig()
   let release: (() => void) | undefined
-  r.build = async (): Promise<PushSnapshot> => {
-    await new Promise<void>((res) => { release = res })
-    return r.next
-  }
+  r.holdFetch = () => new Promise<void>((res) => { release = res })
   const first = r.pusher.tick()
   await new Promise((res) => setImmediate(res))
-  await r.pusher.nudge()
-  ok(r.timers.filter((t) => !t.cancelled).length === 1,
-    'a nudge during an in-flight push arms a trailing tick rather than vanishing')
+  await new Promise((res) => setImmediate(res))
+  r.next = { frame: frame('1', 'arrived mid-flight'), writes: false }
+  await r.pusher.nudge({ urgent: true })
+  ok(r.timers.filter((t) => !t.cancelled).length === 0,
+    'a nudge during an in-flight push arms NO timer of its own')
+  r.holdFetch = undefined
   release?.()
   await first
+  await new Promise((res) => setImmediate(res))
+  await new Promise((res) => setImmediate(res))
+  ok(r.timers.filter((t) => !t.cancelled).length === 1,
+    '…the finished push retries it, and THAT tick arms the gate — one floor, not two')
+  await r.runTimersTo(1_000_000 + URGENT_INTERVAL)
+  ok(r.posts.length === 2 && (r.posts[1]!.body.state as { title: string }).title === 'arrived mid-flight',
+    'and the change reaches the relay one floor after the push it raced, not two')
 }
 
 {
@@ -424,6 +446,92 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
   await r.runTimersTo(1_000_000 + MIN_INTERVAL)
   ok(r.posts.length === 1,
     'dispose() cancels the trailing tick — a replaced engine must not push to the old relay')
+}
+
+// --- a change a PERSON caused is not a streamed token -------------------------
+//
+// MIN_INTERVAL exists to keep a streaming agent's ten frames a second off the
+// event loop the CLI's stdout is drained on. A tap is one change, and holding
+// it to a rule written for a firehose was half the measured lag on the remote
+// board: tap to the board moving was 370-2729 ms, of which ~70 ms was work.
+
+{
+  const r = rig()
+  await r.pusher.tick()
+  ok(r.posts.length === 1, 'the first push goes out')
+
+  r.now += 100
+  r.next = { frame: frame('1', 'after the tap'), writes: false }
+  await r.pusher.nudge({ urgent: true })
+  ok(r.posts.length === 1, 'an urgent nudge is still coalesced — it is a floor, not a bypass')
+  await r.runTimersTo(1_000_000 + URGENT_INTERVAL)
+  ok(r.posts.length === 2, `a tap waits URGENT_INTERVAL (${URGENT_INTERVAL}ms), not MIN_INTERVAL`)
+  ok((r.posts[1]!.body.state as { title: string }).title === 'after the tap',
+    '…and carries what the tap did')
+}
+
+{
+  const r = rig()
+  await r.pusher.tick()
+  r.now += 100
+  r.next = { frame: frame('1', 'streamed'), writes: false }
+  await r.pusher.nudge()
+  await r.runTimersTo(1_000_000 + URGENT_INTERVAL)
+  ok(r.posts.length === 1,
+    'an ORDINARY nudge still waits the full cadence — the event-loop rule is untouched')
+  await r.runTimersTo(1_000_000 + MIN_INTERVAL)
+  ok(r.posts.length === 2, '…and goes out at MIN_INTERVAL as before')
+}
+
+{
+  // A tap that lands mid-stream must not be demoted by the next token's nudge.
+  const r = rig()
+  await r.pusher.tick()
+  r.now += 50
+  r.next = { frame: frame('1', 'tap'), writes: false }
+  await r.pusher.nudge({ urgent: true })
+  r.now += 50
+  r.next = { frame: frame('1', 'tap + a streamed token'), writes: false }
+  await r.pusher.nudge()
+  await r.runTimersTo(1_000_000 + URGENT_INTERVAL)
+  ok(r.posts.length === 2,
+    'urgency is STICKY: an ordinary nudge after an urgent one does not put the floor back up')
+}
+
+{
+  // …and it is spent once something actually leaves, or every later frame of a
+  // streaming run would inherit the short floor from one old tap.
+  const r = rig()
+  await r.pusher.tick()
+  r.now += 50
+  r.next = { frame: frame('1', 'tap'), writes: false }
+  await r.pusher.nudge({ urgent: true })
+  await r.runTimersTo(1_000_000 + URGENT_INTERVAL)
+  ok(r.posts.length === 2, 'the tap went out')
+  r.now += 50
+  r.next = { frame: frame('1', 'streaming again'), writes: false }
+  await r.pusher.nudge()
+  await r.runTimersTo(1_000_000 + URGENT_INTERVAL + 400)
+  ok(r.posts.length === 2,
+    'the next streamed frame is back on the ordinary floor — urgency was spent, not kept')
+}
+
+{
+  // A tick that found nothing to say has NOT delivered the tap, so the urgency
+  // must survive it.
+  const r = rig()
+  await r.pusher.tick()
+  r.now += 50
+  await r.pusher.nudge({ urgent: true })   // nothing changed yet
+  r.now += MIN_INTERVAL
+  await r.pusher.tick()                     // quiet: no push
+  ok(r.posts.length === 1, 'a quiet tick sends nothing')
+  r.next = { frame: frame('1', 'the tap landed late'), writes: false }
+  r.now += 50
+  await r.pusher.nudge()
+  await r.runTimersTo(r.now + URGENT_INTERVAL)
+  ok(r.posts.length === 2,
+    'urgency survives a tick that had nothing to send — it is spent on delivery, not on trying')
 }
 
 // --- patches: the transcript travels once, and only when the relay says so ----

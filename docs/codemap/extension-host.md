@@ -216,6 +216,17 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · `BoardHost.onUserAction`
+  — the one signal that a PERSON did something, as opposed to a board moving on
+  its own. `dispatchBoardMessage` is the single funnel every webview message
+  passes through, local panel and remote page alike, and everything else that
+  repaints (a streamed token, an mtime, the background-agent tick) arrives
+  through the manager instead — so this is the only place that can tell the two
+  apart. The host answers it with an urgent relay push. The message poll was
+  reworked with it: it HOLDS the request open where the relay can, loops
+  straight back on a holder, and keeps its timer for the three cases that need
+  one (a relay that cannot hold, a poll that failed, and an idle board with no
+  watcher, which must not hold a connection open for nobody).
 - 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · the push path stopped
   paying twice and stopped stealing the webview's catalogue. `paint` records the
   state it built (`painted`) and `buildRemoteSnapshot` reuses it inside

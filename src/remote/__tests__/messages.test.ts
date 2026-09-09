@@ -140,6 +140,52 @@ const res = (body: unknown, ok = true, status = 200): Response =>
   ok(!!threw && threw.includes('refused'), 'a relay that refuses the poll throws, rather than running nothing silently')
 }
 
+/* --- the HELD poll ---------------------------------------------------------
+   The page has long-polled for frames since v2; the machine polled the message
+   queue on a timer, so a tap sat there for up to a full interval. That was one
+   of the two 0-2000 ms waits either side of ~70 ms of work. */
+
+{
+  const { client, calls } = clientWith(() => res({ ok: true, msgs: [], viewerAt: 1, longPoll: true }))
+  const out = await client.poll(20)
+  ok(calls[0]!.url.endsWith('&msgs=1&wait=20'), 'a held poll asks the relay to wait')
+  ok(out.longPoll === true,
+    'and reports that this relay HELD it — the host loops straight back only on a holder')
+}
+
+{
+  const { client } = clientWith(() => res({ ok: true, msgs: [], viewerAt: 1 }))
+  const out = await client.poll(20)
+  ok(out.longPoll === undefined,
+    'a relay that did NOT say it holds is never assumed to — Netlify and the worker answer at once')
+}
+
+{
+  const { client, calls } = clientWith(() => res({ ok: true, msgs: [] }))
+  await client.poll()
+  ok(!calls[0]!.url.includes('wait='), 'no wait asked for means no wait in the URL')
+  await client.poll(0)
+  ok(!calls[1]!.url.includes('wait='), 'a wait outside the contract range is dropped, not sent')
+  await client.poll(9999)
+  ok(!calls[2]!.url.includes('wait='), '…at both ends')
+}
+
+{
+  /* The abort budget has to cover the hold. Left at the fixed 10 s, a 20 s hold
+     would abort every single time and the queue would never be read — the
+     feature would look like a dead relay. */
+  const seen: (number | undefined)[] = []
+  const { client } = clientWith((_u, init) => {
+    const sig = init?.signal as AbortSignal & { __ms?: number }
+    seen.push(sig ? 1 : undefined)
+    return res({ ok: true, msgs: [] })
+  })
+  const started = Date.now()
+  await client.poll(20)
+  ok(seen[0] === 1, 'a held poll still carries an abort signal — it must not hang forever')
+  ok(Date.now() - started < 1_000, '…and it does not itself block')
+}
+
 {
   const { client, calls } = clientWith(() => res({ ok: true }))
   await client.ack(['n1', 'n2'])

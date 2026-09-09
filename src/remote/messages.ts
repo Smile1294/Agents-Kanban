@@ -139,6 +139,13 @@ export function acceptMessages(
  * when the board is idle, and the moment a user sends a message from elsewhere
  * is exactly when the board is idle. The host polls on its own timer (see
  * extension.ts) and messages also ride back on push answers.
+ *
+ * `poll(waitSecs)` asks the relay to HOLD the request until something is
+ * queued. Only a host that can hold a connection honours it, and the answer
+ * says which — `longPoll: true` — so the host loops straight back on a holder
+ * and keeps its timer on one that answered immediately. Never assumed: a host
+ * that cannot hold answers empty at once, and a caller that looped on that
+ * would hammer the relay flat out.
  */
 export class RemoteMessageClient {
   private readonly deps: { baseUrl: string; boardId: string; fetch: typeof fetch }
@@ -151,22 +158,38 @@ export class RemoteMessageClient {
     return !!this.deps.baseUrl && this.deps.boardId.length > 0
   }
 
-  /** Fetch the pending message queue. Returns the raw `msgs` payload for
-   *  `acceptMessages` plus the page's last poll time (for the host's cadence) —
-   *  the client stays a transport, the policy lives in the host. */
-  async poll(): Promise<{ msgs?: unknown; viewerAt?: number }> {
-    const res = await this.deps.fetch(
-      `${this.deps.baseUrl}${FN_PATH}?id=${encodeURIComponent(this.deps.boardId)}&msgs=1`,
-      { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
-    )
+  /**
+   * Fetch the pending message queue. Returns the raw `msgs` payload for
+   * `acceptMessages`, the page's last poll time (for the host's cadence), and
+   * whether this relay HELD the request — the client stays a transport, the
+   * policy lives in the host.
+   *
+   * `waitSecs` asks the relay to hold until something is queued. The abort
+   * budget has to cover the hold plus a round trip, or the host aborts its own
+   * poll every single time and the queue is never read — so the timeout is
+   * derived from the wait rather than left at the fixed one.
+   */
+  async poll(waitSecs?: number): Promise<{ msgs?: unknown; viewerAt?: number; longPoll?: boolean }> {
+    const wait = waitSecs !== undefined && waitSecs >= 1 && waitSecs <= 25
+      ? Math.floor(waitSecs)
+      : undefined
+    const url = `${this.deps.baseUrl}${FN_PATH}?id=${encodeURIComponent(this.deps.boardId)}&msgs=1`
+      + (wait !== undefined ? `&wait=${wait}` : '')
+    const budget = wait !== undefined ? wait * 1_000 + FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS
+    const res = await this.deps.fetch(url, { signal: AbortSignal.timeout(budget) })
     if (!res.ok) throw new Error(`relay answered ${res.status}`)
     const answer = (await res.json().catch(() => ({}))) as {
       ok?: boolean
       msgs?: unknown
       viewerAt?: number
+      longPoll?: boolean
     }
     if (answer.ok === false) throw new Error('relay refused the message poll')
-    return { msgs: answer.msgs, viewerAt: answer.viewerAt }
+    return {
+      msgs: answer.msgs,
+      viewerAt: answer.viewerAt,
+      ...(answer.longPoll === true ? { longPoll: true } : {}),
+    }
   }
 
   /** Tell the relay these messages are taken. A lost ack is a re-delivery,

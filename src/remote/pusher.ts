@@ -20,7 +20,12 @@
  *     NO state, just `at`/`writes`/`mv` — rewriting the live number the page
  *     reads.
  *
- *  4. A THROTTLED NUDGE IS DEFERRED, NEVER DROPPED. Rules 1 and 2 are about
+ *  4. A CHANGE A PERSON CAUSED IS NOT A STREAMED TOKEN. `nudge({urgent:true})`
+ *     lowers the cadence floor to URGENT_INTERVAL for that one change. Rule 1
+ *     exists to keep ten pushes a second off the event loop the CLI's stdout is
+ *     drained on; a tap is one change, and making it wait out a rule written
+ *     for a firehose was half the measured lag on the remote board.
+ *  5. A THROTTLED NUDGE IS DEFERRED, NEVER DROPPED. Rules 1 and 2 are about
  *     what leaves; neither may decide that a change never leaves at all. The
  *     cadence gate used to `return` on a nudge that landed inside
  *     MIN_INTERVAL, and nothing rescheduled it — so a board change that
@@ -66,8 +71,27 @@ import type { UiState } from '../board/panel.ts'
  *  checked by scripts/check-contract.mjs on every verify. */
 export const FN_PATH = '/board'
 
-/** Fastest allowed push cadence, ms. */
+/** Fastest allowed push cadence for a board moving on its own, ms.
+ *
+ *  This number is about a STREAMING AGENT: a push rides the same event loop the
+ *  CLI child's stdout is drained on, and ten pushes a second would slow the
+ *  agent down. It was never about a click. */
 export const MIN_INTERVAL = 2_000
+
+/**
+ * Fastest allowed push cadence for a change a PERSON caused, ms.
+ *
+ * A tap produces exactly one state change, so the reason `MIN_INTERVAL` exists
+ * does not apply to it — and applying it anyway was half the remote board's
+ * lag. Measured end to end, tap to the board moving: two independent waits of
+ * 0–2000 ms either side of ~70 ms of actual work, one of them this gate. Six
+ * runs came out 370, 2679, 2394, 2729, 370 and 498 ms, bimodal on whether the
+ * gates happened to be open.
+ *
+ * Still a floor rather than zero, because a burst of messages (a page catching
+ * up after a reconnect) is several changes, not one, and it must still coalesce.
+ */
+export const URGENT_INTERVAL = 200
 
 /** How long silence may last before a state-less frame is pushed as a heartbeat. */
 export const HEARTBEAT_MS = 90_000
@@ -182,6 +206,14 @@ export class RemotePusher {
   /** The relay answered a frame POST saying it understands patches. Never
    *  assumed: a v2 relay handed one stores nothing and the board stops. */
   private patchesOk = false
+  /** A person caused what is waiting to go out, so the cadence floor is
+   *  URGENT_INTERVAL rather than MIN_INTERVAL. Sticky until something actually
+   *  leaves: a tap that arrives during a streaming burst must not lose its
+   *  urgency to the next token's ordinary nudge. */
+  private urgent = false
+  /** Something asked to be pushed while a push was already in flight. Retried
+   *  the moment that one lands rather than on a timer of its own — see `post`. */
+  private againAfterFlight = false
   /** The armed trailing tick, when a nudge was blocked by the cadence gate or
    *  by a push in flight. One at a time: a streaming agent nudges ten times a
    *  second and every one of those must collapse into the same trailing run. */
@@ -226,6 +258,7 @@ export class RemotePusher {
    *  disposed world. */
   dispose(): void {
     this.disposed = true
+    this.againAfterFlight = false
     if (this.trailing !== undefined) { this.clearT(this.trailing); this.trailing = undefined }
   }
 
@@ -252,9 +285,16 @@ export class RemotePusher {
     // A push is already going out. Whatever prompted this tick is NEWER than
     // what that push carries, so it must be retried once that one lands —
     // dropping it here is how a board goes stale one frame behind itself.
-    if (this.inFlight) { this.arm(MIN_INTERVAL); return }
+    // The floor this tick is held to. A change a person caused gets the short
+    // one; a board moving on its own gets the one that protects the event loop.
+    const floor = this.urgent ? URGENT_INTERVAL : MIN_INTERVAL
+    // Retried when the flight ENDS, not on a timer of its own. Arming a whole
+    // floor here made a tap arriving mid-push wait that floor and then the
+    // gate's floor on top: measured, one run in seven came out ~536 ms where
+    // the rest were ~45 ms, and this was the difference.
+    if (this.inFlight) { this.againAfterFlight = true; return }
     const sinceAttempt = now - this.lastAttempt
-    if (sinceAttempt < MIN_INTERVAL) { this.arm(MIN_INTERVAL - sinceAttempt); return }
+    if (sinceAttempt < floor) { this.arm(floor - sinceAttempt); return }
     if (this.lastErrorAt && now - this.lastErrorAt < BACKOFF_MS) {
       // Backing off is not the same as forgetting: the relay is unreachable,
       // not uninteresting. Come back when the backoff expires rather than
@@ -322,9 +362,17 @@ export class RemotePusher {
       stateChanged ? state : undefined)
   }
 
-  /** The host calls this when it knows something changed, so a live board does
-   *  not wait out a heartbeat. Still cadence-bound, still coalesced. */
-  nudge(): Promise<void> {
+  /**
+   * The host calls this when it knows something changed, so a live board does
+   * not wait out a heartbeat. Still cadence-bound, still coalesced.
+   *
+   * `urgent` means a PERSON caused it — a message from the remote page, a click
+   * in the panel — as opposed to a token an agent streamed. It lowers the floor
+   * for this change only, and is sticky until a push actually goes out, so a
+   * tap that lands mid-stream is not demoted by the next frame's ordinary nudge.
+   */
+  nudge(opts?: { urgent?: boolean }): Promise<void> {
+    if (opts?.urgent) this.urgent = true
     return this.tick()
   }
 
@@ -349,6 +397,13 @@ export class RemotePusher {
       }
       this.lastSent = now
       this.lastErrorAt = 0
+      // Spent — but only if this push carried the change it belongs to. A tap
+      // that arrived WHILE this push was in flight is not in it, so clearing
+      // here would demote it to the streaming floor and it would wait 2 s
+      // having already waited for the flight. Cleared here rather than in
+      // tick() for the same reason in the other direction: a tick that decided
+      // the board was quiet has delivered nothing, and the urgency stands.
+      if (!this.againAfterFlight) this.urgent = false
       // Only a WRITE may update what the relay is recorded to hold: a heartbeat
       // sent no state, so the relay's frame is still the last full push's.
       if ('state' in body || 'patch' in body) this.lastStateJson = stateJson
@@ -394,6 +449,13 @@ export class RemotePusher {
       return false
     } finally {
       this.inFlight = false
+      // A tick that arrived mid-flight is due now. The gate is re-evaluated
+      // from THIS push's attempt time, so it arms whatever is genuinely left of
+      // the floor rather than a fresh one. Failures ride `onStatus` already.
+      if (this.againAfterFlight && !this.disposed) {
+        this.againAfterFlight = false
+        void this.tick().catch(() => { /* already reported through onStatus */ })
+      }
     }
   }
 }

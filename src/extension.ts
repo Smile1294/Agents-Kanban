@@ -1673,16 +1673,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         log.error(`Remote message failed: ${String(e)}`)
       }
     }
-    // The board changed (a prompt row, a whole new card): let the relay show it
-    // without waiting out a heartbeat.
-    if (accepted.length) void remotePusher?.nudge()
+    // No nudge here: `dispatchBoardMessage` announces every handled message
+    // through `host.onUserAction`, local and remote alike, and that is where
+    // the urgent push is asked for. A second copy on this path would be the
+    // "two functions that both know" shape — and it would go stale the day a
+    // message reaches the host by some route that is not this loop.
   }
 
+  /** True once a message poll has come back from a relay that HOLDS the
+   *  request open. Learned, never assumed — a host that answers immediately
+   *  and a caller that loops on that would hammer the relay flat out. */
+  let remoteHolds = false
+
   /** Poll the relay for messages. Runs on the remote timer only while writes
-   *  are enabled — with the toggle off, the queue is not even read. */
-  async function pollRemoteMessages(): Promise<void> {
+   *  are enabled — with the toggle off, the queue is not even read.
+   *
+   *  `waitSecs` asks the relay to hold the request until a message is queued.
+   *  Returns whether anything came back, so the scheduler can loop straight
+   *  back on a holder instead of waiting out a timer. */
+  async function pollRemoteMessages(waitSecs?: number): Promise<void> {
     if (!remoteClient?.ready || !remoteWrites) return
-    const { msgs, viewerAt } = await remoteClient.poll()
+    const { msgs, viewerAt, longPoll } = await remoteClient.poll(waitSecs)
+    remoteHolds = longPoll === true
     if (viewerAt !== undefined) remoteViewerAt = viewerAt
     if (msgs !== undefined) await handleRemoteMessages(msgs)
   }
@@ -1726,21 +1738,65 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispose: () => { clearInterval(remoteTimer); remotePusher?.dispose() },
   })
 
-  // The message poll. Fast while a page is watching (the relay's viewerAt is
-  // fresh), slow otherwise — an idle board with no watcher must not hit the
-  // relay every two seconds, but a watcher tapping a prompt must not wait 30
-  // seconds for the board to notice. Self-rescheduling because the delay
-  // changes with viewerAt.
+  /**
+   * The message poll — how a tap on the remote page reaches this machine.
+   *
+   * It HOLDS the request open where the relay can (`&wait=`, answered with
+   * `longPoll: true`), so a tap arrives the moment it is queued rather than at
+   * the next tick. That is not a tuning detail: measured end to end, tap to the
+   * board moving was 370–2729 ms, and the two things making up nearly all of it
+   * were this interval and the pusher's cadence gate — ~70 ms of the round trip
+   * was actual work. Netlify and the Cloudflare worker cannot hold a request,
+   * so they answer at once and the timer below is what runs; the relay SAYS
+   * which it did and this end never assumes.
+   *
+   * The timer still exists for three cases and each is load-bearing: a relay
+   * that does not hold, a poll that failed (a held connection dropped by a
+   * proxy or a sleeping laptop must not stop the queue being read ever again),
+   * and an idle board with no watcher, which must not hold a connection open
+   * forever for nobody.
+   */
   const REMOTE_POLL_FAST_MS = 2_000
   const REMOTE_POLL_SLOW_MS = 30_000
   const REMOTE_POLL_WATCH_MS = 60_000
+  /** How long the relay may hold one message poll. Under the contract's 25s
+   *  cap, and under the idle timeout of every proxy anyone puts in front of a
+   *  relay — a hold that outlives the connection reads as an error every time. */
+  const REMOTE_HOLD_SECS = 20
   let pollTimer: ReturnType<typeof setTimeout> | undefined
+  let pollInFlight = false
+
+  const watching = (): boolean =>
+    remoteEnabled && remoteWrites && Date.now() - remoteViewerAt < REMOTE_POLL_WATCH_MS
+
+  const runPoll = async (): Promise<void> => {
+    if (pollInFlight) return
+    pollInFlight = true
+    // Hold the request only while a page is actually watching. An idle board
+    // with nobody looking keeps its timer: a held connection for no viewer is
+    // one this machine, the relay and every proxy between them pay for.
+    const hold = watching() ? REMOTE_HOLD_SECS : undefined
+    try {
+      await pollRemoteMessages(hold)
+    } catch (e) {
+      // A held poll ends in an abort or a dropped connection as a matter of
+      // course — a laptop that slept, a proxy that trimmed an idle socket. It
+      // is only worth the log when it is NOT that.
+      remoteHolds = false
+      log.error(`Remote message poll failed: ${String(e)}`)
+    } finally {
+      pollInFlight = false
+    }
+  }
+
   const schedulePoll = (): void => {
-    const watching = remoteEnabled && remoteWrites && Date.now() - remoteViewerAt < REMOTE_POLL_WATCH_MS
-    pollTimer = setTimeout(() => {
-      void pollRemoteMessages().catch((e) => log.error(`Remote message poll failed: ${String(e)}`))
-      schedulePoll()
-    }, watching ? REMOTE_POLL_FAST_MS : REMOTE_POLL_SLOW_MS)
+    clearTimeout(pollTimer)
+    // A relay that held the last poll gets the next one straight away: it will
+    // hold that one too, so this is a standing connection, not a busy loop.
+    const delay = remoteHolds && watching()
+      ? 0
+      : watching() ? REMOTE_POLL_FAST_MS : REMOTE_POLL_SLOW_MS
+    pollTimer = setTimeout(() => { void runPoll().finally(() => schedulePoll()) }, delay)
   }
   schedulePoll()
   context.subscriptions.push({ dispose: () => clearTimeout(pollTimer) })
@@ -2859,6 +2915,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // A webview has reloaded and holds nothing, so the next state must carry
     // the model catalogue in full again.
     onReady: forgetSentCatalogue,
+    /* A person just did something — in the panel or on the phone, this is the
+       one funnel both go through. The relay push is held to the short floor
+       for it: the 2 s one exists to keep a streaming agent's ten frames a
+       second off this event loop, and a click is one change, not a firehose. */
+    onUserAction: () => {
+      remotePusher?.nudge({ urgent: true })
+        .catch((e) => log.error(`Remote push failed: ${String(e)}`))
+    },
     async getState(audience: 'webview' | 'remote' = 'webview'): Promise<UiState> {
       const active = currentProvider()
       // The effort levels are the SELECTED MODEL's, not a global list. Haiku 4.5

@@ -647,6 +647,18 @@ export interface BoardHost {
    *  and the panel both send it, and a host that carries nothing across states
    *  need not care. */
   onReady?(): void
+  /**
+   * A message from a webview has been handled — which is to say a PERSON just
+   * did something, on either side of the wire.
+   *
+   * The one signal that separates a discrete action from a board moving on its
+   * own. Everything else that repaints — a streamed token, a file mtime, the
+   * background-agent tick — arrives through the manager, not through here, so
+   * this is the only place that can tell the two apart. The remote push cadence
+   * uses it to hold a tap to a 200 ms floor instead of the 2 s one written for
+   * a streaming firehose. Optional: a host with no remote half need not care.
+   */
+  onUserAction?(): void
 }
 
 /** Shared message plumbing for both the sidebar view and the editor panel. */
@@ -677,6 +689,24 @@ function wire(webview: vscode.Webview, host: BoardHost, refresh: () => Promise<v
  * changed board state.
  */
 export async function dispatchBoardMessage(
+  host: BoardHost,
+  msg: Record<string, unknown>,
+  reply: (m: object) => void,
+  refresh: () => Promise<void>,
+): Promise<void> {
+  try {
+    await routeBoardMessage(host, msg, reply, refresh)
+  } finally {
+    // AFTER the action, and on the failure path too: the board may well have
+    // changed before whatever threw, and a watcher waiting 30 s to find out is
+    // the bug this exists to avoid. Announced once per message, here, because
+    // this is the single funnel every user action passes through — local panel
+    // and remote page alike.
+    host.onUserAction?.()
+  }
+}
+
+async function routeBoardMessage(
   host: BoardHost,
   msg: Record<string, unknown>,
   reply: (m: object) => void,
