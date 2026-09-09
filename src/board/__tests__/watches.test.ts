@@ -6,7 +6,7 @@
  * asserted without an editor; `smoke.mjs` then checks the wiring — that the
  * side bar and the panel really are answered with two different sessions.
  */
-import { Watches, isLocalSink, remoteSink, type Mode, type Watch } from '../watches.ts'
+import { Watches, carriesModels, drawsTranscript, isLocalSink, remoteSink, type Mode, type Watch } from '../watches.ts'
 
 let failures = 0
 const ok = (cond: boolean, msg: string): void => {
@@ -27,6 +27,20 @@ const make = () => new Watches(() => ({ ...defaults }))
      'a surface that has never said anything opens what the host says — that IS the seeding')
   ok(w.of('remote').key === 'host-default', 'including a remote page on its first load')
   ok(w.sinks().length === 0, 'and nothing had to be written to make that true')
+}
+
+{
+  /* WHAT A SINK IS SENT. Both of these were equality tests against the three
+     sinks that existed before there was a slot per page, and an equality that
+     silently stops matching is how a per-token cost comes back. */
+  ok(carriesModels('panel') && carriesModels('sidebar'),
+     'a local surface is sent the model catalogue')
+  ok(!carriesModels('remote') && !carriesModels(remoteSink('phone-7')),
+     'a remote page is NOT — its frame carries the list on its own version key, and BUILDING one spends the memo')
+  ok(drawsTranscript('panel') && drawsTranscript(remoteSink('phone-7')),
+     'the panel and a remote page both draw a conversation')
+  ok(!drawsTranscript('sidebar'),
+     'the side bar does not — so one is never built for it')
 }
 
 {
@@ -134,7 +148,7 @@ const make = () => new Watches(() => ({ ...defaults }))
   const w = make()
   w.set('panel', { key: 'A' })
   w.set('remote', { key: 'C' })
-  ok(w.hostSelect('B', false, 'host-default') === 'B',
+  ok(w.hostSelect('B', undefined, 'host-default') === 'B',
      "a local dispatch moves the host's own selection to what it opened")
   ok(w.of('panel').key === 'host-default',
      'and the panel follows it, because that is the editor acting on itself')
@@ -143,11 +157,24 @@ const make = () => new Watches(() => ({ ...defaults }))
   const w2 = make()
   w2.set('panel', { key: 'A' })
   w2.set('remote', { key: 'C' })
-  ok(w2.hostSelect('B', true, 'host-default') === 'host-default',
+  ok(w2.hostSelect('B', 'remote', 'host-default') === 'host-default',
      "a REMOTE dispatch does NOT move the host's selection — the answer comes back untouched")
   ok(w2.of('remote').key === 'B', 'the page moves itself instead')
   ok(w2.of('panel').key === 'A',
      'and the editor panel is not dragged along by somebody opening a chat on their phone')
+
+  /* THE SURFACE, not a boolean. There is a frame slot per page, so a page that
+     starts a session or opens a search hit has to end up looking at the result
+     — and the shared slot is not where it is looking. */
+  const w3 = make()
+  w3.set(remoteSink('phone-7'), { key: 'A' })
+  w3.set('remote', { key: 'shared' })
+  ok(w3.hostSelect('new-run', remoteSink('phone-7'), 'host-default') === 'host-default',
+     'a named page still does not move the editor')
+  ok(w3.of(remoteSink('phone-7')).key === 'new-run',
+     'and the page that asked ends up on what it started')
+  ok(w3.of('remote').key === 'shared',
+     'while the SHARED slot is untouched — answering that one would leave the asking page behind')
 }
 
 if (failures) { console.log(`\n${failures} FAILURES`); process.exit(1) }

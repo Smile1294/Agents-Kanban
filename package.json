@@ -414,7 +414,7 @@
   "scripts": {
     "build": "node scripts/preflight.mjs && node esbuild.mjs",
     "watch": "node scripts/preflight.mjs && node esbuild.mjs --watch",
-    "typecheck": "node scripts/preflight.mjs && node scripts/run-bin.mjs typescript tsc --noEmit",
+    "typecheck": "node scripts/preflight.mjs && node scripts/run-bin.mjs typescript tsc --noEmit && node scripts/run-bin.mjs typescript tsc --noEmit -p tsconfig.bench.json",
     "test": "node scripts/preflight.mjs && node scripts/test.mjs",
     "package": "node scripts/preflight.mjs && node scripts/run-bin.mjs @vscode/vsce vsce package",
     "smoke": "node scripts/preflight.mjs && node smoke.mjs",

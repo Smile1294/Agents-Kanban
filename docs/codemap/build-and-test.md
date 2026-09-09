@@ -7,6 +7,7 @@ paths:
   - smoke.mjs
   - esbuild.mjs
   - tsconfig.json
+  - tsconfig.bench.json
   - .vscodeignore
   - .vscode/**
 tests:
@@ -181,6 +182,15 @@ without one.
   passes preflight and fails in the first Chromium test.
 
 ## Recent changes
+
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `tsconfig.bench.json`,
+  and `typecheck` now runs BOTH configs. The two new benchmark scripts in
+  `test/` are TypeScript and were invisible to the type checker — outside
+  `rootDir`, so `include: src/**/*.ts` never saw them. They also drive a real
+  browser, and the callbacks handed to `page.evaluate()` run IN the page, so
+  they legitimately name `document` and `MutationObserver`; putting `DOM` into
+  the main config would let `src/` reference browser globals the extension host
+  must never have. Two configs, two jobs.
 
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `test/harness.mjs`:
   the side bar and the editor panel each get their own message handler list and

@@ -71,7 +71,7 @@ the `mode`/`selectedKey` pair of host globals. Pure and vscode-free on purpose:
 its rules are the ones the type system cannot state. `StateSink`
 (`'sidebar' | 'panel' | 'remote'`), `Mode` (declared here, re-exported by
 `panel.ts`), `Watch` (`{key, mode}`), `isLocalSink()` (a PREFIX test — every `remote:<viewer>` is remote),
-`remoteSink(viewer)`, `drawsTranscript()`, and `Watches` —
+`remoteSink(viewer)`, `carriesModels()`, `drawsTranscript()`, and `Watches` —
 `of(sink)` (falls back to the host's defaults, which IS how a brand-new surface
 is seeded), `set(sink, patch)`, `keys()` (the bound on cached review data),
 `followAll(follow)` (each watch crosses the run-id -> session-id swap on its
@@ -282,6 +282,21 @@ bar is handed back to `agentsKanban.sideBarHome`.
   one, nothing implements it (see PLAN.md §9).
 
 ## Recent changes
+
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · review pass over the
+  per-viewer work, three fixes. `Watches.hostSelect` takes the remote SURFACE
+  rather than a boolean and `dialogs.ts` carries it
+  (`remoteDispatchSurface()`): it hardcoded `'remote'`, so a page starting a
+  session, opening a search hit or forking a card moved the SHARED slot's watch
+  and the page that asked was left behind. A remote message is dispatched under
+  `remote` rather than `remote:<viewer>` until the relay has said it keeps slots
+  (`relayKeepsSlots`), or against a contract-v3 relay a page's tap was recorded
+  under a name nothing pushes and swallowed. And `sendModels` gates on
+  `carriesModels(sink)`, not `sink === 'remote'` — that equality stopped being
+  right the moment there was a slot per page, and every named push formatted and
+  discarded a 431-entry catalogue. `VIEWERS_MAX` now comes from
+  `src/remote/pusher.ts` and is pinned against the contract by
+  `check-contract.mjs`. All shown to fail.
 
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `StateSink` gained
   `remote:<viewer>`: one frame slot per remote page (relay contract v4), so the

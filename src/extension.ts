@@ -23,7 +23,10 @@ import {
   type BoardHost, type FocusMode, type SearchAnswer, type SearchRow,
   type UiCard, type UiState,
 } from './board/panel.ts'
-import { Watches, drawsTranscript, isLocalSink, remoteSink, type Mode, type StateSink, type Watch } from './board/watches.ts'
+import {
+  Watches, carriesModels, drawsTranscript, isLocalSink, remoteSink,
+  type Mode, type StateSink, type Watch,
+} from './board/watches.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type PendingMerge, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type SessionMeta, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts } from './sessions/usage.ts'
@@ -69,11 +72,12 @@ import {
   VSCODE_DICTATION_START, VSCODE_DICTATION_STOP,
   type Capture, type VoiceChecks, type VoiceConfig,
 } from './agent/dictation.ts'
-import { MIN_INTERVAL as REMOTE_MIN_INTERVAL, RemotePusher, type PushSnapshot } from './remote/pusher.ts'
+import { MIN_INTERVAL as REMOTE_MIN_INTERVAL, RemotePusher, VIEWERS_MAX, type PushSnapshot } from './remote/pusher.ts'
 import { boardIdOf, remoteFrame, relayBase, type RemoteModel, type RemoteVoice } from './remote/relay.ts'
 import { acceptMessages, parseMessages, RemoteMessageClient } from './remote/messages.ts'
 import {
-  confirm, input, isRemoteDispatch, makeRelayDialogSink, pick, setDefaultDialogSink, toast,
+  confirm, input, isRemoteDispatch, makeRelayDialogSink, pick, remoteDispatchSurface,
+  setDefaultDialogSink, toast,
   withRemoteDialogSink, type DialogSink, type RelayDialogHandle,
 } from './board/dialogs.ts'
 // Imported for effect: this is what puts Claude Code and Codex in the registry.
@@ -213,15 +217,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * the editor acting on itself, so every local surface follows and the
    * per-sink entries are dropped back to the defaults.
    *
-   * Which side of the wire the dispatch came from is read from the ambient
-   * context (`isRemoteDispatch`), the same one that already decides whether a
+   * WHICH surface the dispatch came from is read from the ambient context
+   * (`remoteDispatchSurface`), the same one that already decides whether a
    * dialog opens in VS Code or on the phone — because a remote page sending a
    * message to another session must not retarget the editor either, and a
    * `sink` parameter on fifty host methods is the shape that goes stale the day
    * a fifty-first is added.
+   *
+   * The SURFACE and not a boolean: there is a frame slot per page, so a page
+   * that starts a session, opens a search hit or forks a card has to end up
+   * looking at the result. Answering the shared slot instead would leave that
+   * page watching whatever it was on, with nothing on screen to say why.
    */
   const selectHere = (key: string | undefined): void => {
-    selectedKey = watches.hostSelect(key, isRemoteDispatch(), selectedKey)
+    selectedKey = watches.hostSelect(key, remoteDispatchSurface() as StateSink | undefined, selectedKey)
   }
   let showArchived = false
   /** The user asked to see sessions the age bound is holding back. Session
@@ -538,12 +547,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    */
   function sendModels(cat: ModelCatalogue, profileId: string, sink: StateSink):
       { id: string; label: string; context: string; detail?: string; contextTokens?: number; price?: string }[] | undefined {
-    // A remote frame splits the catalogue out and carries it on its own version
-    // key, so the list in the state is dead weight there — and, worse, marking
-    // it sent would consume a WEBVIEW's memo. A push that landed between a
-    // catalogue change and the next repaint did exactly that, and the local
-    // composer then kept the old backend's models with nothing to say why.
-    if (sink === 'remote') return undefined
+    /* A remote frame splits the catalogue out and carries it on its own version
+       key, so the list in the state is dead weight there — and, worse, marking
+       it sent would consume a WEBVIEW's memo. A push that landed between a
+       catalogue change and the next repaint did exactly that, and the local
+       composer then kept the old backend's models with nothing to say why.
+       `carriesModels` and not `sink === 'remote'`: that equality stopped being
+       right the moment there was a slot per page. */
+    if (!carriesModels(sink)) return undefined
     const key = `${catalogueVersion}:${profileId}:${cat.source}`
     if (key === sentCatalogue.get(sink)) return undefined
     sentCatalogue.set(sink, key)
@@ -1586,6 +1597,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * costing this machine a board the moment the relay evicts it.
    */
   const remotePushers = new Map<string, RemotePusher>()
+  /**
+   * How many NAMED slots this machine will build a board for, past the shared
+   * one. The relay's own bound is the real one — `syncRemoteViewers` prunes to
+   * whatever it says it is keeping — but that only happens on a poll, and a
+   * burst of messages naming distinct viewers arrives between two polls. Each
+   * pusher is a whole board built and serialised on this event loop, which is
+   * the one the CLI's stdout is drained on, so the cap is here as well as
+   * there. A caller able to send those messages already holds the board id and
+   * can start agents that cost money; this is not the boundary, it is the bound
+   * that keeps a mistake on the other side from becoming this machine's
+   * problem. The number itself is the relay's own `viewersMax`, imported
+   * rather than repeated: `check-contract.mjs` pins it, because two numbers
+   * that must agree and can drift is the shape this project has a postmortem
+   * about.
+   */
   /** The shared slot's pusher — the one every code path that predates viewer
    *  slots already had a name for. */
   const remotePusher = (): RemotePusher | undefined => remotePushers.get('')
@@ -1728,6 +1754,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (held) return held
     // A named slot is only real once the relay has SAID it keeps them.
     if (viewer && !relayKeepsSlots) return undefined
+    // Bounded — see the comment on `remotePushers`. The shared slot is never
+    // counted and never refused: it is the v3 path and the private-mode path.
+    if (viewer && [...remotePushers.keys()].filter(Boolean).length >= VIEWERS_MAX) {
+      log.warn(`Ignoring remote page ${viewer}: this board is already serving ${VIEWERS_MAX}.`)
+      return undefined
+    }
     const sink = remoteSink(viewer || undefined)
     const made = new RemotePusher({
       now: Date.now,
@@ -1830,7 +1862,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
          nobody else's — the whole point of a frame slot per viewer. A message
          with no viewer is the shared slot: a page in private mode has no id to
          keep, and a contract-v3 page never had one. */
-      const sink = remoteSink(m.viewer)
+      /* Only once this relay has SAID it keeps a slot per viewer. Against a
+         contract-v3 relay there is one frame for the whole board and only the
+         shared pusher writes it — recording this page's watch under a name
+         nothing pushes would swallow its tap entirely, which is the older
+         relay quietly breaking rather than working as it always did. */
+      const sink = relayKeepsSlots ? remoteSink(m.viewer) : 'remote'
       // Make the slot before acting on the message, or the first tap from a
       // page this machine has not heard of moves a watch nothing will push.
       if (m.viewer) ensurePusher(m.viewer)
@@ -1839,7 +1876,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           dispatchBoardMessage(host, m.msg, (ev) => {
             client.postEvents([ev]).catch((e) => log.error(`Remote event post failed: ${String(e)}`))
           }, async () => { refreshAll() }, sink),
-        )
+        sink)
       } catch (e) {
         log.error(`Remote message failed: ${String(e)}`)
       }

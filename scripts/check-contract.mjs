@@ -24,6 +24,8 @@
  *        MSG_MAX_BYTES   src/remote/messages.ts
  *        FRAME_MAX_BYTES src/remote/pusher.ts
  *        FN_PATH         src/remote/pusher.ts
+ *        VIEWER_OK       src/remote/messages.ts
+ *        VIEWERS_MAX     src/remote/pusher.ts
  *      idOk, msgMax and eventsMax are not duplicated here — the extension
  *      never holds them — so they are pinned only by the relay repo's own
  *      tests/contract.test.mjs and by check (b) below.
@@ -106,6 +108,8 @@ const local = [
   ['msgMaxBytes', contract.msgMaxBytes, grabNumber(messagesSrc, 'MSG_MAX_BYTES'), 'src/remote/messages.ts MSG_MAX_BYTES'],
   ['frameMaxBytes', contract.frameMaxBytes, grabNumber(pusherSrc, 'FRAME_MAX_BYTES'), 'src/remote/pusher.ts FRAME_MAX_BYTES'],
   ['fnPath', contract.fnPath, grabString(pusherSrc, 'FN_PATH'), 'src/remote/pusher.ts FN_PATH'],
+  ['viewerOk', contract.viewerOk, grab(messagesSrc, 'VIEWER_OK'), 'src/remote/messages.ts VIEWER_OK'],
+  ['viewersMax', contract.viewersMax, grabNumber(pusherSrc, 'VIEWERS_MAX'), 'src/remote/pusher.ts VIEWERS_MAX'],
 ]
 for (const [field, want, got, where] of local) {
   ok(got === want, `contract ${field} matches ${where}`)

@@ -1,0 +1,9 @@
+{
+  "//": "The benchmark scripts in test/ — `remote-latency.ts`, `two-pages.ts`. Their own config for two reasons. They live outside `rootDir`, and they drive a real browser: the callbacks handed to `page.evaluate()` run IN the page, so they legitimately name `document` and `MutationObserver`. Putting `DOM` into the main config instead would let `src/` reference browser globals it must never have — the extension host is Node — so the main check keeps its Node-only lib and this one adds the browser. Both run in `verify`.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["test/**/*.ts"]
+}

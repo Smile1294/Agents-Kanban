@@ -106,6 +106,15 @@ export const FETCH_TIMEOUT_MS = 10_000
  *  refuses larger with 413, so the host must not send one. */
 export const FRAME_MAX_BYTES = 4_000_000
 
+/**
+ * HOW MANY FRAME SLOTS a board keeps past the shared one — the relay's
+ * `viewersMax`, held here because the host must not build a pusher for a slot
+ * the relay will not keep. Pinned against `remote-contract.json` by
+ * `scripts/check-contract.mjs`: two numbers that must agree and can drift is
+ * the shape this project has a postmortem about.
+ */
+export const VIEWERS_MAX = 4
+
 /** The largest transcript a frame keeps when it would otherwise exceed the
  *  bound: the last 100 rows, with `transcriptMore` set so the page still knows
  *  there is history above. */

@@ -65,6 +65,23 @@ export const isLocalSink = (sink: StateSink | undefined): boolean =>
   sink === undefined || !sink.startsWith('remote')
 
 /**
+ * Does a state built for this sink CARRY the model catalogue?
+ *
+ * It coincides with `isLocalSink` and is named separately because it is a
+ * different question with the same answer: a remote frame splits the catalogue
+ * out onto its own version key (`mv`), so the list in the state would be dead
+ * weight — and, worse, building it MARKS it sent, spending that sink's memo on
+ * a push that never carried it.
+ *
+ * The test is a PREFIX, through `isLocalSink`, and that is the whole point of
+ * this existing: it was `sink === 'remote'`, an equality that stopped being
+ * right the moment there was a slot per page. Every `remote:<viewer>` push then
+ * formatted 431 entries with a paragraph each — 161 KB, measured — and threw
+ * them away, on the event loop the CLI's stdout is drained on.
+ */
+export const carriesModels = (sink: StateSink): boolean => isLocalSink(sink)
+
+/**
  * Does this surface DRAW a conversation?
  *
  * The side bar draws a title, two counts, two buttons and a list of session
@@ -159,13 +176,21 @@ export class Watches {
    * one rule and a call site that remembered only half of it is exactly how a
    * remote page ends up retargeting the editor.
    *
-   * `remote` is whether the dispatch came from the page (the host reads it off
-   * the ambient dispatch context). When it did, the host's selection does NOT
-   * move — the page's own watch does, and `current` comes back untouched.
+   * `from` is the REMOTE SURFACE the dispatch came from, when it came from one
+   * (the host reads it off the ambient dispatch context). Then the host's
+   * selection does NOT move — that page's own watch does, and `current` comes
+   * back untouched. It is the sink and not a boolean because there is a frame
+   * slot per page: a page that starts a session, opens a search hit or forks a
+   * card has to end up looking at the result, and moving the SHARED slot
+   * instead would leave it watching whatever it was on with nothing to say why.
    */
-  hostSelect(key: string | undefined, remote: boolean, current: string | undefined): string | undefined {
-    if (remote) {
-      this.set('remote', { key })
+  hostSelect(
+    key: string | undefined,
+    from: StateSink | undefined,
+    current: string | undefined,
+  ): string | undefined {
+    if (from) {
+      this.set(from, { key })
       return current
     }
     this.resetLocal()

@@ -70,13 +70,18 @@ export interface PickOptions {
   placeHolder?: string
 }
 
-/** The store holds BOTH the sink and whether this dispatch is remote — the
- *  editor-only actions (open a worktree, show a diff) read the second flag to
- *  decide whether to drive VS Code or say "that happens on the board's
- *  machine". */
+/** The store holds the sink, whether this dispatch is remote — the editor-only
+ *  actions (open a worktree, show a diff) read that to decide whether to drive
+ *  VS Code or say "that happens on the board's machine" — and WHICH remote
+ *  surface it came from, because there is one per page now and the host has to
+ *  answer the page that asked. */
 interface DialogContext {
   sink: DialogSink
   remote: boolean
+  /** The state sink of the page this dispatch came from, when it came from one.
+   *  Opaque here: `dialogs.ts` knows nothing about board surfaces, and giving
+   *  it the type would make this module import the one it is called from. */
+  surface?: string
 }
 
 const storage = new AsyncLocalStorage<DialogContext>()
@@ -98,8 +103,30 @@ export function withDialogSink<T>(sink: DialogSink, fn: () => T | Promise<T>): T
 /** Run `fn` with `sink` as the dialog sink, and mark the context REMOTE — the
  *  remote message executor's wrapper, so editor-only actions can tell they are
  *  being driven from the page. */
-export function withRemoteDialogSink<T>(sink: DialogSink, fn: () => T | Promise<T>): T | Promise<T> {
-  return storage.run({ sink, remote: true }, fn)
+export function withRemoteDialogSink<T>(
+  sink: DialogSink,
+  fn: () => T | Promise<T>,
+  /** WHICH page. Optional so the one caller that has no page — a relay with no
+   *  viewer slots, or a message from a browser with no id of its own — reads
+   *  back as "some remote surface" rather than a name nothing answers to. */
+  surface?: string,
+): T | Promise<T> {
+  return storage.run({ sink, remote: true, ...(surface ? { surface } : {}) }, fn)
+}
+
+/**
+ * WHICH remote surface the running dispatch came from, or undefined.
+ *
+ * `isRemoteDispatch()` answers whether it came from a page at all; this answers
+ * which one. Both are ambient rather than parameters on fifty host methods —
+ * the shape that goes stale the day a fifty-first is added — and the second is
+ * needed because a page starting a session, opening a search hit or forking a
+ * card has to end up looking at the result, and there is a frame slot per page
+ * to look at it in.
+ */
+export function remoteDispatchSurface(): string | undefined {
+  const store = storage.getStore()
+  return store?.remote ? store.surface : undefined
 }
 
 /**

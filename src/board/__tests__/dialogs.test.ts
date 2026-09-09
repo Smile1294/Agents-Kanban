@@ -16,6 +16,7 @@ import {
   withRemoteDialogSink,
   type DialogSink,
   type RemoteDialogSpec,
+  remoteDispatchSurface,
 } from '../dialogs.ts'
 
 let fails = 0
@@ -68,6 +69,22 @@ const recordSink = (calls: string[]): DialogSink => ({
   ok(local.v === false, 'withDialogSink marks the dispatch local')
 
   ok(isRemoteDispatch() === false, 'outside any context is not remote')
+
+/* WHICH page, not just "a page". There is a frame slot per remote page now, so
+   a session started from one has to end up on that page's board — answering the
+   shared slot would leave the page that asked watching whatever it was on. */
+{
+  const named: { v?: string } = {}
+  await withRemoteDialogSink(recordSink([]), async () => { named.v = remoteDispatchSurface() }, 'remote:phone-7')
+  ok(named.v === 'remote:phone-7', 'a remote dispatch names the surface it came from')
+  const anon: { v?: string } = {}
+  await withRemoteDialogSink(recordSink([]), async () => { anon.v = remoteDispatchSurface() })
+  ok(anon.v === undefined,
+    'one with no page named answers undefined — a name nothing answers to would be worse')
+  const local: { v?: string } = {}
+  await withDialogSink(recordSink([]), async () => { local.v = remoteDispatchSurface() })
+  ok(local.v === undefined, 'and a LOCAL dispatch has no remote surface at all')
+}
 }
 
 // --- the relay sink: post, wait, resolve -------------------------------------
