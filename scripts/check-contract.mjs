@@ -95,7 +95,7 @@ const grabString = (src, name) => {
 console.log('— relay contract')
 const contract = JSON.parse(await readFile(path.join(ROOT, 'remote-contract.json'), 'utf8'))
 
-if (contract.version !== 3) fail(`remote-contract.json version is ${contract.version}, expected 3`)
+if (contract.version !== 4) fail(`remote-contract.json version is ${contract.version}, expected 4`)
 
 // (a) the local duplicates
 const messagesSrc = await sourceOf('src/remote/messages.ts')

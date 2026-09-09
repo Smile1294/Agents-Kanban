@@ -256,6 +256,36 @@ browser because the host half IS the extension.
 
 ## Recent changes
 
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · **contract v4: a frame
+  slot per viewer.** A board is one board; the conversation open on it is not.
+  Two pages shared one frame, so whichever tapped last decided what both saw.
+  The page makes a viewer id (localStorage, not a credential — the board id is
+  still the only thing that grants access) and sends it as `&v=` on every board
+  GET and `viewer` on every `msg` POST; the relay keeps a frame and a patch ring
+  per viewer, bounded to `viewersMax`, evicting the least recently seen. The
+  host keeps ONE `RemotePusher` PER SLOT (`remotePushers`, keyed by viewer, `''`
+  = shared), because every rule in `pusher.ts` — the cadence floor, the idle
+  comparison, the held frame a patch is built against — is per board. A message
+  is dispatched under `remoteSink(m.viewer)`, so a `select` on one phone moves
+  that phone's board and nobody else's. `relayKeepsSlots` is learned from
+  `viewers: true` on a frame answer and never assumed, for the reason
+  `patchesOk` is not: a v3 relay ignores `viewer` and every page silently shares
+  one frame again. The slots the host builds for come from `poll()`'s
+  `viewers[]` — a page that only READS never sends a message, and a slot nobody
+  pushes to shows a board frozen at whenever it loaded.
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `painted` holds the
+  BOARD PASS, not a state: there is a slot per page and each watches its own
+  session, so a state built at repaint time would be one page's and the others
+  would redo the expensive half. `buildRemoteSnapshot(sink)` slices that pass.
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `test/remote-latency.ts`
+  (the §7 harness of docs/REMOTE-LATENCY.md, checked in at last) and
+  `test/two-pages.ts` (two real browsers, one real relay, the whole of v4 end to
+  end). Benchmarks, not gates — they need the relay checked out beside this repo
+  and a Chromium. `two-pages.ts` found a real bug on its first run: a frame that
+  landed before `board.js` registered its message listener was posted to nobody
+  and never re-sent, so the page said "Loading sessions…" until the board next
+  changed. The bridge now re-hands `lastState` on `ready`.
+
 - 2026-09-08 · claude/frontend-sync-chat-freeze-wb6a2s · §4 A and B of
   docs/REMOTE-LATENCY.md, built: tap on the phone to the board moving went from
   370–2729 ms to a 50 ms median (ten runs: 41, 41, 42, 42, 49, 52, 54, 58, 523,

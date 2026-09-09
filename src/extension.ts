@@ -23,7 +23,7 @@ import {
   type BoardHost, type FocusMode, type SearchAnswer, type SearchRow,
   type UiCard, type UiState,
 } from './board/panel.ts'
-import { Watches, drawsTranscript, isLocalSink, type Mode, type StateSink, type Watch } from './board/watches.ts'
+import { Watches, drawsTranscript, isLocalSink, remoteSink, type Mode, type StateSink, type Watch } from './board/watches.ts'
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type PendingMerge, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type SessionMeta, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts } from './sessions/usage.ts'
@@ -1568,7 +1568,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let remoteHasCode = false
   let remoteBoardId = ''
   let remoteStatus: { at: number; ok: boolean; note?: string; error?: string } | undefined
-  let remotePusher: RemotePusher | undefined
+  /**
+   * ONE PUSHER PER FRAME SLOT — one per remote page, keyed by its viewer id.
+   *
+   * `''` is the SHARED slot: what a contract-v3 relay stores, what a page in
+   * private mode (no id to keep) reads, and the fallback a page that has just
+   * paired is served from. It always exists while Remote Control is on.
+   *
+   * A pusher per slot rather than one pushing a map, because every rule in
+   * pusher.ts — the cadence floor, the idle comparison, the held frame a patch
+   * is built against — is per BOARD, and a slot holds a board. Shared across
+   * slots, one page's tap would spend another's urgency and one page's patch
+   * would name another's base.
+   *
+   * BOUNDED by the relay's own `viewersMax`: the slots come from what the relay
+   * says it is keeping, so a page that opened once and never came back stops
+   * costing this machine a board the moment the relay evicts it.
+   */
+  const remotePushers = new Map<string, RemotePusher>()
+  /** The shared slot's pusher — the one every code path that predates viewer
+   *  slots already had a name for. */
+  const remotePusher = (): RemotePusher | undefined => remotePushers.get('')
+  /** Every slot, for the paths that mean "push the board wherever it is read". */
+  const allPushers = (): RemotePusher[] => [...remotePushers.values()]
+  /** Fire and forget across every slot, reported once per failure. */
+  const nudgeRemote = (opts?: { urgent?: boolean }): void => {
+    for (const p of allPushers()) {
+      p.nudge(opts).catch((e) => log.error(`Remote push failed: ${String(e)}`))
+    }
+  }
+  const tickRemote = (): void => {
+    for (const p of allPushers()) {
+      void p.tick().catch((e) => log.error(`Remote tick failed: ${String(e)}`))
+    }
+  }
   // The WRITE channel. The pairing code is a capability for the mirror; the
   // code alone must never run anything on this machine, so `remote.writes` is
   // a separate toggle, default OFF, and the gate lives here — messages.ts
@@ -1628,16 +1661,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * relay would be describing a board that has moved on, and a mirror one
    * cadence behind is the bug this whole file is about, not a saving.
    */
-  let painted: { state: UiState; at: number } | undefined
+  let painted: { pass: BoardPass; at: number } | undefined
 
   /** The snapshot one push carries: the CURRENT board — the same state the
    *  window paints, reused when the repaint that nudged us just built it —
    *  with `composer.models` split out into a `models` field (relay.ts
    *  `remoteFrame`). Models ride only when they are due: a changed catalogue,
    *  a new board, a page `ready`, or a relay that reported a differing mv. */
-  async function buildRemoteSnapshot(): Promise<PushSnapshot> {
+  async function buildRemoteSnapshot(sink: StateSink): Promise<PushSnapshot> {
     const fresh = painted && Date.now() - painted.at < REMOTE_MIN_INTERVAL
-    const ui = fresh ? painted!.state : await host.getState('remote')
+    /* The PASS is what a repaint leaves behind, not a state: there is a frame
+       slot per remote page and each watches its own session, so one state built
+       for one of them would make the others redo the expensive half. Slicing a
+       pass that already exists is cheap; building one is not. */
+    const pass = fresh ? painted!.pass : await boardPass()
+    if (!fresh) applyRedirects(pass)
+    const ui = await sessionSlice(pass, sink, watchOf(sink))
     const frame = remoteFrame(ui, modelsDue ? remoteModelsList() : undefined, remoteMv(), remoteVoice())
     return { frame, writes: remoteWrites }
   }
@@ -1648,10 +1687,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *  purpose: a fresh engine's first tick compares against nothing and pushes,
    *  which is exactly what a config change should do. */
   function syncRemoteEngine(): void {
-    // The engine being replaced may hold an armed trailing tick, and it closes
-    // over the OLD baseUrl and board id — so an un-disposed one would push this
-    // board to the relay the user has just moved away from.
-    remotePusher?.dispose()
+    // Every engine being replaced may hold an armed trailing tick, and each
+    // closes over the OLD baseUrl and board id — so an un-disposed one would
+    // push this board to the relay the user has just moved away from.
+    for (const p of allPushers()) p.dispose()
+    remotePushers.clear()
+    relayKeepsSlots = false
     const baseUrl = remoteUrl ? relayBase(remoteUrl) : undefined
     remoteClient = baseUrl
       ? new RemoteMessageClient({ baseUrl, boardId: remoteBoardId, fetch })
@@ -1660,15 +1701,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       remoteClient?.postEvents([event]).catch((e) => log.error(`Remote event post failed: ${String(e)}`))
     }
     remoteDialogHandle = makeRelayDialogSink(postEvent)
-    remotePusher = new RemotePusher({
+    remoteBaseUrl = baseUrl
+    remoteRunning = remoteEnabled && remoteHasCode && !!baseUrl
+    ensurePusher('')
+  }
+
+  /** The relay URL and the enabled verdict the pushers are built from. Held so
+   *  a slot learned later is built exactly like the shared one. */
+  let remoteBaseUrl: string | undefined
+  let remoteRunning = false
+  /**
+   * The relay answered a frame POST saying it keeps a slot per viewer.
+   *
+   * Never assumed, for the reason `patchesOk` is not: a contract-v3 relay
+   * ignores `viewer` and stores every push in one slot, so building a pusher
+   * per page against one would have them overwrite each other several times a
+   * second — the bug slots exist to fix, arriving as a downgrade. Until this is
+   * true only the shared slot is pushed, which is exactly v3's behaviour.
+   */
+  let relayKeepsSlots = false
+
+  /** The pusher for one frame slot, made if it does not exist yet. `''` is the
+   *  shared slot. */
+  function ensurePusher(viewer: string): RemotePusher | undefined {
+    const held = remotePushers.get(viewer)
+    if (held) return held
+    // A named slot is only real once the relay has SAID it keeps them.
+    if (viewer && !relayKeepsSlots) return undefined
+    const sink = remoteSink(viewer || undefined)
+    const made = new RemotePusher({
       now: Date.now,
-      baseUrl,
+      baseUrl: remoteBaseUrl,
       boardId: remoteBoardId,
-      enabled: remoteEnabled && remoteHasCode && !!baseUrl,
+      ...(viewer ? { viewer } : {}),
+      enabled: remoteRunning,
       fetch,
-      build: buildRemoteSnapshot,
+      build: () => buildRemoteSnapshot(sink),
       onStatus: (s) => {
-        remoteStatus = s
+        // The status line describes THE BOARD's connection, so the shared slot
+        // owns it: every slot talks to the same relay over the same URL, and
+        // four of them racing to write one field would make it a lottery.
+        if (!viewer) remoteStatus = s
         // A push that CARRIED models and succeeded means the relay now holds
         // our catalogue — clear the due flag. A heartbeat sent no models, so
         // it must NOT clear it; that is why the flag rides the status, not the
@@ -1677,18 +1750,49 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // The settings page's status line must move on success too — a green
         // tick that no attempt ever produced is the page's own forbidden
         // signal, and so is a red one that a later success never clears.
-        void SettingsPanel.refreshIfOpen()
+        if (!viewer) void SettingsPanel.refreshIfOpen()
       },
       // Queued messages and the page's last poll ride push answers back. The
       // callback does not run them itself: acceptMessages in messages.ts is
       // the gate, and its tests pin that a disabled toggle drops everything.
       onAnswer: (answer) => {
         if (answer.viewerAt !== undefined) remoteViewerAt = answer.viewerAt
+        // Learned from the answer, never inferred — see `relayKeepsSlots`.
+        if (answer.viewers === true) relayKeepsSlots = true
         if (answer.msgs !== undefined) {
           void handleRemoteMessages(answer.msgs).catch((e) => log.error(`Remote message failed: ${String(e)}`))
         }
       },
     })
+    remotePushers.set(viewer, made)
+    return made
+  }
+
+  /**
+   * Build a pusher for every slot the relay says it is keeping, and drop the
+   * ones it has evicted.
+   *
+   * The relay's list is the bound: it holds at most `viewersMax` slots and
+   * evicts the least recently seen, so a page that opened once and never came
+   * back stops costing this machine a board the moment it falls off. The shared
+   * slot is never dropped — it is the v3 path and the private-mode path.
+   */
+  function syncRemoteViewers(viewers: readonly string[] | undefined): void {
+    if (!viewers || !relayKeepsSlots) return
+    const want = new Set(viewers)
+    for (const [viewer, p] of [...remotePushers]) {
+      if (!viewer || want.has(viewer)) continue
+      p.dispose()
+      remotePushers.delete(viewer)
+      watches.forget(remoteSink(viewer))
+    }
+    for (const v of viewers) {
+      // A slot the relay knows and this machine does not: push it a board now
+      // rather than at the next change, or a page that is only reading sits on
+      // whatever the shared slot happened to hold when it loaded.
+      if (!remotePushers.has(v)) ensurePusher(v)?.nudge({ urgent: true })
+        .catch((e) => log.error(`Remote push failed: ${String(e)}`))
+    }
   }
 
   /* --- Remote Control: the WRITE half ---------------------------------------
@@ -1721,11 +1825,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // The page loaded fresh and holds no model list — the next push must
       // carry one, whatever the relay's mv says.
       if (m.msg.type === 'ready') modelsDue = true
+      /* WHICH PAGE sent it. The sink is what the host looks the watched session
+         up under, so a `select` on one phone moves that phone's board and
+         nobody else's — the whole point of a frame slot per viewer. A message
+         with no viewer is the shared slot: a page in private mode has no id to
+         keep, and a contract-v3 page never had one. */
+      const sink = remoteSink(m.viewer)
+      // Make the slot before acting on the message, or the first tap from a
+      // page this machine has not heard of moves a watch nothing will push.
+      if (m.viewer) ensurePusher(m.viewer)
       try {
         await withRemoteDialogSink(handle.sink, () =>
           dispatchBoardMessage(host, m.msg, (ev) => {
             client.postEvents([ev]).catch((e) => log.error(`Remote event post failed: ${String(e)}`))
-          }, async () => { refreshAll() }, 'remote'),
+          }, async () => { refreshAll() }, sink),
         )
       } catch (e) {
         log.error(`Remote message failed: ${String(e)}`)
@@ -1751,9 +1864,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *  back on a holder instead of waiting out a timer. */
   async function pollRemoteMessages(waitSecs?: number): Promise<void> {
     if (!remoteClient?.ready || !remoteWrites) return
-    const { msgs, viewerAt, longPoll } = await remoteClient.poll(waitSecs)
+    const { msgs, viewerAt, longPoll, viewers } = await remoteClient.poll(waitSecs)
     remoteHolds = longPoll === true
     if (viewerAt !== undefined) remoteViewerAt = viewerAt
+    /* WHO to build a board for. A page that is only READING never sends a
+       message, so without this the only pages this machine knows about are the
+       ones that have tapped something — and a slot nobody pushes to shows a
+       board frozen at whenever that page loaded. The relay's list is also the
+       BOUND: it evicts the least recently seen, so a page that opened once and
+       never came back stops costing this machine a board. */
+    syncRemoteViewers(viewers)
     if (msgs !== undefined) await handleRemoteMessages(msgs)
   }
 
@@ -1789,11 +1909,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // with no agent running produces no repaints, so this is what keeps the
   // idle heartbeat honest. Cheap when there is nothing to do: tick() checks
   // its gates before building anything.
-  const remoteTimer = setInterval(() => {
-    void remotePusher?.tick().catch((e) => log.error(`Remote tick failed: ${String(e)}`))
-  }, 30_000)
+  const remoteTimer = setInterval(tickRemote, 30_000)
   context.subscriptions.push({
-    dispose: () => { clearInterval(remoteTimer); remotePusher?.dispose() },
+    dispose: () => { clearInterval(remoteTimer); for (const p of allPushers()) p.dispose() },
   })
 
   /**
@@ -2258,7 +2376,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // A fresh engine compares against nothing, so the first tick
             // pushes the current board — re-enabling after a pause needs no
             // special handling, the tick sends the full frame again.
-            void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+            tickRemote()
           }
           return
         }
@@ -2287,7 +2405,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (relayChanged) {
             // The fresh engine compares against nothing, so the first tick
             // pushes the full board — no backfill, a frame is the whole board.
-            void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+            tickRemote()
             void vscode.window.showInformationMessage(
               'Remote Control connected. Open the relay page on another device and enter the code.')
           }
@@ -2309,7 +2427,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             void flushRemoteMessages().catch((e) => log.error(`Remote flush failed: ${String(e)}`))
             // The frame's `writes` flag changed — push it now so the remote
             // page shows its composer without waiting out the cadence.
-            void remotePusher?.tick().catch((e) => log.error(`Remote push failed: ${String(e)}`))
+            tickRemote()
           }
           void SettingsPanel.refreshIfOpen()
           return
@@ -2444,22 +2562,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await BoardPanel.postCurrent(await sessionSlice(pass, 'panel', watchOf('panel')))
         .catch((e) => log.error(`Panel refresh failed: ${String(e)}`))
     }
-    /* The relay watches its OWN key, so it gets its own slice — off the same
-       board pass, which is the whole point of `painted`: a push rides a repaint
-       rather than redoing the expensive half on the event loop that drains the
-       CLI's stdout. Only when there is a relay at all; nothing else reads it. */
-    if (remotePusher) {
-      painted = { state: await sessionSlice(pass, 'remote', watchOf('remote')), at: Date.now() }
-    }
+    /* The BOARD PASS is what the relay reuses — not a state built from it.
+       There is a frame slot per remote page now, each watching its own session,
+       so a state built here would be one page's and the others would pay for
+       the expensive half again. `buildRemoteSnapshot` slices this pass per
+       slot, which is cheap; the pass is what costs. */
+    painted = { pass, at: Date.now() }
     refreshStatus()
     // Something changed or the board would not be repainting — let the relay
     // cadence know without waiting for its own timer, which exists for the
     // idle case where nothing repaints. tick() gates itself: this fires on
     // every frame an agent streams, and at most one push per MIN_INTERVAL
     // ever leaves.
-    if (remotePusher) {
-      remotePusher.nudge().catch((e) => log.error(`Remote push failed: ${String(e)}`))
-    }
+    nudgeRemote()
   }, REPAINT_INTERVAL_MS, { onError: (e) => log.error(`Repaint failed: ${String(e)}`) })
 
   const refreshAll = () => paint.schedule()
@@ -3626,10 +3741,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
        one funnel both go through. The relay push is held to the short floor
        for it: the 2 s one exists to keep a streaming agent's ten frames a
        second off this event loop, and a click is one change, not a firehose. */
-    onUserAction: () => {
-      remotePusher?.nudge({ urgent: true })
-        .catch((e) => log.error(`Remote push failed: ${String(e)}`))
-    },
+    onUserAction: () => { nudgeRemote({ urgent: true }) },
     /* ONE surface's state. `paint` is what repaints everything, and it does
        the board pass once for all of them; this is the single-surface path a
        webview takes when it resolves, reloads or becomes visible. */

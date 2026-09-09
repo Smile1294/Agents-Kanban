@@ -41,6 +41,11 @@ import { FETCH_TIMEOUT_MS, FN_PATH } from './pusher.ts'
 /** Same rule as the relay's (board-core.mjs): the nonce is an ack handle,
  *  nothing more, and it must look like one. */
 export const NONCE_OK = /^[A-Za-z0-9._-]{1,64}$/
+/** Same rule as the relay's: a viewer id NAMES a frame slot, it is not a
+ *  credential, and it must look like a name. A message with no viewer, or one
+ *  that does not match, is the SHARED slot — an old page has none and must keep
+ *  working. */
+export const VIEWER_OK = /^[A-Za-z0-9._-]{1,64}$/
 /** Same rule as the relay's: a webview message type is a short, dot-safe name —
  *  `sendMessage`, `remote.dialog`, `voiceAudio`. */
 export const TYPE_OK = /^[A-Za-z][A-Za-z0-9._-]{0,39}$/
@@ -55,6 +60,11 @@ export const MSG_MAX_BYTES = 4_000_000
 export interface RemoteMessage {
   nonce: string
   msg: { type: string } & Record<string, unknown>
+  /** WHICH PAGE sent it, when the relay knows. The host answers that page's own
+   *  frame slot, so a `select` on one phone does not move another's board.
+   *  Absent = the shared slot: a page in private mode has no id to keep, and a
+   *  contract-v3 page never had one. */
+  viewer?: string
 }
 
 /** Defensive read of whatever the relay returned as `msgs`. Anything that is
@@ -73,7 +83,12 @@ export function parseMessages(raw: unknown): RemoteMessage[] {
     const m = msg as Record<string, unknown>
     if (typeof m.type !== 'string' || !TYPE_OK.test(m.type)) continue
     if (JSON.stringify(msg).length > MSG_MAX_BYTES) continue
-    out.push({ nonce, msg: msg as { type: string } & Record<string, unknown> })
+    const viewer = typeof c.viewer === 'string' && VIEWER_OK.test(c.viewer) ? c.viewer : undefined
+    out.push({
+      nonce,
+      msg: msg as { type: string } & Record<string, unknown>,
+      ...(viewer ? { viewer } : {}),
+    })
   }
   return out
 }
@@ -169,7 +184,16 @@ export class RemoteMessageClient {
    * poll every single time and the queue is never read — so the timeout is
    * derived from the wait rather than left at the fixed one.
    */
-  async poll(waitSecs?: number): Promise<{ msgs?: unknown; viewerAt?: number; longPoll?: boolean }> {
+  async poll(waitSecs?: number): Promise<{
+    msgs?: unknown
+    viewerAt?: number
+    longPoll?: boolean
+    /** The frame slots the relay is keeping, most recently seen first. How the
+     *  host learns WHO to build a board for: a page that only reads never sends
+     *  a message to announce itself, and a slot nobody pushes to shows a board
+     *  frozen at whenever it loaded. Absent from a contract-v3 relay. */
+    viewers?: string[]
+  }> {
     const wait = waitSecs !== undefined && waitSecs >= 1 && waitSecs <= 25
       ? Math.floor(waitSecs)
       : undefined
@@ -183,12 +207,19 @@ export class RemoteMessageClient {
       msgs?: unknown
       viewerAt?: number
       longPoll?: boolean
+      viewers?: unknown
     }
     if (answer.ok === false) throw new Error('relay refused the message poll')
+    /* PARSED, not cast: this list becomes a set of frame slots the host builds
+       a whole board for, and it arrives from a store nobody here controls. */
+    const viewers = Array.isArray(answer.viewers)
+      ? answer.viewers.filter((v): v is string => typeof v === 'string' && VIEWER_OK.test(v))
+      : undefined
     return {
       msgs: answer.msgs,
       viewerAt: answer.viewerAt,
       ...(answer.longPoll === true ? { longPoll: true } : {}),
+      ...(viewers ? { viewers } : {}),
     }
   }
 

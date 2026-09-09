@@ -3018,6 +3018,76 @@ the verdict.
 All three are the same shape as *"Test assertions that were wrong twice in the
 same way"*: the failing output pointed away from the cause.
 
+### The view owns what it is looking at (2026-09-09)
+
+`mode` and `selectedKey` were ONE pair of host globals, shared by the side bar,
+the editor panel and every remote page at once. Two consequences, and the
+reports were about both. Opening a chat could not draw anything until a message
+reached the host and a whole state came back — on a phone, four internet round
+trips for a decision the view had already made. And no two surfaces could ever
+show different sessions, so the remote board was a MIRROR of the editor rather
+than a client of it: *"you could have opened different chat on the browser and
+on the computer simultaneously"* was not a feature request, it was a
+description of what a board over a wire has to be.
+
+**What moved.** The view decides and renders FIRST, then tells the host
+(`media/board.js`, `view` + `setView`). The host builds one `boardPass()` per
+repaint — the session index, the sidecar, the background-agent walk, identical
+for everyone — and a `sessionSlice(pass, sink, watch)` per WATCHER. Who is
+watching what lives in `board/watches.ts`, keyed by `StateSink`; the relay keeps
+a frame slot per viewer (contract v4) so two phones are two watchers too.
+
+Five things are load-bearing and none is visible to the type system.
+
+**A slice is built only for a surface that will receive it.** Building one
+consumes that sink's model-catalogue memo, so a slice nobody receives marks a
+431-entry list as delivered to a view that never saw it. `provider.live` and
+`BoardPanel.isOpen` are the guards, and the memo is a Map keyed by sink — one
+shared token is spent by whoever paints next.
+
+**The side bar is not BUILT a transcript.** `forControl()` stripped it on the
+way out, which saved the bytes and not the work — free while one state served
+every surface, and a full transcript built and thrown away ten times a second
+once each surface got its own. `drawsTranscript(sink)` is the one place that
+says so, and `forControl` is gone: two functions that both know is one bug.
+
+**A remote surface's choice never moves the editor's selection.** In the editor
+"the selected card" and "the card I am looking at" are the same sentence — a
+menu item, the status bar and every deletion mean the former. On a phone they
+are not. `isLocalSink()` is that rule, and `hostSelect()` is its other half:
+when the HOST opens something itself (the side bar's session list, a search hit,
+a new run, a fork) every local surface follows, because that is the editor
+acting on itself.
+
+**A card that goes away under a watcher is ANNOUNCED, not erased.** The surface
+it happens to is usually not the one that did it — a phone left open on a card
+somebody deleted at the desk. `UiState.vanished` names the key; the view holds
+its position and says the card is no longer on the board, naming the three
+things it could be, because the host cannot tell deleted from archived from
+aged-out and a reason it cannot defend is worse than a statement it can.
+
+**The view keeps the last three conversations, and only the ROWS.** Rows are
+append-only and carry their own timestamps, so an old copy is an old copy of
+something true. `streaming`, `review` and `backgroundAgents` are READINGS — a
+half-written line, a file list, an age — and a stale reading under a new
+session's title is a signal that cannot say bad. The sharpest case: a half
+sentence from the session you just left reads as an agent typing right now.
+
+**What running it found that no unit test could.** Two real browsers against a
+real relay (`test/two-pages.ts`) failed on its first run for a reason nothing in
+either suite covers: the bridge polls immediately and `board.js` registers its
+message listener when its own `<script>` tag parses, so a frame that lands in
+between is posted to nobody — and no later poll carries it again, because
+`since` has caught up and the board has not changed. The page said "Loading
+sessions…" until the machine next did something, which on an idle board is for
+ever. Intermittent; a slow phone loses that race more often than a laptop. The
+bridge now re-hands `lastState` when board.js announces itself.
+
+**Lesson:** one pair of globals shared by every surface is not a small
+simplification to unpick later — it decides what the product can be. And a
+"transport" that is only ever exercised by one client has a whole class of
+races nobody has met yet.
+
 ## Still open
 
 - **A routed subtask's backend must be READ once before the board can check it.**

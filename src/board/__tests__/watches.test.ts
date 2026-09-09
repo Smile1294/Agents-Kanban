@@ -6,7 +6,7 @@
  * asserted without an editor; `smoke.mjs` then checks the wiring — that the
  * side bar and the panel really are answered with two different sessions.
  */
-import { Watches, isLocalSink, type Mode, type Watch } from '../watches.ts'
+import { Watches, isLocalSink, remoteSink, type Mode, type Watch } from '../watches.ts'
 
 let failures = 0
 const ok = (cond: boolean, msg: string): void => {
@@ -52,6 +52,10 @@ const make = () => new Watches(() => ({ ...defaults }))
 {
   ok(isLocalSink('panel') && isLocalSink('sidebar'), 'the editor surfaces are local')
   ok(!isLocalSink('remote'), 'a remote page is NOT — its choice never moves the editor selection')
+  ok(!isLocalSink(remoteSink('some-phone')),
+     'and neither is a NAMED remote page — the rule is a prefix, not one literal')
+  ok(remoteSink() === 'remote',
+     'a page with no id of its own is the shared slot, spelled the one way')
   ok(isLocalSink(undefined),
      'and an unnamed sink counts as local: the host acting on its own is the editor acting')
 }

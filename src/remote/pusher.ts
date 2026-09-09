@@ -153,6 +153,11 @@ export interface RelayAnswer {
   /** The relay could not place the patch — it holds no frame, or a different
    *  one. Not an error: the next push carries a full state. */
   needFrame?: boolean
+  /** The relay keeps a FRAME SLOT PER VIEWER (contract v4). Answered on every
+   *  frame POST, and never inferred, for the reason `patches` is not: a v3
+   *  relay ignores `viewer` and every page silently shares one frame again —
+   *  which is the bug slots exist to fix, arriving as a downgrade. */
+  viewers?: boolean
 }
 
 export interface PusherDeps {
@@ -162,6 +167,18 @@ export interface PusherDeps {
   baseUrl: string | undefined
   /** The sha-256 board id (boardIdOf of the pairing code). */
   boardId: string
+  /**
+   * WHICH FRAME SLOT this pusher writes — one remote page, by the id that page
+   * made for itself. Absent is the SHARED slot, which is what a contract-v3
+   * relay stores and what a page with no id of its own reads.
+   *
+   * One pusher per slot rather than one pusher pushing a map, because every
+   * rule in this file — the cadence floor, the idle comparison, the held frame
+   * a patch is built against — is per board, and a board is what a slot holds.
+   * Sharing them across slots would mean one page's tap spending another's
+   * urgency and one page's patch naming another's base.
+   */
+  viewer?: string
   enabled: boolean
   fetch: typeof fetch
   build(): PushSnapshot | Promise<PushSnapshot>
@@ -179,6 +196,7 @@ interface PostBody {
   at: number
   writes: boolean
   mv: string
+  viewer?: string
   state?: unknown
   patch?: FramePatch
   models?: unknown
@@ -345,6 +363,9 @@ export class RemotePusher {
       at: now,
       writes: snapshot.writes,
       mv: snapshot.frame.mv,
+      // Which slot this frame is for. Omitted rather than sent empty: a v3
+      // relay ignores an unknown key either way, but `''` would be a claim.
+      ...(this.deps.viewer ? { viewer: this.deps.viewer } : {}),
     }
     if (stateChanged) {
       // A PATCH when the relay has said it speaks them AND we know what it is

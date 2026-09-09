@@ -274,7 +274,7 @@ agent streaming**, so it excludes `coalesce`'s adaptive gap (floor 100 ms, cap
 about, and it is worse than this. And the state grows with the board: 220 KB at
 nine sessions, which is what a *remote* switch pays for over the wire.
 
-### Step 1 — the view owns `mode` and `selectedKey` · 1½ days
+### Step 1 — the view owns `mode` and `selectedKey` · 1½ days · **DONE**
 
 The whole of the perceived win, and it touches one file.
 
@@ -296,7 +296,7 @@ host is already sending is now instant, in the editor and on the phone. Sessions
 the host is *not* sending still wait — that is step 2, and seeing exactly which
 ones lag is the best possible input to it.
 
-### Step 2 — the host serves a slice per WATCHER · 2½–3 days
+### Step 2 — the host serves a slice per WATCHER · 2½–3 days · **DONE**
 
 The structural piece.
 
@@ -314,13 +314,13 @@ The structural piece.
 - The host's own `selectedKey` survives only as *what a brand-new client is
   told to open first*. It stops being the truth.
 
-### Step 3 — the view keeps the last few transcripts · ½ day
+### Step 3 — the view keeps the last few transcripts · ½ day · **DONE**
 
 Bounded to about three sessions, because a transcript is the big object and the
 webview holds it in memory. Switching *back* to a session then costs nothing at
 all. This is the step that makes flicking between two chats feel native.
 
-### Step 4 — the redirects the host used to do for you · 1 day
+### Step 4 — the redirects the host used to do for you · 1 day · **DONE**
 
 Each becomes an announcement rather than an action, and each needs a test:
 
@@ -333,7 +333,7 @@ Each becomes an announcement rather than an action, and each needs a test:
 The failure mode to write tests against is a client left watching a key that no
 longer exists — it must land somewhere sensible rather than on a blank panel.
 
-### Step 5 — the relay carries per-page slices · 1–1½ days
+### Step 5 — the relay carries per-page slices · 1–1½ days · **DONE**
 
 The relay stores ONE frame per board, so two phones on different chats need
 more than that. Cheapest correct shape: `boardState` stays the shared frame, and
@@ -343,12 +343,45 @@ own. Frame patches (`delta.ts`) apply to a slice unchanged.
 
 Contract v4, and both repos move together as before.
 
-### Step 6 — gates, docs, re-measure · 1 day
+**Built, and not quite as sketched.** The cheapest correct shape turned out to
+be a frame SLOT per viewer rather than a shared board plus per-session slices:
+splitting the state would have meant splitting the composer, half of which is
+per session and half of which is not, and the patch machinery already composes
+whole boards. So the relay keeps a frame and a patch ring per viewer (bounded,
+LRU), the host keeps one `RemotePusher` per slot, and every rule in `pusher.ts`
+— the cadence floor, the idle comparison, the held frame a patch names — stays
+per board, which is what it was written for. Two things carry the roll-out: an
+absent viewer is the shared slot (a v3 page and a v3 extension both keep
+working), and `viewers: true` on a frame answer is how the pusher learns slots
+exist at all, never assumed.
+
+`test/two-pages.ts` proves it end to end: two real browsers, one real relay, two
+different chats at once. On its first run it found a bug nothing else could
+have: a frame that landed before `board.js` had registered its message listener
+was posted to nobody and never re-sent, so the page said "Loading sessions…"
+until the board next changed. Intermittent, and a slow phone would lose that
+race more often than a laptop.
+
+### Step 6 — gates, docs, re-measure · 1 day · **DONE**
 
 Every new gate shown to fail. `codemap/` areas updated (`webview`,
-`extension-host`, `remote`). A `DECISIONS.md` entry for why view state moved
-client-side. Then re-run the §7 harness and put real numbers back into §6 —
-including the local panel baseline from step 0.
+`extension-host`, `remote`, `build-and-test`). A `DECISIONS.md` entry for why
+view state moved client-side. Then re-run the §7 harness and put real numbers
+back into §6 — including the local panel baseline from step 0.
+
+**Re-measured 2026-09-09**, and the harness is checked in this time
+(`test/remote-latency.ts`), which it was not before — which is why §6 could not
+be re-checked for two rounds of changes.
+
+| | before the rework | after |
+|---|---|---|
+| a tap on the phone, end to end (local relay) | median 50 ms, two of ten at ~525 ms | median 48–52 ms, no outlier in twenty |
+| switching chats in the editor, host round trip | 3 / 5 / 20 ms at 3x20, 6x150, 9x400 | 3 / 5 / 19 ms — the split cost nothing |
+| switching chats in the editor, what the USER waits for | the whole round trip | nothing: the view draws its own click, and re-opening one of the last three conversations is instant |
+
+The ~525 ms outliers did not appear in twenty taps, but the earlier script was
+not kept, so that is not a like-for-like comparison and is not evidence that
+anything fixed them. It is a reproducible baseline for the next change.
 
 **Total: 7–8 days**, against the 5–8 estimated in §6 for piece 1 plus the relay
 work that estimate did not include.

@@ -40,7 +40,14 @@ export type Mode = 'kanban' | 'chat'
  * two surfaces can be watching two sessions on two backends, so one memo would
  * hand whichever painted second nothing at all.
  */
-export type StateSink = 'sidebar' | 'panel' | 'remote'
+export type StateSink = 'sidebar' | 'panel' | 'remote' | `remote:${string}`
+
+/** The sink for one remote page. `remote` with no name is the SHARED slot: a
+ *  page in private mode has no id to keep, and a contract-v3 page never had
+ *  one. One function so the host, the pusher and the registry cannot spell it
+ *  three ways. */
+export const remoteSink = (viewer?: string): StateSink =>
+  (viewer ? `remote:${viewer}` : 'remote')
 
 /** What one surface is looking at. */
 export type Watch = { key: string | undefined; mode: Mode }
@@ -50,10 +57,12 @@ export type Watch = { key: string | undefined; mode: Mode }
  *
  * Its own function because it is the whole security-of-attention rule in one
  * line, and because "everything except remote" is the answer that stays right
- * when a fourth sink is added: a new LOCAL surface should move the selection,
- * and anything reached over a wire should not.
+ * as sinks are added: a new LOCAL surface should move the selection, and
+ * anything reached over a wire should not — including every `remote:<viewer>`,
+ * which is why this is a prefix test and not an equality one.
  */
-export const isLocalSink = (sink: StateSink | undefined): boolean => sink !== 'remote'
+export const isLocalSink = (sink: StateSink | undefined): boolean =>
+  sink === undefined || !sink.startsWith('remote')
 
 /**
  * Does this surface DRAW a conversation?
@@ -174,6 +183,12 @@ export class Watches {
    */
   resetLocal(): void {
     for (const sink of [...this.bySink.keys()]) if (isLocalSink(sink)) this.bySink.delete(sink)
+  }
+
+  /** A surface is gone — a remote page the relay has evicted. Drops its watch
+   *  so nothing keeps loading review data for a chat nobody can see. */
+  forget(sink: StateSink): void {
+    this.bySink.delete(sink)
   }
 
   /** For tests and diagnostics: the sinks that have actually said something. */

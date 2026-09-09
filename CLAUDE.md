@@ -20,8 +20,8 @@ stream reference, current state, and what to build next.
 | Why is it built this way? | [docs/DECISIONS.md](docs/DECISIONS.md) — decisions and bug postmortems |
 | Which AGENT PROGRAM runs a session — Claude Code, Codex? How do I add a third? | [docs/RUNTIMES.md](docs/RUNTIMES.md) |
 | How do I run agents on Bedrock, Vertex, a gateway or a local model? | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
-| Should the remote board become a data server the browser renders from? | [docs/REMOTE-REWORK.md](docs/REMOTE-REWORK.md) — research; nothing built. The blocker is that `mode`/`selectedKey` are ONE pair of host globals shared by every surface, so a remote page is a mirror and opening a chat is a round trip. Carries the effort estimate, the security analysis (localhost is not a trust boundary — CVE-2026-25253) and, in §9, the step-by-step build order for piece 1 |
-| Why is the remote board laggy, and what would fix it? | [docs/REMOTE-LATENCY.md](docs/REMOTE-LATENCY.md) — the measurement (two 2s polling windows, not bandwidth) and the staged plan; §4 A and B are BUILT (median 50ms, was 370–2729ms), C and D are still research |
+| Should the remote board become a data server the browser renders from? | [docs/REMOTE-REWORK.md](docs/REMOTE-REWORK.md) — piece 1 is **BUILT** (§9, steps 0–6): the view owns `mode`/`selectedKey`, the host serves a slice per WATCHER off one board pass, and the relay keeps a frame slot per viewer (contract v4), so the side bar, the panel and two phones can be on four different chats. Also carries the security analysis (localhost is not a trust boundary — CVE-2026-25253) and what is still research |
+| Why is the remote board laggy, and what would fix it? | [docs/REMOTE-LATENCY.md](docs/REMOTE-LATENCY.md) — the measurement (two 2s polling windows, not bandwidth) and the staged plan; §4 A and B are BUILT (median ~50ms, was 370–2729ms), C and D are still research. The harness is `test/remote-latency.ts` — re-run it and put the numbers back into §6 rather than believing the old ones |
 | Where is the relay — the deployable site Remote Control pushes to — and its tests? | its own repository, the sibling `../agents-kanban-relay/`; the shared rules are pinned by `remote-contract.json` (checked by `scripts/check-contract.mjs` in `verify`) |
 | How do I run it? | [README.md](README.md) |
 
@@ -101,9 +101,30 @@ run, since each session needs a worktree.
   frame an agent produces. It used to do a full `getState()` — a session-index
   scan and a transcript parse — twice over, which cost more per minute than the
   minute contained and slowed the agent down, because the CLI's stdout is
-  drained on the same event loop. Repaints go through `board/coalesce.ts`, one
-  state serves both surfaces, and anything that cannot have changed since the
-  run started is captured once rather than re-read.
+  drained on the same event loop. Repaints go through `board/coalesce.ts`, and
+  anything that cannot have changed since the run started is captured once
+  rather than re-read. ONE `boardPass()` per repaint — the session index, the
+  sidecar, the background-agent walk, identical for every surface — and a
+  `sessionSlice()` per WATCHER, never per surface that is not there and never
+  per card. Building a slice has a side effect (it spends that sink's model
+  memo), so one computed for a view that will not receive it marks 161KB as
+  delivered to nobody; and the side bar draws no conversation, so it is not
+  BUILT one (`drawsTranscript`).
+- **Every surface watches its own session, and a remote one never moves the
+  editor's selection.** `mode`/`selectedKey` were one pair of host globals
+  shared by the side bar, the panel and every remote page, so a second surface
+  could only ever be a mirror: opening a chat anywhere retargeted everywhere,
+  and a click could not draw until a whole state came back. `board/watches.ts`
+  is the registry — pure and vscode-free, because its rules are the ones the
+  type system cannot state. A sink with no entry falls back to the host's
+  defaults, and that IS how a brand-new surface is seeded. `isLocalSink()` is a
+  PREFIX test so every `remote:<viewer>` is remote: in the editor "the selected
+  card" and "the card I am looking at" are one sentence, and on a phone they
+  are not. `hostSelect()` is the other half — the host opening something itself
+  moves every local surface with it, one function rather than a reset beside an
+  `if` at ten call sites. And a watcher left on a card that has gone is
+  ANNOUNCED (`UiState.vanished`), never silently cleared: the surface it
+  happens to is usually not the one that did it. See docs/DECISIONS.md.
 - **Never show a signal that cannot say "bad".** A pulsing dot pulses over a
   wedged process too. Show the number the indicator is derived from — the board
   shows the age of the last CLI frame, which climbs when nothing is happening.

@@ -51,7 +51,7 @@ interface Posted {
   at: number
   url: string
   key: string
-  body: { kind: string; at: number; writes: boolean; mv: string; state?: unknown; models?: unknown }
+  body: { kind: string; at: number; writes: boolean; mv: string; viewer?: string; state?: unknown; models?: unknown }
 }
 
 /** One armed timer. Held rather than run, so a test decides when the trailing
@@ -88,7 +88,7 @@ interface Rig {
   build(): Promise<PushSnapshot>
 }
 
-function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
+function rig(opts: { enabled?: boolean; baseUrl?: string; viewer?: string } = {}): Rig {
   const state = {
     now: 1_000_000,
     statuses: [] as PushStatus[],
@@ -158,6 +158,7 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
     now: () => state.now,
     baseUrl: opts.baseUrl ?? 'https://board.example.com',
     boardId: '0123456789abcdef01234567',
+    ...(opts.viewer ? { viewer: opts.viewer } : {}),
     enabled: opts.enabled ?? true,
     fetch: fetch as unknown as typeof fetch,
     build: async () => rig.build(),
@@ -648,6 +649,23 @@ function rig(opts: { enabled?: boolean; baseUrl?: string } = {}): Rig {
   const real = rig()
   await real.pusher.tick()
   ok(real.posts.length === 1, 'a fresh pusher pushes on its first tick after reset')
+}
+
+/* --- one pusher per frame slot ---------------------------------------------
+   The relay keeps a frame per viewer (contract v4), so two phones can be on two
+   chats. A pusher writes ONE slot, and the name of that slot has to be on the
+   wire or every page shares the board again — silently, which is the failure
+   this is here to make loud. */
+{
+  const named = rig({ viewer: 'phone-7' })
+  await named.pusher.tick()
+  ok(named.posts[0]?.body.viewer === 'phone-7',
+    'a pusher for a page NAMES the frame slot it writes')
+
+  const shared = rig()
+  await shared.pusher.tick()
+  ok(shared.posts[0]?.body.viewer === undefined,
+    'and the shared slot sends no name at all — omitted, never `""`, because empty would be a claim')
 }
 
 if (fails) {

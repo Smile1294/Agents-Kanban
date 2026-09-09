@@ -217,6 +217,38 @@ const res = (body: unknown, ok = true, status = 200): Response =>
   ok(noUrl.ready === false && noId.ready === false, 'the client is not ready without a url AND a board id')
 }
 
+/* --- who sent it -------------------------------------------------------------
+   The relay keeps a frame slot per viewer, so the host has to know WHICH page a
+   message came from: a `select` on one phone moves that phone's board and
+   nobody else's. Parsed like everything else on this wire — it becomes part of
+   a store key and the name of a board this machine will build. */
+{
+  const parsed = parseMessages([
+    { nonce: 'a', viewer: 'phone-7', msg: { type: 'select', id: 'x' } },
+    { nonce: 'b', msg: { type: 'select', id: 'y' } },
+    { nonce: 'c', viewer: 'has spaces and is far too long '.repeat(4), msg: { type: 'select', id: 'z' } },
+    { nonce: 'd', viewer: 42, msg: { type: 'select', id: 'w' } },
+  ])
+  ok(parsed.length === 4, 'every well-formed message is still accepted')
+  ok(parsed[0]?.viewer === 'phone-7', 'a message carries the page that sent it')
+  ok(parsed[1]?.viewer === undefined,
+    'one with none is the SHARED slot — a page in private mode has no id to keep')
+  ok(parsed[2]?.viewer === undefined && parsed[3]?.viewer === undefined,
+    'and a viewer that is not a NAME is dropped, never refused: the message still runs')
+}
+
+{
+  const { client } = clientWith(() => res({
+    ok: true, msgs: [], viewers: ['phone-7', 'tablet-2', 'nope nope', 9],
+  }))
+  const answer = await client.poll()
+  ok(JSON.stringify(answer.viewers) === JSON.stringify(['phone-7', 'tablet-2']),
+    'the slots the relay is keeping are parsed, not cast — each becomes a board this machine builds')
+  const { client: old } = clientWith(() => res({ ok: true, msgs: [] }))
+  ok((await old.poll()).viewers === undefined,
+    'and a relay that does not keep slots says nothing, rather than an empty list that reads as "none"')
+}
+
 if (fails) {
   console.error(`\n${fails} failure(s)`)
   process.exit(1)

@@ -208,11 +208,41 @@ in-flight push was CLEARING the urgency of a tap that arrived during it, which
 demoted that tap to the 2 s streaming floor after it had already waited out the
 flight. Urgency is now spent only by a push that actually carried it.
 
-**What is left.** Two runs in ten still come out ~525 ms, consistently enough to
-be a mechanism rather than jitter, and it has not been chased down — it is worth
-one session with the §7 harness before anything larger is contemplated. Beyond
-that: on a real deployment add four internet round trips (~200 ms at 50 ms RTT),
-which is then the dominant term and only **C** removes it.
+**What is left.** Two runs in ten came out ~525 ms, consistently enough to be a
+mechanism rather than jitter. On a real deployment add four internet round trips
+(~200 ms at 50 ms RTT), which is then the dominant term and only **C** removes
+it.
+
+### Re-measured, 2026-09-09, after the data-server rework
+
+The harness is now checked in (`test/remote-latency.ts` — §7), which it was not
+the first time, so this is the first figure anyone else can reproduce.
+
+```
+  10 taps, sorted: 27, 43, 45, 47, 49, 52, 53, 59, 83, 88 ms   median 52
+  a second run:    42, 43, 43, 44, 45, 48, 52, 54, 56, 57 ms   median 48
+
+  +    0ms   1. tap on the phone
+  +    4ms   2. the machine PICKED IT UP off the message poll
+  +   51ms   3. the machine PUSHED the new board
+  +   52ms   4. the phone SHOWS it
+```
+
+Two things worth saying honestly. The ~525 ms outliers did NOT appear in twenty
+taps — but the earlier script was not kept, so this is not a like-for-like
+before-and-after and it is not evidence that anything fixed them; it is a
+reproducible baseline to compare the NEXT change against. And the tail is now
+almost entirely hop 3: the frame POST into a relay that fsyncs a JSON file. The
+pickup is 4 ms, so the two 2 s polling windows this whole document was about are
+gone from the measurement entirely.
+
+**What the rework changed that this number does not show.** The page no longer
+waits for any of this to redraw what the person just clicked. The view owns
+`mode` and `selectedKey`, so a tap highlights the row and opens the chat with no
+round trip at all, and re-opening one of the last three conversations draws it
+from the page's own copy. What the 52 ms buys is the conversation arriving from
+the machine — and, because the host now serves a slice per watcher, the phone
+and the editor can be in two different chats while it does.
 
 So the decision C2 versus nothing is now an evidence question you can actually
 answer: run it on your phone. If ~250 ms feels fine, the relay stays and D
@@ -221,14 +251,27 @@ performance one.
 
 ## 7. The harness
 
-Every number above came from one script, and the plan should be re-checked with
-it after each stage rather than believed. It spawns the real `server.js` on an
-ephemeral port, drives the real `RemotePusher` against it, opens the real page
-in Chromium, taps a session in the rail and timestamps: tap → relay has it →
-extension picks it up → extension pushes → the DOM changes. A `MutationObserver`
-in the page provides the last mark, so "the phone shows it" means the phone
-actually showed it.
+```bash
+node --experimental-strip-types --no-warnings test/remote-latency.ts [taps]
+```
 
-Run it several times. A single run is meaningless here — the answer depends on
-where in two independent 2 s windows the tap happens to land, which is the
-finding.
+It spawns the sibling repository's real `server.js` on an ephemeral port with a
+throwaway store, drives the real `RemotePusher` and `RemoteMessageClient`
+against it, opens the real page in real Chromium, taps a session in the rail and
+timestamps: tap → the machine picks it up → the machine pushes → the DOM
+changes. A `MutationObserver` in the page provides the last mark, so "the phone
+shows it" means the phone actually showed it.
+
+Run it several times. A single run is meaningless here — the answer used to
+depend on where in two independent 2 s windows the tap happened to land, which
+is the finding this whole document is about.
+
+It is a BENCHMARK, not a gate: it prints numbers and exits 0, and the runner
+collects only `src/**/*.test.*`, so `verify` never runs it. It needs the relay
+checked out beside this repository and a Chromium (the same one
+`layout.test.mjs` finds).
+
+**It was a scratch file for the first measurement and was not kept**, which is
+why §6 could not be re-checked for two rounds of changes. Anything measured
+here goes back into §6 with the date; do not trust an older figure against a
+newer build.

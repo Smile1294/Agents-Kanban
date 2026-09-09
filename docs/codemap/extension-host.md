@@ -70,7 +70,8 @@ not stripped on the way out. Test: `smoke.mjs` §live wiring and §view contract
 the `mode`/`selectedKey` pair of host globals. Pure and vscode-free on purpose:
 its rules are the ones the type system cannot state. `StateSink`
 (`'sidebar' | 'panel' | 'remote'`), `Mode` (declared here, re-exported by
-`panel.ts`), `Watch` (`{key, mode}`), `isLocalSink()`, `drawsTranscript()`, and `Watches` —
+`panel.ts`), `Watch` (`{key, mode}`), `isLocalSink()` (a PREFIX test — every `remote:<viewer>` is remote),
+`remoteSink(viewer)`, `drawsTranscript()`, and `Watches` —
 `of(sink)` (falls back to the host's defaults, which IS how a brand-new surface
 is seeded), `set(sink, patch)`, `keys()` (the bound on cached review data),
 `followAll(follow)` (each watch crosses the run-id -> session-id swap on its
@@ -79,7 +80,7 @@ own, and KEEPS a key that resolves to nothing so the surface can be told),
 follows), `hostSelect(key, remote, current)` (the host opening something itself:
 answers what its own selection becomes and moves the local surfaces with it —
 one function rather than a reset beside an `if` at ten call sites) and
-`resetLocal()`. Test: `src/board/__tests__/watches.test.ts`; the wiring end-to-end is
+`resetLocal()` and `forget(sink)` (a remote page the relay has evicted). Test: `src/board/__tests__/watches.test.ts`; the wiring end-to-end is
 smoke's "the side bar and the panel can be on two different sessions".
 
 **`src/board/dialogs.ts`**. The one indirection between "this host message wants
@@ -281,6 +282,13 @@ bar is handed back to `agentsKanban.sideBarHome`.
   one, nothing implements it (see PLAN.md §9).
 
 ## Recent changes
+
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `StateSink` gained
+  `remote:<viewer>`: one frame slot per remote page (relay contract v4), so the
+  host keeps a `RemotePusher` per slot (`remotePushers`) and dispatches each
+  remote message under the sink of the page that sent it. `painted` now holds
+  the board PASS rather than a state, because a state built at repaint time is
+  one page's and the others would redo the expensive half.
 
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · the host's redirects
   became announcements. `UiState.vanished` names the key a surface is watching
