@@ -8,7 +8,7 @@
  */
 import { EventEmitter } from 'node:events'
 import { loadSdk, type Options } from './sdk.ts'
-import type { WorktreeService } from '../git/worktree.ts'
+import { prepareComposerWorktree, type WorktreeService } from '../git/worktree.ts'
 import { normaliseTitle, resolveEffort, resolveThinking, type EffortLevel, type SessionMeta, type ThinkingMode } from '../sessions/meta.ts'
 import { summariseTool, type Entry, type SessionStore } from '../sessions/store.ts'
 import type { AgentState, BoardConfig } from '../board/config.ts'
@@ -1162,6 +1162,7 @@ export class AgentManager extends EventEmitter {
           taskId: shortId(runId), title,
           ...(opts.base ? { baseBranch: opts.base } : {}),
         })
+    await prepareComposerWorktree(wt.path)
 
     // What was already on disk before this run started. Claude Code writes this
     // run to the same transcript as it goes, so without a boundary the chat view

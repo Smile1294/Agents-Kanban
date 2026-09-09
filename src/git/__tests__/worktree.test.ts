@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { promisify } from 'node:util'
-import { KANBAN_DIR, WorktreeService, findRepoRoot, realResolveInWorktree, resolveInWorktree, slug } from '../worktree.ts'
+import { KANBAN_DIR, WorktreeService, findRepoRoot, prepareComposerWorktree, realResolveInWorktree, resolveInWorktree, slug } from '../worktree.ts'
 
 const exec = promisify(execFile)
 let fails = 0
@@ -22,6 +22,24 @@ await g(['add', '-A']); await g(['commit', '-m', 'init'])
 const root = await findRepoRoot(repo)
 ok(!!root, 'findRepoRoot locates the repo')
 ok(await findRepoRoot(tmp) === undefined || root !== await findRepoRoot(tmp), 'non-repo dir handled')
+
+// Composer dependencies are ignored by git, so a fresh worktree needs the
+// project installer before an artisan-backed MCP server can start.
+const composerBin = path.join(tmp, 'bin')
+const composerProject = path.join(tmp, 'composer-project')
+await fs.mkdir(composerBin)
+await fs.mkdir(composerProject)
+await fs.writeFile(path.join(composerProject, 'composer.json'), '{}\n')
+await fs.writeFile(path.join(composerBin, 'composer'),
+   `#!/usr/bin/env node\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst marker = path.join(process.cwd(), 'composer-ran');\nfs.writeFileSync(marker, String(Number(fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8') : 0) + 1));\nfs.mkdirSync(path.join(process.cwd(), 'vendor'), { recursive: true });\nfs.writeFileSync(path.join(process.cwd(), 'vendor', 'autoload.php'), '<?php\\n');\n`)
+await fs.chmod(path.join(composerBin, 'composer'), 0o755)
+const oldPath = process.env.PATH
+process.env.PATH = `${composerBin}${path.delimiter}${oldPath ?? ''}`
+await prepareComposerWorktree(composerProject)
+await prepareComposerWorktree(composerProject)
+ok(await fs.readFile(path.join(composerProject, 'composer-ran'), 'utf8') === '1',
+    'Composer dependencies are installed once when autoload.php is missing')
+process.env.PATH = oldPath
 
 const svc = new WorktreeService(root!)
 ok(await svc.currentBranch() === 'main', 'reads current branch')

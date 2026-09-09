@@ -3,10 +3,10 @@
  * Every agent works in its own worktree on its own branch, so three agents can
  * run at once without touching each other's files or your working tree.
  *
- * Deliberately NO seeding — we do not copy .env, symlink node_modules, or run
- * an install. Nimbalyst does the same, and it is the right default: copying
- * secrets into a sibling directory is a surprise, and install steps vary per
- * project. `onCreate` is exposed so a project can opt in.
+ * Deliberately NO seeding — we do not copy .env or symlink node_modules.
+ * Dependency manifests are different: a fresh checkout cannot start a
+ * configured MCP server until its ignored dependencies exist. `onCreate` is
+ * exposed so callers can opt into project-specific preparation.
  */
 import { execFile } from 'node:child_process'
 import { promises as fs } from 'node:fs'
@@ -15,6 +15,28 @@ import { promisify } from 'node:util'
 import { withRepoLock } from './lock.ts'
 
 const exec = promisify(execFile)
+
+/** Install Composer dependencies needed by a newly-created worktree.
+ *
+ * Composer's vendor directory is ignored and therefore absent from every git
+ * worktree. Run only when Composer metadata is present and autoload.php is
+ * missing; this keeps non-PHP projects untouched and makes the operation
+ * idempotent for resumed or already-prepared worktrees.
+ */
+export async function prepareComposerWorktree(worktreePath: string): Promise<void> {
+  const composerJson = path.join(worktreePath, 'composer.json')
+  const autoload = path.join(worktreePath, 'vendor', 'autoload.php')
+  const [hasJson, hasAutoload] = await Promise.all([
+    fs.access(composerJson).then(() => true, () => false),
+    fs.access(autoload).then(() => true, () => false),
+  ])
+  if (!hasJson || hasAutoload) return
+
+  await exec('composer', ['install', '--no-interaction', '--prefer-dist'], {
+    cwd: worktreePath,
+    maxBuffer: 32 * 1024 * 1024,
+  })
+}
 
 export interface WorktreeInfo {
   path: string
