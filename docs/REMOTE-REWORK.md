@@ -240,12 +240,39 @@ it fiddlier:
   behalf — a run getting its session id, a fork, an archive, a delete. Each of
   those has to become something the host TELLS clients rather than does to them.
 
-### Step 0 — branch, and measure the local panel too · ½ day
+### Step 0 — branch, and measure the local panel too · ½ day · **DONE**
 
 Baseline what switching chats costs **in the editor**, not just on the phone.
-Every number so far has been about the remote page; the round trip is the same
-one locally and nobody has measured it. Without this there is no before/after
-for the thing being changed.
+`test/switch-latency.mjs` drives the BUILT bundle through the smoke gate's stub
+— real `getState()`, real session-index scan, real transcript parse — and posts
+what a click posts, timing until the state for that session has been handed to
+the webview. Twelve switches per run, after a warm-up:
+
+| board | median | max | state shipped |
+|---|---|---|---|
+| 3 sessions × 20 entries | 3 ms | 12 ms | 14 KB |
+| 6 sessions × 150 entries | 5 ms | 23 ms | 85 KB |
+| 9 sessions × 400 entries | 20 ms | 38 ms | 220 KB |
+
+**This corrects a claim in §7 and §8.** Locally the round trip is 3–20 ms —
+imperceptible. There is no local speed win in piece 1 worth naming, and saying
+otherwise would have been selling it on a number that does not exist.
+
+What piece 1 actually delivers, restated honestly:
+
+1. **Two screens, two chats.** The stated ask, and the whole reason to do it.
+   Unaffected by this measurement.
+2. **Instant switching REMOTELY**, where the round trip is a network one — the
+   measured 41–58 ms median plus whatever the phone's link costs, against a
+   local state change of zero.
+3. **A client that owns its view**, which is the client a subscription API in
+   piece 2 needs anyway.
+
+Two caveats on the numbers, both pointing the same way. The bench runs with **no
+agent streaming**, so it excludes `coalesce`'s adaptive gap (floor 100 ms, cap
+500 ms) — switching while an agent works is the case the original complaint was
+about, and it is worse than this. And the state grows with the board: 220 KB at
+nine sessions, which is what a *remote* switch pays for over the wire.
 
 ### Step 1 — the view owns `mode` and `selectedKey` · 1½ days
 

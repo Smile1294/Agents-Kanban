@@ -182,6 +182,17 @@ without one.
 
 ## Recent changes
 
+- 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `test/switch-latency.mjs`
+  — a BENCHMARK, not a gate: it prints numbers and exits 0, and the runner only
+  collects `src/**/*.test.*` so it never runs in `verify`. It drives the BUILT
+  bundle through the smoke gate's stub and times what a click on a session
+  costs: post `select`, wait until the state for that session has reached the
+  webview. Written for step 0 of docs/REMOTE-REWORK.md §9, and it immediately
+  corrected the plan — locally that round trip is 3–20 ms, so piece 1 has no
+  local speed win to sell. It needs `process.exit(0)`: the host's timers (the
+  remote poll, the push ticker, the background-agent tick) keep the loop alive
+  forever, and a benchmark that never exits reads as a hang.
+
 - 2026-09-08 · claude/pr-review-test-fixes · `scripts/test.mjs` no longer stops
   at the first failing file. The `break` turned one red suite into a silent
   hole: `relay.test.ts` sorts 42nd of 51, so a single failure there meant nine
