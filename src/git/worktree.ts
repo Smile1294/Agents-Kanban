@@ -972,6 +972,32 @@ export async function realResolveInWorktree(
   }
 }
 
+/**
+ * Is this ABSOLUTE path inside the worktree, following symlinks?
+ *
+ * The sibling above refuses an absolute target by policy, because its caller
+ * deals in repo-relative test links. This one exists for the other question:
+ * a tool has named a file by absolute path and we need to know whether it is
+ * the agent's own worktree or somewhere else on the machine.
+ *
+ * Symlinks are followed for the reason `realResolveInWorktree` follows them —
+ * the agent has full write access inside its worktree, so `ln -s ~/.ssh keys`
+ * makes `<worktree>/keys/id_rsa` resolve textually inside the root and open a
+ * real private key. The root is realpath'd too, or a worktree that itself sits
+ * behind a symlink (/tmp on macOS) reads as an escape from itself.
+ *
+ * A path that does not exist is not inside anything: it answers false, and the
+ * caller asks the user. That is the safe direction — a Read of a file that is
+ * not there is either a mistake or a probe, and neither is worth a silent yes.
+ */
+export async function realContains(worktreeRoot: string, target: string): Promise<boolean> {
+  if (!worktreeRoot.trim() || !target.trim()) return false
+  const realRoot = await fs.realpath(worktreeRoot).catch(() => path.resolve(worktreeRoot))
+  const real = await fs.realpath(path.resolve(target)).catch(() => undefined)
+  if (!real) return false
+  return real === realRoot || real.startsWith(realRoot + path.sep)
+}
+
 /** As many characters of the title as a directory name carries. */
 const SLUG_MAX = 40
 

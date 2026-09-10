@@ -22,6 +22,7 @@ import type { EffortLevel, ThinkingMode } from '../sessions/meta.ts'
 import type { AgentState } from '../board/config.ts'
 import { buildAskAnswers, parseAskQuestions } from '../board/questions.ts'
 import { reconcileProvider, resolvedLabel, type ProviderProfile } from './providers.ts'
+import { realContains } from '../git/worktree.ts'
 import type { AgentRun, Meter } from './runtime.ts'
 
 export interface PermissionRequest {
@@ -184,8 +185,24 @@ export function agentEnv(
 }
 
 /**
- * Built-in tools the agent may always use without asking. Read-only, and the
- * agent is confined to its own worktree anyway.
+ * Built-in tools the agent may always use without asking.
+ *
+ * This list used to carry `WebFetch` and `WebSearch` as well, under the comment
+ * "Read-only, and the agent is confined to its own worktree anyway". Both
+ * halves of that were false, and together they were an exfiltration channel
+ * with no prompt anywhere on it: `Read` is NOT confined to the worktree —
+ * nothing enforced that, and the tool takes an absolute path — and read-only
+ * stops being a containment property the moment an egress tool sits in the same
+ * allow-list. An injection in anything an agent reads (a README, a fetched
+ * page, a dependency's changelog) could read `~/.aws/credentials` and POST it,
+ * with no dialog drawn, no card in `needsInput`, and one truncated transcript
+ * row as the only trace.
+ *
+ * So the two that reach the network are out — they take the ordinary prompt,
+ * which is Claude Code's own default — and `Read` is auto-allowed only for a
+ * path inside the worktree, checked in `decide()` with symlinks followed. The
+ * modes that mean "do not ask me" (`dontAsk`, `bypassPermissions`) are not
+ * consulted here and still mean what they say.
  *
  * The BOARD tools are auto-allowed too, but they are not listed here — they are
  * passed in from their own definitions (see `autoAllow`). Writing them out by
@@ -194,8 +211,12 @@ export function agentEnv(
  * not move its own card without a click.
  */
 const AUTO_ALLOW_BUILTIN = new Set([
-  'Read', 'Glob', 'Grep', 'TodoWrite', 'Task', 'WebFetch', 'WebSearch',
+  'Glob', 'Grep', 'TodoWrite', 'Task',
 ])
+
+/** Auto-allowed, but only for a target inside the agent's own worktree. `Read`
+ *  takes an absolute path and will read anything on the machine. */
+const AUTO_ALLOW_IN_WORKTREE = new Set(['Read'])
 
 /** Test hook: is this tool name in the built-in auto-allow set? The board tools
  *  are checked per-session, via `boardTools`. */
@@ -854,10 +875,31 @@ export class AgentSession extends EventEmitter implements AgentRun {
     return AUTO_ALLOW_BUILTIN.has(toolName) || (this.opts.boardTools ?? []).includes(toolName)
   }
 
+  /**
+   * A tool that is auto-allowed only INSIDE the worktree, answered for this
+   * call's actual target.
+   *
+   * `Read` takes an absolute path and will read anything the user can. Silent
+   * approval is right for the agent's own checkout and wrong for `~/.aws/
+   * credentials`, and the difference is a question about a path, so it is asked
+   * per call rather than per tool. Symlinks are followed: the agent can write
+   * inside its worktree, so `ln -s ~/.ssh keys` would otherwise make the whole
+   * home directory look local. Anything unreadable, absent or outside falls
+   * through to the ordinary prompt — the safe direction.
+   */
+  private async allowedInWorktree(toolName: string, input: Record<string, unknown>): Promise<boolean> {
+    if (!AUTO_ALLOW_IN_WORKTREE.has(toolName)) return false
+    const target = typeof input.file_path === 'string' ? input.file_path
+      : typeof input.path === 'string' ? input.path
+      : ''
+    if (!target) return false
+    return realContains(this.opts.cwd, target)
+  }
+
   /** The permission gate. Auto-allow the safe set; surface everything else. */
-  private decide(toolName: string, input: Record<string, unknown>): Promise<PermissionResult> {
-    if (this.autoAllowed(toolName)) {
-      return Promise.resolve({ behavior: 'allow', updatedInput: input })
+  private async decide(toolName: string, input: Record<string, unknown>): Promise<PermissionResult> {
+    if (this.autoAllowed(toolName) || await this.allowedInWorktree(toolName, input)) {
+      return { behavior: 'allow', updatedInput: input }
     }
     return new Promise<PermissionResult>((resolve) => {
       const id = `${this.taskId}:${this.permissions.size}:${Date.now()}`

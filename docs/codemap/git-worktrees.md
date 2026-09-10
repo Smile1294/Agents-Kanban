@@ -116,6 +116,15 @@ frames. Worktree cleanup is offered at `complete`, never automatic.
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `realContains(root, abs)`
+  — the containment check for an ABSOLUTE path, which `realResolveInWorktree`
+  refuses by policy. It is what decides whether a `Read` is auto-allowed or
+  asks. Symlinks are followed on both sides for the reason its sibling follows
+  them: the agent can write inside its worktree, so `ln -s ~/.ssh keys` would
+  otherwise make the home directory look local. A path that does not exist
+  answers false — it asks, which is the safe direction. Gate in
+  `worktree.test.ts` against real files and a real symlink.
+
 - 2026-09-09 · task · Composer dependencies are prepared before every session launch when a worktree lacks `vendor/autoload.php`, so Composer-backed MCP servers can start.
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S5kc3 · `changedFiles()` and `fileStatuses()` pass `-uall`, so untracked files in a new directory are listed one by one; found because the knowledge-file gate could not see the new `docs/codemap/` files and refused its own branch.

@@ -86,12 +86,28 @@ for (const n of names) {
   // the definitions, so that a rename cannot silently un-allow them.
   ok(!AUTO_ALLOWED_FOR_TEST(n), `${n} is auto-allowed from its definition, not from a hand-written list`)
 }
-for (const n of ['Read', 'Grep', 'Glob']) {
-  ok(AUTO_ALLOWED_FOR_TEST(n), `${n} is auto-allowed as a read-only built-in`)
+for (const n of ['Grep', 'Glob']) {
+  ok(AUTO_ALLOWED_FOR_TEST(n), `${n} is auto-allowed — it cannot leave the machine or name a path outside it`)
 }
 for (const n of ['Bash', 'Edit', 'Write']) {
   ok(!AUTO_ALLOWED_FOR_TEST(n), `${n} still goes through the user`)
 }
+
+/* THE EGRESS TOOLS ARE NOT AUTO-ALLOWED, and `Read` is not auto-allowed by
+   NAME. They were, all three, under the comment "Read-only, and the agent is
+   confined to its own worktree anyway" — and both halves were false. `Read`
+   takes an absolute path and nothing confined it; read-only stops being a
+   containment property the moment an egress tool is in the same allow-list. An
+   injection in anything an agent reads could `Read` ~/.aws/credentials and
+   `WebFetch` it out with no dialog drawn anywhere. `Read` is now allowed per
+   CALL, for a target inside the worktree (see AgentSession.allowedInWorktree
+   and realContains); these two take the ordinary prompt, which is Claude
+   Code's own default. */
+for (const n of ['WebFetch', 'WebSearch']) {
+  ok(!AUTO_ALLOWED_FOR_TEST(n), `${n} reaches the network, so it asks — read-only plus egress is exfiltration`)
+}
+ok(!AUTO_ALLOWED_FOR_TEST('Read'),
+   'Read is not auto-allowed by NAME — it takes an absolute path, so the question is about the path')
 
 // --- the spawn allowlist reaches the DESCRIPTION, not just the gate -----------
 //

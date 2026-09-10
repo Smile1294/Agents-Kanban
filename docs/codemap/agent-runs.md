@@ -190,6 +190,21 @@ started column while the title is still the guess.
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `AUTO_ALLOW_BUILTIN` lost
+  `WebFetch`, `WebSearch` and `Read`. The comment above it said "Read-only, and
+  the agent is confined to its own worktree anyway" and both halves were false:
+  `Read` takes an absolute path and nothing confined it, and read-only stops
+  being a containment property the moment an egress tool sits in the same
+  allow-list. Together they were an exfiltration channel with no prompt anywhere
+  on it — an injection in anything an agent reads could `Read`
+  `~/.aws/credentials` and `WebFetch` it out, no dialog, no `needsInput`, one
+  truncated transcript row. The two that reach the network now take the ordinary
+  prompt (Claude Code's own default); `Read` is auto-allowed per CALL for a
+  target inside the worktree, symlinks followed
+  (`AgentSession.allowedInWorktree` → `realContains`). `dontAsk` and
+  `bypassPermissions` are not consulted here and still mean what they say.
+  Gates in `tools.test.ts` and `worktree.test.ts`, both shown to fail.
+
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · a resume that comes back
   as a DIFFERENT session id is reported. The runtime started a fresh
   conversation instead of continuing the one asked for, so the follow-up went

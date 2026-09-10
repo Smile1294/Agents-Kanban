@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { promisify } from 'node:util'
-import { KANBAN_DIR, WorktreeService, findRepoRoot, prepareComposerWorktree, realResolveInWorktree, resolveInWorktree, slug } from '../worktree.ts'
+import { KANBAN_DIR, WorktreeService, findRepoRoot, prepareComposerWorktree, realContains, realResolveInWorktree, resolveInWorktree, slug } from '../worktree.ts'
 
 const exec = promisify(execFile)
 let fails = 0
@@ -663,6 +663,37 @@ ok(slug('!!!') === 'task', 'a title with nothing sluggable still names the direc
   const rp = renamed.files.map((f) => f.path)
   ok(rp.includes('Their Notes.md') && !rp.some((p) => p.includes(' -> ')),
      `a rename reports the new name, not "old -> new": ${JSON.stringify(rp)}`)
+}
+
+/* --- is this absolute path the agent's own worktree, or the rest of the disk?
+   `realContains` is what decides whether a `Read` is auto-allowed or asks. The
+   symlink case is the one that matters: an agent has full write access inside
+   its worktree, so it can plant a link and make the whole home directory look
+   local. Real files, real symlinks, real realpath. */
+{
+  const root = path.join(tmp, 'contain-root')
+  const outside = path.join(tmp, 'contain-outside')
+  await fs.mkdir(path.join(root, 'src'), { recursive: true })
+  await fs.mkdir(outside, { recursive: true })
+  await fs.writeFile(path.join(root, 'src', 'a.ts'), 'inside\n')
+  await fs.writeFile(path.join(outside, 'secret'), 'ssh-rsa AAAA\n')
+
+  ok(await realContains(root, path.join(root, 'src', 'a.ts')), 'a file in the worktree is inside it')
+  ok(await realContains(root, root), 'the worktree is inside itself')
+  ok(!await realContains(root, path.join(outside, 'secret')),
+     'a file outside it is not — that is the Read that has to ask')
+  ok(!await realContains(root, path.join(root, '..', 'contain-outside', 'secret')),
+     'and neither is one reached through `..`, however it is spelled')
+
+  // The attack: the agent writes a symlink inside its own worktree.
+  await fs.symlink(outside, path.join(root, 'keys')).catch(() => {})
+  ok(!await realContains(root, path.join(root, 'keys', 'secret')),
+     'a path THROUGH a symlink the agent planted resolves to where it really goes')
+
+  ok(!await realContains(root, path.join(root, 'does-not-exist')),
+     'a path that is not there is not inside anything — it asks, which is the safe direction')
+  ok(!await realContains(root, ''), 'and an empty target is never silently allowed')
+  ok(!await realContains('', '/etc/passwd'), 'nor is anything, when there is no worktree to be inside')
 }
 
 await fs.rm(tmp, { recursive: true, force: true })
