@@ -457,6 +457,16 @@ export class RemotePusher {
         // cannot be patched against. Whole states from here.
         this.held = undefined
       }
+      /* A DISPOSED pusher says nothing back. `dispose()` means this engine is
+         finished, but a push already in flight lands afterwards — and its
+         callbacks are the OLD engine's, closing over the old relay. The host
+         learns things from them that outlive one engine: whether the relay
+         keeps a frame slot per viewer, the connection status line, the queued
+         messages to run. A late answer from the relay the user just moved AWAY
+         from would teach the new one facts about the old, and the sharpest is
+         `viewers` — believed about a relay that does not keep slots, every page
+         is pushed into one frame and the board stops moving for all of them. */
+      if (this.disposed) return true
       // The answer drives the host's next move (models-due, poll cadence,
       // queued messages) — the pusher itself does not look at it.
       this.deps.onAnswer?.(answer)
@@ -472,6 +482,10 @@ export class RemotePusher {
       // what it holds is no longer known. Guessing here is how a patch gets
       // spliced into a frame that was never stored.
       this.held = undefined
+      // Silent once disposed, for the reason the success arm is: this engine's
+      // failure is not the new engine's, and a red status line the user cannot
+      // clear is the "signal that cannot say good" half of the same rule.
+      if (this.disposed) return false
       this.deps.onStatus({
         at: now, ok: false,
         error: err instanceof Error ? err.message : String(err),

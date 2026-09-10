@@ -871,9 +871,42 @@ console.log('\n— the side bar and the panel can be on two different sessions')
      `the host names the key that has no card (${ctl.boardPanel.state()?.vanished})`)
   ok(ctl.boardPanel.state()?.selectedKey === undefined,
      'and reports nothing selected, because there is nothing there to select')
-  await ctl.sideBar.send({ type: 'ready' })
+  /* Its OWN watch, deliberately: `openSession` above dropped every local watch
+     back to the host's default (that is the editor acting on itself), and a
+     surface on the default when the default's card dies is TOLD — correctly.
+     The claim under test here is the other one: a surface looking at a real
+     card of its own hears nothing about somebody else's. */
+  await ctl.sideBar.send({ type: 'select', id: ON_GATEWAY })
   ok(ctl.sideBar.state()?.vanished === undefined,
      'while the surface that is watching a real card is told nothing of the sort')
+
+  /* A surface that never CHOSE anything is following the host's own selection,
+     and when THAT card leaves the board the explanation used to go with it —
+     the panel simply arrived on the new-session screen. Reachable: opening a
+     session from the side bar list drops every local watch back to the default
+     (that is the editor acting on itself), and a phone deleting the card then
+     leaves the panel with nothing to say why. `openSession` is the host doing
+     exactly that. */
+  await send({ type: 'toggleArchived' })
+  await send({ type: 'archive', id: ON_GATEWAY, archived: true })
+  await send({ type: 'openSession', id: ON_GATEWAY })
+  await ctl.boardPanel.send({ type: 'ready' })
+  ok(ctl.boardPanel.state()?.selectedKey === ON_GATEWAY,
+     'the panel follows the host opening a session, with no watch of its own')
+  // The card leaves the board without anyone deleting it — the archive filter
+  // closing over it, which is the same shape as the age bound and as another
+  // machine removing it.
+  await send({ type: 'toggleArchived' })
+  await ctl.boardPanel.send({ type: 'ready' })
+  ok(ctl.boardPanel.state()?.vanished === ON_GATEWAY,
+     `a surface following the default is told which card went (${ctl.boardPanel.state()?.vanished})`)
+  await ctl.boardPanel.send({ type: 'select', id: STORED_SESSION })
+  ok(ctl.boardPanel.state()?.vanished === undefined,
+     'and the claim stops the moment it is looking at something again')
+  // Put the card back, or every later assertion is about a board missing one.
+  await send({ type: 'toggleArchived' })
+  await send({ type: 'archive', id: ON_GATEWAY, archived: false })
+  await send({ type: 'toggleArchived' })
 
   // Put the board back where the rest of this file expects to find it.
   await ctl.boardPanel.send({ type: 'select', id: '' })

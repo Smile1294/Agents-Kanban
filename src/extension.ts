@@ -207,6 +207,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * card" and "the card I am looking at" are the same sentence.
    */
   const watches = new Watches(() => ({ key: selectedKey, mode }))
+  /** The card the host's own selection was on when it left the board — see
+   *  `applyRedirects`. What a surface following the default is told instead of
+   *  being dropped silently onto the new-session screen. */
+  let defaultVanished: string | undefined
   const watchOf = (sink: StateSink) => watches.of(sink)
   const watchedKeys = () => watches.keys()
   /**
@@ -3438,7 +3442,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    */
   function applyRedirects(pass: BoardPass): void {
     const resolve = (k: string) => pass.ws?.manager?.byKey(k)?.sessionId
-    selectedKey = followKey(selectedKey, pass.keys, resolve)
+    const next = followKey(selectedKey, pass.keys, resolve)
+    /* WHY the host's own selection became nothing. `followAll` KEEPS a watch
+       whose card has gone, so a surface with a watch of its own can be told —
+       but a surface that had never chosen anything was following the DEFAULT,
+       and clearing that would take the explanation with it. Reachable: opening
+       a session from the side bar list drops every local watch back to the
+       default, and a phone deleting that card then leaves the panel on the
+       new-session screen with nothing to say why. One entry, because the host
+       has one selection, and it clears itself on the next pass that resolves. */
+    if (next) defaultVanished = undefined
+    else if (selectedKey) defaultVanished = selectedKey
+    // else: already gone and still nothing selected — the claim STANDS. It must
+    // outlive the repaint that noticed, or it is cleared by the very next frame
+    // and no surface is ever handed it. It ends when something is selected.
+    selectedKey = next
     watches.followAll((k) => followKey(k, pass.keys, resolve))
   }
 
@@ -3478,7 +3496,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
        selection that quietly becomes nothing is a chat disappearing with no
        explanation anywhere. `followKey` already answered `undefined`, so this
        says WHICH key it was about. */
-    const vanished = !selectedKey && watch.key ? watch.key : undefined
+    /* This surface's own dead key, or — when it was following the host's
+       default and THAT is what went — the card the default was on. A surface
+       genuinely on nothing selected has neither, and claims nothing. */
+    const vanished = selectedKey ? undefined : (watch.key ?? defaultVanished)
     /* The side bar draws names and counts. It used to be handed the whole
        conversation and have it stripped on the way out (`forControl`), which
        saved the bytes and not the work — free while one state served every

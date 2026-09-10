@@ -221,6 +221,7 @@ the first time, so this is the first figure anyone else can reproduce.
 ```
   10 taps, sorted: 27, 43, 45, 47, 49, 52, 53, 59, 83, 88 ms   median 52
   a second run:    42, 43, 43, 44, 45, 48, 52, 54, 56, 57 ms   median 48
+  a day later:     40, 47, 48, 48, 50, 51, 51, 55, 59, 61 ms   median 51
 
   +    0ms   1. tap on the phone
   +    4ms   2. the machine PICKED IT UP off the message poll
@@ -228,10 +229,10 @@ the first time, so this is the first figure anyone else can reproduce.
   +   52ms   4. the phone SHOWS it
 ```
 
-Two things worth saying honestly. The ~525 ms outliers did NOT appear in twenty
-taps — but the earlier script was not kept, so this is not a like-for-like
-before-and-after and it is not evidence that anything fixed them; it is a
-reproducible baseline to compare the NEXT change against. And the tail is now
+Two things worth saying honestly. The ~525 ms outliers did NOT appear in thirty
+taps across three runs — but the earlier script was not kept, so this is not a
+like-for-like before-and-after and it is not evidence that anything fixed them;
+it is a reproducible baseline to compare the NEXT change against. And the tail is now
 almost entirely hop 3: the frame POST into a relay that fsyncs a JSON file. The
 pickup is 4 ms, so the two 2 s polling windows this whole document was about are
 gone from the measurement entirely.

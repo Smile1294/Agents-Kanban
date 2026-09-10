@@ -668,6 +668,47 @@ function rig(opts: { enabled?: boolean; baseUrl?: string; viewer?: string } = {}
     'and the shared slot sends no name at all — omitted, never `""`, because empty would be a claim')
 }
 
+/* --- a disposed pusher says nothing back ------------------------------------
+   `dispose()` means this engine is finished, but a push already in flight lands
+   afterwards, and its callbacks close over the relay the user has just moved
+   AWAY from. The host learns things from them that outlive one engine — whether
+   the relay keeps a frame slot per viewer, the status line, the queued messages
+   to run — so a late answer would teach the new engine facts about the old. */
+{
+  const r = rig()
+  let release: (() => void) | undefined
+  r.holdFetch = () => new Promise<void>((res) => { release = res })
+  const inFlight = r.pusher.tick()
+  // Let the fetch actually START before disposing — `release` does not exist
+  // until `holdFetch` has been called, and releasing before that hangs for ever.
+  await new Promise((res) => setImmediate(res))
+  await new Promise((res) => setImmediate(res))
+  r.pusher.dispose()
+  r.holdFetch = undefined
+  release?.()
+  await inFlight
+  ok(r.posts.length === 1, 'the push already on the wire still completes — it cannot be recalled')
+  ok(r.answers.length === 0, 'but its ANSWER is not handed to the host it no longer belongs to')
+  ok(r.statuses.length === 0, '…and neither is its status')
+}
+
+{
+  // The same on the failure arm: a dead engine's error is not the new one's,
+  // and a red line the user cannot clear is a signal that cannot say good.
+  const r = rig()
+  let release: (() => void) | undefined
+  r.holdFetch = () => new Promise<void>((res) => { release = res })
+  r.failFetchWith = new Error('relay unreachable')
+  const inFlight = r.pusher.tick()
+  await new Promise((res) => setImmediate(res))
+  await new Promise((res) => setImmediate(res))
+  r.pusher.dispose()
+  r.holdFetch = undefined
+  release?.()
+  await inFlight
+  ok(r.statuses.length === 0, 'a disposed pusher reports no failure either')
+}
+
 if (fails) {
   console.error(`\n${fails} failure(s)`)
   process.exit(1)

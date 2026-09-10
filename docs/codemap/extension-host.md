@@ -248,8 +248,12 @@ bar is handed back to `agentsKanban.sideBarHome`.
   at" are the same sentence — a menu item, the status bar and every deletion
   mean the former. On a phone they are not, and a page opening a chat must not
   retarget what somebody at the keyboard is about to click.
-- **A surface left watching a card that is gone is TOLD.** `UiState.vanished`
-  carries the key. The surface it happens to is usually not the one that did it
+- **A surface left watching a card that is gone is TOLD, including one that
+  was following the host's own selection.** `UiState.vanished` carries the key;
+  `defaultVanished` carries it for the surfaces with no watch of their own,
+  because clearing `selectedKey` would otherwise take the explanation with it —
+  and it STANDS until something is selected rather than being cleared by the
+  repaint that noticed, or no surface is ever handed it. The surface it happens to is usually not the one that did it
   — a phone left open on a card somebody deleted at the desk — and a selection
   that quietly becomes nothing is a chat disappearing with no explanation
   available anywhere on the board. A statement, never a reason: deleted,
@@ -282,6 +286,20 @@ bar is handed back to `agentsKanban.sideBarHome`.
   one, nothing implements it (see PLAN.md §9).
 
 ## Recent changes
+
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · second review pass, two
+  fixes. `defaultVanished`: a surface with NO watch of its own follows the host's
+  selection, and when that card left the board the explanation went with it —
+  the panel simply arrived on the new-session screen. Reachable, because
+  `openSession` (the side bar's session list) drops every local watch back to
+  the default and a phone deleting that card then says nothing. The claim stands
+  until something is selected; clearing it on the next repaint means no surface
+  ever sees it, which is how the first attempt failed its own gate. And a
+  DISPOSED `RemotePusher` no longer calls `onAnswer`/`onStatus`: a push already
+  in flight lands after `syncRemoteEngine` has torn the engine down, and its
+  callbacks close over the relay the user just moved away from — a late
+  `viewers: true` believed about a relay that does not keep slots pushes every
+  page into one frame and the board stops moving for all of them.
 
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · review pass over the
   per-viewer work, three fixes. `Watches.hostSelect` takes the remote SURFACE
