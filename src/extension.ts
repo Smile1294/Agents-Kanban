@@ -1797,7 +1797,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       onAnswer: (answer) => {
         if (answer.viewerAt !== undefined) remoteViewerAt = answer.viewerAt
         // Learned from the answer, never inferred — see `relayKeepsSlots`.
+        // BEFORE the slot list is applied: `syncRemoteViewers` refuses to act
+        // until slots are known to be real, and both facts arrive together.
         if (answer.viewers === true) relayKeepsSlots = true
+        /* WHO IS READING THIS BOARD, learned off a request this host makes
+           whatever the write toggle says.
+           This used to come only from the message poll, which returns early
+           when `remote.writes` is off — the DEFAULT. So with writes off no
+           viewer was ever discovered, no per-viewer slot was ever built, and
+           every browser page read the SHARED slot: the board could only show
+           the conversation the computer had open, and opening one on the phone
+           did nothing until somebody opened it at the desk. Reported exactly
+           that way. Viewer discovery is a READ concern and must never have
+           been behind the write gate. */
+        if (answer.slots) syncRemoteViewers(answer.slots)
         if (answer.msgs !== undefined) {
           void handleRemoteMessages(answer.msgs).catch((e) => log.error(`Remote message failed: ${String(e)}`))
         }

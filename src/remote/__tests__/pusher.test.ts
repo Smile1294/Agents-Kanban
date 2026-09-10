@@ -709,6 +709,37 @@ function rig(opts: { enabled?: boolean; baseUrl?: string; viewer?: string } = {}
   ok(r.statuses.length === 0, 'a disposed pusher reports no failure either')
 }
 
+/* --- who is reading, learned off the PUSH --------------------------------- */
+//
+// This is the read path's half of the slot scheme, and it exists because the
+// other half was behind the wrong gate. The host used to discover viewers only
+// from the message poll, which returns early while `remote.writes` is off —
+// the default — so a page that was merely READING was never discovered, no
+// slot was built for it, and every browser fell back to the shared slot: the
+// board could show only the conversation the computer had open. A push happens
+// whatever the write toggle says, so the list rides it.
+
+{
+  const r = rig()
+  r.answer = { ok: true, patches: true, viewers: true, slots: ['phone-b', 'phone-a'], frameSeq: 1 }
+  await r.pusher.nudge()
+  const a = r.answers.at(-1)
+  ok(!!a && Array.isArray(a.slots), 'a push answer carries the slot list through to the host')
+  ok(a?.slots?.[0] === 'phone-b', '…in the relay’s order, most recently seen first')
+  ok(a?.viewers === true, 'and the capability flag beside it, so the host can act on the list')
+}
+
+{
+  // ABSENT is "not answered", never "no viewers". A relay that does not send
+  // the field must not make the host tear down every board it is serving.
+  const r = rig()
+  r.answer = { ok: true, patches: true, frameSeq: 1 }
+  await r.pusher.nudge()
+  const a = r.answers.at(-1)
+  ok(a?.slots === undefined, 'an older relay simply omits it')
+  ok(a?.viewers === undefined, '…and says nothing about slots at all, which is not the same as none')
+}
+
 if (fails) {
   console.error(`\n${fails} failure(s)`)
   process.exit(1)
