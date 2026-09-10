@@ -673,9 +673,10 @@ bugs it found in the code are fixed. What remains, in the order it hurts:
 
 - **Permission prompts that survive a window reload.** A pending request lives
   in memory on the `AgentSession` and is denied when the session ends.
-- **Fail loudly when a resumed session comes back with a different id** than the
-  one we asked for, as Nimbalyst does. The reverse case — two runs sharing an
-  id — warns; this one is not detected.
+- ~~Fail loudly when a resumed session comes back with a different id.~~ Done:
+  the `sessionId` handler reports it, naming both ids so the original
+  conversation can still be found. It is REPORTED and not repaired — the turn is
+  already running on the new session by the time we hear.
 
 ### Smaller, worthwhile
 
@@ -684,17 +685,14 @@ bugs it found in the code are fixed. What remains, in the order it hurts:
   entry kind exists and nothing reads the new HEAD, so a commit is not yet a row
   in the transcript.
 - **A `Fixes <id>` commit-message watcher** to close a card, as Nimbalyst's
-  `CommitTrackerLinker` does. **The `set_phase` description already promises
-  this** — "The user marks work complete, or a commit message closes it", in
-  `board/config.ts` — and nothing implements it. A prose promise the code does
-  not keep is the class of bug this project keeps a rule about: build it, or
-  reword the description.
+  `CommitTrackerLinker` does. Still a feature worth having. The
+  `set_phase` description no longer PROMISES it — it said "The user marks work
+  complete, or a commit message closes it" while nothing watched commit
+  messages, which an agent reads as a fact it can act on. It now says only what
+  is true; build the watcher and say so again.
 - **Board config from a file**, so columns are customisable. `DEFAULT_BOARD` in
   `board/config.ts` is a constant.
 - **Syntax highlighting in code blocks.** Language label and monospace only.
-- **Real timestamps on rehydrated transcripts.** `readTranscript` stamps every
-  entry with the time it was PARSED; `SessionMessage.timestamp` now exists in
-  the SDK and nothing uses it.
 
 ### Known limits
 

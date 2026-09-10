@@ -60,8 +60,15 @@ export const DEFAULT_BOARD: BoardConfig = {
       name: 'Complete',
       category: 'done',
       humanOnly: true,
+      /* What the agent is told must be TRUE. This said "or a commit message
+         closes it", and nothing watches commit messages — a promise the code
+         does not keep, read by an agent as a fact it can act on: write
+         "Fixes <id>" and the card will close. It never does. Either build the
+         watcher or say what actually happens; PLAN.md §9 keeps the watcher on
+         the list as a feature, and this is the sentence that stops lying about
+         it meanwhile. */
       agentHint:
-        'You may not set this. The user marks work complete, or a commit message closes it.',
+        'You may not set this. Only the user marks work complete, from the board.',
     },
   ],
 }

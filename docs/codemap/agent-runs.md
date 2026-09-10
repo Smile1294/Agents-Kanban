@@ -190,5 +190,14 @@ started column while the title is still the guess.
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · a resume that comes back
+  as a DIFFERENT session id is reported. The runtime started a fresh
+  conversation instead of continuing the one asked for, so the follow-up went
+  somewhere the transcript on screen will never show and the card re-keyed onto
+  a session with no history — silently, reading as a lost transcript. Reported
+  and not repaired: the turn is already running by the time we hear, so the
+  warning names BOTH ids and the original stays findable. Gate in
+  `manager.test.ts` drives the real handler rather than mirroring its condition.
+
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit; `knowledgeCheck` added to `BoardToolContext`, wired in `boardContext()`, and the brief gained the knowledge-file paragraph when a codemap exists.
 - 2026-09-07 · task/S116g8 · dead-code sweep: dictation tuning constants `WHISPER_BIN`, `FFMPEG_BIN`, `DICTATION_MIN_VERSION` de-exported — module-private, referenced only inside dictation.ts.

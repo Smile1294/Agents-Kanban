@@ -1262,6 +1262,35 @@ export class AgentManager extends EventEmitter {
       // id with the run that resumes it — treating that as a collision fired a
       // warning on every follow-up message and refused the resumed run its own
       // identity.
+      /* WE ASKED TO RESUME ONE CONVERSATION AND WERE GIVEN ANOTHER.
+       *
+       * A resume hands the runtime the id to continue. If what comes back is a
+       * DIFFERENT id, the runtime started a fresh session instead — so the
+       * follow-up the user just sent went somewhere the transcript they were
+       * reading will never show, and the card silently re-keys onto a
+       * conversation with none of the history. Nothing throws; the board simply
+       * shows an almost-empty chat where a long one was, which reads as the
+       * transcript having been lost.
+       *
+       * Reported, not repaired: the turn is already running on the new session
+       * and there is no honest way to move it back. Naming both ids is what
+       * makes it recoverable — the old conversation is still on disk under the
+       * id this names, and searching for it finds it.
+       *
+       * The mirror of this — two runs arriving with the SAME id — is refused
+       * below. That one is a merge and can be prevented; this one has already
+       * happened by the time we hear about it.
+       */
+      if (opts.resume && id !== opts.resume) {
+        this.emit(
+          'warning',
+          `"${agent.title}" was resumed from session ${opts.resume} and came back as ${id}. ` +
+          'The agent started a NEW conversation rather than continuing that one, so this turn ' +
+          'does not have the earlier history and the card now follows the new session. The ' +
+          'original is still on disk under its own id.',
+        )
+      }
+
       const clash = [...this.agents.values()].find(
         (a) => a !== agent && a.sessionId === id && this.sessions.has(a.runId),
       )

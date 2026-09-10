@@ -148,6 +148,86 @@ ok(!!clashesWith(incoming, 'sess-A'), 'an id already held by another live agent 
 ok(!clashesWith(incoming, 'sess-B'), 'a fresh id is not a clash')
 ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with itself')
 
+// --- a resume that comes back as a DIFFERENT session -------------------------
+//
+// A resume hands the runtime the id to continue. If what comes back is another
+// id, the runtime started a fresh conversation instead: the follow-up the user
+// just sent went somewhere the transcript they were reading will never show,
+// and the card re-keys onto a session with none of the history. Nothing throws
+// — the board just shows an almost-empty chat where a long one was, which reads
+// as the transcript having been lost.
+//
+// Driven through the REAL handler, not a copy of its condition: the collision
+// guard above is mirrored in this file and could not catch a change to the
+// original, which is the shape this suite has a comment about elsewhere.
+{
+  const { EventEmitter } = await import('node:events')
+  const emitters: InstanceType<typeof EventEmitter>[] = []
+  const warnings: string[] = []
+  const mgr = new AgentManager({
+    store: {
+      get: async () => ({ title: 'Long conversation' }),
+      card: async () => ({ phase: 'implementing', tags: [] }),
+      childrenOf: async () => [],
+      patch: async () => {},
+      transcript: async () => [],
+      usage: async () => ({ costUsd: 0 }),
+      adoptKey: async () => {},
+      rename: async () => ({ renamed: true }),
+      setTags: async () => {},
+    } as never,
+    worktrees: {
+      create: async (a: { taskId: string }) => ({ path: '/tmp/wt/' + a.taskId, branch: 'task/' + a.taskId, base: 'main' }),
+      isClean: async () => true,
+      aheadOf: async () => 0,
+      discard: async () => {},
+    } as never,
+    board: DEFAULT_BOARD,
+    defaults: {},
+    permissionMode: 'acceptEdits',
+    maxConcurrent: 2,
+  })
+  mgr.on('warning', (m: string) => warnings.push(m))
+  const inner = mgr as unknown as {
+    startRun: (...a: never[]) => Promise<unknown>
+    agents: Map<string, RunningAgent>
+  }
+  inner.startRun = (async (_rt: unknown, runId: string) => {
+    const a = inner.agents.get(runId as string)
+    if (a) a.state = { kind: 'working' }
+    const e = new EventEmitter() as unknown as Record<string, unknown>
+    e.run = async () => {}
+    e.send = () => {}
+    e.stop = () => {}
+    e.interrupt = async () => {}
+    e.clearQueue = () => 0
+    e.answerPermission = () => false
+    e.setPermissionMode = async () => false
+    emitters.push(e as unknown as InstanceType<typeof EventEmitter>)
+    return e as never
+  }) as never
+
+  // The user sends a follow-up to a finished session — the resume path.
+  await mgr.send('sess-original', 'and one more thing')
+  await new Promise((r) => setTimeout(r, 40))
+  ok(emitters.length === 1, `the resume started a run (${emitters.length})`)
+
+  emitters[0]!.emit('sessionId', 'sess-original')
+  ok(warnings.length === 0, 'a resume that comes back as the SAME session says nothing')
+
+  // Now the failure: another finished session resumed, answered with an id that
+  // is not the one asked for. A different key, because the first is now LIVE and
+  // a live session takes the send straight to its running process.
+  await mgr.send('sess-second', 'again')
+  await new Promise((r) => setTimeout(r, 40))
+  const second = emitters[1]
+  ok(!!second, 'the second resume started a run too')
+  second?.emit('sessionId', 'sess-brand-new')
+  ok(warnings.length === 1, `a resume that comes back as a different session is REPORTED (${warnings.length})`)
+  ok(/sess-second/.test(warnings[0] ?? '') && /sess-brand-new/.test(warnings[0] ?? ''),
+     `naming both ids, so the original can still be found (${warnings[0]?.slice(0, 90)})`)
+}
+
 // --- the concurrency slot ----------------------------------------------------
 // `drain()` starts whatever is queued behind maxConcurrentAgents, and it used to
 // run ONLY from finish(), which fires on the 'done'/'error' events. A run that

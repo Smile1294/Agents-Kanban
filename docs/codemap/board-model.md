@@ -117,10 +117,16 @@ repository → nothing is required, so the extension stays generic.
 
 - Board configuration from a file, so columns are customisable — `DEFAULT_BOARD`
   is a constant.
-- The `set_phase` description says "or a commit message closes it"; no watcher
-  exists (PLAN.md §9).
+- A `Fixes <id>` commit-message watcher to close a card (PLAN.md §9). The
+  `set_phase` description no longer claims one exists.
 
 ## Recent changes
+
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · the `complete` column's
+  `agentHint` stopped promising a commit-message watcher that does not exist.
+  What the agent is told must be TRUE: an agent reads "a commit message closes
+  it" as a fact it can act on — write "Fixes <id>" and the card will close — and
+  it never does.
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit; `codemap.ts` added with the knowledge-file gate.
 - 2026-09-07 · task/S116g8 · dead-code sweep: `normalisePath` and `knowledgeMessage` de-exported — module-private helpers used only by exported functions' bodies.
