@@ -276,6 +276,26 @@ const preflightCode = preflightSource
   .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '')).join('\n')
 ok(!/\.bin/.test(preflightCode), 'the preflight does not require node_modules/.bin to exist')
 
+/* And it must cover EVERY declared dependency. It was a hand-written list of
+   five, so a dependency added afterwards was not checked at all: `playwright`
+   arrived, preflight passed a checkout without it, and the failure surfaced as
+   `Cannot find package 'playwright'` from inside a test — the exact "names
+   neither the cause nor the fix" this file exists to prevent, for the one
+   package it had never heard of. Read from the script's own answer rather than
+   from its source, so a return to a hand-written list fails here. */
+{
+  const { execFileSync } = await import('node:child_process')
+  const listed = new Set(
+    execFileSync(process.execPath, [path.join(repoRoot, 'scripts', 'preflight.mjs'), '--list'],
+      { encoding: 'utf8' }).split('\n').map((l) => l.trim()).filter(Boolean),
+  )
+  const declared = Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })
+  ok(declared.length > 0, 'the manifest declares dependencies')
+  const uncovered = declared.filter((d) => !listed.has(d))
+  ok(uncovered.length === 0,
+     `the preflight checks every declared dependency${uncovered.length ? ` — missing: ${uncovered.join(', ')}` : ` (${declared.length})`}`)
+}
+
 // The preflight's Node floor and the manifest's must agree, or one of them lies.
 const floor = /const MIN_NODE = \[(\d+), (\d+), (\d+)\]/.exec(preflightSource)
 ok(!!floor, 'the preflight declares a minimum Node version')
@@ -388,6 +408,19 @@ await send({ type: 'select', id: STORED_SESSION })
 const sel = latestState()
 ok(sel?.selectedKey === STORED_SESSION, 'and can be selected with nothing running')
 ok((sel?.transcript ?? []).length > 0, 'its transcript is read back from disk')
+/* WITH THE TIMES IT WAS WRITTEN, not the time it was parsed. Every rehydrated
+   entry used to be stamped `Date.now()`, so a conversation from last week said
+   "just now" on every row and the day-group headers filed all of it under
+   today. The seed above uses 2001-09-09 (`new Date(1e12)`), which no clock on
+   any machine running this will ever be near. */
+{
+  const stamps = (sel?.transcript ?? []).map((e) => e.at).filter((n) => typeof n === 'number')
+  ok(stamps.length > 0, 'every entry carries a time')
+  ok(stamps.every((n) => n >= 1e12 && n < 1e12 + 60_000),
+     `and it is the time the message was WRITTEN, not read: ${new Date(Math.min(...stamps)).toISOString()}`)
+  ok(stamps.some((n) => n !== stamps[0]),
+     'so two messages a second apart are a second apart on the board, not identical')
+}
 ok(sel?.composer?.contextTokens === STORED_CONTEXT,
    `its context fill is read back exactly: ${sel?.composer?.contextTokens} (expected ${STORED_CONTEXT})`)
 ok(sel?.composer?.contextWindow === 1_000_000,

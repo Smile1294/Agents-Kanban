@@ -780,6 +780,29 @@ export class SessionStore {
     const usage = summariseUsage(msgs as readonly UsageMessage[], this.book)
     const windowed = msgs.length > limit ? msgs.slice(msgs.length - limit) : msgs
     const entries: Entry[] = []
+    /* WHEN each message was written, not when this parse ran.
+     *
+     * Every rehydrated entry used to be stamped `Date.now()`, so a session read
+     * back off disk showed every message as having happened just now — `ago()`
+     * said "just now" for a conversation from last week, and the day-group
+     * headers filed all of it under today. A board that says the wrong time is
+     * the same class of bug as one that shows a signal which cannot say bad.
+     *
+     * The SDK RETURNS the field and does not DECLARE it: `SessionMessage` in
+     * `sdk.d.ts` has no `timestamp`, and every message off a real read carries
+     * one (verified against a seeded store — see docs/SDK-NOTES.md). So it is
+     * read defensively off an unknown-shaped object rather than typed, parsed
+     * rather than cast, and anything unreadable falls back to the receive time
+     * the SDK's own comment prescribes — ONE receive time for the whole read,
+     * so messages that lack it stay in order with each other.
+     */
+    const receivedAt = Date.now()
+    const stampOf = (m: unknown): number => {
+      const raw = (m as { timestamp?: unknown }).timestamp
+      if (typeof raw !== 'string') return receivedAt
+      const t = Date.parse(raw)
+      return Number.isFinite(t) ? t : receivedAt
+    }
     const toolNames = new Map<string, { list: Entry[]; idx: number }>()
     /** Subagent work, keyed by the id of the Task tool_use that started it.
      *  Collected as we go and attached to that Task's entry at the end.
@@ -794,7 +817,7 @@ export class SessionStore {
 
     for (const m of windowed) {
       const body = (m.message ?? {}) as { content?: unknown }
-      const at = Date.now()
+      const at = stampOf(m)
       // The compact summary is the model's own recap, not something anyone
       // said. Claude Code's CLI never shows it as a chat message, and neither
       // does this board: it renders as one muted divider, the same one the

@@ -183,6 +183,14 @@ without one.
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `scripts/preflight.mjs`
+  derives what it checks from `package.json` instead of a hand-written list of
+  five. `playwright` was added afterwards and was never checked, so a checkout
+  without it passed preflight and failed as `Cannot find package 'playwright'`
+  from inside a test — the failure this script exists to prevent. `--list`
+  prints what it covers, and `smoke.mjs` reads that answer rather than the
+  source, so a return to a hand-written list fails.
+
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · `tsconfig.bench.json`,
   and `typecheck` now runs BOTH configs. The two new benchmark scripts in
   `test/` are TypeScript and were invisible to the type checker — outside

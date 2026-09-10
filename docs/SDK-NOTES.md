@@ -81,6 +81,21 @@ lives in the sidecar rather than here.
 `SessionMessage.parent_tool_use_id` is set for subagent messages — filter them
 out or subagent chatter swamps the main transcript.
 
+**`SessionMessage` carries a `timestamp` that the types do not declare.** The
+declared shape is `type`, `uuid`, `session_id`, `message`, `parent_tool_use_id`,
+`parent_agent_id` — no timestamp anywhere. Every message off a real
+`getSessionMessages` has one anyway, an ISO string, verified against a seeded
+store. It matters because without it a transcript read back from disk has no
+times at all, and this project stamped `Date.now()` on every entry for it —
+so a conversation from last week said "just now" on every row. Read it
+defensively (it is undeclared, so it is an unknown-shaped field on another
+program's output) and fall back to receive time, which is what the SDK's own
+comment on the declared `timestamp` fields elsewhere prescribes.
+
+This is the one place the types are *poorer* than reality rather than richer.
+Both directions have now caught this project out, so check twice: once in the
+`.d.ts`, once against a real answer.
+
 ---
 
 ## In-process MCP tools

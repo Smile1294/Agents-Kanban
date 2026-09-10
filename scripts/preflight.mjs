@@ -64,14 +64,31 @@ if (!existsSync(modules)) {
   console.log('')
 }
 
-/** Everything a script here actually reaches for, and why. */
-const REQUIRED = [
-  ['typescript', 'npm run typecheck'],
-  ['esbuild', 'npm run build'],
-  ['@types/node', 'the typecheck (without it every `process` and `console` is an error)'],
-  ['@anthropic-ai/claude-agent-sdk', 'running agents at all — it is an external, not bundled'],
-  ['zod', 'the SDK’s tool schemas; it must be the SAME instance the SDK resolves'],
-]
+/**
+ * WHY each package is needed, for the ones where naming the reason helps.
+ *
+ * The list of WHAT to check is not here — it is `package.json`. This used to be
+ * a hand-written list of five, so a dependency added afterwards was not checked
+ * at all: `playwright` arrived, preflight passed a checkout without it, and the
+ * failure surfaced as `Cannot find package 'playwright'` from inside a test —
+ * the exact "names neither the cause nor the fix" this file exists to prevent,
+ * for the one package it had never heard of. A declared dependency that is not
+ * installed IS an incomplete install, whatever it is for, so the check is now
+ * over everything declared and a new one is covered the day it is added.
+ */
+const WHY = {
+  typescript: 'npm run typecheck',
+  esbuild: 'npm run build',
+  '@types/node': 'the typecheck (without it every `process` and `console` is an error)',
+  '@types/vscode': 'the typecheck of everything that touches the editor',
+  '@vscode/vsce': 'npm run package — building the .vsix',
+  '@anthropic-ai/claude-agent-sdk': 'running agents at all — it is an external, not bundled',
+  zod: 'the SDK’s tool schemas; it must be the SAME instance the SDK resolves',
+  playwright: 'the gates that measure real layout in real Chromium',
+}
+const REQUIRED = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies })
+  .sort()
+  .map((name) => [name, WHY[name] ?? 'this project’s scripts'])
 
 const missing = REQUIRED.filter(([name]) => !existsSync(path.join(modules, ...name.split('/'))))
 if (missing.length) {
@@ -115,4 +132,12 @@ if (unresolvable.length) {
 
 if (process.argv.includes('--verbose')) {
   console.log(`  ✓ Node ${process.versions.node}, ${REQUIRED.length} required packages, ${pkg.name}@${pkg.version}`)
+}
+
+/** What this check actually covers, one name per line. Exists so a gate can
+ *  read the answer rather than the source: the list is derived from
+ *  package.json, and a return to a hand-written one would silently stop
+ *  covering whatever was added last. */
+if (process.argv.includes('--list')) {
+  for (const [name] of REQUIRED) console.log(name)
 }

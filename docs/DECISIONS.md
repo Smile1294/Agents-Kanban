@@ -3088,6 +3088,46 @@ simplification to unpick later — it decides what the product can be. And a
 "transport" that is only ever exercised by one client has a whole class of
 races nobody has met yet.
 
+### A rehydrated transcript is stamped when it was WRITTEN (2026-09-10)
+
+Every entry read back off disk carried `at: Date.now()`, so a conversation from
+last week said "just now" on every row and the day-group headers filed all of it
+under today. A board that states the wrong time is the same class of bug as one
+that shows a signal which cannot say bad — and this one was in the field the
+reader trusts most.
+
+The note in *Still open* said `SessionMessage.timestamp` "now exists in the SDK".
+It does not: `sdk.d.ts` declares `SessionMessage` with `type`, `uuid`,
+`session_id`, `message`, `parent_tool_use_id` and `parent_agent_id`, and no
+timestamp. What is true is that the SDK **returns** the field anyway — probed
+against a seeded store, every message off `getSessionMessages` has one. So it is
+read defensively off an unknown-shaped object, parsed rather than cast, and
+anything unreadable falls back to ONE receive time for the whole read, which is
+what the SDK's own comment prescribes and keeps the messages that lack it in
+order with each other.
+
+**Lesson:** "the SDK has a field for this" is worth checking twice — once in the
+types and once against a real answer, because this project has now been wrong in
+both directions. See docs/SDK-NOTES.md.
+
+### The preflight checked a list it wrote down, not the one that is true (2026-09-10)
+
+`REQUIRED` was five packages, hand-written. `playwright` was added afterwards as
+a devDependency, so a checkout without it passed preflight and failed later as
+`Cannot find package 'playwright'` from inside a test — which is precisely the
+"names neither the cause nor the fix" failure this script exists to prevent, for
+the one package it had never heard of.
+
+The list of WHAT to check is now `package.json`; the file keeps only the WHY
+strings that make the message useful. A declared dependency that is not
+installed is an incomplete install whatever it is for, so a new one is covered
+the day it is added rather than the day someone remembers. `preflight --list`
+prints what it covers so the gate can read the answer rather than the source: a
+return to a hand-written list fails in `smoke.mjs`.
+
+**Lesson:** a checklist maintained beside the thing it checks goes stale on the
+first change nobody connects to it. Derive it.
+
 ## Still open
 
 - **A routed subtask's backend must be READ once before the board can check it.**
@@ -3096,10 +3136,6 @@ races nobody has met yet.
   still a step a first-time user will hit. Seeding every configured profile's
   endpoint list at activation would remove it, at the cost of N HTTP requests on
   a path that is currently free.
-- **Preflight checks a fixed list of five packages**, so a newly added
-  devDependency (playwright) passes preflight and fails in the test that imports
-  it. (`verify` now builds before it tests, so the stale-bundle half of this
-  entry is closed.)
 - **No syntax highlighting in code blocks.** Language label and monospace only.
 
 - **A live process still cannot be re-attached after a restart**, and never will
@@ -3141,11 +3177,6 @@ races nobody has met yet.
   extension has never run — one started in a terminal — falls back to the
   model's maximum from `MODEL_WINDOWS`. If that session was actually running
   under a smaller compaction window, its meter reads emptier than it is.
-- **Rehydrated transcript entries are stamped with the time they were PARSED.**
-  `readTranscript` sets `at: Date.now()`, so every message in a session read
-  back from disk shows today's clock. `SessionMessage.timestamp` now exists in
-  the SDK and would fix it; nothing uses it yet. It is why the transcript-window
-  test compares entries on content rather than by deep equality.
 - **Annotating an attached image is not implemented.** Paste, drop and pick are;
   drawing on the image is not, for the reasons in the entry above.
 - **The Run button never stops what it started.** The terminals it opens are

@@ -179,6 +179,15 @@ from `run-…` to the session id when `system/init` arrives, and
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `readTranscript` stamps
+  each entry with the time the MESSAGE was written, not the time the parse ran.
+  Every rehydrated entry carried `Date.now()`, so a session read back off disk
+  showed every row as "just now" and the day-group headers filed all of it under
+  today. The SDK returns a `timestamp` its own `SessionMessage` type does not
+  declare (see docs/SDK-NOTES.md), so it is read defensively and falls back to
+  ONE receive time for the whole read. Gate in `smoke.mjs` against the seeded
+  2001 transcript, shown to fail.
+
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S116g8 · dead-code sweep: `parseDecomposition` de-exported — module-private, called only inside `parseMeta`.
 - 2026-09-08 · task/S2cdw-implement-this-new-thing · compacted sessions: pre-compaction messages recovered from the raw JSONL, the compact summary hidden behind a muted notice; usage and spend run over the merged list.
