@@ -3128,6 +3128,41 @@ return to a hand-written list fails in `smoke.mjs`.
 **Lesson:** a checklist maintained beside the thing it checks goes stale on the
 first change nobody connects to it. Derive it.
 
+### A cloned repository could name the binary we spawn (2026-09-10)
+
+`agentsKanban.claudeExecutable` — and `codexExecutable`, `whisperPath`,
+`ffmpegPath` — declared no `scope`. VS Code's default is `window`, which means
+a `.vscode/settings.json` checked into a repository OVERRIDES the user's own
+value. So: clone a project, open it, press anything that starts an agent, and
+the path that repository chose is executed as you, with no prompt, from a file
+nobody reads. There is nothing to detect afterwards either — the board would
+report a perfectly ordinary run.
+
+Two locks, because they fail differently.
+
+`scope: "machine"` on those four: a workspace file cannot set them at all, only
+user or remote settings can. The cost is zero — nobody has ever needed to ship
+the path to their own `claude` inside a project — which is the tell that
+`window` was a default nobody chose rather than a decision.
+
+`capabilities.untrustedWorkspaces: { supported: false }`: an extension that
+declares nothing is treated as supporting untrusted workspaces, i.e. it runs
+before anyone has said they trust the folder. This one spawns agents that edit
+the folder and run commands in it; Workspace Trust is the mechanism that exists
+for precisely that, and there is no useful half-state to offer. The
+`description` matters as much as the flag, because it is the sentence shown in
+the trust dialog.
+
+The second lock is what covers the settings the first one deliberately leaves
+alone: `agentsKanban.runCommand` is a shell command, and it stays
+workspace-settable because a per-project run command is a real thing people
+want. Behind trust that is a choice; in front of it, it was a gift.
+
+**Lesson:** an unset `scope` is not "the default", it is the most permissive
+option, chosen silently. The `smoke.mjs` gate therefore checks the SHAPE of the
+name — anything ending `Executable` or `Path` must be on the machine-scoped
+list — so the fifth one cannot arrive with the old default and no one notice.
+
 ## Still open
 
 - **A routed subtask's backend must be READ once before the board can check it.**

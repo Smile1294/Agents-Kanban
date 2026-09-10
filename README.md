@@ -176,6 +176,13 @@ and let it go.
 Everything else — agents, backends, logins, scheduled runs, remote control,
 dictation — lives on the **Agents Kanban: Settings** page.
 
+The four settings that name a program to run (`claudeExecutable`,
+`codexExecutable`, `whisperPath`, `ffmpegPath`) are **user settings only** — a
+project's own `.vscode/settings.json` cannot supply them, so cloning a
+repository can never choose the binary this extension spawns. The extension also
+declines **untrusted workspaces**: it runs coding agents in your folder, and
+there is nothing useful it could do in one you have not trusted.
+
 ## Building from source
 
 ```bash

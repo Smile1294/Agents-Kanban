@@ -231,6 +231,42 @@ for (const p of props) {
   ok(read.includes(p.replace(/^agentsKanban\./, '')), `declared setting is actually read: ${p}`)
 }
 
+// A setting that NAMES A BINARY must be `scope: "machine"`, or a repository can
+// supply it. VS Code's default scope is `window`, which means a checked-in
+// `.vscode/settings.json` wins — so cloning a repository and pressing anything
+// that starts an agent would run whatever binary that file named, as you, with
+// no prompt anywhere. Nobody has ever needed to ship the path to their own
+// `claude` inside a project, so the cost of `machine` is zero and the cost of
+// `window` is arbitrary code execution on clone.
+const EXECUTABLE_SETTINGS = [
+  'agentsKanban.claudeExecutable',
+  'agentsKanban.codexExecutable',
+  'agentsKanban.whisperPath',
+  'agentsKanban.ffmpegPath',
+]
+const declaredProps = manifest.contributes?.configuration?.properties ?? {}
+for (const key of EXECUTABLE_SETTINGS) {
+  ok(declaredProps[key]?.scope === 'machine',
+    `a setting that names an executable is machine-scoped, so a repo cannot supply it: ${key}`)
+}
+// And the same rule for any FUTURE one: anything whose name says it points at a
+// program has to be on that list, so adding a fifth cannot quietly default to
+// `window`.
+for (const key of Object.keys(declaredProps)) {
+  if (!/Executable$|Path$/.test(key) || key === 'agentsKanban.worktreeRoot') continue
+  ok(EXECUTABLE_SETTINGS.includes(key),
+    `every executable-shaped setting is covered by the machine-scope check: ${key}`)
+}
+
+// The extension spawns agents that edit this folder and run commands in it.
+// Workspace Trust is the mechanism that exists for exactly that, and an
+// extension that does not declare an answer is treated as supporting untrusted
+// workspaces — i.e. it runs before anyone has said they trust the code.
+ok(manifest.capabilities?.untrustedWorkspaces?.supported === false,
+  'the manifest declines untrusted workspaces — this extension runs agents in the folder')
+ok((manifest.capabilities?.untrustedWorkspaces?.description ?? '').length > 20,
+  'and says why, because that sentence is what the user is shown in the trust dialog')
+
 // --------------------------------------------------- 2b. the project can be run
 //
 // `tsc: not found` on a fresh clone, because nothing installed anything and

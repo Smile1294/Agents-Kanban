@@ -119,8 +119,16 @@ npm scripts (every one starts with `node scripts/preflight.mjs`; `verify` runs
 [build-and-test.md](build-and-test.md)); the two runtime dependencies
 (`@anthropic-ai/claude-agent-sdk`, `zod` — both externals); `relayRepo`, the
 URL of the sibling relay repository that the contract gate falls back to when
-no local `../agents-kanban-relay` exists. Test: `smoke.mjs` §manifest (declared
-↔ registered), `test/package.test.mjs`.
+no local `../agents-kanban-relay` exists; and `capabilities.untrustedWorkspaces`
+(`supported: false` — this extension spawns agents that edit the folder and run
+commands in it, so it must not run before someone has said they trust it; the
+`description` is the sentence VS Code shows in the trust dialog). Every setting
+that NAMES A BINARY carries `scope: "machine"` — `claudeExecutable`,
+`codexExecutable`, `whisperPath`, `ffmpegPath` — because the default scope is
+`window`, which lets a repository's own `.vscode/settings.json` choose the
+executable we spawn. Test: `smoke.mjs` §manifest (declared ↔ registered, the
+machine-scope rule by NAME SHAPE so a fifth cannot arrive on the old default,
+and the trust declaration), `test/package.test.mjs`.
 
 ## How it works
 
@@ -222,6 +230,9 @@ bar is handed back to `agentsKanban.sideBarHome`.
   description as documentation) → read it where it is used in `extension.ts`
   (settings are read on demand, never cached across a change) → the README
   settings table. Smoke §manifest fails on a setting declared but never read.
+  If it names a program to run, it needs `scope: "machine"` and a line in
+  `EXECUTABLE_SETTINGS` in `smoke.mjs`; without the scope a checked-in
+  `.vscode/settings.json` picks the binary.
 - **A new command.** `package.json` `contributes.commands` + `registerCommand`
   in the big subscriptions block. Smoke §manifest fails on one without the other.
 - **A new `vscode` API.** Add it to `test/harness.mjs` AND `server/stub.mjs`, or
@@ -286,6 +297,18 @@ bar is handed back to `agentsKanban.sideBarHome`.
   description no longer promises one.
 
 ## Recent changes
+
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **a repository could
+  name the binary we spawn.** The four executable-path settings declared no
+  `scope`, and VS Code's default (`window`) lets a workspace file override the
+  user's value — so cloning a project and starting an agent ran whatever path
+  that project's `.vscode/settings.json` chose, as the user, with no prompt.
+  They are `scope: "machine"` now, and the manifest declares
+  `untrustedWorkspaces.supported: false`, which is the lock that also covers
+  `runCommand` (a shell command that stays workspace-settable on purpose — a
+  per-project run command is a real thing people want, and behind trust it is a
+  choice rather than a gift). The gate checks the NAME SHAPE, not a list of
+  four, so the fifth `…Executable` cannot arrive with the old default.
 
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · second review pass, two
   fixes. `defaultVanished`: a surface with NO watch of its own follows the host's

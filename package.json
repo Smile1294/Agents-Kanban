@@ -169,7 +169,8 @@
         "agentsKanban.claudeExecutable": {
           "type": "string",
           "default": "",
-          "description": "Path to the `claude` executable. Leave empty to auto-detect (PATH, then the usual install locations)."
+          "description": "Path to the `claude` executable. Leave empty to auto-detect (PATH, then the usual install locations).",
+          "scope": "machine"
         },
         "agentsKanban.statusBar": {
           "type": "boolean",
@@ -350,7 +351,8 @@
         "agentsKanban.codexExecutable": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `codex` binary. Leave empty to find it on your PATH, then in the usual install locations. Never resolved from `node_modules` \u2014 the board runs the Codex you maintain, not a bundled copy."
+          "markdownDescription": "Path to the `codex` binary. Leave empty to find it on your PATH, then in the usual install locations. Never resolved from `node_modules` \u2014 the board runs the Codex you maintain, not a bundled copy.",
+          "scope": "machine"
         },
         "agentsKanban.orchestration": {
           "type": "string",
@@ -370,7 +372,8 @@
         "agentsKanban.whisperPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to `whisper-cli` (a whisper.cpp build). Leave empty to find it on your PATH. This is what makes the composer's microphone button dictate, and dictation is **fully local** — the audio never leaves your machine. Install whisper.cpp with: `brew install whisper-cpp` (macOS) or `sudo apt install whisper-cpp` (Debian/Ubuntu), then download a model with `whisper-cli -m models/ggml-base.en.bin -f nothing.wav` — or set `#agentsKanban.whisperModel#` to a model file you already have."
+          "markdownDescription": "Path to `whisper-cli` (a whisper.cpp build). Leave empty to find it on your PATH. This is what makes the composer's microphone button dictate, and dictation is **fully local** — the audio never leaves your machine. Install whisper.cpp with: `brew install whisper-cpp` (macOS) or `sudo apt install whisper-cpp` (Debian/Ubuntu), then download a model with `whisper-cli -m models/ggml-base.en.bin -f nothing.wav` — or set `#agentsKanban.whisperModel#` to a model file you already have.",
+          "scope": "machine"
         },
         "agentsKanban.whisperModel": {
           "type": "string",
@@ -380,7 +383,8 @@
         "agentsKanban.ffmpegPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to `ffmpeg`. Leave empty to find it on your PATH. ffmpeg captures the microphone (16 kHz mono WAV) for local transcription; install it with `brew install ffmpeg` or `sudo apt install ffmpeg`."
+          "markdownDescription": "Path to `ffmpeg`. Leave empty to find it on your PATH. ffmpeg captures the microphone (16 kHz mono WAV) for local transcription; install it with `brew install ffmpeg` or `sudo apt install ffmpeg`.",
+          "scope": "machine"
         },
         "agentsKanban.recordDevice": {
           "type": "string",
@@ -460,5 +464,11 @@
   "bugs": {
     "url": "https://github.com/Smile1294/Agents-Kanban/issues"
   },
-  "homepage": "https://github.com/Smile1294/Agents-Kanban#readme"
+  "homepage": "https://github.com/Smile1294/Agents-Kanban#readme",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "This extension runs coding agents in this folder \u2014 they edit files, run commands and spend money. There is nothing it could usefully do in a folder whose authors you have not trusted."
+    }
+  }
 }
