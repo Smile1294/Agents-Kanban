@@ -10,6 +10,7 @@ tests:
   - src/board/__tests__/questions.test.ts
   - src/board/__tests__/ask.test.mjs
   - src/board/__tests__/codemap.test.ts
+  - src/board/__tests__/permission-detail.test.ts
 last_verified: 2026-09-07
 ---
 # The board model
@@ -121,6 +122,22 @@ repository → nothing is required, so the extension stays generic.
   `set_phase` description no longer claims one exists.
 
 ## Recent changes
+
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `summarise()`,
+  `permissionDetail()` and `PERMISSION_DETAIL_MAX` moved here from `panel.ts`
+  and stopped truncating silently. The Allow/Deny prompt is the security control
+  in this extension and it could not say what it was authorising: the detail was
+  cut at 200 characters with NO marker, so a `Bash` command whose payload sat
+  past that point rendered as its innocuous beginning while Allow resolved
+  `canUseTool` with the FULL input — and no other surface shows a tool input in
+  full (the transcript row cuts at 180, the log line at 160). It now shows up to
+  4000 characters and says how much is hidden when it has to cut. Every
+  `ASKS_FIRST` tool also has a summary now: all four had none of the keys the
+  generic branch reads, so `split_task` was approved with its subtask prompts,
+  agents and models nowhere on screen. It lives in `questions.ts` because that
+  is vscode-free — the silent cut survived precisely because it sat in a file no
+  unit test could import. Gates: `permission-detail.test.ts` and
+  `webview.test.mjs`, both shown to fail.
 
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · the `complete` column's
   `agentHint` stopped promising a commit-message watcher that does not exist.

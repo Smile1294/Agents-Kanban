@@ -135,3 +135,68 @@ export function buildAskAnswers(
   return answers
 }
 
+/**
+ * How much of a permission detail is shown.
+ *
+ * Generous on purpose. This is the text an Allow/Deny decision is made on, and
+ * it used to be cut at 200 characters with NO marker: a `Bash` command whose
+ * first line is innocuous and whose payload is past that point rendered as the
+ * innocuous part alone, and the click authorised the whole thing. Nothing else
+ * in the extension shows a tool input in full either, so there was no surface
+ * on which the command could be read before approving it.
+ *
+ * Anything beyond this is still cut — a runaway input must not become the
+ * frame — but it is cut LOUDLY, naming how much is hidden, because "I could
+ * not show you all of this" is an answer and silence is not.
+ */
+export const PERMISSION_DETAIL_MAX = 4000
+
+/** The one-line label plus, for a tool whose input is a command or a path, the
+ *  thing itself. See `PERMISSION_DETAIL_MAX`. */
+export function summarise(toolName: string, input: Record<string, unknown>): string {
+  const name = toolName.replace(/^mcp__[^_]+__/, '')
+  const detail = permissionDetail(name, input)
+  if (!detail) return name
+  if (detail.length <= PERMISSION_DETAIL_MAX) return `${name} — ${detail}`
+  const hidden = detail.length - PERMISSION_DETAIL_MAX
+  return `${name} — ${detail.slice(0, PERMISSION_DETAIL_MAX)}\n\n` +
+    `⚠ ${hidden} more character${hidden === 1 ? '' : 's'} NOT SHOWN. Deny unless you know what the rest is.`
+}
+
+/**
+ * WHAT this tool is being allowed to do, as text.
+ *
+ * The generic branch reads the keys a built-in tool puts its subject under.
+ * The named branches exist because the tools in `ASKS_FIRST` have none of
+ * those keys and fell through to the bare tool name — so the user was asked to
+ * approve `split_task` with the subtask prompts, their target agents and their
+ * models nowhere on screen, and `schedule_create` with the prompt, the time and
+ * the recurrence nowhere on screen. Those are the four tools that start billed
+ * work or write a durable record; they are the LAST ones that should be
+ * approved blind.
+ *
+ * Defensive throughout: this is model-written input, and a shape it cannot read
+ * degrades to naming the tool rather than throwing on the render path.
+ */
+export function permissionDetail(name: string, input: Record<string, unknown>): string {
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+  const num = (v: unknown): string => (typeof v === 'number' && Number.isFinite(v) ? String(v) : '')
+  if (name === 'split_task') {
+    const pieces = Array.isArray(input.subtasks) ? input.subtasks : []
+    if (!pieces.length) return ''
+    return pieces.map((raw, i) => {
+      const p = (raw ?? {}) as Record<string, unknown>
+      const route = [str(p.agent), str(p.model), str(p.effort)].filter(Boolean).join(' · ')
+      return `${i + 1}. ${str(p.title) || '(untitled)'}${route ? `  [${route}]` : ''}\n   ${str(p.prompt)}`
+    }).join('\n\n')
+  }
+  if (name === 'schedule_create') {
+    const at = num(input.hour) && `${num(input.hour)}:${num(input.minute).padStart(2, '0')}`
+    const days = Array.isArray(input.days) && input.days.length ? ` on days ${input.days.join(',')}` : ' every day'
+    return `${str(input.title) || '(untitled)'} — ${at || 'no time given'}${days}\n\n${str(input.prompt)}`
+  }
+  if (name === 'schedule_delete' || name === 'schedule_run') {
+    return str(input.id) || str(input.title)
+  }
+  return str(input.command) || str(input.file_path) || str(input.path) || str(input.url)
+}

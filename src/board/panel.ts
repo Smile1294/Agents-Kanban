@@ -19,7 +19,7 @@ import type { TestPlan } from '../sessions/meta.ts'
 import type { Meter } from '../agent/runtime.ts'
 import type { SlashCommand } from '../sessions/commands.ts'
 import type { ColumnDef } from './config.ts'
-import { parseAskQuestions, type AskQuestion } from './questions.ts'
+import { parseAskQuestions, summarise, type AskQuestion } from './questions.ts'
 import { isRemoteDispatch, toast } from './dialogs.ts'
 
 /** One transcript search hit, joined to the session it lives in. */
@@ -1188,16 +1188,12 @@ function selectionsOf(raw: unknown): Record<string, string[]> | undefined {
   return Object.keys(out).length ? out : undefined
 }
 
-export function summarise(toolName: string, input: Record<string, unknown>): string {
-  const name = toolName.replace(/^mcp__[^_]+__/, '')
-  const detail =
-    (typeof input.command === 'string' && input.command) ||
-    (typeof input.file_path === 'string' && input.file_path) ||
-    (typeof input.path === 'string' && input.path) ||
-    (typeof input.url === 'string' && input.url) ||
-    ''
-  return detail ? `${name} — ${String(detail).slice(0, 200)}` : name
-}
+/* `summarise`, `permissionDetail` and `PERMISSION_DETAIL_MAX` live in
+   board/questions.ts — vscode-free, so the text an Allow/Deny decision is made
+   on can be unit-tested without an editor, which is where the 200-character
+   silent truncation survived unnoticed. Re-exported here because this is where
+   every caller already reaches for them. */
+export { PERMISSION_DETAIL_MAX, permissionDetail, summarise } from './questions.ts'
 
 function nonceString(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'

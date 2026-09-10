@@ -159,6 +159,12 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `.ask code` is
+  `pre-wrap` and scrollable (`max-height: 40vh`). It was one `word-break: break-all`
+  line, which is what a permission detail had to fit into — and the detail was
+  being cut to 200 characters to make it fit. The text an Allow/Deny decision is
+  made on has to be reachable in full.
+
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · a card that goes away
   under this surface is drawn as such: `adoptView()` holds the view on a key the
   host announced as `vanished` instead of sliding to the new-session screen, the
