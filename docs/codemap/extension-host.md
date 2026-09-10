@@ -282,8 +282,8 @@ bar is handed back to `agentsKanban.sideBarHome`.
 - Permission prompts do not survive a window reload (held on the `AgentSession`).
 - The review panel refreshes on events, not on every render; an agent finishing
   while a different card is selected leaves stale data behind Refresh.
-- A `Fixes <id>` commit-message watcher: the `set_phase` description promises
-  one, nothing implements it (see PLAN.md §9).
+- A `Fixes <id>` commit-message watcher (PLAN.md §9). The `set_phase`
+  description no longer promises one.
 
 ## Recent changes
 

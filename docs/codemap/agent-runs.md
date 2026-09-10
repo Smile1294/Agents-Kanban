@@ -183,8 +183,8 @@ started column while the title is still the guess.
 ## Open work
 
 - Permission prompts do not survive a window reload.
-- A resumed session returning a DIFFERENT id is not detected (the reverse case
-  warns).
+- A resume that returns a DIFFERENT id is reported but not repaired — the turn
+  is already running on the new session by the time the id arrives.
 - Images do not reach a Codex session (it takes `local_image` by path).
 - Nothing re-runs a parent once its subtasks land.
 

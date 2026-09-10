@@ -170,8 +170,9 @@ from `run-…` to the session id when `system/init` arrives, and
 
 ## Open work
 
-- Rehydrated entries are stamped with the time they were PARSED;
-  `SessionMessage.timestamp` exists in the SDK and nothing uses it.
+- A rehydrated entry with NO timestamp at all falls back to receive time — one
+  per read, so those messages stay in order with each other. Every message off a
+  real read has one, so this is the shape of an older emitter, not today's.
 - A session never run here falls back to the model's maximum window.
 - `MODEL_RATES` cannot know about discounts or subscriptions; the drift check
   only runs while a turn is watched.

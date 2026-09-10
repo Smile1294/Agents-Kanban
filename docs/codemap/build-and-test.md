@@ -178,8 +178,8 @@ without one.
 
 ## Open work
 
-- Preflight's `REQUIRED` list does not include `playwright`, so a fresh clone
-  passes preflight and fails in the first Chromium test.
+- None recorded. (Preflight now derives what it checks from `package.json`, so
+  a dependency added later is covered the day it is added.)
 
 ## Recent changes
 
