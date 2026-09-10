@@ -887,7 +887,7 @@ function remoteSection() {
   code.type = 'text'
   code.placeholder = r.hasCode
     ? 'A code is stored — leave blank to keep it'
-    : 'A pairing code you choose — the relay page asks for the same one'
+    : 'Press Generate — this code is the only thing protecting the board'
   code.value = remoteDraft.code
   code.setAttribute('data-focus', 'remote::code')
   code.title = 'A new pairing code replaces the stored one. Blank keeps the stored code.'
@@ -896,6 +896,26 @@ function remoteSection() {
     render()
   })
   form.appendChild(code)
+
+  /* GENERATE, rather than invite one.
+     The board's address on the relay is a public, unsalted hash of this code,
+     and that address is read AND write access to the whole board. So its
+     strength is the code's strength and nothing else — a code somebody thinks
+     of falls to an offline sweep, and the relay has no throttle to notice one.
+     The host refuses a short one with the reason; this is the path that means
+     nobody has to read the reason. 96 bits, from the platform CSPRNG. */
+  const gen = button('Generate', null, () => {
+    const bytes = new Uint8Array(12)
+    const c = typeof crypto !== 'undefined' && crypto.getRandomValues ? crypto : null
+    if (!c) { post({ type: 'copyText', text: '' }); return }
+    c.getRandomValues(bytes)
+    let raw = ''
+    for (let i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i])
+    remoteDraft.code = btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    render()
+  })
+  gen.title = 'Make a strong pairing code. The relay page asks for the same one, so copy it before saving.'
+  form.appendChild(gen)
 
   const acts = el('div', 'remote-acts')
   const canConnect = !!(remoteDraft.url.trim() && (remoteDraft.code.trim() || r.hasCode))
@@ -920,7 +940,7 @@ function remoteSection() {
     acts.appendChild(el('span', 'muted small', 'Deploy the relay first — it lives in its own repository (agents-kanban-relay), whose README walks through it.'))
   } else if (!r.hasCode && !remoteDraft.code.trim()) {
     acts.appendChild(el('span', 'muted small',
-      'A pairing code is needed once: choose one here, and enter the same one on the relay page to watch the board.'))
+      'A pairing code is needed once: press Generate, then enter the same one on the relay page to watch the board. The board\u2019s address is derived from the code, so a code you invent is the whole of its security.'))
   }
   form.appendChild(acts)
   sec.appendChild(form)

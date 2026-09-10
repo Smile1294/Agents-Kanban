@@ -91,8 +91,11 @@ Cloudflare Workers, or a plain Node process — the free tiers cover ordinary
 use), so you can watch it from a phone without the extension's machine being
 reachable at all. The relay is not part of this repository — it lives in its
 own, [agents-kanban-relay](https://github.com/Smile1294/agents-kanban-relay):
-deploy that repo, paste its URL and a pairing code into **settings page →
-Remote Control**, then open the site on any device and enter the same code.
+deploy that repo, paste its URL into **settings page → Remote Control**, press
+**Generate** for a pairing code, then open the site on any device and enter that
+code. Generate rather than invent: the board's address on the relay is a public
+hash of the code, so a guessable code is a guessable address — and the address
+is read *and* write.
 Prompts can be sent back too, behind a switch that is off by default. The two
 repos stay in step through [`remote-contract.json`](remote-contract.json),
 carried verbatim in both and checked by this repo's `verify`.

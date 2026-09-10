@@ -31,7 +31,16 @@ repository (see below), [server/README.md](../../server/README.md).
 **`src/remote/relay.ts`**. The shape of what may leave — now the FULL board, so
 there is no redaction boundary to enumerate field by field the way v1's index
 was. `boardIdOf(code)` — the first 24 hex of sha-256 of the pairing code, the
-board's address, so the relay never sees the code; `relayBase`; `forRemote(state,
+board's address, so the relay never sees the code. That id is the board's ONLY
+credential (a GET returns the whole board; with writes on, a POST drives this
+machine), and because the mapping is public, unsalted and one cheap hash, its
+search space is the entropy of the CODE and not the digest's — an invented code
+falls to an offline sweep the relay never sees. So `PAIRING_CODE_MIN` (16),
+`pairingCodeProblem(code)` (refuses, and says why — a rule with no reason is a
+rule people work around) and `newPairingCode()` (96 bits, base64url, the same
+shape `server/server.mjs` prints). The floor is not a strength meter:
+`passwordpassword` passes it, which is why the honest fix is the Generate button
+handing over a code nobody invented. `relayBase`; `forRemote(state,
 voice)` — the one transform that legitimately differs: the composer's mic
 becomes the whisper path, because a phone has no built-in VS Code dictation;
 `remoteFrame(state, models, mv, voice)` — builds the frame one push carries,
@@ -255,6 +264,21 @@ browser because the host half IS the extension.
 - None recorded beyond the general "run a real agent before believing the suite".
 
 ## Recent changes
+
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **the pairing code has a
+  floor, and the relay stopped claiming 96 bits it never had.** The relay's own
+  header said "a board id is 24 hex chars of a sha-256 (~96 bits). Nobody
+  guesses one" — false for every hand-typed code, since code → id is public,
+  deterministic, unsalted and cheap, so the id is worth exactly what the code is
+  and an attacker sweeps offline without ever touching the relay. The settings
+  page had invited exactly that ("A pairing code you choose"). Now `saveRemote`
+  refuses anything under `PAIRING_CODE_MIN`, `media/settings.js` has a
+  **Generate** button (`crypto.getRandomValues` → base64url) and a placeholder
+  that says what the code is protecting, and the claim is corrected in the
+  relay's own header, README and protocol note (that repository). What
+  was NOT done: moving the id to a slow salted KDF. It would be contract v5 in
+  both repos, would invalidate every existing pairing, and only buys anything
+  for weak codes — which generate-and-enforce removes.
 
 - 2026-09-09 · claude/frontend-sync-chat-freeze-wb6a2s · **contract v4: a frame
   slot per viewer.** A board is one board; the conversation open on it is not.

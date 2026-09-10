@@ -20,7 +20,7 @@ import {
   remoteFrame,
   type RemoteFrame,
   type RemoteModel,
-  type RemoteVoice,
+  type RemoteVoice, PAIRING_CODE_MIN, newPairingCode, pairingCodeProblem,
 } from '../relay.ts'
 import type { UiState } from '../../board/panel.ts'
 
@@ -182,6 +182,34 @@ ok(relayBase('https://board.example.com/board/') === 'https://board.example.com'
 ok(relayBase('') === undefined && relayBase('   ') === undefined, 'blank is undefined')
 ok(relayBase('not a url') === undefined && relayBase('ftp://x.com') === undefined,
   'unparseable and non-http schemes are refused')
+
+/* --- the pairing code IS the board -------------------------------------------
+   The board's address on the relay is `sha256(code)` truncated, and that
+   address is read AND write access: a GET returns every transcript, worktree
+   path and branch name, and with writes on a POST drives the machine. The
+   mapping is public, deterministic, unsalted and cheap, so the id's search
+   space is not the digest's 96 bits — it is exactly the entropy of the code
+   somebody typed, and the relay has no throttle to make guessing expensive.
+   The header of board-core.mjs used to claim "~96 bits. Nobody guesses one". */
+{
+  ok(pairingCodeProblem('kanban2026') !== undefined,
+     'a code a person would think of is REFUSED')
+  ok(/at least/.test(pairingCodeProblem('short') ?? ''), 'and told how long it must be')
+  ok(/offline/.test(pairingCodeProblem('short') ?? ''),
+     'and WHY — a rule with no reason is a rule people work around')
+  ok(pairingCodeProblem('') !== undefined, 'and a blank one is refused too')
+  ok(pairingCodeProblem('a'.repeat(PAIRING_CODE_MIN)) === undefined,
+     'a long enough one is accepted — this is a floor, not a strength meter')
+
+  const made = newPairingCode()
+  ok(pairingCodeProblem(made) === undefined, 'the generated code passes its own floor')
+  ok(made.length >= 16, `and is long (${made.length} chars)`)
+  ok(!/[^A-Za-z0-9_-]/.test(made), 'url-safe, so it survives being pasted into the relay page')
+  const many = new Set(Array.from({ length: 200 }, () => newPairingCode()))
+  ok(many.size === 200, 'and 200 of them are 200 different codes, not a counter')
+  ok(new Set([...many].map((c) => boardIdOf(c))).size === 200,
+     'each naming its own board')
+}
 
 if (fails) {
   console.error(`\n${fails} failure(s)`)

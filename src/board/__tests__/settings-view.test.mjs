@@ -658,8 +658,13 @@ const state = (over = {}) => ({
     remote: { enabled: false, url: 'https://board.example.com', hasCode: false },
   }))
   const secN = secOf(noCode)
-  ok(secN.querySelector('.remote-code').placeholder.includes('you choose'),
-     'with no code stored the field says a code must be chosen')
+  /* The field used to say "A pairing code you choose". The board's address on
+     the relay is a public, unsalted hash of it and that address is read AND
+     write access, so a code somebody thinks of is a board somebody guesses —
+     the page points at Generate instead. */
+  ok(secN.querySelector('.remote-code').placeholder.includes('Generate'),
+     'with no code stored the field points at Generate, not at inventing one')
+  ok(!!findButton(secN, 'Generate'), 'and the button is there to press')
   ok(findButton(secN, 'Save and connect').disabled === true,
      'Save stays disabled while no code is typed')
   ok(noCode.text().includes('A pairing code is needed once'),
@@ -679,15 +684,15 @@ const state = (over = {}) => ({
   urlF.oninput({ target: urlF })
   const secF2 = secOf(freshConnect)
   const codeF = secF2.querySelector('.remote-code')
-  ok(codeF && codeF.placeholder.includes('you choose'), 'the URL survives the re-render')
-  codeF.value = 'my-secret-code'
+  ok(codeF && codeF.placeholder.includes('Generate'), 'the URL survives the re-render')
+  codeF.value = 'a-code-long-enough-to-be-accepted'
   codeF.oninput({ target: codeF })
   const secF3 = secOf(freshConnect)
   ok(!findButton(secF3, 'Save and connect').disabled,
      'typing URL and code enables Save')
   findButton(secF3, 'Save and connect').onclick()
   const sent = freshConnect.posted.find((m) => m.type === 'saveRemote')
-  ok(sent?.url === 'https://board.example.com' && sent.code === 'my-secret-code',
+  ok(sent?.url === 'https://board.example.com' && sent.code === 'a-code-long-enough-to-be-accepted',
      'Save posts the URL and the new code')
   const afterSave = secOf(freshConnect)
   ok(afterSave.querySelector('.remote-code').value === '',

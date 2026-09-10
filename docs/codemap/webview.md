@@ -102,7 +102,12 @@ the only way to find one), `schedDraft` / `schedEditingId`, `state`, `error`.
 `backendRow`, `modelsRow`, `missingRow`; `providerSection` + `providerModels`
 (the "offered" tick and the separate "allowed for spawned agents" tick);
 `schedForm` / `schedRow` / `scheduledSection`; `dictationSection`;
-`remoteSection`. Posts exactly the names the host's settings switch handles.
+`remoteSection` — whose pairing-code field carries a **Generate** button
+(`crypto.getRandomValues` → base64url, 96 bits) because the code is the board's
+whole security on the relay and the field used to say "a pairing code you
+choose"; the host refuses short ones regardless (`pairingCodeProblem`), since a
+control that only asks nicely is a prompt, not a boundary. Posts exactly the
+names the host's settings switch handles.
 
 **`media/settings.css`**. Layered over `board.css`. Every flex item that holds
 text carries `min-width: 0` — the default `min-width: auto` defeats
@@ -159,6 +164,11 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · the pairing-code field
+  offers **Generate** and stopped inviting an invented code. The relay board's
+  address is a public unsalted hash of that code, so what a person types IS the
+  search space; the placeholder now says what the code protects. The refusal is
+  host-side (`pairingCodeProblem`), so a stale webview cannot post a weak one.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `.ask code` is
   `pre-wrap` and scrollable (`max-height: 40vh`). It was one `word-break: break-all`
   line, which is what a permission detail had to fit into — and the detail was

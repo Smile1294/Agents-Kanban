@@ -32,7 +32,7 @@
  * All matching, hashing and shape logic is here and is pure; the transport
  * (what to POST, when) is pusher.ts.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { UiState } from '../board/panel.ts'
 
 /** The model catalogue the relay stores, split out of the frame. The same
@@ -65,10 +65,50 @@ export interface RemoteVoice {
   why?: string
 }
 
+/**
+ * How short a hand-typed pairing code may be.
+ *
+ * The board id is `sha256(code)` truncated, and it is simultaneously the
+ * board's address and its ONLY credential — a GET with it returns every
+ * transcript, worktree path and branch name, and with writes enabled a POST
+ * with it drives this machine. The mapping is public, deterministic, unsalted
+ * and cheap, so the id's search space is NOT the digest's 96 bits: it is
+ * exactly the entropy of the code somebody typed. `kanban2026` falls to an
+ * offline sweep in seconds, and the relay has no throttle to notice.
+ *
+ * So a typed code has a floor, and `newPairingCode()` is the path that should
+ * be taken instead. This is deliberately not a strength meter: a rule a person
+ * can satisfy with `passwordpassword` is not a defence, and the honest fix is
+ * to hand them one they did not invent.
+ */
+export const PAIRING_CODE_MIN = 16
+
+/** A pairing code nobody has to think of — 96 bits from the platform CSPRNG,
+ *  the same shape `server/server.mjs` generates for the headless board. */
+export function newPairingCode(): string {
+  return randomBytes(12).toString('base64url')
+}
+
+/** Why this code is not good enough, or undefined when it is. */
+export function pairingCodeProblem(code: string): string | undefined {
+  const c = code.trim()
+  if (!c) return 'A pairing code is required — it is the only thing protecting the board.'
+  if (c.length < PAIRING_CODE_MIN) {
+    return `A pairing code must be at least ${PAIRING_CODE_MIN} characters. The board's address is ` +
+      'derived from it by a public, unsalted hash, so anyone who finds the relay can try codes ' +
+      'offline as fast as they like — and the address is read AND write access to this board. ' +
+      'Press Generate rather than inventing one.'
+  }
+  return undefined
+}
+
 /** The sha-256 of a pairing code, hex, cut to the first 24 chars. The relay
  *  derives its storage names from this, so a board is addressable only by
  *  someone who knows the code — and the code itself is never stored anywhere
- *  except this machine's keychain and the head of the remote viewer. */
+ *  except this machine's keychain and the head of the remote viewer.
+ *
+ *  Truncating to 24 characters costs nothing: the id is only ever as strong as
+ *  the CODE, which is why `PAIRING_CODE_MIN` and `newPairingCode()` exist. */
 export function boardIdOf(code: string): string {
   return createHash('sha256').update(code, 'utf8').digest('hex').slice(0, 24)
 }

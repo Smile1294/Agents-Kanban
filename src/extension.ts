@@ -73,7 +73,10 @@ import {
   type Capture, type VoiceChecks, type VoiceConfig,
 } from './agent/dictation.ts'
 import { MIN_INTERVAL as REMOTE_MIN_INTERVAL, RemotePusher, VIEWERS_MAX, type PushSnapshot } from './remote/pusher.ts'
-import { boardIdOf, remoteFrame, relayBase, type RemoteModel, type RemoteVoice } from './remote/relay.ts'
+import {
+  boardIdOf, pairingCodeProblem, remoteFrame, relayBase,
+  type RemoteModel, type RemoteVoice,
+} from './remote/relay.ts'
 import { acceptMessages, parseMessages, RemoteMessageClient } from './remote/messages.ts'
 import {
   confirm, input, isRemoteDispatch, makeRelayDialogSink, pick, remoteDispatchSurface,
@@ -2427,6 +2430,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // stored code, and clearing it is its own message.
           const url = relayBase(msg.url)
           if (!url) throw new Error(`"${msg.url}" is not an http(s) address the relay can live at.`)
+          /* A code the user typed has to be worth something. The board id is a
+             public, unsalted hash of it and that id is read AND write access,
+             so a guessable code is a guessable board — and the relay has no
+             throttle to make guessing expensive. Refused with the reason, not
+             silently accepted: this is a path the user deliberately took. */
+          if (msg.code) {
+            const problem = pairingCodeProblem(msg.code)
+            if (problem) throw new Error(problem)
+          }
           const codeChanged = !!msg.code
           const relayChanged = url !== remoteUrl || codeChanged
           remoteUrl = url
