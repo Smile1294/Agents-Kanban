@@ -17,6 +17,7 @@ import {
   boardIdOf,
   forRemote,
   relayBase,
+  relayUrlProblem,
   remoteFrame,
   type RemoteFrame,
   type RemoteModel,
@@ -182,6 +183,32 @@ ok(relayBase('https://board.example.com/board/') === 'https://board.example.com'
 ok(relayBase('') === undefined && relayBase('   ') === undefined, 'blank is undefined')
 ok(relayBase('not a url') === undefined && relayBase('ftp://x.com') === undefined,
   'unparseable and non-http schemes are refused')
+
+// --- http is not a scheme choice, it is the board in the clear ---------------
+//
+// The frame is the FULL board — every transcript, worktree path and branch
+// name — and the board id it travels under is read AND write. On http both are
+// readable by anything between here and the relay, and the id is a capability:
+// reading it once is having it forever.
+
+ok(relayBase('http://board.example.com') === undefined,
+  'a cleartext relay host is refused, not quietly accepted')
+ok(/https/.test(relayUrlProblem('http://board.example.com') ?? ''),
+  'and the refusal names the fix')
+ok(/clear|write/.test(relayUrlProblem('http://board.example.com') ?? ''),
+  'and why — the board AND the key to it travel')
+ok(relayBase('http://localhost:8787') === 'http://localhost:8787',
+  'but a relay on this machine is fine on http — it crosses no network')
+ok(relayBase('http://127.0.0.1:8787/board') === 'http://127.0.0.1:8787',
+  '…by IP too, normalised like any other')
+ok(relayBase('http://evil.example.com/?host=localhost') === undefined,
+  'loopback is matched on the HOSTNAME, never on the URL text')
+ok(relayUrlProblem('https://board.example.com') === undefined,
+  'https has no problem to report')
+ok(relayUrlProblem('') !== undefined && relayBase('') === undefined,
+  'blank is refused by both faces of the same decision')
+ok(relayUrlProblem('ftp://x.com') !== undefined,
+  'and the two faces agree on the scheme case as well')
 
 /* --- the pairing code IS the board -------------------------------------------
    The board's address on the relay is `sha256(code)` truncated, and that

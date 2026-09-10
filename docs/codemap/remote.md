@@ -40,7 +40,14 @@ falls to an offline sweep the relay never sees. So `PAIRING_CODE_MIN` (16),
 rule people work around) and `newPairingCode()` (96 bits, base64url, the same
 shape `server/server.mjs` prints). The floor is not a strength meter:
 `passwordpassword` passes it, which is why the honest fix is the Generate button
-handing over a code nobody invented. `relayBase`; `forRemote(state,
+handing over a code nobody invented. `relayBase(raw)` and
+`relayUrlProblem(raw)` — the two faces of ONE decision (`parseRelay`), because a
+validator beside a normaliser is how a page accepts what the pusher will not
+use. It refuses cleartext `http://` to any non-loopback host: the frame is the
+whole board and the id it travels under is read AND write, so http hands both to
+anything on the path. Loopback stays allowed and is matched on the HOSTNAME
+(`evil.com/?x=localhost` is not loopback) — a relay you are running yourself
+crosses no network. `forRemote(state,
 voice)` — the one transform that legitimately differs: the composer's mic
 becomes the whisper path, because a phone has no built-in VS Code dictation;
 `remoteFrame(state, models, mv, voice)` — builds the frame one push carries,
@@ -265,6 +272,16 @@ browser because the host half IS the extension.
 
 ## Recent changes
 
+- 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **a relay URL on
+  `http://` is refused unless it is loopback.** `relayBase` accepted either
+  scheme, so a board could be pushed in the clear — the full frame (transcripts,
+  worktree paths, branch names) and, in the URL and the `x-rc-key` header, the
+  board id, which is read AND write and is a capability forever once seen. The
+  decision is one function (`parseRelay`) with two faces, `relayBase` (or
+  undefined) and `relayUrlProblem` (or the reason), so the settings page cannot
+  accept what the pusher will refuse. `saveRemote` reports the reason instead of
+  the old catch-all "not an http(s) address", which covered four different
+  fixes.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **the pairing code has a
   floor, and the relay stopped claiming 96 bits it never had.** The relay's own
   header said "a board id is 24 hex chars of a sha-256 (~96 bits). Nobody

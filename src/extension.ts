@@ -74,7 +74,7 @@ import {
 } from './agent/dictation.ts'
 import { MIN_INTERVAL as REMOTE_MIN_INTERVAL, RemotePusher, VIEWERS_MAX, type PushSnapshot } from './remote/pusher.ts'
 import {
-  boardIdOf, pairingCodeProblem, remoteFrame, relayBase,
+  boardIdOf, pairingCodeProblem, remoteFrame, relayBase, relayUrlProblem,
   type RemoteModel, type RemoteVoice,
 } from './remote/relay.ts'
 import { acceptMessages, parseMessages, RemoteMessageClient } from './remote/messages.ts'
@@ -2428,8 +2428,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // Saving a valid URL and (optionally) a code IS the connect action.
           // The pairing code is change-only: saving without one keeps the
           // stored code, and clearing it is its own message.
-          const url = relayBase(msg.url)
-          if (!url) throw new Error(`"${msg.url}" is not an http(s) address the relay can live at.`)
+          /* The URL refusal SAYS which of the reasons it is. "not an http(s)
+             address" covered four different fixes, one of which — a cleartext
+             http host — is not a typo at all but a decision to send the whole
+             board and its write key across the network in the open. */
+          const urlProblem = relayUrlProblem(msg.url)
+          if (urlProblem) throw new Error(urlProblem)
+          const url = relayBase(msg.url)!
           /* A code the user typed has to be worth something. The board id is a
              public, unsalted hash of it and that id is read AND write access,
              so a guessable code is a guessable board — and the relay has no
