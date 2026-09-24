@@ -167,7 +167,7 @@ and let it go.
 | `agentsKanban.runCommand` / `runUrl` | How to start your app from a worktree |
 | `agentsKanban.orchestration` | How readily a new session splits itself: `minimal`, `balanced` (default), `maximum` |
 | `agentsKanban.hideSessionsOlderThanDays` | Hide sessions the board never touched once older than this (default 30); the hidden count stays visible |
-| `agentsKanban.discoverModels` | Ask the backend for its model list instead of using the built-in one (default on) |
+| `agentsKanban.discoverModels` | Ask the backend for its model list instead of using the built-in one (default on). Claude Code's list is compiled into the CLI, so a newer model needs a newer `claude` — the model menu names the version that answered, and **Agents Kanban: Update Claude Code** runs its updater (the board switches the CLI's own auto-update off for every run) |
 | `agentsKanban.notifyOnReview` / `statusBar` | The notification when a card reaches review; the status-bar item |
 | `agentsKanban.sideBarHome` / `closeOnClickAway` | Which view the left side bar returns to; whether clicking away closes the board |
 | `agentsKanban.claudeExecutable` / `codexExecutable` | Paths to the CLIs when they are not on `PATH` |

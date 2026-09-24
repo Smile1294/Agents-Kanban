@@ -237,6 +237,13 @@ export function makeVscodeStub(ctl) {
       },
       clipboard: { writeText: async () => {}, readText: async () => '' },
     },
+    /* A headless box runs no editor extensions, so VS Code's own Claude Code
+       extension — the board's one hint that the `claude` on PATH is stale — is
+       simply absent here, and the board claims nothing about staleness. */
+    extensions: {
+      getExtension: () => undefined,
+      all: [],
+    },
     commands: {
       registerCommand: (id, fn) => { calls.push('cmd:' + id); cmds.set(id, fn); return disposable },
       executeCommand: async (id, ...args) => {

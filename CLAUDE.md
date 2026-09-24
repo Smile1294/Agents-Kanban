@@ -527,6 +527,21 @@ run, since each session needs a worktree.
   never an empty picker: empty reads as a broken extension and the cause would
   be something as ordinary as being offline. When the built-in list is in force
   the picker SAYS so, because "why is Fable missing?" is otherwise unanswerable.
+- **The CLI's model list is only as new as the CLI, and this extension is why
+  the CLI goes stale.** The list is compiled into each Claude Code release —
+  2.1.272 does not contain Opus 5.5 at all — and `agentEnv()` puts
+  `DISABLE_UPDATES` on every run, so a `claude` on PATH that only the board
+  starts (VS Code's Claude Code extension brings its own binary) is never
+  updated. Reported as "only Opus 5, it should be dynamic", nine releases
+  behind. So the answering VERSION is cached beside the list and a different
+  one on disk means ask again; the picker names it ("Listed by Claude Code
+  2.1.272 — 2.1.281 is out", staleness claimed only when a newer version is
+  KNOWN, via VS Code's own Claude Code extension); and updating is a click
+  (`agent/cli-update.ts`), never automatic. Two traps: `DISABLE_UPDATES` makes
+  `claude update` refuse and EXIT 0, so its environment is never built by
+  `agentEnv()` and the outcome is judged by the version, never the exit code;
+  and a new model needs a row in `MODEL_RATES` checked against the pricing
+  page's CACHE-READ column too — Opus 5.5 and Fable 5.1 break the 0.1x rule.
 - **A session flag is a request the CLI never refuses.** `ultracode` and
   `fastMode` go through `Options.settings` / `applyFlagSettings()`, which
   validates NOTHING — measured against a real CLI it resolves for

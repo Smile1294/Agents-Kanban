@@ -31,6 +31,8 @@
  */
 import type { EffortLevel } from '../sessions/meta.ts'
 import { withSilentQuery, type ConnectOptions } from './connect.ts'
+import { claudeVersion, compareVersions } from './cli-update.ts'
+import { resolveClaudeExecutable } from './sdk.ts'
 import type { EndpointModel, EndpointRate } from './endpoint.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
 
@@ -117,6 +119,9 @@ export interface ModelCatalogue {
   source: ModelSource
   /** When the CLI was last asked, for the cache and for the picker's footer. */
   at?: number
+  /** The Claude Code version whose answer `choices` is — `cli` source only.
+   *  The list is compiled into the CLI, so this is what says how new it is. */
+  version?: string
   /** Why discovery did not happen, when it did not. Never swallowed: a picker
    *  silently falling back to the built-in list is how a missing model becomes
    *  a mystery. */
@@ -191,6 +196,12 @@ export function toChoices(
  * usable list rather than an error dialog. The reason travels back in
  * `problem` so it can be logged and shown, because a silent fallback is how
  * "why is Fable missing?" becomes unanswerable.
+ *
+ * `version` is the version of the binary that ANSWERED, read from the same
+ * resolved path the question is put to. The list is compiled into the CLI, so
+ * it is exactly as new as that binary: Claude Code 2.1.272 has no Opus 5.5 in
+ * it at all, and a picker that does not say which version it asked makes a
+ * stale CLI look like a hardcoded list. See `cli-update.ts`.
  */
 export async function discoverModels(
   _profile: ProviderProfile,
@@ -201,22 +212,76 @@ export async function discoverModels(
     windowLabel: (tokens: number | undefined) => string
   },
   opts: ConnectOptions = {},
-): Promise<{ choices: ModelChoice[]; problem?: string }> {
+): Promise<{ choices: ModelChoice[]; problem?: string; version?: string }> {
   try {
-    const models = await withSilentQuery(env, { timeoutMs: 15_000, ...opts }, async (q, race) => {
+    // Resolved ONCE and handed to the query, so the version reported is the
+    // version of the binary whose answer this is — not of whatever PATH says
+    // a moment later.
+    const exe = await resolveClaudeExecutable(opts.claudeExecutable)
+    const version = exe ? await claudeVersion(exe) : undefined
+    const models = await withSilentQuery(env, {
+      timeoutMs: 15_000, ...opts, ...(exe ? { claudeExecutable: exe } : {}),
+    }, async (q, race) => {
       if (typeof q.supportedModels !== 'function') return undefined
       return race(q.supportedModels()) as Promise<SdkModelInfo[] | undefined>
     })
+    const answered = version ? { version } : {}
     if (!Array.isArray(models) || !models.length) {
-      return { choices: [], problem: 'The CLI did not report a model list. Older versions do not.' }
+      return { choices: [], problem: 'The CLI did not report a model list. Older versions do not.', ...answered }
     }
     const choices = toChoices(models, deps.normaliseModel, deps.windows, deps.windowLabel)
     return choices.length
-      ? { choices }
-      : { choices: [], problem: 'The CLI reported a model list this version cannot read.' }
+      ? { choices, ...answered }
+      : { choices: [], problem: 'The CLI reported a model list this version cannot read.', ...answered }
   } catch (e) {
     return { choices: [], problem: e instanceof Error ? e.message : String(e) }
   }
+}
+
+/**
+ * The line under the picker that says WHICH Claude Code listed these models,
+ * and whether a newer one is known to exist.
+ *
+ * `newest` is the newest Claude Code this machine is known to have besides the
+ * one that answered — the host reads it from VS Code's own Claude Code
+ * extension, which ships the same CLI and is kept current by the marketplace.
+ * Undefined when nothing is known, and then nothing is claimed: a version
+ * alone cannot say "stale", and "up to date" is a claim only the updater can
+ * make.
+ *
+ * Pure, and returns the NEWER version rather than a boolean, because the
+ * picker's update row names it.
+ */
+export function cliListNote(
+  version: string | undefined,
+  newest: string | undefined,
+): { note?: string; newer?: string } {
+  if (!version) return {}
+  if (newest && compareVersions(newest, version) > 0) {
+    return { note: `Listed by Claude Code ${version} — ${newest} is out`, newer: newest }
+  }
+  return { note: `Listed by Claude Code ${version}` }
+}
+
+/**
+ * Models in `after` that `before` did not have, named the way a person would
+ * name them.
+ *
+ * An update's whole point, stated back: "2.1.272 → 2.1.281, new: Opus 5.5 with
+ * 1M context". The CLI's own ids are aliases (`default`, `opus[1m]`) that stay
+ * the same across the change, so identity is the id AND its one-liner — the
+ * description is where "Opus 5" became "Opus 5.5" — and the name is the part of
+ * that one-liner before its first ` · `.
+ */
+export function newModelNames(before: readonly ModelChoice[], after: readonly ModelChoice[]): string[] {
+  const seen = new Set(before.map((c) => `${c.id}\u0000${c.detail ?? ''}`))
+  const names: string[] = []
+  for (const c of after) {
+    if (seen.has(`${c.id}\u0000${c.detail ?? ''}`)) continue
+    const name = c.detail?.split(' · ')[0]?.trim() || c.label
+    if (!names.includes(name)) names.push(name)
+  }
+  return names
 }
 
 /**

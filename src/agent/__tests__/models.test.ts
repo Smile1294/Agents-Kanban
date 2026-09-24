@@ -17,8 +17,8 @@
  * rather than setting them false).
  */
 import {
-  ALL_EFFORTS, catalogueFor, effortsFor, endpointChoices, fastModeFor, mergeModels,
-  modelsForProfile, parseCachedChoices, priceLabel, thinkingFor, toChoices,
+  ALL_EFFORTS, catalogueFor, cliListNote, effortsFor, endpointChoices, fastModeFor, mergeModels,
+  modelsForProfile, newModelNames, parseCachedChoices, priceLabel, thinkingFor, toChoices,
   ultracodeFor, type SdkModelInfo,
 } from '../models.ts'
 import type { EndpointModel } from '../endpoint.ts'
@@ -65,6 +65,47 @@ const REAL: SdkModelInfo[] = [
     value: 'haiku', resolvedModel: 'claude-haiku-4-5-20251001',
     displayName: 'Haiku', description: 'Haiku 4.5 · Fastest for quick answers',
   },
+]
+
+/** The same question, asked of the two versions this bug was between, on the
+ *  same account on the same day (2026-09-24). Verbatim.
+ *
+ *  2.1.272 is the `claude` on PATH that the board had been asking; 2.1.281 is
+ *  the one VS Code's Claude Code extension ships. Same ids, same aliases — and
+ *  `default` resolves to Opus 5 in one and Opus 5.5 in the other. The model is
+ *  not missing from a list somewhere; it is missing from the BINARY. */
+const OPUS_CAPS = {
+  supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] as SdkModelInfo['supportedEffortLevels'],
+  supportsAdaptiveThinking: true, supportsFastMode: true, supportsAutoMode: true,
+}
+const REST_2_1_27X: SdkModelInfo[] = [
+  {
+    value: 'claude-fable-5-1[1m]', resolvedModel: 'claude-fable-5-1', displayName: 'Fable',
+    description: 'Fable 5.1 · Most capable for your hardest and longest-running tasks',
+    supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    supportsAdaptiveThinking: true, supportsAutoMode: true,
+  },
+  {
+    value: 'sonnet', resolvedModel: 'claude-sonnet-5', displayName: 'Sonnet',
+    description: 'Sonnet 5 · Efficient for routine tasks',
+    supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    supportsAdaptiveThinking: true, supportsAutoMode: true,
+  },
+  { value: 'haiku', resolvedModel: 'claude-haiku-4-5-20251001', displayName: 'Haiku', description: 'Haiku 4.5 · Fastest for quick answers' },
+]
+const REAL_2_1_272: SdkModelInfo[] = [
+  { value: 'default', resolvedModel: 'claude-opus-5[1m]', displayName: 'Default (recommended)',
+    description: 'Opus 5 with 1M context · Best for everyday, complex tasks', ...OPUS_CAPS },
+  { value: 'opus[1m]', resolvedModel: 'claude-opus-5[1m]', displayName: 'Opus (1M context)',
+    description: 'Opus 5 with 1M context · Best for everyday, complex tasks', ...OPUS_CAPS },
+  ...REST_2_1_27X,
+]
+const REAL_2_1_281: SdkModelInfo[] = [
+  { value: 'default', resolvedModel: 'claude-opus-5-5[1m]', displayName: 'Default (recommended)',
+    description: 'Opus 5.5 with 1M context · Best for everyday, complex tasks', ...OPUS_CAPS },
+  { value: 'opus[1m]', resolvedModel: 'claude-opus-5-5[1m]', displayName: 'Opus (1M context)',
+    description: 'Opus 5.5 with 1M context · Best for everyday, complex tasks', ...OPUS_CAPS },
+  ...REST_2_1_27X,
 ]
 
 const choices = toChoices(REAL, normaliseModel, MODEL_WINDOWS, windowLabel)
@@ -242,13 +283,22 @@ const by = (id: string) => choices.find((c) => c.id === id)
 // Fable shipped, the picker gained it, and neither table had it. This ties the
 // two together the way `tools.test.ts` ties the auto-allow list to the tool
 // definitions, so the NEXT model to appear fails here rather than in a session.
+//
+// It only ever works for the CLI answers it is SHOWN, which is why every real
+// answer the project has captured is in the loop. It passed for months over
+// 2.1.239's list while 2.1.272 was already offering Fable 5.1 and 2.1.281 made
+// Opus 5.5 the default — both unpriced. When a CLI answers with a model this
+// table lacks, paste that answer in here.
 {
-  for (const m of REAL) {
-    const id = normaliseModel(m.resolvedModel ?? m.value)
-    ok(!!MODEL_RATES[id], `${m.displayName} (${id}) has a published rate, so its spend is a total and not a floor`)
-    ok(!!MODEL_WINDOWS[id], `${m.displayName} (${id}) has a context window, so the meter has a denominator`)
+  for (const [cli, answer] of [['2.1.239', REAL], ['2.1.272', REAL_2_1_272], ['2.1.281', REAL_2_1_281]] as const) {
+    for (const m of answer) {
+      const id = normaliseModel(m.resolvedModel ?? m.value)
+      ok(!!MODEL_RATES[id], `${cli}: ${m.displayName} (${id}) has a published rate, so its spend is a total and not a floor`)
+      ok(!!MODEL_WINDOWS[id], `${cli}: ${m.displayName} (${id}) has a context window, so the meter has a denominator`)
+    }
   }
   ok(!!MODEL_RATES['claude-fable-5'], 'Fable specifically — it was in the picker and in neither table')
+  ok(!!MODEL_RATES['claude-opus-5-5'], 'and Opus 5.5, the default the day it appeared, which had no rate either')
 
   // Every rate needs a window and vice versa: one without the other is a model
   // that shows a cost with no meter, or a meter with no cost.
@@ -494,6 +544,39 @@ const by = (id: string) => choices.find((c) => c.id === id)
   const one = toChoices([{ value: 'claude-opus-5' }], normaliseModel, MODEL_WINDOWS, windowLabel)[0]!
   ok(one.context === '1M' && one.contextTokens === 1_000_000,
      'the window is carried as a NUMBER as well as a label — a label cannot be measured against anything')
+}
+
+// --- WHICH Claude Code answered ---------------------------------------------
+//
+// The bug report was "I reload the models and only get Opus 5 — it should be
+// dynamic, not hardcoded". It WAS dynamic: the list came from the CLI on PATH,
+// and that CLI was 2.1.272, whose binary has no Opus 5.5 in it. What was missing
+// was any way to see that from the picker, so a stale CLI and a hardcoded table
+// looked identical. These are the words that tell them apart.
+{
+  const at272 = toChoices(REAL_2_1_272, normaliseModel, MODEL_WINDOWS, windowLabel)
+  const at281 = toChoices(REAL_2_1_281, normaliseModel, MODEL_WINDOWS, windowLabel)
+  ok(!at272.some((c) => /5\.5/.test(c.detail ?? '')) && at281.filter((c) => /Opus 5\.5/.test(c.detail ?? '')).length === 2,
+     'the fixtures are the bug: 2.1.272 has no Opus 5.5 anywhere, 2.1.281 has it as `default` and `opus[1m]`')
+
+  const stale = cliListNote('2.1.272', '2.1.281')
+  ok(stale.note === 'Listed by Claude Code 2.1.272 — 2.1.281 is out' && stale.newer === '2.1.281',
+     `a list from an older CLI than one the machine has says so, naming both (${stale.note})`)
+  ok(cliListNote('2.1.281', '2.1.281').newer === undefined && cliListNote('2.1.281', '2.1.281').note === 'Listed by Claude Code 2.1.281',
+     'an equal version is not stale, and still says which version answered')
+  ok(cliListNote('2.1.290', '2.1.281').newer === undefined,
+     'a PATH CLI newer than the editor’s is not stale either')
+  ok(cliListNote('2.1.100', '2.1.99').newer === undefined,
+     'and versions compare as numbers — a string compare would call 2.1.100 older than 2.1.99')
+  ok(cliListNote('2.1.272', undefined).newer === undefined && !!cliListNote('2.1.272', undefined).note,
+     'with nothing newer KNOWN, nothing is claimed — a version alone cannot say "stale"')
+  ok(cliListNote(undefined, '2.1.281').note === undefined,
+     'and with no version for the list there is no sentence to say at all')
+
+  const fresh = newModelNames(at272, at281)
+  ok(fresh.length === 1 && fresh[0] === 'Opus 5.5 with 1M context',
+     `after an update the board can name what arrived (${JSON.stringify(fresh)}), though the ids are the same aliases`)
+  ok(newModelNames(at281, at281).length === 0, 'and nothing, when nothing did')
 }
 
 // --- the cache, which outlives the build that wrote it ----------------------

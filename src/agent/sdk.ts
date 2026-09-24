@@ -34,8 +34,11 @@ export function loadSdk(): Promise<Sdk> {
  *
  * The SDK ships a ~190MB per-platform binary. Bundling that into the .vsix
  * makes an 87MB extension, so we exclude it and use the Claude Code CLI you
- * already have. It also means the CLI updates on its own schedule rather than
- * being pinned to whatever we shipped.
+ * already have. That was meant to let the CLI update on its own schedule rather
+ * than be pinned to whatever we shipped — but every run the board spawns sets
+ * `DISABLE_UPDATES`, so a `claude` that nothing else starts is never updated at
+ * all, and its compiled-in model list freezes with it. `cli-update.ts` is the
+ * other half of that promise: the version is shown, and updating is a click.
  *
  * Order: explicit setting -> `claude` on PATH -> the usual install locations.
  * That is the whole list. This function does NOT reach into `node_modules`.

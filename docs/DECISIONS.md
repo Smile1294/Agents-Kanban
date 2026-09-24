@@ -3163,6 +3163,80 @@ option, chosen silently. The `smoke.mjs` gate therefore checks the SHAPE of the
 name — anything ending `Executable` or `Path` must be on the machine-scoped
 list — so the fifth one cannot arrive with the old default and no one notice.
 
+### "Only Opus 5, never Opus 5.5 — it should be dynamic" (2026-09-24)
+
+Reported as: *"I try to reload models from Claude to pull the latest Opus 5.5
+but I only get Opus 5 … would make sense if it's dynamic and not hardcoded."*
+
+It was dynamic. The picker's list is `Query.supportedModels()`, asked of the
+`claude` on PATH, and on that machine the `claude` on PATH was **2.1.272**,
+installed nine days earlier. Asked the same question on the same account the
+same minute, 2.1.272 answered `default → claude-opus-5[1m]` and 2.1.281 answered
+`default → claude-opus-5-5[1m]`. The 2.1.272 binary does not contain the string
+`claude-opus-5-5` at all. The model was not missing from a list, a cache or a
+flag; it was missing from the program, and Refresh re-asked that program.
+
+Why nine releases behind, when the user's Claude Code was current? Their Claude
+Code is VS Code's extension, which carries its own binary (2.1.281) and is
+updated by the marketplace. The PATH `claude` is only ever started by this
+board — and `agentEnv()` sets `DISABLE_AUTOUPDATER` and `DISABLE_UPDATES` on
+every process it spawns, for a good reason (NIM-1573: a self-update mid-session
+corrupted the binary under a running agent). So nothing ever updated it. The
+comment on `resolveClaudeExecutable` said using the machine's CLI "means the CLI
+updates on its own schedule"; with the updater switched off, its schedule was
+never. And the picker never said WHICH version answered, so a stale CLI and a
+hardcoded table looked identical from the outside — hence the report's word.
+
+Three things now, each for a different half of that:
+
+- **The version is said.** Discovery returns the version of the binary that
+  answered (resolved once and handed to the query, so it cannot be another
+  binary's), the host caches it beside the list, and the model menu's footer
+  reads "Listed by Claude Code 2.1.272 — 2.1.281 is out". Staleness is claimed
+  only when a newer version is KNOWN — VS Code's own Claude Code extension
+  reports one through `vscode.extensions` — because a version on its own cannot
+  say "old", and "up to date" is the updater's claim, not ours.
+- **The cache is an answer from one version.** It was trusted forever, so a CLI
+  updated in a terminal still produced the old list until somebody found a
+  button. Unforced `refreshModels()` now re-asks only when `claude --version`
+  (a fast path, no handshake) reports something else, and it runs in the
+  background after activation — the event that changes the answer most happens
+  outside this extension, so no event inside it could have fired for it. A
+  background re-ask that fails keeps the cached list rather than dropping to
+  the built-in three.
+- **Updating is one click** — a row in the model menu (only when a newer
+  version is known), a settings button, and `Agents Kanban: Update Claude Code`.
+  Never automatic. Two traps, both in `cli-update.ts`: `DISABLE_UPDATES` makes
+  `claude update` print "Updates are disabled by your administrator" and EXIT 0,
+  so the update's environment is never built by `agentEnv()` and the outcome is
+  judged by the version before and after, never by the exit code (an exit 0 that
+  changed nothing is shown as a modal in the CLI's words); and stdin is ignored,
+  or an updater that stops to ask waits out the five-minute clock. A native
+  install keeps every version in its own file behind a symlink, so live agents
+  are unaffected and are not asked about; any other install is replaced in
+  place, and then live agents are a real question and the user is asked.
+
+Pressed on the reporting machine: `2.1.272 → 2.1.281` in seven seconds, and
+the PATH CLI then listed Opus 5.5 as `default` and `opus[1m]`.
+
+The same audit found the meters one step behind the picker. `MODEL_RATES` had
+neither `claude-fable-5-1` (offered since 2.1.272) nor `claude-opus-5-5` (the
+DEFAULT from 2.1.281), so most new sessions would have read `≥` a floor; both
+also break the fixed cache-read multiple (0.025x and 0.05x of input, where every
+other model is 0.1x), so deriving it would have over-reported cache-heavy agent
+sessions two- to four-fold. And Sonnet 5 had been moved to $3/$15 on the belief
+that its introductory price lapsed on 2026-08-31 — the rise was cancelled and
+$2/$10 became the list price, so every Sonnet session had read 50% high. The
+rate gate in `models.test.ts` passed through all of it because it only priced
+the models of the one CLI answer it was shown (2.1.239's); it now loops over
+every captured answer, and the next one goes in beside them.
+
+**Lesson:** "dynamic" is only as dynamic as the thing you ask, and a source you
+have switched the updates off on is a snapshot. When a list comes from another
+program, say which version of it answered — that one number is the difference
+between "hardcoded" and "stale", and only one of those has a fix the user can
+press.
+
 ## Still open
 
 - **A routed subtask's backend must be READ once before the board can check it.**
@@ -3171,6 +3245,13 @@ list — so the fifth one cannot arrive with the old default and no one notice.
   still a step a first-time user will hit. Seeding every configured profile's
   endpoint list at activation would remove it, at the cost of N HTTP requests on
   a path that is currently free.
+- **A stale Claude Code is only DETECTED where VS Code's Claude Code extension
+  is installed.** That extension's version is the one local evidence a newer CLI
+  exists; without it (the headless board, an editor without it) the picker names
+  the version and claims nothing, and the update stays reachable from settings
+  and the palette. Asking the release channel would detect it everywhere, at the
+  cost of a network request and of knowing which channel (`stable` lags
+  `latest`) the user's CLI follows.
 - **No syntax highlighting in code blocks.** Language label and monospace only.
 
 - **A live process still cannot be re-attached after a restart**, and never will

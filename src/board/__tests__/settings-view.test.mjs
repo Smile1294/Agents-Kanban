@@ -326,6 +326,44 @@ const state = (over = {}) => ({
   ok(!!findButton(v.root, 'Check again'), 'while still offering the way to re-check it')
 }
 
+// --- the Claude Code the board runs, and bringing it up to date -------------
+//
+// The model list is compiled into the CLI, and every run the board starts
+// switches the CLI's own updater off — so a machine where nothing else starts
+// that `claude` never gets a newer model. This page is where "why is the new
+// model missing?" gets asked, so it names the version and offers the update.
+{
+  const at = (version) => ({
+    id: 'claude', label: 'Claude Code', at: Date.now(),
+    location: { command: '/Users/me/.local/bin/claude', source: 'path', version },
+    login: { kind: 'signedIn', via: 'subscription' },
+  })
+  const stale = await renderSettings(state({
+    runtimes: [{ ...CLAUDE, status: at('2.1.272'), cliUpdate: { newer: '2.1.281' } }, CODEX],
+  }))
+  ok(stale.text().includes('2.1.272'), 'the page names the version the board actually runs')
+  ok(stale.text().includes('2.1.281 is out'), 'and a newer one, when one is known to exist')
+  ok(stale.text().includes('The model list comes with the CLI'),
+     'and says why that matters, which is the whole answer to "why is the new model missing?"')
+  const update = findButton(stale.root, 'Update Claude Code')
+  ok(!!update && (update.className || '').includes('primary'), 'with the update as the primary action')
+  update.onclick()
+  ok(stale.posted.some((m) => m.type === 'updateCli' && m.runtime === 'claude'),
+     'which posts the message the host handles')
+
+  const current = await renderSettings(state({
+    runtimes: [{ ...CLAUDE, status: at('2.1.281'), cliUpdate: {} }, CODEX],
+  }))
+  ok(!current.text().includes('is out'), 'with nothing newer known, nothing is claimed about staleness')
+  ok(!!findButton(current.root, 'Update Claude Code') && !(findButton(current.root, 'Update Claude Code').className || '').includes('primary'),
+     'but the update stays reachable, as a plain link — only the updater can say "up to date"')
+
+  const codexOnly = await renderSettings(state({
+    runtimes: [{ ...CODEX, status: { id: 'codex', label: 'Codex', at: Date.now(), login: { kind: 'signedIn', via: 'subscription' } } }],
+  }))
+  ok(!findButton(codexOnly.root, 'Update Claude Code'), 'and it is never offered on an agent it cannot update')
+}
+
 // --- dictation: the composer mic's two local binaries -----------------------
 {
   // Not checked yet is a real state, and is not painted as "not installed".

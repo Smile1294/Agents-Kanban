@@ -66,7 +66,7 @@ read that store instead of duplicating it.
 | Model / effort / thinking / agent / backend / orchestration level | Same sidecar, recorded at launch (`durablePatch`) | Per session. The settings hold only what the NEXT new session gets; the composer describes the selected card, never the default. |
 | Scheduled runs | `workspaceState` (`schedules`) | Per workspace; fire only while the window is open. |
 | Provider credentials | `SecretStorage` | Never in settings, which sync and get committed. |
-| Model catalogues | `globalState`, per provider | Discovery spawns a CLI; the cache keeps it off the render path. |
+| Model catalogues | `globalState`, per provider, with the CLI version that answered (`modelsFrom:*`) | Discovery spawns a CLI; the cache keeps it off the render path. The list is compiled into the CLI, so the cache is valid for one CLI version and is re-asked when `claude --version` moves. |
 
 **Nothing is written to your repository.** The sidecar lives under the
 extension's global storage directory, keyed by workspace root.
@@ -423,6 +423,14 @@ Working:
   The context window and per-token price it publishes reach the picker AND both
   spend meters, so a session on a router shows a real figure instead of
   `≥ $0.00`. See [`src/agent/endpoint.ts`](src/agent/endpoint.ts)
+- **The model list says which Claude Code listed it, and can update it.**
+  Claude Code's models are compiled into each release, and every run the board
+  spawns carries `DISABLE_UPDATES`, so a PATH `claude` only the board starts
+  froze at 2.1.272 while VS Code's Claude Code extension moved to 2.1.281 with
+  Opus 5.5. The picker's footer names the answering version, offers "Update
+  Claude Code…" when VS Code's extension is newer, the settings page and the
+  palette offer the same, and a changed CLI version re-asks at activation. See
+  [`src/agent/cli-update.ts`](src/agent/cli-update.ts)
 - **The headless board — Remote Control that runs the board itself.**
   `npm run remote` serves the built extension on a box, activated against a
   `vscode` stub (the `test/harness.mjs` technique) with the browser as its

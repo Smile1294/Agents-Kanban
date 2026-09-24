@@ -2710,7 +2710,7 @@
         m.price || '',
         m.detail || '',
       ].filter(Boolean).join(' · '),
-    })), view.selectedKey, modelSourceNote()))
+    })).concat(cliUpdateRow()), view.selectedKey, modelSourceNote()))
     /* The model-switch warning, built HOST-side (this file does no arithmetic
        on money): the selected session has a conversation, and the picker's
        model differs from the one it was on — the next turn re-reads it all
@@ -3375,10 +3375,29 @@
     const m = s.composer.models.find((x) => x.id === id)
     return m ? m.label : 'Model'
   }
-  /* Where the model list came from. Only shown when it is NOT the CLI's, because
-     that is the only case with a question attached: "why is the model I use in
-     Claude Code missing from this picker?" is unanswerable unless you can see
-     that we fell back. */
+  /* The way to a model the list does not have yet, at the bottom of the list.
+     Claude Code's model list is compiled into the CLI, so a model newer than
+     the installed binary cannot appear however often the list is refreshed —
+     only a newer CLI brings it. Offered ONLY when the host knows a newer one
+     exists (VS Code's own Claude Code extension ships it); an update row in
+     every model menu on a guess would be a control nobody can trust. An
+     action row, like the agent picker's settings entry, because a menu is
+     where somebody looking for a missing model is already looking. */
+  function cliUpdateRow() {
+    const u = s.composer.cliUpdate
+    if (!u || !u.to) return []
+    return [{
+      command: 'updateClaude',
+      label: '⬇  Update Claude Code to ' + u.to + '…',
+      meta: 'This list is ' + (u.from || 'an older version') + '’s. New models come with the new CLI.',
+    }]
+  }
+  /* Where the model list came from. For a fallback, because "why is the model
+     I use in Claude Code missing from this picker?" is unanswerable unless you
+     can see that we fell back — and for the CLI's own list too, as the VERSION
+     that listed it (the host's `modelNote`): that list is compiled into the
+     CLI, and a stale CLI with no version on screen looks exactly like a
+     hardcoded table. */
   /* One short line. It answers "where did this list come from?", which is the
      question a menu full of unfamiliar model names provokes — and it names the
      HOST, because "served by api.deepseek.com" is the whole explanation for why

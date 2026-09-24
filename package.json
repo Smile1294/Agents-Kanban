@@ -97,6 +97,11 @@
         "command": "agentsKanban.refreshModels",
         "title": "Agents Kanban: Refresh Model List",
         "icon": "$(sync)"
+      },
+      {
+        "command": "agentsKanban.updateClaudeCode",
+        "title": "Agents Kanban: Update Claude Code (for newer models)",
+        "icon": "$(cloud-download)"
       }
     ],
     "configuration": {

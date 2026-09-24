@@ -411,5 +411,44 @@ ok(noUsage.responses === 0, 'an assistant frame without usage is skipped rather 
      'clean and poisoned books price the session identically')
 }
 
+// ---------------------------------------------------------------------------
+// 7. The models a CURRENT CLI offers, at the published price.
+//
+// Opus 5.5 became the CLI's `default` in 2.1.281 and Fable 5.1 was offered from
+// 2.1.272, while this table knew neither — so the model most sessions now run
+// on reported `≥` a floor. And both break the fixed cache multiple: a cache hit
+// is 0.05x input on Opus 5.5 and 0.025x on Fable 5.1, where every other model is
+// 0.1x, so deriving it would over-report every cache-heavy session (an agent
+// session is mostly cache reads) by 2x and 4x. Rates from the pricing page,
+// 2026-09-24: platform.claude.com/docs/en/about-claude/pricing.
+{
+  const mtok = (usage: Record<string, number>, model: string) => costOfUsage(model, usage as never)!
+  const read = { cache_read_input_tokens: 1_000_000 }
+
+  ok(near(mtok({ input_tokens: 1_000_000 }, 'claude-opus-5-5[1m]'), 4)
+     && near(mtok({ output_tokens: 1_000_000 }, 'claude-opus-5-5[1m]'), 20),
+     'Opus 5.5 is $4/$20, reached through the [1m] alias the CLI resolves `default` to')
+  ok(near(mtok(read, 'claude-opus-5-5'), 0.2),
+     `an Opus 5.5 cache hit is $0.20, not the derived $0.40 (got ${mtok(read, 'claude-opus-5-5')})`)
+  ok(near(mtok({ cache_creation_input_tokens: 1_000_000 }, 'claude-opus-5-5'), 5),
+     'while its cache WRITES keep the standard multiple: $5 for 5 minutes')
+
+  ok(near(mtok({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'claude-fable-5-1'), 60),
+     'Fable 5.1 is $10/$50')
+  ok(near(mtok(read, 'claude-fable-5-1'), 0.25),
+     `a Fable 5.1 cache hit is $0.25 — a quarter of Fable 5's (got ${mtok(read, 'claude-fable-5-1')})`)
+  ok(near(mtok(read, 'claude-fable-5'), 1), 'and Fable 5 keeps its $1, the plain 0.1x')
+  ok(near(mtok(read, 'claude-mythos-5-1'), 0.25), 'Mythos 5.1 is priced as Fable 5.1')
+
+  // The introductory Sonnet 5 price became the standard one; the scheduled
+  // rise to $3/$15 was cancelled. This table had applied the rise anyway.
+  ok(near(mtok({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'claude-sonnet-5'), 12),
+     `Sonnet 5 is $2/$10, the price that stayed (got ${mtok({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'claude-sonnet-5')})`)
+  ok(windowFor('claude-opus-5-5[1m]') === 1_000_000 && windowFor('claude-fable-5-1') === 1_000_000,
+     'and both new models have the 1M denominator the meter measures against')
+  ok(windowFor('us.anthropic.claude-opus-5-5') === 1_000_000,
+     'including under a Bedrock inference-profile id')
+}
+
 console.log(fails ? `\n${fails} FAILED` : '\nall usage tests passed')
 process.exit(fails ? 1 : 0)

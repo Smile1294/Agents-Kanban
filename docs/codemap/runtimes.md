@@ -7,9 +7,11 @@ paths:
   - src/agent/jsonrpc.ts
   - src/agent/sdk.ts
   - src/agent/connect.ts
+  - src/agent/cli-update.ts
   - src/agent/status.ts
   - src/sessions/codex-store.ts
 tests:
+  - src/agent/__tests__/cli-update.test.ts
   - src/agent/__tests__/codex.test.ts
   - src/agent/__tests__/executable.test.ts
   - src/agent/__tests__/status.test.ts
@@ -52,7 +54,9 @@ registration is an import side effect, on purpose. Import it for effect from
 `extension.ts` and from any test needing a populated registry.
 
 **`src/agent/runtimes/claude.ts`**. Claude Code behind the contract, adding no
-behaviour: `detect` → `resolveClaudeExecutable`; `login` → `accountInfo()`
+behaviour: `detect` → `resolveClaudeExecutable` plus the VERSION (`claudeVersion`,
+a `--version` fast path) — the model list is compiled into the CLI, so that
+number is what answers "why is the new model missing?"; `login` → `accountInfo()`
 under `withSilentQuery` (it once hung forever on a gateway that dropped
 packets); `models` → the built-in list (discovery lives in `models.ts`);
 `start` → `new AgentSession(spec)`; `capabilities.boardTools = 'inProcess'`.
@@ -88,6 +92,23 @@ SIGBUSes on some Linux boxes; a dev checkout would run a different Claude Code
 from the one the user maintains). Test: `executable.test.ts` — asserts on the
 BUILT bundle, because the bug used `__filename`, which exists in CJS and not in
 the ESM the test runner uses.
+
+**`src/agent/cli-update.ts`**. Which Claude Code the board runs, and updating
+it. `parseCliVersion` (`2.1.272 (Claude Code)` → `2.1.272`), `compareVersions`
+(numeric, part by part — a string compare calls 2.1.100 older than 2.1.99),
+`claudeVersion(exe)`, `replacedInPlace(exe)` (false only for a native install,
+whose versions live in `…/claude/versions/` behind a symlink),
+`updateEnv(base)`, `judgeUpdate` (pure) and `updateClaudeCode(exe)` →
+`UpdateOutcome` (`updated` / `unchanged` / `failed`, each carrying the CLI's own
+words). Exists because `agentEnv()` puts `DISABLE_UPDATES` on every run — right
+for a run, and the reason a `claude` nothing else starts is never updated, so
+its compiled-in model list froze (2.1.272 has no Opus 5.5 in it at all). Two
+traps: `DISABLE_UPDATES` makes `claude update` print a refusal and EXIT 0, so the
+update env is never built by `agentEnv()` and the outcome is judged by the
+version before/after, never the exit code; and stdin is IGNORED, or an updater
+that asks a question waits out the five-minute wall clock. Test:
+`cli-update.test.ts` — a stand-in `claude` on disk that behaves like the real
+one where it matters (the exit-0 refusal is verbatim from the 2.1.281 bundle).
 
 **`src/agent/connect.ts`**. `withSilentQuery(env, opts, ask)` — ask the CLI a
 control question (`accountInfo`, `supportedModels`) without a turn: a prompt
@@ -146,6 +167,9 @@ once came back with empty transcripts that way). The settings page asks
 - Cached-token accounting is per vendor: Anthropic sums disjoint figures, Codex's
   cached count is already inside `input_tokens`.
 - Run the CLI on the machine, never the SDK's bundled binary.
+- The board disables the CLI's updater on every run, so it owes the user the
+  update: `claude update` runs only on a click, with an environment NOT built by
+  `agentEnv()`, and is judged by the version, never the exit code.
 - An unanswered permission request is a wedged agent: every branch answers.
 - `RuntimeHistory.delete` is optional and a foreign delete is verified against
   that runtime's OWN listing.
@@ -161,3 +185,4 @@ once came back with empty transcripts that way). The settings page asks
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S116g8 · dead-code sweep: `_resetSdkCache` (sdk.ts) and `_clearRuntimes` (runtime.ts) test hooks deleted — no test imported either; `RpcEvents` in jsonrpc.ts de-exported — zero references outside the module.
+- 2026-09-24 · main · `cli-update.ts` added (version, staleness, the update button's updater); Claude's `detect()` reports the CLI version.

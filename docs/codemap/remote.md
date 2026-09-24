@@ -183,7 +183,8 @@ LONG-LIVED secret, compared as sha-256 digests with `timingSafeEqual`),
 credential that rides in a URL, so it must die on a clock), `_AUTH_BACKOFF_AFTER`, `_AUTH_BLOCK_AFTER`,
 `_AUTH_BLOCK_MINUTES`, `_TRUST_PROXY`. `stub.mjs`: a fake VS Code kept
 deliberately SMALL so a missing API fails at activation as it would in the
-editor; a webview's `postMessage` becomes an SSE frame to every watcher; dialogs
+editor (`extensions` answers nothing: a headless box runs no editor extensions,
+so the board never claims its CLI is stale there); a webview's `postMessage` becomes an SSE frame to every watcher; dialogs
 become browser overlays. `page.mjs`: pure — `theme.css` FIRST or the page paints
 white; `bridge.js` before the app scripts. `bridge.js`: installs
 `acquireVsCodeApi()` (`postMessage` → `POST /api/msg`, a 409 retries after
@@ -272,6 +273,7 @@ browser because the host half IS the extension.
 
 ## Recent changes
 
+- 2026-09-24 · main · `server/stub.mjs` gained `vscode.extensions` (empty) for the host's Claude Code version check.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **a relay URL on
   `http://` is refused unless it is loopback.** `relayBase` accepted either
   scheme, so a board could be pushed in the clear — the full frame (transcripts,

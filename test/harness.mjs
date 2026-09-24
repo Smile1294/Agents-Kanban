@@ -297,8 +297,14 @@ export function makeVscodeStub(ctl) {
         return item
       },
       showErrorMessage: (m) => { errors.push('showErrorMessage: ' + m); return Promise.resolve(undefined) },
-      showInformationMessage: () => Promise.resolve(undefined),
-      showWarningMessage: () => Promise.resolve(undefined),
+      showInformationMessage: (m) => { calls.push('info:' + m); return Promise.resolve(undefined) },
+      // Recorded with whether it was MODAL, because "a refusal on a path the
+      // user clicked is modal, never a toast" is a rule a test has to be able
+      // to see broken.
+      showWarningMessage: (m, opts) => {
+        calls.push((opts && typeof opts === 'object' && opts.modal ? 'modal:' : 'warn:') + m)
+        return Promise.resolve(undefined)
+      },
       showInputBox: async (opts) => {
         calls.push('inputBox:' + (opts?.title ?? opts?.prompt ?? ''))
         // A function lets a test answer a MULTI-STEP form differently per
@@ -390,6 +396,15 @@ export function makeVscodeStub(ctl) {
     },
     env: {
       openExternal: async (uri) => { calls.push('openExternal:' + String(uri)); return true },
+    },
+    /* How the board learns the version of VS Code's own Claude Code
+       extension, which ships a CLI of the same version: the one signal that a
+       stale `claude` on PATH is stale. `ctl.extensions` seeds it by id
+       (`{ 'anthropic.claude-code': { packageJSON: { version } } }`); VS Code
+       matches ids case-insensitively, so this does too. */
+    extensions: {
+      getExtension: (id) => ctl.extensions?.[String(id).toLowerCase()],
+      get all() { return Object.values(ctl.extensions ?? {}) },
     },
     commands: {
       registerCommand: (id, fn) => { calls.push('cmd:' + id); cmds.set(id, fn); return disposable },

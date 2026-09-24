@@ -9,7 +9,7 @@ import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
 import * as vscode from 'vscode'
 import { AgentManager, followKey, type RunningAgent, type RunSettings } from './agent/manager.ts'
-import { loadSdk, type Options as AgentOptions } from './agent/sdk.ts'
+import { loadSdk, resolveClaudeExecutable, type Options as AgentOptions } from './agent/sdk.ts'
 import {
   applyRestore, checkpointMapFor, claudeHome, historyDirFor, planRestore,
   sessionFileFor, waitForQuiescent, type CheckpointMap,
@@ -92,10 +92,11 @@ import {
   type Meter, type RuntimeId, type RuntimeStatus,
 } from './agent/runtime.ts'
 import {
-  ALL_EFFORTS, catalogueFor, discoverModels, effortsFor, fastModeFor, parseCachedChoices,
-  priceLabel, thinkingFor, ultracodeFor,
+  ALL_EFFORTS, catalogueFor, cliListNote, discoverModels, effortsFor, fastModeFor, newModelNames,
+  parseCachedChoices, priceLabel, thinkingFor, ultracodeFor,
   type ModelCatalogue, type ModelChoice,
 } from './agent/models.ts'
+import { claudeVersion, compareVersions, parseCliVersion, replacedInPlace, updateClaudeCode } from './agent/cli-update.ts'
 
 type AgentPermissionMode = AgentOptions['permissionMode']
 
@@ -442,6 +443,50 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     parseCachedChoices(context.globalState.get(catalogueKey(id, rt)))
 
   /**
+   * Which version of the CLI wrote a cached list.
+   *
+   * The list is compiled into the CLI, so a cache is an answer from ONE VERSION
+   * of it — and it was trusted forever. Update Claude Code in a terminal and
+   * the picker kept offering the old binary's models until somebody found a
+   * Refresh button, which is the "it must be hardcoded" report. So the version
+   * is written beside the list and a different one on disk means ask again
+   * (`refreshModels`). Its own key rather than a new shape for the list: a
+   * build that predates it reads the list exactly as before. Parsed, not cast.
+   */
+  const versionKey = (id: string, rt: RuntimeId = runtime) => `modelsFrom:${rt}:${id}`
+  const cachedVersion = (id: string, rt: RuntimeId = runtime): string | undefined =>
+    parseCliVersion(context.globalState.get(versionKey(id, rt)))
+
+  /**
+   * The newest Claude Code this machine is KNOWN to have, besides the `claude`
+   * the board runs.
+   *
+   * VS Code's own Claude Code extension ships the same CLI under the same
+   * version number and is kept current by the marketplace — which is exactly
+   * why a machine can have a fresh 2.1.281 in the editor and a nine-release-old
+   * 2.1.272 on PATH: the board disables the CLI's updater on every run, and
+   * nothing else ever starts that one. Undefined without that extension, and
+   * then the picker claims nothing about staleness; a version alone cannot say
+   * "old", and "up to date" is the updater's claim to make, not ours.
+   */
+  const newestClaudeKnown = (): string | undefined =>
+    parseCliVersion(vscode.extensions.getExtension('anthropic.claude-code')?.packageJSON?.version)
+
+  /**
+   * What the model picker says about the CLI that produced its list, and the
+   * update it offers when a newer Claude Code is known.
+   *
+   * Only for a list Claude Code itself answered: an endpoint's list, a
+   * profile's own, or the built-in fallback is not a claim about the CLI's
+   * version and each has its own sentence already.
+   */
+  function cliProvenance(cat: ModelCatalogue, rt: RuntimeId): { note?: string; update?: { from: string; to: string } } {
+    if (rt !== 'claude' || cat.source !== 'cli' || !cat.version) return {}
+    const { note, newer } = cliListNote(cat.version, newestClaudeKnown())
+    return { ...(note ? { note } : {}), ...(newer ? { update: { from: cat.version, to: newer } } : {}) }
+  }
+
+  /**
    * Where a CUSTOM ENDPOINT's own catalogue is cached.
    *
    * Not keyed by runtime, unlike `catalogueKey`: this is what the endpoint at a
@@ -588,10 +633,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const memo = `${rt}:${p.id}`
     const hit = perProfileCatalogue.get(memo)
     if (hit) return hit
-    const built = catalogueFor(p, cachedChoices(p.id, rt), builtinChoices(),
-      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, undefined, endpointFor(p))
+    const built = withVersion(catalogueFor(p, cachedChoices(p.id, rt), builtinChoices(),
+      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, undefined, endpointFor(p)), cachedVersion(p.id, rt))
     perProfileCatalogue.set(memo, built)
     return built
+  }
+
+  /** Stamp a CLI-sourced catalogue with the version that answered it. Nothing
+   *  else is stamped: a version is a claim about Claude Code's list only. */
+  function withVersion(cat: ModelCatalogue, version: string | undefined): ModelCatalogue {
+    return cat.source === 'cli' && version ? { ...cat, version } : cat
   }
 
   function recomputeCatalogue(discovered?: readonly ModelChoice[], problem?: string): void {
@@ -600,8 +651,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     modelsDue = true
     const p = currentProvider()
     const cached = discovered ?? cachedChoices(p.id)
-    catalogue = catalogueFor(p, cached, builtinChoices(),
-      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, problem, endpointFor(p))
+    catalogue = withVersion(catalogueFor(p, cached, builtinChoices(),
+      { normaliseModel, windows: MODEL_WINDOWS, windowLabel }, problem, endpointFor(p)), cachedVersion(p.id))
   }
 
   /**
@@ -761,12 +812,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Through the same parse, so a cache this build cannot read counts as a
     // MISS and is re-asked, rather than counting as a hit and never being fixed.
     if (!force && cachedChoices(p.id).length) {
-      recomputeCatalogue()
-      return
+      /* A hit only while it is an answer from the Claude Code that is
+         installed NOW. The list is compiled into the CLI, so a cache written
+         by 2.1.272 describes 2.1.272 forever — and was trusted forever, which
+         left a machine updated to a CLI with Opus 5.5 in it offering Opus 5.
+         `--version` is a fast path in the CLI (no handshake, no process that
+         lingers), so this costs next to nothing; an unreadable version trusts
+         the cache, because "could not tell" is not evidence of a change. */
+      const exe = await resolveClaudeExecutable(configuredPathFor('claude'))
+      const now = exe ? await claudeVersion(exe) : undefined
+      const was = cachedVersion(p.id)
+      if (!now || now === was) {
+        recomputeCatalogue()
+        return
+      }
+      log.info(
+        `Claude Code is now ${now}; the model list was read from ` +
+        `${was ?? 'a version this build did not record'}. Asking again.`,
+      )
     }
     if (discovering) return discovering
     discovering = (async () => {
-      const { choices, problem } = await discoverModels(p, providerEnv, {
+      const { choices, problem, version } = await discoverModels(p, providerEnv, {
         normaliseModel, windows: MODEL_WINDOWS, windowLabel,
       }, {
         ...(cfg().get<string>('claudeExecutable') ? { claudeExecutable: cfg().get<string>('claudeExecutable')! } : {}),
@@ -774,9 +841,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       })
       if (choices.length) {
         // Keyed by the runtime the answer BELONGS to, not by whichever is
-        // selected when the round trip lands.
+        // selected when the round trip lands. The version goes beside it
+        // (cleared when unknown), because that is what makes the next launch
+        // able to tell a stale answer from a current one.
         await context.globalState.update(catalogueKey(p.id, rt), choices)
-        log.info(`Models for ${profileLabel(p)}: ${choices.map((c) => c.id).join(', ')}`)
+        await context.globalState.update(versionKey(p.id, rt), version)
+        log.info(`Models for ${profileLabel(p)} from Claude Code ${version ?? '(version unknown)'}: ${choices.map((c) => c.id).join(', ')}`)
       } else if (problem) {
         log.warn(`Could not read the model list for ${profileLabel(p)}: ${problem}`)
       }
@@ -798,10 +868,98 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
          outranks the CLI's. Without this the fallback is silent, and a silent
          fallback is how "why is my model missing?" becomes unanswerable — the
          same rule `problem` exists for on the CLI path. */
-      recomputeCatalogue(choices, endpointProblem ?? problem)
+      /* Unasked — the background re-ask after the CLI's version moved — a
+         CLI that did not answer must not replace a list that was working with
+         the built-in three: the cached one is still true about the version it
+         names, and the footer says which. Asked (a Refresh), the failure is
+         shown, because a button that silently keeps the old list is a button
+         that "did nothing". */
+      const keepCache = !force && !choices.length && cachedChoices(p.id).length > 0
+      recomputeCatalogue(keepCache ? undefined : choices, endpointProblem ?? problem)
       alignModelToProvider()
     })().finally(() => { discovering = undefined })
     return discovering
+  }
+
+  /** In-flight update, so two clicks do not run two updaters against one
+   *  install — the CLI's own lock would refuse the second, as a failure. */
+  let updatingClaude: Promise<void> | undefined
+
+  /**
+   * Update the Claude Code CLI the board runs, then read its models again.
+   *
+   * The model list is compiled into the CLI, so this — not a refresh — is how
+   * a model newer than the installed binary ever reaches the picker. And the
+   * board is the reason the binary goes stale: every run it spawns carries
+   * `DISABLE_UPDATES`, so on a machine where nothing else starts the `claude`
+   * on PATH, nothing else updates it either. See `agent/cli-update.ts`.
+   *
+   * A click, never automatic, like every other action here that changes
+   * something the user did not ask to change. And every outcome is SAID: an
+   * update that did nothing ("up to date", "disabled by your administrator",
+   * "managed by Homebrew") is modal, because this is a path the user clicked
+   * and a toast is how "I pressed it and nothing happened" gets reported.
+   */
+  async function updateClaude(): Promise<void> {
+    if (updatingClaude) return updatingClaude
+    updatingClaude = (async () => {
+      const exe = await resolveClaudeExecutable(configuredPathFor('claude'))
+      if (!exe) {
+        await vscode.window.showWarningMessage(
+          'Claude Code was not found, so there is nothing to update. Install it, or set ' +
+          '"agentsKanban.claudeExecutable" to its path.',
+          { modal: true },
+        )
+        return
+      }
+      /* NIM-1573 is the reason agent runs disable the updater: a binary
+         replaced underneath a running agent. A native install cannot do that —
+         each version is its own file behind a symlink, and a running process
+         keeps the one it started on — so it is not asked about. Anything else
+         may be rewritten in place, and live agents make that a real question. */
+      const live = (ws?.manager?.list() ?? []).filter((a) => a.runtime === 'claude' && isLive(a)).length
+      if (live && await replacedInPlace(exe)) {
+        const go = await vscode.window.showWarningMessage(
+          `${live === 1 ? 'An agent is' : `${live} agents are`} running on this Claude Code, and this ` +
+          'install is replaced in place when it updates, which can break a running agent.',
+          { modal: true },
+          'Update anyway',
+        )
+        if (go !== 'Update anyway') return
+      }
+      const before = catalogue.choices
+      const outcome = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Updating Claude Code…' },
+        () => updateClaudeCode(exe),
+      )
+      log.info(`claude update: ${outcome.kind}${'to' in outcome ? ` → ${outcome.to}` : ''} — ${outcome.said}`)
+      // Re-read whatever happened. "Up to date" is also the case where the CLI
+      // was updated elsewhere and the board's list is the stale part.
+      await refreshModels(true)
+      if (runtime === 'claude' && runtimeModels.has('claude')) rememberClaudeModels()
+      if (runtimeStatuses.length) await refreshRuntimeStatus('claude')
+      void SettingsPanel.refreshIfOpen()
+      refreshAll()
+      if (outcome.kind === 'updated') {
+        // Only Claude Code's own list says anything about this update; with
+        // another agent selected, the picker is showing that agent's models.
+        const arrived = runtime === 'claude' ? newModelNames(before, catalogue.choices) : []
+        void vscode.window.showInformationMessage(
+          `Claude Code ${outcome.from ? `${outcome.from} → ` : 'updated to '}${outcome.to}. ` +
+          (runtime !== 'claude' ? ''
+            : arrived.length ? `New in the model picker: ${arrived.join(', ')}. ` : 'The model list is the same. ') +
+          'Agents already running keep the version they started on.',
+        )
+        return
+      }
+      await vscode.window.showWarningMessage(
+        outcome.kind === 'failed'
+          ? `Could not update Claude Code: ${outcome.said}`
+          : `Claude Code was not updated${outcome.version ? ` (still ${outcome.version})` : ''}: ${outcome.said}`,
+        { modal: true },
+      )
+    })().finally(() => { updatingClaude = undefined })
+    return updatingClaude
   }
 
   /**
@@ -1275,6 +1433,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *  rather than showing an empty list, which reads as "there are none". */
   const endpointNotes = new Map<string, string>()
   const runtimeModels = new Map<RuntimeId, { models: { id: string; label: string }[]; source: string; note?: string }>()
+  /** The Claude Code card's model list, from the catalogue in force — with the
+   *  version that listed it, which is the settings page's answer to "why is the
+   *  new model missing?". */
+  const rememberClaudeModels = (): void => {
+    const note = catalogue.problem ?? cliProvenance(catalogue, 'claude').note
+    runtimeModels.set('claude', {
+      models: catalogue.choices.map((m) => ({ id: m.id, label: m.label })),
+      source: catalogue.source === 'cli' ? 'runtime' : catalogue.source,
+      ...(note ? { note } : {}),
+    })
+  }
   let settingsBusy: string | undefined
 
   // ——— Voice dictation (the composer's mic) ———
@@ -2057,6 +2226,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         runtimes: allRuntimes().map((rt) => {
           const models = runtimeModels.get(rt.id)
           const status = runtimeStatuses.find((r) => r.id === rt.id)
+          // Newer than the installed one, when that is KNOWN; see
+          // `newestClaudeKnown` for why nothing is claimed otherwise.
+          const installed = rt.id === 'claude' ? status?.location?.version : undefined
+          const newer = installed ? newestClaudeKnown() : undefined
           return {
             id: rt.id,
             label: rt.label,
@@ -2085,6 +2258,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               : {}),
             ...(models ? { models: models.models, modelSource: models.source } : {}),
             ...(models?.note ? { modelNote: models.note } : {}),
+            // Claude Code only, and only once it is known to be installed: an
+            // update button for a CLI that is not there has nothing to run.
+            ...(rt.id === 'claude' && status?.location
+              ? { cliUpdate: installed && newer && compareVersions(newer, installed) > 0 ? { newer } : {} }
+              : {}),
           }
         }),
         activeProvider: providerId,
@@ -2238,11 +2416,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                being asked. */
             if (msg.runtime === 'claude') {
               await refreshModels(true)
-              runtimeModels.set(msg.runtime, {
-                models: catalogue.choices.map((m) => ({ id: m.id, label: m.label })),
-                source: catalogue.source === 'cli' ? 'runtime' : catalogue.source,
-                ...(catalogue.problem ? { note: catalogue.problem } : {}),
-              })
+              rememberClaudeModels()
               return
             }
             const loc = await rt.detect(configuredPathFor(msg.runtime))
@@ -2265,6 +2439,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
           return
         }
+        case 'updateCli':
+          // Claude Code is the one agent whose updater the board switches off,
+          // and so the one this page offers to run.
+          if (msg.runtime === 'claude') await updateClaude()
+          return
         case 'selectProvider':
           await setActiveProvider(msg.id)
           return
@@ -2561,10 +2740,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         )
         refreshAll()
         const note = catalogue.problem
-        if (note) vscode.window.showWarningMessage(`Using the built-in model list: ${note}`)
-        else vscode.window.showInformationMessage(
-          `${catalogue.choices.length} models: ${catalogue.choices.map((c) => c.label).join(', ')}`,
+        if (note) { void vscode.window.showWarningMessage(`Using the built-in model list: ${note}`); return }
+        /* Which Claude Code answered, because "why is the new model missing?"
+           is answered by that number and by nothing else on this screen. */
+        const provenance = cliProvenance(catalogue, runtime)
+        const listed = `${catalogue.choices.length} models${catalogue.version ? ` from Claude Code ${catalogue.version}` : ''}: ` +
+          catalogue.choices.map((c) => c.label).join(', ')
+        if (!provenance.update) { void vscode.window.showInformationMessage(listed); return }
+        const pick = await vscode.window.showInformationMessage(
+          `${listed}. Claude Code ${provenance.update.to} is out — the list comes with the CLI, so newer models need the newer version.`,
+          'Update Claude Code',
         )
+        if (pick === 'Update Claude Code') await updateClaude()
         return
       }
       case 'remove': return removeProvider(active)
@@ -3191,6 +3378,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // say no, which is the same class of bug as a spinner over a wedged
     // process.
     const levels = effortsFor(catalogue.choices, model)
+    const provenance = cliProvenance(catalogue, runtime)
+    const footer = catalogue.problem ?? provenance.note
     /* Built by `sendModels` below, ONCE per state and only when the list has
        actually changed. It used to be mapped inline here — and then AGAIN in
        the selected-session branch, so a 431-model catalogue was formatted
@@ -3209,7 +3398,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ultracodeSupported: ultracodeFor(catalogue.choices, model),
       fastModeSupported: fastModeFor(catalogue.choices, model),
       modelSource: catalogue.source,
-      ...(catalogue.problem ? { modelNote: catalogue.problem } : {}),
+      ...(footer ? { modelNote: footer } : {}),
+      // The picker's "Update Claude Code…" row. Only when a NEWER CLI is known
+      // to exist — offered on a guess it would sit in every model menu forever.
+      ...(provenance.update ? { cliUpdate: provenance.update } : {}),
       agent: agentKey(runtime, active.id),
       agents: agentChoices(),
       agentLocked: false,
@@ -3657,7 +3849,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       effectiveCatalogue = cat
       effectiveProfile = ranOn?.id ?? pass.activeProfile
       composer.modelSource = cat.source
-      if (cat.problem) composer.modelNote = cat.problem
+      /* The footer describes the list being SHOWN, so it is recomputed from
+         this catalogue rather than kept from the active one — otherwise a Codex
+         card would be told its models were "Listed by Claude Code 2.1.272". */
+      const provenance = cliProvenance(cat, (sessionMeta.runtime ?? runtime) as RuntimeId)
+      const footer = cat.problem ?? provenance.note
+      if (footer) composer.modelNote = footer
+      else delete composer.modelNote
+      if (provenance.update) composer.cliUpdate = provenance.update
+      else delete composer.cliUpdate
       if (sessionMeta.model) composer.model = sessionMeta.model
       if (sessionMeta.effort) composer.effort = sessionMeta.effort
       if (sessionMeta.thinking) composer.thinking = sessionMeta.thinking
@@ -3882,6 +4082,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     async selectProvider() { await selectProvider() },
     openSettings() { openSettings() },
+    updateClaude() { return updateClaude() },
 
     /** Workspace-relative paths for the @-mention picker.
      *
@@ -5495,6 +5696,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await refreshModels(true)
       refreshAll()
     }),
+    vscode.commands.registerCommand('agentsKanban.updateClaudeCode', () => updateClaude()),
     vscode.commands.registerCommand('agentsKanban.stopTask', async () => {
       const id = await pickSession(requireWs().store, 'Stop agent')
       if (id) await host.stop(id)
@@ -5611,9 +5813,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // empty cache defaults to. Logged, because "which provider am I on" is the
   // first question when a run bills the wrong account.
   await refreshProviderEnv()
-  // From the cache only — see refreshModels: asking spawns a CLI, and the
-  // launch gate must not depend on one. The first provider switch or an
-  // explicit refresh fills it in.
+  // From the cache only, for the first paint — see refreshModels: asking spawns
+  // a CLI, and the launch gate must not depend on one. The background check
+  // below replaces it when the Claude Code on disk is not the one that wrote it.
   recomputeCatalogue()
   alignModelToProvider()
   /* Except for a CUSTOM ENDPOINT, which is asked here, in the background.
@@ -5667,6 +5869,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (startupProblem) log.warn(startupProblem)
 
   await rebuild()
+
+  /* Claude Code's own model list, when the CLI on disk is not the one that
+     wrote the cache — or nothing has asked it yet.
+     This used to wait for a provider switch or a Refresh, on the argument that
+     asking is driven "by the events that can actually change the answer". A
+     NEW VERSION of the CLI is the event that changes it most, and it happens
+     outside this extension (a terminal `claude update`, an installer), so no
+     event here ever fired for it: the picker offered the old binary's models
+     until somebody went looking for a button. `refreshModels()` unforced reads
+     `--version` (a fast path, no handshake) and spends the ~460ms CLI round
+     trip only when the version moved. After `rebuild()`, so the question is
+     asked from the workspace its sessions run in; never awaited; and off with
+     discovery, which is how the launch gate stays hermetic. A gateway is left
+     to the endpoint block above: its own list outranks the CLI's. */
+  if (cfg().get<boolean>('discoverModels') !== false && runtime === 'claude'
+      && currentProvider().kind !== 'gateway') {
+    refreshModels()
+      .then(() => refreshAll())
+      .catch((e: unknown) => log.error(`Could not check the model list against Claude Code: ${String(e)}`))
+  }
 }
 
 /** Scheme for the base-branch side of a diff. */

@@ -1326,6 +1326,50 @@ ok(parentChat.text().includes('1/2 ready'), "the parent's chat page leads with i
      'a filter that matches nothing says so, rather than looking like an empty picker')
 }
 
+// --- WHICH Claude Code listed these, and the way to a newer one --------------
+//
+// Reported: "I reload the models to pull the latest Opus 5.5 but only get Opus
+// 5 — it should be dynamic, not hardcoded." It was dynamic: the list came from
+// the `claude` on PATH, which was 2.1.272, and 2.1.272 does not contain Opus
+// 5.5. The picker said nothing about which version had answered, so a stale
+// CLI looked exactly like a hardcoded list — and nothing on screen led to the
+// one fix there is, a newer CLI.
+{
+  const models = [
+    { id: 'default', label: 'Default (recommended)', context: '1M', detail: 'Opus 5 with 1M context · Best for everyday, complex tasks' },
+    { id: 'sonnet', label: 'Sonnet', context: '1M', detail: 'Sonnet 5 · Efficient for routine tasks' },
+  ]
+  const stale = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: {
+      ...COMPOSER, model: 'default', models, modelSource: 'cli',
+      modelNote: 'Listed by Claude Code 2.1.272 — 2.1.281 is out',
+      cliUpdate: { from: '2.1.272', to: '2.1.281' },
+    },
+  })
+  findButton(stale.root, 'Default (recommended)').onclick({ stopPropagation() {}, preventDefault() {} })
+  const menu = stale.text()
+  ok(menu.includes('Listed by Claude Code 2.1.272 — 2.1.281 is out'),
+     'the menu says WHICH Claude Code listed its models, and that a newer one exists')
+  const row = findButton(stale.root, 'Update Claude Code to 2.1.281')
+  ok(!!row && (row.className || '').includes('menu-item'),
+     'and offers the update as a row of the same menu — where somebody looking for a missing model already is')
+  row.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(stale.posted.some((m) => m.type === 'updateClaude'), 'which asks the host to run the update')
+  ok(!stale.posted.some((m) => m.type === 'composer'),
+     'and is not mistaken for picking a model — no model change is sent')
+
+  // Current, or nothing known: the version is still named, and no row is drawn.
+  const current = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    composer: { ...COMPOSER, model: 'default', models, modelSource: 'cli', modelNote: 'Listed by Claude Code 2.1.281' },
+  })
+  findButton(current.root, 'Default (recommended)').onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(current.text().includes('Listed by Claude Code 2.1.281'), 'a current list still names its version')
+  ok(!findButton(current.root, 'Update Claude Code'),
+     'with no newer version KNOWN, no update is offered — a row in every menu on a guess is a control nobody trusts')
+}
+
 // --- a short list is left alone ---------------------------------------------
 {
   const v = run({

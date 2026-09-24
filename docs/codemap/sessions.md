@@ -88,7 +88,9 @@ per content block and each repeats the whole response's usage; the obvious sum
 was ~2.7× high), `costOfUsage`, `contextOfUsage` (per-response `input +
 cache_read + cache_creation`, never the cumulative `result.usage`),
 `mainWindowOf`, `MODEL_RATES` and `MODEL_WINDOWS` (Anthropic's ids; the
-hand-maintained tables), `CACHE_WRITE_5M/1H/READ`, `normaliseModel` (strips
+hand-maintained tables — a row may carry an absolute `cacheRead` where the model
+breaks the 0.1x multiple: Opus 5.5 is 0.05x, Fable 5.1 / Mythos 5.1 0.025x),
+`CACHE_WRITE_5M/1H/READ`, `normaliseModel` (strips
 Bedrock/Vertex prefixes and suffixes; an inference-profile ARN stays unpriced),
 `rateFor`, `windowFor`, `ModelBook` (endpoint-published prices and windows),
 `priced: false` for an unknown model → the view says `≥`. Test: `usage.test.ts`
@@ -148,7 +150,11 @@ from `run-…` to the session id when `system/init` arrives, and
   `search.ts` matches it.
 - **A new model price or window.** `MODEL_RATES` / `MODEL_WINDOWS` (Anthropic
   ids only — other providers publish their own through `ModelBook`); the live
-  drift check against `total_cost_usd` will say when the table is stale.
+  drift check against `total_cost_usd` will say when the table is stale. Check
+  the cache-read column of the pricing page, not just input/output — the newer
+  models do not follow the 0.1x rule — and paste the CLI's `supportedModels()`
+  answer into `models.test.ts`, whose gate prices every model a captured CLI
+  answer offers.
 - **Reading something new off Claude Code's disk.** Prefer the SDK's session API;
   fall back to the raw JSONL only for records the API projects away, as
   `checkpoints.ts` and `subagents.ts` do, and say so in the header.
@@ -192,3 +198,4 @@ from `run-…` to the session id when `system/init` arrives, and
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S116g8 · dead-code sweep: `parseDecomposition` de-exported — module-private, called only inside `parseMeta`.
 - 2026-09-08 · task/S2cdw-implement-this-new-thing · compacted sessions: pre-compaction messages recovered from the raw JSONL, the compact summary hidden behind a muted notice; usage and spend run over the merged list.
+- 2026-09-24 · main · rates and windows for `claude-opus-5-5` ($4/$20, cache read $0.20), `claude-fable-5-1` / `claude-mythos-5-1` ($10/$50, cache read $0.25) — the CLI already offered both, unpriced; Sonnet 5 back to its standing $2/$10 (the scheduled rise to $3/$15 was cancelled, so the table over-reported by half).

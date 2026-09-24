@@ -47,8 +47,9 @@ base ref, no temp files); `pickSession()` for palette commands; `deactivate()`,
 which is empty because subscriptions handle teardown. Registered commands (all
 declared in `package.json`, and the smoke gate asserts the two agree): `openBoard`,
 `toggleFocus`, `newSession`, `init`, `openSettings`, `selectProvider`,
-`addProvider`, `testProvider`, `refreshModels`, `stopTask`, `archiveSession`,
-`deleteSession`, `openWorktree`. Activation is `onStartupFinished`. Test:
+`addProvider`, `testProvider`, `refreshModels`, `updateClaudeCode`, `stopTask`,
+`archiveSession`, `deleteSession`, `openWorktree`. Activation is
+`onStartupFinished`. Test:
 `smoke.mjs` only — it activates the BUILT bundle against `test/harness.mjs`.
 
 **`src/board/panel.ts`**. The webview surface in two places and two modes.
@@ -172,12 +173,33 @@ splits the catalogue out onto its own version key (`mv`).
 **Settings webview → host.** `media/settings.js` posts; `parseMessage` in
 `settings.ts` validates; the `switch` in `extension.ts` acts. Groups: page
 (`ready`, `refresh`); runtimes (`setDefaultRuntime`, `install`, `signIn`,
-`refreshModels`); providers (`selectProvider`, `addProvider`, `editProvider`,
+`refreshModels`, `updateCli`); providers (`selectProvider`, `addProvider`, `editProvider`,
 `removeProvider`, `testProvider`, `refreshEndpoint`, `setProfileModels`,
 `setSpawnAllowed`); shell-outs (`openSetting`, `openUrl`, `copyText`);
 dictation (`checkVoice`); schedules (`saveSchedule`, `removeSchedule`,
 `toggleSchedule`, `runSchedule`); remote (`setRemote`, `saveRemote`,
 `setRemoteWrites`, `clearRemoteCode`).
+
+**Which Claude Code listed the models, and updating it.** The model list is
+compiled into the CLI, and every run the board spawns carries `DISABLE_UPDATES`,
+so a `claude` on PATH that nothing else starts is never updated — reported as
+"only Opus 5, never Opus 5.5" from a 2.1.272 CLI nine releases behind the
+2.1.281 VS Code's own Claude Code extension ran. So: `versionKey()`
+(`modelsFrom:<rt>:<profile>`) records the answering version beside
+`catalogueKey()`'s list; unforced `refreshModels()` trusts the cache only while
+`claude --version` still reports that version (after `rebuild()` at activation,
+in the background, under `discoverModels`), and a failed background re-ask
+keeps the cache rather than dropping to the built-in three; `newestClaudeKnown()`
+reads `vscode.extensions.getExtension('anthropic.claude-code')`'s version, the
+only local evidence a newer CLI exists; `cliProvenance(cat, rt)` turns both into
+`composer.modelNote` ("Listed by Claude Code 2.1.272 — 2.1.281 is out") and
+`composer.cliUpdate` (the picker's update row), recomputed in the session branch
+so a Codex card is never told about Claude Code. `updateClaude()` is the one
+update path — picker row (`updateClaude`, editor-only), settings (`updateCli`),
+palette (`updateClaudeCode`): asks first only when Claude agents are live on an
+install `replacedInPlace()`, runs `updateClaudeCode()` behind a progress
+notification, re-reads the list whatever happened, and reports an update that
+changed nothing as a MODAL in the CLI's words (an exit-0 refusal is not success).
 
 **The repaint, and the state split.** Any event → `refreshAll()` →
 `paint.schedule()` → ONE `boardPass()` → `applyRedirects(pass)` → a
@@ -298,6 +320,7 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-24 · main · the model cache records the CLI version that wrote it and is re-asked when it moves; the picker names that version and offers "Update Claude Code…" when VS Code's own Claude Code extension is newer; `updateClaude()` behind a row, a settings button and the `updateClaudeCode` command; first `vscode.extensions` use.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **a repository could
   name the binary we spawn.** The four executable-path settings declared no
   `scope`, and VS Code's default (`window`) lets a workspace file override the

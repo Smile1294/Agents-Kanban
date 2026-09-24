@@ -411,8 +411,14 @@ export interface UiState {
      *  and because `cli` against a custom endpoint is a list about Claude Code
      *  rather than about that endpoint. */
     modelSource?: string
-    /** Why the CLI's list is not in use, when it is not. */
+    /** Why the CLI's list is not in use, when it is not — or, when it IS, which
+     *  Claude Code version answered. The list is compiled into the CLI, so that
+     *  version is the only thing that tells a stale CLI from a hardcoded list. */
     modelNote?: string
+    /** Present only when a NEWER Claude Code than the one that listed the
+     *  models is known to exist (VS Code's own Claude Code extension ships
+     *  one). Draws the picker's "Update Claude Code…" row. */
+    cliUpdate?: { from: string; to: string }
     /** Shown beside the model picker when the selected session HAS a
      *  conversation and the picker's model differs from the one that
      *  conversation was on: switching re-reads it all at the new model's
@@ -665,6 +671,10 @@ export interface BoardHost {
   /** Open the settings tab: agents, backends and logins. Synchronous because
    *  showing a panel is not something to await — the page fills itself in. */
   openSettings(): void
+  /** Run Claude Code's own updater, then list the models again. Reached from
+   *  the model picker when a newer CLI is known to exist: the list is compiled
+   *  into the CLI, so this is the only way a newer model can ever appear. */
+  updateClaude(): Promise<void>
   /** A webview has (re)loaded and holds no cached state. Optional: the side bar
    *  and the panel both send it, and a host that carries nothing across states
    *  need not care. */
@@ -880,6 +890,13 @@ async function routeBoardMessage(
     case 'openSettings':
       if (editorOnly('Settings open in the editor.')) break
       host.openSettings()
+      break
+    case 'updateClaude':
+      // It installs software on THIS machine and may ask a question on the way,
+      // neither of which a phone watching the board should be doing.
+      if (editorOnly('Updating Claude Code happens in the editor.')) break
+      await host.updateClaude()
+      await refresh()
       break
     case 'permission':
       host.answerPermission(id(), String(msg.requestId), Boolean(msg.allow), selectionsOf(msg.selections))

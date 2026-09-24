@@ -239,7 +239,23 @@ function runtimeCard(card) {
       () => post({ type: 'signIn', runtime: card.id })))
   }
   tools.appendChild(button('Check again', 'link', () => post({ type: 'refresh', runtime: card.id })))
+  /* Claude Code's model list is compiled into the CLI, and every run the board
+     starts switches the CLI's own updater off — so on a machine where nothing
+     else starts this `claude`, nothing else updates it, and a new model never
+     appears. The button runs its updater; the note says when a newer version is
+     KNOWN to exist, and says nothing when it is not. */
+  if (card.cliUpdate) {
+    tools.appendChild(button('Update Claude Code', card.cliUpdate.newer ? 'primary' : 'link',
+      () => post({ type: 'updateCli', runtime: card.id })))
+  }
   box.appendChild(tools)
+  if (card.cliUpdate && card.cliUpdate.newer) {
+    const installed = card.status && card.status.location && card.status.location.version
+    box.appendChild(el('div', 'muted small',
+      'Claude Code ' + card.cliUpdate.newer + ' is out — it is what VS Code’s Claude Code extension runs — ' +
+      'while this board runs ' + (installed || 'an older version') + '. The model list comes with the CLI, ' +
+      'so newer models appear once it is updated.'))
+  }
 
   box.appendChild(modelsRow(card))
 

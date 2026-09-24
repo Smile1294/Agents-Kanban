@@ -102,8 +102,12 @@ and what the host posts; models the workbench layout — side bar, panel, aux ba
 names), `loadBundle(vscode)` (patches `Module._resolveFilename` so `'vscode'`
 resolves to the stub), `makeContext(storage)` (real Maps for `globalState`,
 `workspaceState`, `secrets` — a stub that swallowed writes let "the key went
-into settings.json" pass), `makeRepo(prefix)`, `repoRoot`. Deliberately
-incomplete: a missing API fails smoke exactly as it fails activation.
+into settings.json" pass), `makeRepo(prefix)`, `repoRoot`. Toasts and dialogs
+land in `calls` as `info:` / `warn:` / `modal:` lines, so "a refusal on a clicked
+path is modal" is checkable; `ctl.extensions` seeds `vscode.extensions`
+(VS Code's Claude Code extension version is the board's staleness signal).
+Deliberately incomplete: a missing API fails smoke exactly as it fails
+activation.
 
 **`test/dom.mjs`** — a DOM just big enough to run `board.js` and `settings.js`
 in a `vm`: `renderBoard(state, opts)`, `renderBoardWith`, `renderSettings`,
@@ -183,6 +187,7 @@ without one.
 
 ## Recent changes
 
+- 2026-09-24 · main · harness: `vscode.extensions` (seeded by `ctl.extensions`) and toasts/modals recorded in `calls`; smoke: the stale-CLI footer and update row through the real view, and the update button against a stand-in `claude` — including the exit-0 `DISABLE_UPDATES` refusal reported as a modal.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `scripts/preflight.mjs`
   derives what it checks from `package.json` instead of a hand-written list of
   five. `playwright` was added afterwards and was never checked, so a checkout

@@ -1506,6 +1506,137 @@ console.log('\n— providers: the picker, and where the credential goes')
     await send({ type: 'composer', model: 'claude-opus-5' })
     await send({ type: 'ready' })
 
+    /* --- WHICH CLAUDE CODE LISTED THESE, and the way to a newer one ------
+     *
+     * Reported: "I reload the models to pull Opus 5.5 but only get Opus 5 —
+     * it should be dynamic, not hardcoded." It WAS dynamic: the list came from
+     * the `claude` on PATH, 2.1.272, whose binary does not contain Opus 5.5 —
+     * and the board disables that CLI's updater on every run it spawns, so on
+     * a machine whose Claude Code is VS Code's extension (2.1.281, kept current
+     * by the marketplace) nothing ever updated it. Nothing on screen said which
+     * version had answered, so a stale CLI looked exactly like a hardcoded
+     * list.
+     *
+     * Driven through the built bundle: the version key as the host writes it
+     * beside the cache, VS Code's extension registry, the picker's footer and
+     * row in the real view, and the update button against a stand-in `claude`
+     * on disk — so no real CLI is touched and the gate stays hermetic. The
+     * string below must match `versionKey()` in extension.ts.
+     */
+    {
+      const VKEY = 'modelsFrom:claude:inherit'
+      const reload = async () => {
+        await send({ type: 'composer', provider: saved[0].id })
+        await send({ type: 'composer', provider: 'inherit' })
+        await send({ type: 'ready' })
+        return latestState().composer
+      }
+      ctl.extensions = { 'anthropic.claude-code': { id: 'Anthropic.claude-code', packageJSON: { version: '2.1.281' } } }
+      ctx3._globalState.set(KEY, cached)
+      ctx3._globalState.set(VKEY, '2.1.272')
+      const stale = await reload()
+      ok(stale.modelSource === 'cli' && stale.modelNote === 'Listed by Claude Code 2.1.272 — 2.1.281 is out',
+         `a list from an older CLI than VS Code's own says so, naming both versions (${stale.modelNote})`)
+      ok(stale.cliUpdate?.from === '2.1.272' && stale.cliUpdate?.to === '2.1.281',
+         `and the host offers the update (${JSON.stringify(stale.cliUpdate)})`)
+      try {
+        const view = await renderBoard(latestState(), { layout: 'full' })
+        const chip = walkNodes(view.root).find(
+          (n) => (n.className || '').split(' ').includes('picker') && /Default \(recommended\)/.test(n.textContent ?? ''))
+        ok(!!chip, 'the model picker is on the bar')
+        chip?.onclick({ stopPropagation() {} })
+        ok(view.text().includes('Listed by Claude Code 2.1.272 — 2.1.281 is out'),
+           'the real view prints the footer inside the model menu, where the missing model is looked for')
+        const row = walkNodes(view.root).find(
+          (n) => n.tagName === 'button' && /Update Claude Code to 2\.1\.281/.test(n.textContent ?? ''))
+        ok(!!row, 'with the update as a row of that menu')
+        row?.onclick({ stopPropagation() {} })
+        ok(view.posted.some((m) => m.type === 'updateClaude'), 'which posts the message the host routes')
+      } catch (e) {
+        ok(false, `the view threw on a stale CLI list — ${e.message}`)
+      }
+
+      ctx3._globalState.set(VKEY, '2.1.281')
+      const current = await reload()
+      ok(current.modelNote === 'Listed by Claude Code 2.1.281' && current.cliUpdate === undefined,
+         `a list from the newest known CLI names its version and offers nothing (${current.modelNote})`)
+      ctx3._globalState.set(VKEY, { version: '2.1.272' })
+      const junk = await reload()
+      ok(junk.modelNote === undefined && junk.cliUpdate === undefined,
+         'a version key this build cannot read is no claim at all — parsed, not cast')
+      ctl.extensions = {}
+      ctx3._globalState.set(VKEY, '2.1.272')
+      const unknown = await reload()
+      ok(unknown.modelNote === 'Listed by Claude Code 2.1.272' && unknown.cliUpdate === undefined,
+         'without VS Code’s Claude Code extension nothing newer is KNOWN, so nothing is claimed stale')
+
+      /* The update button, against a stand-in `claude` whose `update` bumps a
+         version file — the only evidence the host believes. And the refusal
+         the real CLI gives under `DISABLE_UPDATES` — a message and EXIT 0 —
+         which must reach the user as a modal, not be taken for success. */
+      const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-fake-claude-'))
+      const fake = path.join(bin, 'claude')
+      const stateFile = path.join(bin, 'state.json')
+      await fs.writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const st = JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)}, 'utf8'))
+const arg = process.argv[2]
+if (arg === '--version') { console.log(st.version + ' (Claude Code)'); process.exit(0) }
+if (arg !== 'update') process.exit(2)
+if (process.env.DISABLE_UPDATES) { console.log('Updates are disabled by your administrator. Contact your IT team to get the latest version.'); process.exit(0) }
+const from = st.version
+st.version = st.next
+fs.writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify(st))
+console.log('Successfully updated from ' + from + ' to version ' + st.next)
+`, 'utf8')
+      await fs.chmod(fake, 0o755)
+      await fs.writeFile(stateFile, JSON.stringify({ version: '2.1.272', next: '2.1.281' }), 'utf8')
+      const hadDisable = process.env.DISABLE_UPDATES
+      delete process.env.DISABLE_UPDATES
+      ctl.config.claudeExecutable = fake
+      try {
+        /* ONE surface. `send()` fans a message out to every webview the
+           host wired, which is right for "the user did this" on state, and
+           would run the updater once per surface here — the second run a
+           no-op that muddies what the first one said. */
+        const click = (msg) => stub.handlers[0](msg)
+        stub.calls.length = 0
+        await click({ type: 'updateClaude' })
+        ok(JSON.parse(await fs.readFile(stateFile, 'utf8')).version === '2.1.281',
+           'the board’s update button really runs the CLI’s updater, WITHOUT the DISABLE_UPDATES every agent run carries')
+        ok(stub.calls.includes('progress:Updating Claude Code…'), 'behind a progress notification')
+        ok(stub.calls.some((c) => c.startsWith('info:Claude Code 2.1.272 → 2.1.281.')),
+           `and the outcome is said with both versions (${stub.calls.find((c) => c.startsWith('info:Claude Code'))})`)
+        ok(stub.infos.some((l) => l.includes('claude update: updated → 2.1.281')), 'and logged')
+
+        await fs.writeFile(stateFile, JSON.stringify({ version: '2.1.272', next: '2.1.281' }), 'utf8')
+        process.env.DISABLE_UPDATES = '1'
+        stub.calls.length = 0
+        await click({ type: 'updateClaude' })
+        ok(JSON.parse(await fs.readFile(stateFile, 'utf8')).version === '2.1.272',
+           'an administrator’s DISABLE_UPDATES is honoured, not routed around')
+        ok(stub.calls.some((c) => c.startsWith('modal:Claude Code was not updated (still 2.1.272): Updates are disabled by your administrator')),
+           `and the exit-0 refusal is a MODAL in the CLI's words, never a success (${stub.calls.find((c) => c.includes('not updated'))})`)
+        ok(!stub.calls.some((c) => c.startsWith('info:Claude Code 2.1.272 →')), 'with no success toast beside it')
+
+        // The palette reaches the same path.
+        ok(typeof stub.cmds.get('agentsKanban.updateClaudeCode') === 'function',
+           'and the command palette has the same update')
+      } finally {
+        if (hadDisable === undefined) delete process.env.DISABLE_UPDATES
+        else process.env.DISABLE_UPDATES = hadDisable
+        delete ctl.config.claudeExecutable
+        ctl.extensions = undefined
+        ctx3._globalState.delete(KEY)
+        ctx3._globalState.delete(VKEY)
+        await fs.rm(bin, { recursive: true, force: true })
+        await send({ type: 'composer', provider: saved[0].id })
+        await send({ type: 'composer', provider: 'inherit' })
+        await send({ type: 'composer', model: 'claude-opus-5' })
+        await send({ type: 'ready' })
+      }
+    }
+
     /* --- WHAT THE ENDPOINT ITSELF SERVES ---------------------------------
      *
      * The bug this gate is named after, driven end to end through the built

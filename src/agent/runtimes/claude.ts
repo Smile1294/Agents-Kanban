@@ -22,6 +22,7 @@
 import { AgentSession, agentEnv } from '../session.ts'
 import { resolveClaudeExecutable, type Options } from '../sdk.ts'
 import { withSilentQuery } from '../connect.ts'
+import { claudeVersion } from '../cli-update.ts'
 import { MODELS } from '../../sessions/meta.ts'
 import { MODEL_WINDOWS } from '../../sessions/usage.ts'
 import type { ProviderEnv } from '../providers.ts'
@@ -70,9 +71,18 @@ export const claudeRuntime: AgentRuntime = {
     boardTools: 'inProcess',
   },
 
-  detect(configured?: string): Promise<RuntimeLocation | undefined> {
-    return resolveClaudeExecutable(configured).then((command) =>
-      command ? { command, source: configured ? ('setting' as const) : ('path' as const) } : undefined)
+  /** Where the CLI is, and WHICH VERSION it is. The version is not decoration:
+   *  the model picker's list is compiled into the CLI, so it is the one number
+   *  that answers "why is the new model missing?" — see `cli-update.ts`. */
+  async detect(configured?: string): Promise<RuntimeLocation | undefined> {
+    const command = await resolveClaudeExecutable(configured)
+    if (!command) return undefined
+    const version = await claudeVersion(command)
+    return {
+      command,
+      source: configured ? ('setting' as const) : ('path' as const),
+      ...(version ? { version } : {}),
+    }
   },
 
   /**

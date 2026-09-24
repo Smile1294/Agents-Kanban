@@ -90,18 +90,30 @@ export const MODEL_RATES: Record<string, ModelRate> = {
   // A model the picker can select and this table cannot price is the gap
   // `models.test.ts` now ties shut: every model in its real-CLI fixture must
   // have a rate and a window here.
+  // The x.5 and x.1 releases break the fixed cache multiple: a cache hit is
+  // 0.025x input on Fable 5.1 / Mythos 5.1 and 0.05x on Opus 5.5, where every
+  // other model is 0.1x — so they carry an absolute `cacheRead` and derive only
+  // the writes. Both were MISSING while the CLI already offered them (Fable 5.1
+  // from 2.1.272, Opus 5.5 as the DEFAULT from 2.1.281), so every such session
+  // reported `≥` a floor. Checked against platform.claude.com/docs pricing,
+  // 2026-09-24.
+  'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.25 },
+  'claude-mythos-5-1': { input: 10, output: 50, cacheRead: 0.25 },
   'claude-fable-5': { input: 10, output: 50 },
   'claude-mythos-5': { input: 10, output: 50 },
+  'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.2 },
   'claude-opus-5': { input: 5, output: 25 },
   'claude-opus-4-8': { input: 5, output: 25 },
   'claude-opus-4-7': { input: 5, output: 25 },
   'claude-opus-4-6': { input: 5, output: 25 },
-  // List price. This read 2/10 — Sonnet 5's introductory rate, which ran
-  // through 2026-08-31 and has since lapsed, so every Sonnet session was
-  // under-reported by a third. A dated price in an undated table goes wrong
-  // silently on a specific day; `settleTurn`'s comparison against the CLI's
-  // own `total_cost_usd` is what would eventually have said so.
-  'claude-sonnet-5': { input: 3, output: 15 },
+  // $2/$10 is the LIST price. This briefly read 3/15, on the belief that the
+  // introductory 2/10 lapsed on 2026-08-31 — but the scheduled increase was
+  // cancelled and the introductory price became the standard one, so every
+  // Sonnet session was OVER-reported by half. A dated price in an undated
+  // table goes wrong silently on a specific day, in either direction;
+  // `settleTurn`'s comparison against the CLI's own `total_cost_usd` is what
+  // says so.
+  'claude-sonnet-5': { input: 2, output: 10 },
   'claude-sonnet-4-6': { input: 3, output: 15 },
   'claude-haiku-4-5': { input: 1, output: 5 },
 }
@@ -123,8 +135,11 @@ export const CACHE_READ = 0.1
  * session last reported (persisted in the sidecar), then this table.
  */
 export const MODEL_WINDOWS: Record<string, number> = {
+  'claude-fable-5-1': 1_000_000,
+  'claude-mythos-5-1': 1_000_000,
   'claude-fable-5': 1_000_000,
   'claude-mythos-5': 1_000_000,
+  'claude-opus-5-5': 1_000_000,
   'claude-opus-5': 1_000_000,
   'claude-opus-4-8': 1_000_000,
   'claude-opus-4-7': 1_000_000,

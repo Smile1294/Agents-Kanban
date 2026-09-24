@@ -180,6 +180,14 @@ export interface RuntimeAgentCard {
   models?: { id: string; label: string }[]
   modelSource?: string
   modelNote?: string
+  /**
+   * Present for a runtime this page can UPDATE — Claude Code, whose model list
+   * is compiled into the CLI and which the board itself stops from updating
+   * (every run it spawns carries `DISABLE_UPDATES`). `newer` is a newer version
+   * known to exist on this machine (VS Code's Claude Code extension ships one);
+   * absent when none is known, and then the page claims nothing about it.
+   */
+  cliUpdate?: { newer?: string }
 }
 
 export interface ProviderCard {
@@ -236,6 +244,9 @@ export type SettingsMessage =
   | { type: 'signIn'; runtime: RuntimeId }
   | { type: 'install'; runtime: RuntimeId }
   | { type: 'refreshModels'; runtime: RuntimeId }
+  /** Run the agent's own updater. Claude Code only: its model list is compiled
+   *  into the binary, so a newer model needs a newer CLI. */
+  | { type: 'updateCli'; runtime: RuntimeId }
   | { type: 'selectProvider'; id: string }
   | { type: 'addProvider' }
   | { type: 'editProvider'; id: string }
@@ -391,6 +402,7 @@ export function parseMessage(raw: unknown): SettingsMessage | undefined {
     case 'signIn':
     case 'install':
     case 'refreshModels':
+    case 'updateCli':
       return known.has(runtime) ? ({ type, runtime: runtime as RuntimeId } as SettingsMessage) : undefined
     case 'selectProvider':
     case 'editProvider':

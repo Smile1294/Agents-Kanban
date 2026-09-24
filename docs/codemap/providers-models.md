@@ -50,8 +50,17 @@ trace of any other provider, the credential never lands beside the profile.
 point; `mergeModels` decides which list is in force and reports the source:
 `endpoint` → `cli` → `profile` → `builtin`. `discoverModels` asks
 `Query.supportedModels()` through `withSilentQuery`, once per provider, cached
-in `globalState`, never on the render or activation path; the result is applied
-only if the active profile is still the one captured before the `await`.
+in `globalState`, never on the render path; the result is applied only if the
+active profile is still the one captured before the `await`. It also returns
+the `version` of the binary that ANSWERED (resolved once, handed to the query):
+the list is compiled into the CLI, so it is exactly as new as that binary —
+Claude Code 2.1.272 has no Opus 5.5 anywhere in it. The host caches the version
+beside the list and re-asks, in the background after activation, only when the
+CLI on disk reports a different one. `ModelCatalogue.version` carries it (`cli`
+source only); `cliListNote(version, newest)` is the picker's footer ("Listed by
+Claude Code 2.1.272 — 2.1.281 is out") and claims staleness only when a newer
+version is KNOWN; `newModelNames(before, after)` names what an update brought
+(the ids are aliases that do not change, so identity is id + one-liner).
 `endpointChoices`, `modelsForProfile`; `effortsFor` / `thinkingFor` /
 `ultracodeFor` / `fastModeFor` — per-model capability gates (`supportsEffort ===
 true`; Haiku 4.5 has NEITHER field); `parseCachedChoices` — rejects the whole
@@ -121,6 +130,9 @@ re-read cost warning); its runtime cannot.
 - A custom endpoint's model list comes from the ENDPOINT; the CLI's list is
   about the CLI.
 - Fallback logic lives in exactly ONE place (`catalogueFor`).
+- The CLI's list is only as new as the CLI. A cached answer is valid for the
+  version that wrote it; a picker that does not say which version answered makes
+  a stale CLI look like a hardcoded list.
 - Anything read from `globalState` is parsed, not cast.
 - A value captured before an `await` is re-checked after it.
 - Switching provider applies to the NEXT session only.
@@ -136,3 +148,4 @@ re-read cost warning); its runtime cannot.
 
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S116g8 · dead-code sweep: `ResolvedProvider` type de-exported — module-private, used only by the private `EXPECTED` table.
+- 2026-09-24 · main · discovery reports the answering CLI's version; `cliListNote` / `newModelNames`; `models.test.ts` carries the real 2.1.272 and 2.1.281 answers and gates rates/windows over every captured answer.
