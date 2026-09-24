@@ -258,6 +258,32 @@ for (const key of Object.keys(declaredProps)) {
     `every executable-shaped setting is covered by the machine-scope check: ${key}`)
 }
 
+// Viewer discovery must NOT sit behind the write toggle.
+//
+// The host learned who was watching the relay only from `pollRemoteMessages`,
+// which returns early while `remote.writes` is off — the DEFAULT. So with the
+// write toggle off no viewer was ever discovered, no per-viewer frame slot was
+// ever built, and every browser page read the shared slot: the board could show
+// only the conversation the computer had open, and opening one on a phone did
+// nothing until somebody opened it at the desk. Reported exactly that way.
+//
+// A source check rather than a behavioural one, because the wiring lives inside
+// `activate()` with no seam — and a source check is the right shape for THIS
+// bug, which was a call sitting in the wrong function. The relay half is
+// covered behaviourally in the relay repo's own handler tests.
+{
+  const onAnswer = /onAnswer:\s*\(answer\)\s*=>\s*\{([\s\S]*?)\n      \}/.exec(src)
+  ok(!!onAnswer, 'the pusher answer handler is where the host reacts to a push')
+  ok(/answer\.slots/.test(onAnswer?.[1] ?? ''),
+    'the host learns which viewers exist from the PUSH answer, which happens whatever remote.writes says')
+  ok(/syncRemoteViewers\(/.test(onAnswer?.[1] ?? ''),
+    '…and builds a board for each of them from there')
+  // And the old path stays: a relay that answers the queue is still a source of
+  // the same list. Two callers of one function, not two functions that both know.
+  const callers = [...src.matchAll(/syncRemoteViewers\(/g)].length
+  ok(callers >= 3, `syncRemoteViewers is defined once and called from both paths (${callers} mentions)`)
+}
+
 // The extension spawns agents that edit this folder and run commands in it.
 // Workspace Trust is the mechanism that exists for exactly that, and an
 // extension that does not declare an answer is treated as supporting untrusted

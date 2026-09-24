@@ -167,6 +167,22 @@ export interface RelayAnswer {
    *  relay ignores `viewer` and every page silently shares one frame again —
    *  which is the bug slots exist to fix, arriving as a downgrade. */
   viewers?: boolean
+  /**
+   * WHICH slots the relay is keeping, most recently seen first.
+   *
+   * The same list `?msgs=1` answers, carried on the frame POST as well — and
+   * that is the point, not a convenience. The message poll is the WRITE
+   * channel and does not run at all while `remote.writes` is off, so a host
+   * that learned viewers only from there never learned about a page that was
+   * merely READING: no slot was built, every page fell back to the shared one,
+   * and the browser could only ever show the chat the computer had open. This
+   * rides a request the host makes whatever the write toggle says.
+   *
+   * Absent from a relay that does not send it, and absent is "not answered",
+   * never "no viewers" — clearing the slots on a silent relay would tear down
+   * every board this machine is serving.
+   */
+  slots?: string[]
 }
 
 export interface PusherDeps {
