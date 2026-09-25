@@ -4,10 +4,12 @@ description: One worktree per task — creation on a task branch, the load-beari
 paths:
   - src/git/*.ts
   - src/run/recipe.ts
+  - src/run/app.ts
 tests:
   - src/git/__tests__/worktree.test.ts
   - src/git/__tests__/lock.test.ts
   - src/run/__tests__/recipe.test.ts
+  - src/run/__tests__/app.test.ts
 last_verified: 2026-09-07
 ---
 # Git worktrees, review and merge
@@ -18,7 +20,13 @@ The whole return path for an agent's work: an isolated checkout per session,
 what changed in it, committing it, merging it back into the user's branch
 without committing on their behalf, refusing when the repository is not in a
 state to take it — plus the per-repository lock everything destructive runs
-under, and the detection of how to start the app inside a worktree.
+under, and the detection of how to start the app inside a worktree — and `src/run/app.ts`,
+which starts that same recipe for an AGENT (`AppProcesses`: child processes in
+their own process group, output in a ring buffer, the port taken only from the
+recipe, a `PORT` we chose, or a URL printed on the child's OWN output — never a
+scan, because another worktree's server on 3000 shows old code and looks fine;
+`announcedUrl`; `killTree` waits for the whole GROUP, since `sh -c` dies at
+once while its server still holds the port).
 
 ## Files
 
@@ -116,6 +124,7 @@ frames. Worktree cleanup is offered at `complete`, never automatic.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/run/app.ts` — `AppProcesses`, the Run recipe started as child processes for an agent (`app_start`), with its output kept, the port never scanned for, and the whole process group killed on stop; `app.test.ts` against real servers.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `realContains(root, abs)`
   — the containment check for an ABSOLUTE path, which `realResolveInWorktree`
   refuses by policy. It is what decides whether a `Read` is auto-allowed or

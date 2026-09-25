@@ -37,7 +37,10 @@ const ctxFor = (over: Partial<BoardToolContext> = {}): BoardToolContext => ({
 // Every board tool the agent is handed must also be one it may call without
 // stopping. This is the assertion that would have caught the shipped bug.
 const names = boardToolNames(DEFAULT_BOARD, tool)
-ok(names.length === 6, `six board tools are auto-allowed (${names.join(', ')})`)
+ok(names.length === 16, `sixteen board tools are auto-allowed — six card tools and ten app/browser tools (${names.join(', ')})`)
+for (const t of ['app_start', 'app_logs', 'browser_open', 'browser_snapshot', 'browser_screenshot', 'browser_act', 'browser_console']) {
+  ok(names.includes(boardToolName(t)), `${t} is auto-allowed — an agent that must ask before every click cannot verify anything`)
+}
 ok(names.includes(boardToolName('set_phase')), 'set_phase is among them — moving a card is the whole point')
 ok(names.includes(boardToolName('notify_user')), 'and notify_user, for when the agent is stuck mid-run')
 ok(names.includes(boardToolName('set_title')),
@@ -670,6 +673,45 @@ ok(d.includes('file') && d.includes('command') && d.includes('url'), 'and what t
 
   const plain = handler(ctxFor())
   ok(!plain.description.includes('docs/codemap'), 'and a repository without a codemap is told nothing about one')
+}
+
+// --- the app and browser tools ------------------------------------------------
+// Without a harness they still EXIST (so the auto-allow list is complete) and
+// say why they cannot work, rather than the agent finding no tool and reaching
+// for Bash with a browser it does not have.
+{
+  const bare = buildBoardTools(DEFAULT_BOARD, ctxFor(), tool)
+  type Callable = { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+  const open = bare.find((t) => t.name === 'browser_open') as unknown as Callable
+  const res = await open.handler({}, {}) as { content: { text: string }[]; isError?: boolean }
+  ok(res.isError === true && /not available/.test(res.content[0]!.text), 'without a harness, browser_open says it is not available')
+
+  // With one, a screenshot comes back as an IMAGE block the model can see, and
+  // the path the user can open — the whole point of "let the agent see the screen".
+  const calls: string[] = []
+  const harness = {
+    appStart: async () => ({ content: [{ type: 'text' as const, text: 'running' }] }),
+    appLogs: () => ({ content: [{ type: 'text' as const, text: 'logs' }] }),
+    appStop: async () => ({ content: [{ type: 'text' as const, text: 'stopped' }] }),
+    open: async (u?: string) => { calls.push(`open ${u ?? ''}`); return { content: [{ type: 'text' as const, text: 'opened' }] } },
+    snapshot: async () => ({ content: [{ type: 'text' as const, text: 'tree' }] }),
+    screenshot: async () => ({ content: [{ type: 'image' as const, data: 'AAAA', mimeType: 'image/jpeg' }, { type: 'text' as const, text: 'Saved to /x/shot-001.jpg' }] }),
+    act: async (a: { action: string }) => { calls.push(`act ${JSON.stringify(a)}`); return { content: [{ type: 'text' as const, text: 'done' }] } },
+    evaluate: async () => ({ content: [{ type: 'text' as const, text: '1' }] }),
+    console: () => ({ content: [{ type: 'text' as const, text: 'none' }] }),
+    close: async () => ({ content: [{ type: 'text' as const, text: 'closed' }] }),
+    dispose: async () => {},
+  }
+  const wired = buildBoardTools(DEFAULT_BOARD, ctxFor({ harness }), tool)
+  const by = (n: string) => wired.find((t) => t.name === n) as unknown as Callable
+  const shot = await by('browser_screenshot').handler({}, {}) as { content: { type: string }[] }
+  ok(shot.content[0]!.type === 'image', 'browser_screenshot returns an image content block')
+  await by('browser_act').handler({ action: 'fill', target: '#q', text: 'hi', submit: true }, {})
+  ok(calls.includes('act {"action":"fill","target":"#q","text":"hi","submit":true}'), 'browser_act passes a fill through whole')
+  const bad = await by('browser_act').handler({ action: 'click' }, {}) as { content: { text: string }[]; isError?: boolean }
+  ok(bad.isError === true && /needs `target`/.test(bad.content[0]!.text), 'a click with no target is refused with the missing field named')
+  await by('browser_open').handler({}, {})
+  ok(calls.includes('open '), 'browser_open with no url asks the harness for the running app')
 }
 
 console.log(fails === 0 ? 'PASS — board tools are reachable, and the approval boundary holds' : `${fails} FAILURES`)

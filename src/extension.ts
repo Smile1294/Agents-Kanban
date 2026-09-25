@@ -41,6 +41,9 @@ import {
 } from './board/decomposition.ts'
 import { coalesce } from './board/coalesce.ts'
 import { describeImages, sanitiseImages } from './agent/images.ts'
+import { BrowserPool } from './agent/browser.ts'
+import type { HarnessDeps } from './agent/harness.ts'
+import { AppProcesses } from './run/app.ts'
 import {
   COMMON_DEV_PORTS, detect as detectRun, isListening, readWtRegistry, waitForPort,
 } from './run/recipe.ts'
@@ -3004,14 +3007,53 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return { profile: p, env: envForProfile(p, secret, process.env) }
   }
 
+  /* The agents' own app and browser (src/agent/harness.ts): ONE process table
+     and ONE Chromium per window, a context per run inside it. The browser's
+     options are read when it LAUNCHES, so a changed executable or the headed
+     switch applies to the next browser rather than needing a reload; turning
+     the tools off or on is read when the manager is made, which is once per
+     window. Both are torn down with the extension — an agent-started dev
+     server surviving a window reload is a port held by nobody. */
+  const agentApps = new AppProcesses()
+  const agentBrowser = new BrowserPool(() => ({
+    executable: cfg().get<string>('browserExecutable') || undefined,
+    allowExternal: cfg().get<boolean>('browserAllowExternal') === true,
+    headed: cfg().get<boolean>('browserHeaded') === true,
+    shotsDir: vscode.Uri.joinPath(context.globalStorageUri, 'screens').fsPath,
+    log: (line) => log.info(line),
+  }))
+  context.subscriptions.push({
+    dispose: () => {
+      void agentApps.stopAll().catch(() => {})
+      void agentBrowser.shutdown().catch(() => {})
+    },
+  })
+  const harnessDeps = (): HarnessDeps | undefined => {
+    if (cfg().get<boolean>('agentBrowser') === false) return undefined
+    return {
+      apps: agentApps,
+      browser: agentBrowser,
+      // The Run button's recipe, the same settings — one answer to "how does
+      // this project start", whoever is asking.
+      recipe: (dir) => detectRun({
+        worktree: dir,
+        ...(ws?.repoRoot ? { repoRoot: ws.repoRoot } : {}),
+        ...(cfg().get<string>('runCommand') ? { configuredCommand: cfg().get<string>('runCommand')! } : {}),
+        ...(cfg().get<string>('runUrl') ? { configuredUrl: cfg().get<string>('runUrl')! } : {}),
+      }),
+    }
+  }
+
   const ensureManager = (): AgentManager => {
     const w = requireWs()
     if (!w.worktrees) {
       throw new Error(`${w.root} is not a git repository, so agents cannot be isolated in worktrees.`)
     }
     if (!w.manager) {
+      const harness = harnessDeps()
       w.manager = new AgentManager({
         store: w.store,
+        ...(harness ? { harness } : {}),
         worktrees: w.worktrees,
         board: w.board,
         defaults: { model, effort, thinking, ultracode, fastMode, runtime },
@@ -3295,6 +3337,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (choice !== 'Remove worktree') return
     try {
       // Keep the branch: the commits are the work, and a merge may still be wanted.
+      // The app an agent left running there goes first: a dev server whose
+      // directory has been deleted is a port held by nothing anyone can see.
+      await agentApps.stop(wt.dir)
       await w.worktrees.remove(wt.dir, { force: true, keepBranch: true })
       // '' and not undefined: stripUndefined() would drop the key and leave the
       // card pointing at a directory that no longer exists.
@@ -5172,6 +5217,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const term = vscode.window.createTerminal({ name: `Test ${wt.branch}`, cwd: wt.dir })
         term.show()
         term.sendText(target, false)
+        return
+      }
+      // A screenshot the agent's browser took. Those live in extension storage
+      // on purpose (an untracked file in the worktree would be committed on
+      // the move into review), so they are the ONE place outside the worktree
+      // a file link may point — checked by real path, like the worktree, and
+      // opened in the image viewer rather than as text.
+      const shots = vscode.Uri.joinPath(context.globalStorageUri, 'screens').fsPath
+      const shot = path.isAbsolute(target) ? await realResolveInWorktree(shots, path.relative(shots, target)) : undefined
+      if (shot) {
+        await ownLayoutChange(async () => {
+          await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(shot), { preview: true, viewColumn: vscode.ViewColumn.Beside })
+        }).catch(() => vscode.window.showWarningMessage(`Could not open the screenshot ${target} — it may have been pruned.`))
         return
       }
       // A file, relative to the worktree. Refuse to escape it: the target comes

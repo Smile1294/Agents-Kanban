@@ -243,6 +243,7 @@ const EXECUTABLE_SETTINGS = [
   'agentsKanban.codexExecutable',
   'agentsKanban.whisperPath',
   'agentsKanban.ffmpegPath',
+  'agentsKanban.browserExecutable',
 ]
 const declaredProps = manifest.contributes?.configuration?.properties ?? {}
 for (const key of EXECUTABLE_SETTINGS) {

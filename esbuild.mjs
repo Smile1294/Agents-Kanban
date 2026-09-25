@@ -10,7 +10,11 @@ const watch = process.argv.includes('--watch')
  *  - `zod`: a PEER dependency of the Agent SDK. Bundling it inline would give us a
  *    second zod instance while the SDK resolves its own from node_modules, and the
  *    two disagree on instanceof checks during schema conversion. One instance only.
- *  All three ship inside the .vsix via node_modules. */
+ *  - `playwright-core`: the agents' browser (`src/agent/browser.ts`). It locates
+ *    its own driver files relative to its package directory at runtime, which a
+ *    bundle breaks, and it is loaded lazily by dynamic import() so a session
+ *    that never opens a browser never loads it.
+ *  All four ship inside the .vsix via node_modules. */
 const ctx = await esbuild.context({
   entryPoints: ['src/extension.ts'],
   bundle: true,
@@ -20,7 +24,7 @@ const ctx = await esbuild.context({
   format: 'cjs',
   sourcemap: true,
   minify: !watch,
-  external: ['vscode', '@anthropic-ai/claude-agent-sdk', 'zod'],
+  external: ['vscode', '@anthropic-ai/claude-agent-sdk', 'zod', 'playwright-core'],
   logLevel: 'info',
 })
 

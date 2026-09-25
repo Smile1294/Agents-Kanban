@@ -26,6 +26,7 @@ import { describeWhen, parseScheduleDraft, type Schedule, type ScheduleDraft } f
 import { loadSdk } from './sdk.ts'
 import { describeSpawnAgents, type SpawnAgent } from './routing.ts'
 import type { KnowledgeVerdict } from '../board/codemap.ts'
+import { buildHarnessTools, type Harness } from './harness.ts'
 
 /** The MCP namespace these tools are mounted under; `mcpServers: { board: … }`. */
 export const BOARD_SERVER = 'board'
@@ -211,6 +212,13 @@ export interface BoardToolContext {
   onScheduleCreate?: (draft: ScheduleDraft, createdBy: string) => Promise<ScheduleCreateOutcome>
   onScheduleDelete?: (id: string) => Promise<ScheduleActOutcome>
   onScheduleRun?: (id: string) => Promise<ScheduleActOutcome>
+  /**
+   * Start the app in this session's worktree and drive a browser at it
+   * (`harness.ts`). Bound to ONE run, like everything else here. Absent means
+   * the host has no harness (tests, a host without a browser pool), and the
+   * `app_*` / `browser_*` tools say so when called.
+   */
+  harness?: Harness
 }
 
 type Content = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -786,6 +794,10 @@ export function buildBoardTools(
   return [
     setPhase, setTitle, setTags, listBoard, splitTask, notifyUser,
     listSchedules, createSchedule, deleteSchedule, runSchedule,
+    // The app and browser tools. Built whatever the context, like the
+    // schedule tools, so the auto-allow list derived below covers them; a
+    // context without a harness answers each call with the reason.
+    ...buildHarnessTools(ctx.harness, tool),
   ]
 }
 

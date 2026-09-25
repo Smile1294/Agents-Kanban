@@ -8,6 +8,8 @@ paths:
   - src/agent/board-bridge.ts
   - src/agent/images.ts
   - src/agent/dictation.ts
+  - src/agent/harness.ts
+  - src/agent/browser.ts
   - src/board-mcp.ts
 tests:
   - src/agent/__tests__/manager.test.ts
@@ -18,6 +20,8 @@ tests:
   - src/agent/__tests__/board-bridge.test.ts
   - src/agent/__tests__/images.test.ts
   - src/agent/__tests__/dictation.test.ts
+  - src/agent/__tests__/harness.test.ts
+  - src/agent/__tests__/browser.test.ts
 last_verified: 2026-09-07
 ---
 # Agent runs — what is running
@@ -91,6 +95,32 @@ bound to ONE session (`key()`, `onChanged`, `onNotice`, `onSplit`,
 `spawnAgents`, `commitWorktree`, `knowledgeCheck`, `onRename`, `derivedTitle`,
 `sessionTitle`, `onSchedule*`). Tests: `tools.test.ts`, `board-bridge.test.ts`.
 
+**`src/agent/harness.ts`**. The tools an agent uses to LOOK at its own work,
+riding the board server so both transports carry them: `app_start` /
+`app_logs` / `app_stop` (the HOST's Run recipe, started as child processes in
+the agent's worktree via `run/app.ts`, output kept for the agent) and
+`browser_open` / `browser_snapshot` / `browser_screenshot` / `browser_act` /
+`browser_eval` / `browser_console` / `browser_close`. `buildHarnessTools(h,
+tool)` — ALWAYS built (so `boardToolNames` auto-allows them) and answering "not
+available" without a harness; `bindHarness(deps, worktree, runKey)` — one run's
+view, never throwing at the agent; `harnessBrief()` — the brief's paragraph,
+stated only when the host has a harness; `MAX_APPS`. The app is keyed by
+WORKTREE and outlives the run (the test plan links to it); the browser is keyed
+by RUN id and closes with it (`finish()` / `halt()`). Tests: `harness.test.ts`
+(real child processes), `tools.test.ts` (image content, the unavailable path).
+
+**`src/agent/browser.ts`**. `BrowserPool`: one lazily launched Chromium
+(`playwright-core`, external in the bundle) and a context per run key.
+`open` (loopback only unless `browserAllowExternal` — `allowedUrl` is the
+boundary, in code), `snapshot` (the ARIA tree — the cheap view), `screenshot`
+(JPEG, 1280x800, saved under extension storage `screens/` for the user,
+`KEEP_SHOTS` per card), `act`, `evaluate`, `console` — console errors, page
+errors, failed requests and HTTP >= 400 are collected from the moment a page
+opens and reported ONCE with the step that caused them. `findBrowser()` — the
+setting, any Playwright-cached build, then installed Chrome/Chromium/Edge.
+Test: `browser.test.ts` — a real Chromium against a real local page; FAILS
+without one, like `layout.test.mjs`.
+
 **`src/agent/board-bridge.ts`**. `startBoardBridge(board, ctx, {dir, script})`
 serves the same definitions over a unix socket / named pipe for a runtime that
 spawns MCP servers; per SESSION (the tools take no id, so a Codex agent cannot
@@ -132,7 +162,8 @@ review is "how a run ENDS", because a project's own slash command once ended
 with "Then STOP" and finished work sat in Implementing.
 
 **The brief** (`buildBrief`): the card name and branch, the two moves, the
-`howToTest` requirement, `set_tags`, `set_title`, the aim sentence for the
+`howToTest` requirement, `set_tags`, the app/browser paragraph when the host
+has a harness, `set_title`, the aim sentence for the
 orchestration level, the split rules and the spawn catalogue (parent sessions
 only), and — when the repository carries a `docs/codemap/` — the knowledge-file
 rule and the fact that the review move is refused without it.
@@ -190,6 +221,7 @@ started column while the title is still the guess.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · agents can look at their own work: `harness.ts` (app_start/app_logs/app_stop + seven browser_* tools, on the board server, auto-allowed, always defined) and `browser.ts` (`BrowserPool` on `playwright-core`, loopback-only by default, console/network errors reported with each step, screenshots as image blocks and saved to extension storage); the brief says so when a harness exists; the browser closes with the run, the app stays for the test plan.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `AUTO_ALLOW_BUILTIN` lost
   `WebFetch`, `WebSearch` and `Read`. The comment above it said "Read-only, and
   the agent is confined to its own worktree anyway" and both halves were false:

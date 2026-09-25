@@ -31,6 +31,7 @@ import {
   type ProposalNote, MAX_STATED,
 } from '../board/decomposition.ts'
 import { knowledgeCheck, loadCodemap } from '../board/codemap.ts'
+import { bindHarness, harnessBrief, type Harness, type HarnessDeps } from './harness.ts'
 import {
   agentKeyOf, describeSpawnAgents, resolveRoute,
   type PieceRoute, type SpawnAgent, type SpawnCatalogue,
@@ -95,6 +96,12 @@ export function launchSettings(opts: Pick<LaunchOptions, 'chosen'>, defaults: Ru
 
 export interface ManagerOptions {
   store: SessionStore
+  /**
+   * The app and browser an agent uses to look at its own work (`harness.ts`).
+   * Absent means the `app_*` / `browser_*` tools answer "not available" and
+   * the brief does not mention them.
+   */
+  harness?: HarnessDeps
   worktrees: WorktreeService
   board: BoardConfig
   defaults: AgentDefaults
@@ -386,6 +393,9 @@ export interface LaunchOptions {
 
 export interface RunningAgent {
   runId: string
+  /** This run's app and browser tools, bound once. Its browser closes when the
+   *  run ends; the app belongs to the worktree and outlives it. */
+  harness?: Harness
   /** Which agent program is running this. Fixed for the life of the session:
    *  the transcript, the model ids and the login all belong to it. */
   runtime: RuntimeId
@@ -1095,6 +1105,12 @@ export class AgentManager extends EventEmitter {
         : undefined,
       onScheduleDelete: this.opts.schedules ? async (id) => this.opts.schedules!.remove(id) : undefined,
       onScheduleRun: this.opts.schedules ? async (id) => this.opts.schedules!.run(id) : undefined,
+      // Bound to the RUN id — stable for the run's whole life, where the card
+      // key changes when the session id arrives — and to the worktree read at
+      // call time, which does not exist yet when the context is built.
+      ...(this.opts.harness
+        ? { harness: (agent.harness ??= bindHarness(this.opts.harness, () => agent.worktreePath, agent.runId)) }
+        : {}),
     }
   }
 
@@ -1517,6 +1533,9 @@ export class AgentManager extends EventEmitter {
       // leaked node process and an open descriptor per ended session.
       this.bridges.get(runId)?.dispose()
       this.bridges.delete(runId)
+      // And its browser — ~150MB of Chromium nobody else looks at. The APP is
+      // left running: the test plan the agent just wrote links to it.
+      void agent.harness?.dispose().catch(() => {})
       // This run reached the end under its own power, so it was not cut off.
       // Zero, not undefined: a patch drops undefined and the mark would stay.
       if (agent.sessionId) void this.opts.store.patch(agent.sessionId, { running: 0 }).catch(() => {})
@@ -1649,7 +1668,7 @@ export class AgentManager extends EventEmitter {
       executable: location.command,
       appendSystemPrompt: buildBrief(
         this.opts.board, title, wt.branch, policyFor(level), canSplit, spawnAgents,
-        agent.knowledgeFiles === true,
+        agent.knowledgeFiles === true, !!this.opts.harness,
       ),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
@@ -1755,6 +1774,7 @@ export class AgentManager extends EventEmitter {
     try {
       if (!(await this.opts.worktrees.isClean(agent.worktreePath))) return
       if (agent.base && (await this.opts.worktrees.aheadOf(agent.worktreePath, agent.base)) > 0) return
+      await this.opts.harness?.apps.stop(agent.worktreePath)
       await this.opts.worktrees.remove(agent.worktreePath, { force: true })
     } catch {
       // Keeping a stale worktree is the safe way to fail here.
@@ -1863,6 +1883,7 @@ export class AgentManager extends EventEmitter {
 
   /** Tear a run down without judging why. See stop() and stopAll(). */
   private halt(a: RunningAgent): void {
+    void a.harness?.dispose().catch(() => {})
     this.sessions.get(a.runId)?.stop()
     this.sessions.delete(a.runId)
     // Same reason as in `finish()`. `stopAll()` runs on host teardown, so this
@@ -1941,6 +1962,8 @@ export function buildBrief(
   /** Whether the worktree carries `docs/codemap/`. The rule is stated only
    *  where it applies; on any other repository the paragraph would be noise. */
   knowledgeFiles = false,
+  /** Whether the app and browser tools work in this host. Stated only then. */
+  harness = false,
 ): string {
   const started = board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'
   const review = board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
@@ -1976,6 +1999,7 @@ export function buildBrief(
     '',
     'Use `set_tags` once you know what this work touches, so it can be found later.',
     '',
+    ...(harness ? harnessBrief() : []),
     'That card name was taken from the first line of the request, so it is often',
     'not what the work turns out to be. Once you know, call `set_title` with six',
     'words or fewer. It renames the CARD only — your branch and worktree keep the',

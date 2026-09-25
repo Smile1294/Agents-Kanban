@@ -192,6 +192,27 @@
           "default": "",
           "markdownDescription": "URL to open once `agentsKanban.runCommand` is serving, e.g. `http://localhost:3000`. Leave empty to use the port the detected launcher assigned. Only used alongside a custom `runCommand`."
         },
+        "agentsKanban.agentBrowser": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Give agents their own headless browser and app tools (`app_start`, `browser_open`, `browser_snapshot`, `browser_screenshot`, `browser_act`, …) so they can start the app in their worktree and check their own work before handing it over. Applies to sessions started after the change."
+        },
+        "agentsKanban.browserExecutable": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Chromium, Chrome or Edge for the agents' browser. Leave empty to use a Playwright-cached Chromium or an installed Chrome/Chromium/Edge.",
+          "scope": "machine"
+        },
+        "agentsKanban.browserAllowExternal": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Let the agents' browser open sites other than this machine (`localhost`). Off by default: a page is text the agent reads and acts on, and these tools run without a permission prompt."
+        },
+        "agentsKanban.browserHeaded": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show the agents' browser window instead of running it headless, to watch an agent test its work."
+        },
         "agentsKanban.provider": {
           "type": "string",
           "default": "inherit",
@@ -437,6 +458,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.259",
+    "playwright-core": "1.49.1",
     "zod": "^4.0.0"
   },
   "devDependencies": {

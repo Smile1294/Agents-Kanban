@@ -123,6 +123,12 @@ ok(has('node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs'),
 ok(hasPrefix('node_modules/zod/'),
   'zod ships — it is the SDK peer dependency and must be the SAME instance')
 
+// The agents' browser. External in the bundle and loaded lazily, so a package
+// without it builds, installs and activates fine — and every browser_* tool
+// then answers "missing playwright-core" in the first session that tries one.
+ok(has('node_modules/playwright-core/package.json'),
+   'playwright-core ships, for the agents\' browser tools')
+
 // And the one that must NOT ship: ~190MB per platform, an 87MB .vsix.
 ok(!hasPrefix('node_modules/@anthropic-ai/claude-agent-sdk-'),
   'the SDK native binary is excluded (resolveClaudeExecutable finds the CLI instead)')

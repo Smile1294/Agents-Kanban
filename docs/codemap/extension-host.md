@@ -320,6 +320,7 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the agents' harness is made here — one `AppProcesses` and one `BrowserPool` per window (options read at launch, torn down on dispose), handed to `AgentManager` as `harness` unless `agentBrowser` is off; removing a worktree stops its agent app first; a test-plan file link may also point into extension storage `screens/` (the one place outside the worktree), opened with `vscode.open`; four new settings: `agentBrowser`, `browserExecutable`, `browserAllowExternal`, `browserHeaded`; `playwright-core` is a runtime dependency.
 - 2026-09-24 · main · the model cache records the CLI version that wrote it and is re-asked when it moves; the picker names that version and offers "Update Claude Code…" when VS Code's own Claude Code extension is newer; `updateClaude()` behind a row, a settings button and the `updateClaudeCode` command; first `vscode.extensions` use.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **a repository could
   name the binary we spawn.** The four executable-path settings declared no
