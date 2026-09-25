@@ -32,6 +32,7 @@ import type { AppProcesses, AppStatus } from '../run/app.ts'
 import type { RunRecipe } from '../run/recipe.ts'
 import type { Action, BrowserPool } from './browser.ts'
 import type { loadSdk } from './sdk.ts'
+import type { Verification } from '../sessions/meta.ts'
 
 /** Agent-started apps kept alive at once. The oldest goes when a new one starts. */
 export const MAX_APPS = 4
@@ -68,6 +69,9 @@ export interface Harness {
   close(): Promise<ToolContent>
   /** Close this run's browser. Called when the run ends. */
   dispose(): Promise<void>
+  /** What this run was seen to check in its browser, or undefined when it
+   *  opened nothing. Stamped onto the test plan by `set_phase`. */
+  ledger(): Verification | undefined
 }
 
 export function describeApp(s: AppStatus, logTail: string[] = []): string {
@@ -89,6 +93,16 @@ export function describeApp(s: AppStatus, logTail: string[] = []): string {
 export function bindHarness(deps: HarnessDeps, worktree: () => string | undefined, runKey: string): Harness {
   const wrap = async (f: () => Promise<ToolContent>): Promise<ToolContent> => {
     try { return await f() } catch (e) { return err(e instanceof Error ? e.message : String(e)) }
+  }
+  // The ledger: counted HERE, where the calls happen, not asked of the agent.
+  let pages = 0
+  let actions = 0
+  const shots: string[] = []
+  let lastErrors = 0
+  let lastUrl: string | undefined
+  const settle = () => {
+    lastErrors = deps.browser.errorsOnPage?.(runKey) ?? lastErrors
+    lastUrl = deps.browser.url?.(runKey) ?? lastUrl
   }
   const dir = () => {
     const d = worktree()
@@ -149,11 +163,16 @@ export function bindHarness(deps: HarnessDeps, worktree: () => string | undefine
         }
         target = st.url
       }
-      return ok(await deps.browser.open(runKey, target))
+      const text = await deps.browser.open(runKey, target)
+      pages += 1
+      settle()
+      return ok(text)
     }),
     snapshot: (target) => wrap(async () => ok(await deps.browser.snapshot(runKey, target))),
     screenshot: (opts) => wrap(async () => {
       const shot = await deps.browser.screenshot(runKey, opts)
+      if (shot.saved) { shots.push(shot.saved); if (shots.length > 6) shots.shift() }
+      settle()
       return {
         content: [
           { type: 'image', data: shot.data, mimeType: shot.mimeType },
@@ -164,11 +183,26 @@ export function bindHarness(deps: HarnessDeps, worktree: () => string | undefine
         ],
       }
     }),
-    act: (a) => wrap(async () => ok(await deps.browser.act(runKey, a))),
-    evaluate: (expression) => wrap(async () => ok(await deps.browser.evaluate(runKey, expression))),
+    act: (a) => wrap(async () => {
+      const text = await deps.browser.act(runKey, a)
+      actions += 1
+      settle()
+      return ok(text)
+    }),
+    evaluate: (expression) => wrap(async () => {
+      const text = await deps.browser.evaluate(runKey, expression)
+      settle()
+      return ok(text)
+    }),
     console: (clear) => ok(deps.browser.console(runKey, clear)),
     close: () => wrap(async () => ok((await deps.browser.close(runKey)) ? 'Closed the browser.' : 'No browser was open.')),
     dispose: async () => { await deps.browser.close(runKey).catch(() => false) },
+    ledger: () => {
+      if (!pages) return undefined
+      // The page may have logged more since the last call (a timer, a poll).
+      settle()
+      return { pages, actions, screenshots: [...shots], consoleErrors: lastErrors, ...(lastUrl ? { url: lastUrl } : {}), at: Date.now() }
+    },
   }
 }
 

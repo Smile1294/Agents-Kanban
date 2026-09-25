@@ -336,6 +336,13 @@ export function buildBoardTools(
       // silently: the user gets a card that says "ready" and no idea what to do
       // with it. The description asks; this makes it so.
       const plan = normaliseTestPlan(args.howToTest)
+      // The evidence is the HOST's record of what the browser tools saw, never
+      // the agent's: a `verified` it wrote into howToTest itself is dropped.
+      if (plan) {
+        delete plan.verified
+        const seen = ctx.harness?.ledger()
+        if (seen) plan.verified = seen
+      }
       // isHumanOnly already returned above, so the phase is one the agent may set.
       if (isReviewColumn(board, args.phase) && !plan) {
         return err(

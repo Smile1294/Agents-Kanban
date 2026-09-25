@@ -701,6 +701,7 @@ ok(d.includes('file') && d.includes('command') && d.includes('url'), 'and what t
     console: () => ({ content: [{ type: 'text' as const, text: 'none' }] }),
     close: async () => ({ content: [{ type: 'text' as const, text: 'closed' }] }),
     dispose: async () => {},
+    ledger: () => ({ pages: 2, actions: 3, screenshots: ['/s/shot-001.jpg'], consoleErrors: 1, url: 'http://localhost:5173/', at: 5 }),
   }
   const wired = buildBoardTools(DEFAULT_BOARD, ctxFor({ harness }), tool)
   const by = (n: string) => wired.find((t) => t.name === n) as unknown as Callable
@@ -712,6 +713,29 @@ ok(d.includes('file') && d.includes('command') && d.includes('url'), 'and what t
   ok(bad.isError === true && /needs `target`/.test(bad.content[0]!.text), 'a click with no target is refused with the missing field named')
   await by('browser_open').handler({}, {})
   ok(calls.includes('open '), 'browser_open with no url asks the harness for the running app')
+}
+
+// --- the move into review carries what the browser SAW -----------------------
+{
+  const plans: Array<Record<string, unknown>> = []
+  const ctx = ctxFor({
+    store: {
+      get: async () => ({ phase: 'implementing', tags: [] }),
+      card: async () => ({ phase: 'implementing', tags: [] }),
+      childrenOf: async () => [], setPhase: async () => {}, setTags: async () => {},
+      setTestPlan: async (_id: string, p: Record<string, unknown>) => { plans.push(p) }, list: async () => [],
+    } as never,
+    harness: { ledger: () => ({ pages: 2, actions: 3, screenshots: ['/s/shot-001.jpg'], consoleErrors: 1, at: 5 }) } as never,
+  })
+  const setPhase = buildBoardTools(DEFAULT_BOARD, ctx, tool).find((t) => t.name === 'set_phase') as unknown as {
+    handler: (a: unknown, e: unknown) => Promise<unknown>
+  }
+  await setPhase.handler({ phase: 'validating', howToTest: {
+    summary: 'Fixed the Add button', steps: ['Click Add'], links: [],
+    verified: { pages: 99, actions: 99, screenshots: [], consoleErrors: 0, at: 1 },
+  } }, {})
+  const v = plans[0]?.verified as { pages?: number; consoleErrors?: number } | undefined
+  ok(v?.pages === 2 && v?.consoleErrors === 1, `the plan carries the host's ledger, not the agent's claim (${JSON.stringify(v)})`)
 }
 
 console.log(fails === 0 ? 'PASS — board tools are reachable, and the approval boundary holds' : `${fails} FAILURES`)

@@ -24,6 +24,10 @@ const browser = {
   open: async (key: string, url: string) => { opened.push(`${key} ${url}`); return `Opened ${url}` },
   close: async () => true,
   snapshot: async () => { throw new Error('No page is open for this card. Use browser_open first.') },
+  act: async () => 'Done',
+  screenshot: async () => ({ data: 'AA', mimeType: 'image/jpeg', saved: '/shots/shot-001.jpg', where: 'x', news: '' }),
+  errorsOnPage: () => 2,
+  url: () => 'http://localhost:3100/',
 } as unknown as BrowserPool
 
 const apps = new AppProcesses()
@@ -49,6 +53,13 @@ try {
   await h.open()
   ok(opened.length === 1 && /^run-1 http:\/\/localhost:\d+$/.test(opened[0]!), `browser_open with no url opens the running app, keyed by RUN (${opened[0]})`)
 
+  ok(h.ledger()?.pages === 1, 'the ledger counts the page it opened')
+  await h.act({ action: 'click', target: '#add' })
+  await h.screenshot({})
+  const led = h.ledger()
+  ok(led?.actions === 1 && led?.screenshots[0] === '/shots/shot-001.jpg' && led?.consoleErrors === 2 && led?.url === 'http://localhost:3100/',
+     `and the action, the screenshot and the errors on the page it left (${JSON.stringify(led)})`)
+
   const logs = h.appLogs(20) as Out
   ok(/Local: http:\/\/localhost/.test(text(logs)), 'app_logs shows the server\'s own output')
 
@@ -63,6 +74,7 @@ try {
   ok(refused.isError === true && /runCommand/.test(text(refused)) && /Bash/.test(text(refused)),
     'no recipe is an answer naming the setting and the way round it — never a guessed command')
 
+  ok(none.ledger() === undefined, 'a run that opened nothing has no record — not a record of zero')
   const noTree = bindHarness({ apps, browser, recipe: async () => undefined }, () => undefined, 'run-3')
   ok(/no worktree/.test(text(await noTree.appStart() as Out)), 'a run without a worktree says so')
 

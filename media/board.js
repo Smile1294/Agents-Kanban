@@ -2420,6 +2420,33 @@
 
     const body = el('div', 'testplan-body')
     if (p.summary) body.append(el('div', 'testplan-summary', p.summary))
+    // What the agent's browser was SEEN to do, recorded host-side — numbers,
+    // with the error count coloured when it is not zero, because "checked in a
+    // browser" alone would be a signal that cannot say bad.
+    const v = p.verified
+    if (v && typeof v.pages === 'number') {
+      const row = el('div', 'testplan-verified' + (v.consoleErrors ? ' bad' : ''))
+      row.append(el('span', 'testplan-verified-icon', '🌐'))
+      row.append(el('span', null,
+        'Checked in a browser: ' + v.pages + (v.pages === 1 ? ' page' : ' pages') +
+        ' · ' + v.actions + (v.actions === 1 ? ' action' : ' actions') +
+        ' · ' + (v.screenshots || []).length + ((v.screenshots || []).length === 1 ? ' screenshot' : ' screenshots') +
+        ' · ' + v.consoleErrors + (v.consoleErrors === 1 ? ' error' : ' errors') + ' on the last page'))
+      row.title = v.url ? 'Last page: ' + v.url : ''
+      body.append(row)
+      if ((v.screenshots || []).length) {
+        const shots = el('div', 'testplan-links')
+        v.screenshots.forEach((path, i) => {
+          const sb = el('button', 'testlink kind-file')
+          sb.append(el('span', 'testlink-icon', '🖼'))
+          sb.append(el('span', 'testlink-label', 'Screenshot ' + (i + 1)))
+          sb.title = 'Open ' + path
+          sb.onclick = () => post('testLink', { id: c.key, kind: 'file', target: path })
+          shots.append(sb)
+        })
+        body.append(shots)
+      }
+    }
 
     if (p.steps && p.steps.length) {
       const ol = el('ol', 'testplan-steps')

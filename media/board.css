@@ -1253,6 +1253,8 @@ details.thinking summary::-webkit-details-marker { display: none; }
   flex-direction: column;
   gap: 8px;
 }
+.testplan-verified { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 0.9em; margin: 4px 0; }
+.testplan-verified.bad { color: var(--warn); }
 .testplan-summary { font-size: 0.88em; line-height: 1.5; }
 .testplan-steps {
   margin: 0;

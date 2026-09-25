@@ -88,6 +88,47 @@ export interface TestPlan {
   steps: string[]
   links: TestLink[]
   at: number
+  /** What the agent was SEEN to check in its browser, recorded by the host —
+   *  never taken from the agent's own `howToTest`, which is prose. */
+  verified?: Verification
+}
+
+/**
+ * The evidence behind a test plan: what the agent's browser tools recorded
+ * during the run that wrote it (`agent/harness.ts`). Numbers, because "tested
+ * in the browser ✓" is a signal that cannot say bad and "2 console errors" is
+ * one that can.
+ */
+export interface Verification {
+  /** Pages the agent opened and that loaded. */
+  pages: number
+  /** Clicks, fills, key presses… on those pages. */
+  actions: number
+  /** Screenshot files it took (newest last, at most six), openable from the card. */
+  screenshots: string[]
+  /** Errors on the page the agent left open: console errors, uncaught
+   *  exceptions, failed requests, HTTP >= 400 since that page was opened. */
+  consoleErrors: number
+  /** That page. */
+  url?: string
+  at: number
+}
+
+/** A stored `Verification`, parsed rather than cast; nonsense is no record. */
+export function parseVerification(raw: unknown): Verification | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Record<string, unknown>
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined)
+  const pages = n(r.pages), actions = n(r.actions), consoleErrors = n(r.consoleErrors)
+  if (pages === undefined || actions === undefined || consoleErrors === undefined) return undefined
+  const screenshots = Array.isArray(r.screenshots)
+    ? r.screenshots.filter((x): x is string => typeof x === 'string' && targetIsClean(x)).slice(-6)
+    : []
+  return {
+    pages, actions, consoleErrors, screenshots,
+    ...(typeof r.url === 'string' && r.url && targetIsClean(r.url) ? { url: r.url.slice(0, 500) } : {}),
+    at: typeof r.at === 'number' ? r.at : Date.now(),
+  }
 }
 
 /** As long as a card title gets to be before it is cut short. */
@@ -151,11 +192,13 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
       })
     : []
   if (!summary && !steps.length && !links.length) return undefined
+  const verified = parseVerification(r.verified)
   return {
     summary,
     steps,
     links,
     at: typeof r.at === 'number' ? r.at : Date.now(),
+    ...(verified ? { verified } : {}),
   }
 }
 

@@ -854,6 +854,24 @@ for (const label of ['calc.js', 'Run the tests', 'Local server']) {
   ok(!!findButton(planned.root, label), `"${label}" is a clickable button`)
 }
 
+// The browser evidence: counted, with the error count visible, and each
+// screenshot a button that opens it.
+{
+  const seen = run({
+    ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{ ...WT_CARD, testPlan: { ...PLAN, verified: {
+      pages: 2, actions: 4, screenshots: ['/g/screens/k/shot-001.jpg', '/g/screens/k/shot-002.jpg'], consoleErrors: 1, at: 1 } } }],
+  })
+  ok(seen.text().includes('Checked in a browser: 2 pages · 4 actions · 2 screenshots · 1 error on the last page'),
+     'the plan says what the browser saw, in numbers')
+  const shot = findButton(seen.root, 'Screenshot 2')
+  ok(!!shot, 'each screenshot is a button')
+  shot?.onclick()
+  ok(seen.posted.some((m) => m.type === 'testLink' && m.kind === 'file' && m.target === '/g/screens/k/shot-002.jpg'),
+     'which opens that screenshot')
+  ok(!planned.text().includes('Checked in a browser'), 'a plan with no record claims nothing')
+}
+
 // A session with no plan must not grow an empty panel.
 const unplanned = run({ ...base, mode: 'chat', selectedKey: 'abc-123', cards: [WT_CARD], transcript: [] })
 ok(!unplanned.text().includes('How to test this'), 'no plan, no panel')

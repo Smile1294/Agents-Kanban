@@ -380,6 +380,22 @@ ok(resolveOrchestration('nonsense', 'nonsense') === 'balanced',
   await fs.rm(planDir, { recursive: true, force: true })
 }
 
+// The browser evidence rides inside the plan, and must come back through a
+// RELOAD — a write with no round trip is not persistence. A garbage record is
+// no record, never a card claiming numbers nobody measured.
+{
+  const vDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-verified-'))
+  const plan = normaliseTestPlan({ summary: 's', steps: ['x'], verified: {
+    pages: 2, actions: 5, screenshots: ['/store/screens/k/shot-001.jpg'], consoleErrors: 0, url: 'http://localhost:3100/', at: 7 } })
+  await new MetaStore(vDir, root).update('v1', { testPlan: plan })
+  const back = (await new MetaStore(vDir, root).get('v1')).testPlan?.verified
+  ok(back?.pages === 2 && back?.actions === 5 && back?.consoleErrors === 0 && back?.screenshots[0] === '/store/screens/k/shot-001.jpg'
+     && back?.url === 'http://localhost:3100/', `the verification survives a reload (${JSON.stringify(back)})`)
+  ok(normaliseTestPlan({ summary: 's', verified: { pages: 'lots', actions: 1, consoleErrors: 0 } })?.verified === undefined,
+     'an unreadable record is dropped, not half-shown')
+  await fs.rm(vDir, { recursive: true, force: true })
+}
+
 // --- two writes racing a COLD store -----------------------------------------
 //
 // `all()` guarded on `this.cache`, which is assigned only after a readFile and

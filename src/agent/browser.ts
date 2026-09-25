@@ -75,6 +75,9 @@ interface Tab {
   events: PageEvent[]
   /** Index into `events` of the first one not yet reported. */
   seen: number
+  /** Index into `events` where the current page was opened — its errors are
+   *  the ones after this, which is what the card reports as the end state. */
+  openedAt: number
   shots: number
 }
 
@@ -242,10 +245,14 @@ export class BrowserPool {
     const browser = await this.launch()
     const context = await browser.newContext({ viewport: VIEWPORT, ignoreHTTPSErrors: true })
     const page = await context.newPage()
-    const tab: Tab = { context, page, events: [], seen: 0, shots: have?.shots ?? 0 }
+    const tab: Tab = { context, page, events: [], seen: 0, openedAt: 0, shots: have?.shots ?? 0 }
     const add = (e: Omit<PageEvent, 'at'>) => {
       tab.events.push({ ...e, at: Date.now() })
-      if (tab.events.length > 500) { tab.events.splice(0, 100); tab.seen = Math.max(0, tab.seen - 100) }
+      if (tab.events.length > 500) {
+        tab.events.splice(0, 100)
+        tab.seen = Math.max(0, tab.seen - 100)
+        tab.openedAt = Math.max(0, tab.openedAt - 100)
+      }
     }
     page.on('console', (m: Pw) => {
       const level = m.type()
@@ -283,6 +290,7 @@ export class BrowserPool {
     const allowed = allowedUrl(raw, this.opts.allowExternal)
     if (!allowed.ok) throw new Error(allowed.message)
     const tab = await this.tab(key)
+    tab.openedAt = tab.events.length
     const res = await tab.page.goto(allowed.url, { waitUntil: 'load', timeout: 30_000 }).catch((e: Error) => e)
     if (res instanceof Error) {
       const first = res.message.split('\n')[0] ?? ''
@@ -358,6 +366,19 @@ export class BrowserPool {
     let text: string
     try { text = JSON.stringify(value, null, 2) ?? 'undefined' } catch { text = String(value) }
     return (text.length > 8000 ? `${text.slice(0, 8000)}…` : text) + this.news(tab)
+  }
+
+  /** Errors on the page as it stands now — since it was opened. */
+  errorsOnPage(key: string): number {
+    const tab = this.tabs.get(key)
+    if (!tab) return 0
+    return tab.events.slice(tab.openedAt).filter((e) => e.kind !== 'console' || e.level === 'error').length
+  }
+
+  /** The page's URL, or undefined with no page. */
+  url(key: string): string | undefined {
+    const tab = this.tabs.get(key)
+    return tab && !tab.page.isClosed() ? tab.page.url() : undefined
   }
 
   console(key: string, clear = false): string {
