@@ -950,6 +950,25 @@ for (const label of ['calc.js', 'Run the tests', 'Local server']) {
      'folded, it shows a dot per card instead of ten cards')
 }
 
+// The board's own auto-check on the test plan: a failure names what failed,
+// keeps the suite's output, and offers to send it back.
+{
+  const fail = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [{ ...WT_CARD, testPlan: { ...PLAN, autoCheck: {
+    ok: false, at: 1, url: 'http://localhost:3100', pageErrors: 2, errorLines: ['- [pageerror] undefinedCall is not defined'],
+    screenshot: '/g/screens/autocheck/shot-001.jpg', e2e: { command: 'npm run test:e2e', ok: false, tail: ['1 failed', 'Expected: Hello'], durationMs: 5 } } } }] })
+  const ft = fail.text()
+  ok(ft.includes('Auto-check ✖') && ft.includes('page loads · 2 errors') && ft.includes('npm run test:e2e FAILED'), 'a failed auto-check says what failed')
+  ok(ft.includes('undefinedCall') && ft.includes('Expected: Hello'), 'with the page error and the end of the suite\'s output')
+  findButton(fail.root, 'Send failure to agent')?.onclick()
+  ok(fail.posted.some((m) => m.type === 'sendAutoCheck' && m.id === WT_CARD.key), 'and sends it back on a click')
+  findButton(fail.root, 'What the board saw')?.onclick()
+  ok(fail.posted.some((m) => m.type === 'testLink' && m.target === '/g/screens/autocheck/shot-001.jpg'), 'with the screenshot it took')
+  const running = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [{ ...WT_CARD, autoChecking: true, testPlan: PLAN }] })
+  ok(running.text().includes('checking this in its own browser'), 'a check in progress says so')
+  const passed = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [{ ...WT_CARD, testPlan: { ...PLAN, autoCheck: { ok: true, at: 1, pageErrors: 0 } } }] })
+  ok(passed.text().includes('Auto-check ✓ page loads · 0 errors') && !findButton(passed.root, 'Send failure to agent'), 'a pass is a tick, with nothing to send')
+}
+
 // A session with no plan must not grow an empty panel.
 const unplanned = run({ ...base, mode: 'chat', selectedKey: 'abc-123', cards: [WT_CARD], transcript: [] })
 ok(!unplanned.text().includes('How to test this'), 'no plan, no panel')

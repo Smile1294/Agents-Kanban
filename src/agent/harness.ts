@@ -329,13 +329,17 @@ export function buildHarnessTools(h: Harness | undefined, tool: ToolFn) {
 }
 
 /** The brief's paragraph. Stated only where the tools work. */
-export function harnessBrief(): string[] {
+export function harnessBrief(required = false): string[] {
   return [
     'You can LOOK at your work. If the change shows up in a UI, check it before you hand it over:',
     '`app_start` (starts the app in this worktree), `browser_open`, then `browser_snapshot` to',
     'find things and `browser_act` to use them. `browser_screenshot` when appearance matters.',
     'Console errors and failed requests are reported with every step — fix them, or say why not.',
     'Put what you checked, and the screenshot paths, in `howToTest`.',
+    ...(required
+      ? ['On this board it is REQUIRED: a change to files a browser shows cannot move to review until you have opened it.']
+      : []),
+    'When you move to review the board also runs its own check (the page and any e2e suite) and shows the result.',
     '',
   ]
 }

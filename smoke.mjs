@@ -574,6 +574,10 @@ for (const msg of [
   { type: 'sentImages', id: 'nope', messageId: 'u-nope' },
   { type: 'sentImages', id: 'nope' },
   { type: 'sentImages', messageId: 42 },
+  // The board's own auto-check, asked for on a card that has none, or no worktree.
+  { type: 'sendAutoCheck', id: 'nope' },
+  { type: 'runAutoCheck', id: 'nope' },
+  { type: 'runAutoCheck' },
   // The background-agent scan runs on the render path for every card, so it has
   // to survive a workspace whose sessions never spawned one — which is most of
   // them — without contributing a card field or an error.

@@ -33,6 +33,7 @@ import {
 } from '../board/decomposition.ts'
 import { knowledgeCheck, loadCodemap } from '../board/codemap.ts'
 import { dropCheckpoints, takeCheckpoint } from '../git/checkpoints.ts'
+import { uiFilesIn } from '../run/autocheck.ts'
 import { bindHarness, harnessBrief, type Harness, type HarnessDeps } from './harness.ts'
 import {
   agentKeyOf, describeSpawnAgents, resolveRoute,
@@ -111,6 +112,8 @@ export interface ManagerOptions {
    * count, and inventing some would be a cap on a number that is not spend.
    */
   spendCapUsd?: () => number | undefined
+  /** `agentsKanban.autoVerify`, read at the move. Only `require` gates it. */
+  autoVerify?: () => 'off' | 'check' | 'require'
   worktrees: WorktreeService
   board: BoardConfig
   defaults: AgentDefaults
@@ -1168,6 +1171,7 @@ export class AgentManager extends EventEmitter {
       ...(this.opts.harness
         ? { harness: (agent.harness ??= bindHarness(this.opts.harness, () => agent.worktreePath, agent.runId)) }
         : {}),
+      ...(this.opts.harness && this.opts.autoVerify ? { browserGate: () => this.browserGate(agent) } : {}),
     }
   }
 
@@ -1737,7 +1741,7 @@ export class AgentManager extends EventEmitter {
       executable: location.command,
       appendSystemPrompt: buildBrief(
         this.opts.board, title, wt.branch, policyFor(level), canSplit, spawnAgents,
-        agent.knowledgeFiles === true, !!this.opts.harness,
+        agent.knowledgeFiles === true, !!this.opts.harness, this.opts.autoVerify?.() === 'require',
       ),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
@@ -1909,6 +1913,25 @@ export class AgentManager extends EventEmitter {
   }
 
   /** Stop this turn, keep the session. The common case, and it was unreachable. */
+  /**
+   * `autoVerify: require` — an agent that changed files a browser shows must
+   * have opened one before handing the work back. Not required when the board
+   * cannot start the app at all (there is nothing to open, and refusing would
+   * strand the card), nor when nothing a browser shows changed.
+   */
+  private async browserGate(agent: RunningAgent): Promise<string | undefined> {
+    if (this.opts.autoVerify?.() !== 'require' || !agent.worktreePath || !this.opts.harness) return undefined
+    if (agent.harness?.ledger()?.pages) return undefined
+    const changed = await this.opts.worktrees.changedFiles(agent.worktreePath, agent.base ?? 'HEAD').catch(() => [] as string[])
+    const ui = uiFilesIn(changed)
+    if (!ui.length) return undefined
+    if (!(await this.opts.harness.recipe(agent.worktreePath).catch(() => undefined))) return undefined
+    return `This change touches files a browser shows (${ui.slice(0, 4).join(', ')}${ui.length > 4 ? ` and ${ui.length - 4} more` : ''}), ` +
+      'and this board requires checking them before review (agentsKanban.autoVerify: require). ' +
+      'Run app_start, then browser_open, use it (browser_act), look at it (browser_snapshot, or browser_screenshot for ' +
+      'appearance), fix any console errors, and move again. The board records what you checked on the test plan.'
+  }
+
   /** Stop a message's work that has spent past the cap. The session stays
    *  open (an interrupt, not a stop), and the card says why and what to do. */
   private checkSpendCap(agent: RunningAgent): void {
@@ -2058,6 +2081,8 @@ export function buildBrief(
   knowledgeFiles = false,
   /** Whether the app and browser tools work in this host. Stated only then. */
   harness = false,
+  /** `autoVerify: require` — said up front, so the agent does not learn it from a refusal. */
+  browserRequired = false,
 ): string {
   const started = board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'
   const review = board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
@@ -2093,7 +2118,7 @@ export function buildBrief(
     '',
     'Use `set_tags` once you know what this work touches, so it can be found later.',
     '',
-    ...(harness ? harnessBrief() : []),
+    ...(harness ? harnessBrief(browserRequired) : []),
     'That card name was taken from the first line of the request, so it is often',
     'not what the work turns out to be. Once you know, call `set_title` with six',
     'words or fewer. It renames the CARD only — your branch and worktree keep the',

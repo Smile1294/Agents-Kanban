@@ -1274,6 +1274,14 @@ details.thinking summary::-webkit-details-marker { display: none; }
   border: 1px solid var(--vscode-focusBorder); border-radius: var(--radius); background: var(--panel);
 }
 .review-drafts-label { flex: 1; min-width: 0; }
+.testplan-auto { display: flex; gap: 6px; align-items: center; color: var(--ok); font-size: 0.9em; margin: 4px 0; }
+.testplan-auto.bad { color: var(--bad); }
+.testplan-auto.skipped, .testplan-auto.running { color: var(--muted); }
+.testplan-auto-line { color: var(--muted); font-size: 0.85em; margin-left: 22px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.testplan-auto-tail {
+  font-family: var(--vscode-editor-font-family); font-size: 0.8em; max-height: 160px; overflow: auto;
+  background: var(--vscode-textCodeBlock-background); padding: 6px 8px; border-radius: 4px; margin: 4px 0;
+}
 .testplan-verified { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 0.9em; margin: 4px 0; }
 .testplan-verified.bad { color: var(--warn); }
 .testplan-summary { font-size: 0.88em; line-height: 1.5; }

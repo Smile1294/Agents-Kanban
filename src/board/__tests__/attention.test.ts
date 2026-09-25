@@ -25,6 +25,10 @@ const items = attentionFor([
 ok(items.map((i) => i.key).join(',') === 'q1,q2,e,i,s,r',
    `blocking questions first (oldest first), then failures, cut-offs, stalls, then work ready to test (${items.map((i) => i.key).join(',')})`)
 ok(!items.some((i) => i.key === 'w' || i.key === 'a'), 'a working card and an archived one need nothing')
+{
+  const broken = attentionFor([{ key: 'b', title: 'Broken', phase: review, testPlan: { at: 1, autoCheck: { ok: false, at: 9 } } }], DEFAULT_BOARD)
+  ok(broken[0]?.kind === 'failed' && /auto-check/.test(broken[0].why), 'a card that failed the board\'s own check is a failure, not "ready to test"')
+}
 ok(!items.some((i) => i.key === 'rc'), 'a review card whose comments you are still writing is yours already, not waiting')
 ok(!items.some((i) => i.key === 'rw'), 'nor one whose agent is running again')
 ok(items.find((i) => i.key === 'e')?.why === 'failed: spawn ENOENT', 'a failure says why, in one line')

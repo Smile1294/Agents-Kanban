@@ -191,6 +191,7 @@ from `run-…` to the session id when `system/init` arrives, and
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `TestPlan.autoCheck` / `AutoCheck` / `parseAutoCheck` — the board's own review-time check, parsed on the way back (bounded strings, clean paths).
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `TestPlan.verified` / `Verification` / `parseVerification` — the browser evidence rides inside the plan (so it reaches the sidecar, the card and the view on the plan's own path), parsed on the way back; `meta.test.ts` round-trips it through a reload.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `checkpoints.ts` is now the rewind FALLBACK — `forkAt` prefers the board's own git checkpoint (`git/checkpoints.ts`), which restores the whole worktree.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `sentImages(id, messageId)` — a sent message's images read back as data URLs on a click (four types, `MAX_SENT`), and `imageBytes(id)` — the base64 the next request would re-send (tool-result screenshots included, reset at a compaction), both off the transcript read; the parse cache carries `imageBytes`.

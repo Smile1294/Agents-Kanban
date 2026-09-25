@@ -219,6 +219,9 @@ export interface BoardToolContext {
    * `app_*` / `browser_*` tools say so when called.
    */
   harness?: Harness
+  /** Refuse the move into review with this sentence, or undefined to allow
+   *  it. Set by the host under `autoVerify: require`. */
+  browserGate?: () => Promise<string | undefined>
 }
 
 type Content = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -340,6 +343,7 @@ export function buildBoardTools(
       // the agent's: a `verified` it wrote into howToTest itself is dropped.
       if (plan) {
         delete plan.verified
+        delete plan.autoCheck
         const seen = ctx.harness?.ledger()
         if (seen) plan.verified = seen
       }
@@ -351,6 +355,14 @@ export function buildBoardTools(
           'the concrete steps to check it, and links to the files you changed and the command that ' +
           'verifies them (kind: "file" | "command" | "url").',
         )
+      }
+      // Look before you hand it over: under `autoVerify: require`, a change to
+      // UI files cannot reach review until the agent has opened it in its
+      // browser. Host-side, like the knowledge check, so the same over both
+      // transports — a brief can ask, only code can refuse.
+      if (isReviewColumn(board, args.phase) && ctx.browserGate) {
+        const refusal = await ctx.browserGate()
+        if (refusal) return err(refusal)
       }
       // Knowledge files move with the code. Checked BEFORE anything is written,
       // so a refusal leaves the card exactly where it was, and host-side, so it

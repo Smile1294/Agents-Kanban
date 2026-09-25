@@ -36,7 +36,7 @@ export interface AttentionCard {
   archived?: boolean
   interrupted?: number
   stalled?: number
-  testPlan?: { at: number }
+  testPlan?: { at: number; autoCheck?: { ok: boolean; at: number } }
   reviewComments?: number
   agent?: { kind: string; message?: string; lastEventAt?: number; since?: number }
 }
@@ -58,6 +58,10 @@ export function attentionFor(cards: readonly AttentionCard[], board: BoardConfig
       out.push({ key: c.key, title: c.title, kind: 'interrupted', why: 'was cut off mid-turn when the editor closed', since: c.interrupted })
     } else if (!a && c.stalled) {
       out.push({ key: c.key, title: c.title, kind: 'stalled', why: 'stopped without handing its work back', since: c.stalled })
+    } else if (isReviewColumn(board, c.phase) && c.testPlan?.autoCheck && !c.testPlan.autoCheck.ok && (!a || a.kind === 'done' || a.kind === 'idle')) {
+      // Ranked with the failures: the board's own check of it did not pass, so
+      // "ready to test" would send the user to test something known broken.
+      out.push({ key: c.key, title: c.title, kind: 'failed', why: 'failed the board\'s auto-check', since: c.testPlan.autoCheck.at })
     } else if (isReviewColumn(board, c.phase) && c.testPlan && !c.reviewComments && (!a || a.kind === 'done' || a.kind === 'idle')) {
       out.push({ key: c.key, title: c.title, kind: 'review', why: 'is ready for you to test', since: c.testPlan.at })
     }

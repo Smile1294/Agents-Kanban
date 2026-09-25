@@ -211,6 +211,17 @@
           "minimum": 0,
           "markdownDescription": "Pause an agent when the work for ONE message you sent has cost more than this many dollars (0 = no cap). The session stays open; your next message starts a new allowance. Applies to dollar-priced sessions only — a subscription (Codex on ChatGPT) has no dollar figure to cap."
         },
+        "agentsKanban.autoVerify": {
+          "type": "string",
+          "enum": ["check", "require", "off"],
+          "enumDescriptions": [
+            "When a card reaches review, the board starts the app in its worktree, opens it in its own headless browser, records errors and a screenshot, and runs the project's e2e script (test:e2e, e2e, playwright…) if it has one. The result is shown on the test plan.",
+            "As check, and an agent that changed files a browser shows cannot move to review until it has opened the app in its browser.",
+            "No automatic check."
+          ],
+          "default": "check",
+          "markdownDescription": "Browser testing as part of the standard flow. See the options."
+        },
         "agentsKanban.agentBrowser": {
           "type": "boolean",
           "default": true,

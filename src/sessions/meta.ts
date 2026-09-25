@@ -91,6 +91,52 @@ export interface TestPlan {
   /** What the agent was SEEN to check in its browser, recorded by the host —
    *  never taken from the agent's own `howToTest`, which is prose. */
   verified?: Verification
+  /** The BOARD's own check, run when the card reached review
+   *  (`run/autocheck.ts`) — what the page did with nobody steering. */
+  autoCheck?: AutoCheck
+}
+
+export interface AutoCheck {
+  ok: boolean
+  at: number
+  /** Why nothing was checked — a result, not a pass. */
+  skipped?: string
+  uiFiles?: string[]
+  url?: string
+  appError?: string
+  pageError?: string
+  /** Errors while the page loaded, and the first lines of them. */
+  pageErrors?: number
+  errorLines?: string[]
+  screenshot?: string
+  e2e?: { command: string; ok: boolean; tail: string[]; durationMs: number; timedOut?: boolean }
+}
+
+/** A stored `AutoCheck`, parsed. Strings are bounded, paths must be clean. */
+export function parseAutoCheck(raw: unknown): AutoCheck | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Record<string, unknown>
+  if (typeof r.ok !== 'boolean') return undefined
+  const str = (v: unknown, n = 600) => (typeof v === 'string' && v ? v.slice(0, n) : undefined)
+  const strs = (v: unknown, max: number, n = 300) =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(-max).map((x) => x.slice(0, n)) : undefined
+  const out: AutoCheck = { ok: r.ok, at: typeof r.at === 'number' ? r.at : Date.now() }
+  const skipped = str(r.skipped); if (skipped) out.skipped = skipped
+  const ui = strs(r.uiFiles, 10); if (ui?.length) out.uiFiles = ui
+  const url = str(r.url, 500); if (url && targetIsClean(url)) out.url = url
+  const appError = str(r.appError); if (appError) out.appError = appError
+  const pageError = str(r.pageError); if (pageError) out.pageError = pageError
+  if (typeof r.pageErrors === 'number' && r.pageErrors >= 0) out.pageErrors = Math.floor(r.pageErrors)
+  const el = strs(r.errorLines, 8); if (el?.length) out.errorLines = el
+  const shot = str(r.screenshot, 1000); if (shot && targetIsClean(shot)) out.screenshot = shot
+  const e = r.e2e as Record<string, unknown> | undefined
+  if (e && typeof e === 'object' && typeof e.command === 'string' && typeof e.ok === 'boolean') {
+    out.e2e = {
+      command: e.command.slice(0, 200), ok: e.ok, tail: strs(e.tail, 40, 400) ?? [],
+      durationMs: typeof e.durationMs === 'number' ? e.durationMs : 0, ...(e.timedOut === true ? { timedOut: true } : {}),
+    }
+  }
+  return out
 }
 
 /**
@@ -193,12 +239,14 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
     : []
   if (!summary && !steps.length && !links.length) return undefined
   const verified = parseVerification(r.verified)
+  const autoCheck = parseAutoCheck(r.autoCheck)
   return {
     summary,
     steps,
     links,
     at: typeof r.at === 'number' ? r.at : Date.now(),
     ...(verified ? { verified } : {}),
+    ...(autoCheck ? { autoCheck } : {}),
   }
 }
 

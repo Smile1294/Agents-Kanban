@@ -45,6 +45,7 @@ import { describeImages, imageLoadNote, sanitiseImages } from './agent/images.ts
 import { BrowserPool } from './agent/browser.ts'
 import type { HarnessDeps } from './agent/harness.ts'
 import { AppProcesses } from './run/app.ts'
+import { autoCheckPrompt, runAutoCheck } from './run/autocheck.ts'
 import { ReviewDrafts, reviewPrompt } from './board/review-comments.ts'
 import { attentionFor, attentionSummary, type AttentionItem } from './board/attention.ts'
 import {
@@ -3078,6 +3079,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void agentBrowser.shutdown().catch(() => {})
     },
   })
+  /** `agentsKanban.autoVerify`: off, check (the board checks at review), or
+   *  require (and an agent that changed UI files must have looked first). */
+  const autoVerifyMode = (): 'off' | 'check' | 'require' => {
+    const v = cfg().get<string>('autoVerify')
+    return v === 'off' || v === 'require' ? v : 'check'
+  }
+  /** Cards whose auto-check is running right now, for the card to say so. */
+  const autoChecking = new Set<string>()
+  async function runCardAutoCheck(key: string, dir: string | undefined, base: string | undefined): Promise<void> {
+    const w = ws
+    if (!w?.worktrees || !dir || autoChecking.has(key)) return
+    const deps = harnessDeps()
+    if (!deps) return
+    autoChecking.add(key)
+    refreshAll()
+    try {
+      const changed = await w.worktrees.changedFiles(dir, base ?? 'HEAD').catch(() => [] as string[])
+      const result = await runAutoCheck({ apps: agentApps, browser: agentBrowser, recipe: deps.recipe }, key, dir, changed)
+      // Onto the plan as it stands NOW — the agent may have rewritten it
+      // while the check ran — and only if it is still in review.
+      const card = await w.store.card(key)
+      if (!card.testPlan || !isReviewColumn(w.board, card.phase)) return
+      await w.store.setTestPlan(key, { ...card.testPlan, autoCheck: result })
+      log.info(`Auto-check for ${key}: ${result.ok ? 'passed' : 'FAILED'}${result.skipped ? ` (${result.skipped})` : ''}`)
+      if (!result.ok) {
+        const pick = await vscode.window.showWarningMessage(
+          'The board\'s own check of a card in review failed' +
+            (result.pageErrors ? ` — ${result.pageErrors} error(s) on the page` : '') +
+            (result.e2e && !result.e2e.ok ? ` — ${result.e2e.command} failed` : '') +
+            (result.appError ? ' — the app did not start' : '') + '.',
+          'Open card', 'Send failure to agent',
+        )
+        if (pick === 'Open card') { BoardPanel.show(context.extensionUri, host); mode = 'chat'; host.select(key); refreshAll() }
+        if (pick === 'Send failure to agent') await host.sendAutoCheck(key)
+      }
+    } finally {
+      autoChecking.delete(key)
+      refreshAll()
+    }
+  }
+
   const harnessDeps = (): HarnessDeps | undefined => {
     if (cfg().get<boolean>('agentBrowser') === false) return undefined
     return {
@@ -3106,6 +3148,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(harness ? { harness } : {}),
         // Read on every meter reading, so a changed cap applies to the turn in flight.
         spendCapUsd: () => cfg().get<number>('maxSpendPerMessageUsd') || undefined,
+        autoVerify: () => autoVerifyMode(),
         worktrees: w.worktrees,
         board: w.board,
         defaults: { model, effort, thinking, ultracode, fastMode, runtime },
@@ -3286,6 +3329,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // parent is moved to review and gets the notification instead. Fired
         // before the notifyOnReview check so the board is kept honest even for
         // someone who has turned the toasts off.
+        // The board's own check of the work — part of the flow, not up to the
+        // agent (`run/autocheck.ts`). In the background: it starts an app and
+        // a browser, which is seconds, and the move itself is already done.
+        if (autoVerifyMode() !== 'off') {
+          runCardAutoCheck(movedKey, agent.worktreePath, agent.base)
+            .catch((e: unknown) => log.error(`Auto-check failed to run: ${String(e)}`))
+        }
         void rollUpToParent(movedKey).then((rolled) => {
           if (cfg().get<boolean>('notifyOnReview') === false) return
           if (rolled) return
@@ -3682,6 +3732,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(a.parent ?? m?.parent ? { parent: (a.parent ?? m?.parent)! } : {}),
         ...(testPlan ? { testPlan } : {}),
         ...(reviewDrafts.count(key) ? { reviewComments: reviewDrafts.count(key) } : {}),
+        ...(autoChecking.has(key) ? { autoChecking: true } : {}),
         ...(a.queued?.length ? { queued: a.queued } : {}),
         ...agentBadge(a.sessionId),
         agent: toUiAgent(a),
@@ -3715,6 +3766,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(s.parent ? { parent: s.parent } : {}),
         ...(s.testPlan ? { testPlan: s.testPlan } : {}),
         ...(reviewDrafts.count(s.id) ? { reviewComments: reviewDrafts.count(s.id) } : {}),
+        ...(autoChecking.has(s.id) ? { autoChecking: true } : {}),
         ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
         ...agentBadge(s.id),
         // Only reachable in THIS loop, and that is the point: these are the
@@ -4680,6 +4732,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const review = ws?.board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
       await this.sendMessage(key, reviewPrompt(drafts, review))
       refreshAll()
+    },
+
+    /** Send the board's failed auto-check to the agent, as one message. */
+    async sendAutoCheck(key) {
+      const card = await requireWs().store.card(key)
+      const ac = card.testPlan?.autoCheck
+      if (!ac || ac.ok) return
+      const review = ws?.board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
+      await this.sendMessage(key, autoCheckPrompt(ac, review))
+    },
+
+    /** Run the board's check again, by hand. */
+    async runAutoCheck(key) {
+      const a = ws?.manager?.byKey(key)
+      const stored = a ? undefined : await ws?.store.worktreeMeta(key)
+      await runCardAutoCheck(a?.sessionId ?? key, a?.worktreePath ?? stored?.worktree, a?.base ?? stored?.base)
     },
 
     async discardReview(key) {

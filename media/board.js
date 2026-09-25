@@ -1398,6 +1398,8 @@
     if (!a && (c.interrupted || c.stalled)) return 'needs'
     if (a && (a.kind === 'working' || a.kind === 'starting' || a.kind === 'waiting')) return 'running'
     if (a && a.kind === 'queued') return 'queued'
+    // Known broken by the board's own check: not "ready to test".
+    if (cat === 'review' && c.testPlan && c.testPlan.autoCheck && !c.testPlan.autoCheck.ok) return 'needs'
     if (cat === 'review') return 'test'
     if (cat === 'completed' || cat === 'done' || (col && col.humanOnly && cat !== 'review')) return 'done'
     return 'planned'
@@ -1484,6 +1486,8 @@
     if (a && a.kind === 'queued') return 'waiting for a free agent slot'
     if (c.interrupted) return 'cut off ' + ago(c.interrupted) + ' when the editor closed'
     if (c.stalled) return 'stopped without handing its work back'
+    if (c.autoChecking) return 'the board is checking it in its own browser…'
+    if (c.testPlan && c.testPlan.autoCheck && !c.testPlan.autoCheck.ok) return 'failed the board\'s auto-check'
     if (c.testPlan && c.testPlan.summary) return c.testPlan.summary
     if (a && a.kind === 'done') return a.summary ? String(a.summary).slice(0, 140) : 'finished its turn'
     return c.branch ? '⎇ ' + c.branch.replace(/^task\//, '') : 'not started'
@@ -2634,6 +2638,45 @@
     // What the agent's browser was SEEN to do, recorded host-side — numbers,
     // with the error count coloured when it is not zero, because "checked in a
     // browser" alone would be a signal that cannot say bad.
+    // The BOARD's own check, run when the card reached review — kept apart
+    // from `verified` (what the agent looked at) because nobody steered it.
+    const ac = p.autoCheck
+    if (c.autoChecking) {
+      body.append(el('div', 'testplan-auto running', '🤖 The board is checking this in its own browser…'))
+    } else if (ac) {
+      const row = el('div', 'testplan-auto' + (ac.ok ? '' : ' bad') + (ac.skipped ? ' skipped' : ''))
+      const bits = []
+      if (ac.skipped) bits.push('not checked: ' + ac.skipped)
+      if (ac.appError) bits.push('the app did not start')
+      if (ac.pageError) bits.push('the page did not open')
+      if (typeof ac.pageErrors === 'number') bits.push('page loads · ' + ac.pageErrors + (ac.pageErrors === 1 ? ' error' : ' errors'))
+      if (ac.e2e) bits.push(ac.e2e.command + (ac.e2e.ok ? ' passed' : ac.e2e.timedOut ? ' timed out' : ' FAILED'))
+      row.append(el('span', null, '🤖 Auto-check ' + (ac.skipped && ac.ok && !ac.e2e ? '—' : ac.ok ? '✓' : '✖') + ' ' + bits.join(' · ')))
+      row.title = ac.url ? 'Checked ' + ac.url : ''
+      body.append(row)
+      for (const l of (ac.errorLines || []).slice(0, 3)) body.append(el('div', 'testplan-auto-line', l))
+      if (ac.e2e && !ac.e2e.ok && ac.e2e.tail && ac.e2e.tail.length) {
+        body.append(el('pre', 'testplan-auto-tail', ac.e2e.tail.slice(-8).join('\n')))
+      }
+      const acts = el('div', 'testplan-links')
+      if (ac.screenshot) {
+        const sb = el('button', 'testlink kind-file')
+        sb.append(el('span', 'testlink-icon', '🖼'), el('span', 'testlink-label', 'What the board saw'))
+        sb.onclick = () => post('testLink', { id: c.key, kind: 'file', target: ac.screenshot })
+        acts.append(sb)
+      }
+      if (!ac.ok) {
+        const send = el('button', 'primary', 'Send failure to agent')
+        send.title = 'Resume the agent with exactly what failed'
+        send.onclick = () => post('sendAutoCheck', { id: c.key })
+        acts.append(send)
+      }
+      const again = el('button', null, 'Check again')
+      again.onclick = () => post('runAutoCheck', { id: c.key })
+      acts.append(again)
+      body.append(acts)
+    }
+
     const v = p.verified
     if (v && typeof v.pages === 'number') {
       const row = el('div', 'testplan-verified' + (v.consoleErrors ? ' bad' : ''))

@@ -877,6 +877,39 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
 
 // --- the tools' side of a run is actually wired up ---------------------------
 //
+// `autoVerify: require`: a change to files a browser shows cannot reach review
+// until the agent has opened one. The gate is host-side and conditional on
+// every fact it depends on — so each one is flipped here.
+{
+  let mode: 'off' | 'check' | 'require' = 'require'
+  let changed = ['src/App.tsx', 'server/db.ts']
+  let canStart = true
+  let pages = 0
+  const mgr = new AgentManager({
+    store: {} as never,
+    worktrees: { changedFiles: async () => changed } as never,
+    board: DEFAULT_BOARD, defaults: {}, permissionMode: 'acceptEdits', maxConcurrent: 3,
+    autoVerify: () => mode,
+    harness: { apps: {} as never, browser: {} as never, recipe: async () => (canStart ? { steps: [], why: 'x' } : undefined) },
+  })
+  const agent: RunningAgent = {
+    runId: 'run-9-gate', runtime: 'claude', title: 'UI', state: { kind: 'working' }, worktreePath: '/tmp/wt', branch: 'task/x',
+    live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
+    harness: { ledger: () => (pages ? { pages, actions: 0, screenshots: [], consoleErrors: 0, at: 1 } : undefined) } as never,
+  }
+  const gate = (mgr as unknown as { boardContext: (a: RunningAgent) => { browserGate?: () => Promise<string | undefined> } })
+    .boardContext(agent).browserGate!
+  ok(/src\/App\.tsx/.test((await gate()) ?? '') && /app_start/.test((await gate()) ?? ''), 'a UI change nobody looked at is refused, naming the file and the fix')
+  pages = 1
+  ok((await gate()) === undefined, 'once the agent has opened a page, it passes')
+  pages = 0; changed = ['server/db.ts']
+  ok((await gate()) === undefined, 'a change no browser shows is not held up')
+  changed = ['src/App.tsx']; canStart = false
+  ok((await gate()) === undefined, 'nor one the board cannot start an app for — refusing would strand the card')
+  canStart = true; mode = 'check'
+  ok((await gate()) === undefined, 'and under "check" the board checks, it does not refuse')
+}
+
 // The seam a mutation test found open: `set_title` existed, was auto-allowed and
 // was unit-tested, and NOTHING failed when the manager did not pass `onRename`
 // into the board server. Every optional callback on BoardToolContext degrades

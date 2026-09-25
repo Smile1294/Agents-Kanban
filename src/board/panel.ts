@@ -208,6 +208,8 @@ export interface UiCard {
   testPlan?: TestPlan
   /** Review comments drafted on this card's diff and not yet sent. */
   reviewComments?: number
+  /** The board's own review-time check is running for this card. */
+  autoChecking?: boolean
   /**
    * When a run was cut off by the extension host going away — a reload, a
    * reinstall, a crash. The process is gone and cannot be re-attached; the
@@ -568,6 +570,9 @@ export interface BoardHost {
   sendMessage(id: string, text: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
   /** Send a card's review comments to its agent as one message. */
   sendReview(id: string): Promise<void>
+  /** Send the board's failed auto-check to the agent; run it again by hand. */
+  sendAutoCheck(id: string): Promise<void>
+  runAutoCheck(id: string): Promise<void>
   discardReview(id: string): Promise<void>
   move(key: string, phase: string): Promise<void>
   stop(key: string): Promise<void>
@@ -942,6 +947,8 @@ async function routeBoardMessage(
       break
     }
     case 'sendReview': if (id()) await host.sendReview(id()); break
+    case 'sendAutoCheck': if (id()) await host.sendAutoCheck(id()); break
+    case 'runAutoCheck': if (id()) await host.runAutoCheck(id()); break
     case 'discardReview': if (id()) await host.discardReview(id()); break
     case 'moreTranscript': await host.loadOlderTranscript(id()); await refresh(); break
     case 'openHit': {

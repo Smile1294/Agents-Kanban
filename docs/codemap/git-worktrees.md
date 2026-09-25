@@ -5,11 +5,13 @@ paths:
   - src/git/*.ts
   - src/run/recipe.ts
   - src/run/app.ts
+  - src/run/autocheck.ts
 tests:
   - src/git/__tests__/worktree.test.ts
   - src/git/__tests__/lock.test.ts
   - src/run/__tests__/recipe.test.ts
   - src/run/__tests__/app.test.ts
+  - src/run/__tests__/autocheck.test.ts
 last_verified: 2026-09-07
 ---
 # Git worktrees, review and merge
@@ -126,6 +128,7 @@ frames. Worktree cleanup is offered at `complete`, never automatic.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/run/autocheck.ts` — the board's OWN check at review time: `uiFilesIn` (what a browser shows), `e2eScript` (`test:e2e`, `e2e`, `test:browser`, `playwright`…), `runAutoCheck` (start/reuse the app, open it in a context of its own, record load errors and a screenshot, run the suite with `BASE_URL`/`PLAYWRIGHT_BASE_URL`, never throw), `autoCheckPrompt`. `autocheck.test.ts` against real processes and Chromium.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/git/checkpoints.ts` — whole-worktree checkpoints: a temporary index seeded from the real one, `write-tree`, a commit whose parent is HEAD, on `refs/agentskanban/checkpoints/<branch>/<messageId>`; `restoreCheckpoint` resets the branch to that HEAD when it moved (`--mixed`), `git restore --worktree` from the checkpoint, and removes files created since (ignored files never touched); `dropCheckpoints` with the worktree. `checkpoints.test.ts` against real repositories.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/run/app.ts` — `AppProcesses`, the Run recipe started as child processes for an agent (`app_start`), with its output kept, the port never scanned for, and the whole process group killed on stop; `app.test.ts` against real servers.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `realContains(root, abs)`

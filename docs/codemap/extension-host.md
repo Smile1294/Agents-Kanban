@@ -320,6 +320,7 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `agentsKanban.autoVerify` (`check` default, `require`, `off`): on a move into review the host runs `runCardAutoCheck` in the background (cards carry `autoChecking`), writes `autoCheck` onto the plan as it stands then (only while still in review), and a failure is a warning with Open card / Send failure to agent; host `sendAutoCheck` / `runAutoCheck`; the manager gets `autoVerify`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · setting `agentsKanban.maxSpendPerMessageUsd` (0 = off), handed to the manager as `spendCapUsd`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the board pass derives `attention` once from the cards it built; the slice carries it (omitted when empty) and the status bar leads with `attentionSummary` (`$(bell) 2 waiting on you · 3 more need you`).
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · review comments: a `agentsKanban.review` comment controller (registered unconditionally) whose `commentingRangeProvider` offers the + only on files inside a card's worktree (`cardForPath`: live runs, the store, then the sidecar); `agentsKanban.reviewComment.add` / `.delete` (comment menus, hidden from the palette) and `agentsKanban.sendReview`; host `sendReview` / `discardReview`; cards carry `reviewComments`; drafts follow a card's key in `applyRedirects`. First use of `vscode.comments`.
