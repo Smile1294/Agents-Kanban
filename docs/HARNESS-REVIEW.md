@@ -221,6 +221,32 @@ page that throws on load fails, a failing suite fails with its output, an app
 that dies on boot fails with its log, and a change with no UI files is skipped
 without starting anything), plus `renderOverview` in `media/board.js`.
 
+## 4c. Fourth round — the whole stack in a worktree, a live browser, verified on Laravel
+
+- **A fresh worktree is set up before it runs** (`prepareFor` / `runPrepare`):
+  - the main checkout's `.env`, or `.env.example` plus `key:generate`;
+  - `composer install` when `vendor/` is missing, and the lockfile's install when `node_modules/` is missing (`npm install --no-package-lock` when none is committed);
+  - the worktree's own SQLite database, created and migrated. A shared database is never migrated from here.
+- **Laravel starts everything it runs as:** `npm run dev`, `php artisan queue:listen` (unless `QUEUE_CONNECTION` is sync), and `php artisan serve` on a free port, with `APP_URL` on that port.
+- **The live browser pane** ("🖥 Browser" in the chat head) streams the agent's headless page beside the conversation, with the URL and the last action. It also shows the board's own check when a card reaches review.
+
+**Verified, not assumed.** A real Laravel 13 app with a Vite-built page and a queued job, in a fresh board worktree:
+- The recipe set up `.env`, `composer install`, `npm install` and SQLite plus `migrate`, then started Vite, the queue worker and artisan serve. The first start took 61–85s, most of it the installs.
+- A job dispatched from the page was processed by the worker, in the worktree; the main checkout was untouched.
+- A watcher received frames tagged with each action.
+- The board's check opened `/` and `/counter` with 0 errors.
+- `git status` in the worktree stayed clean. The first run found the new lockfile, which is why `--no-package-lock` is used.
+
+Then a **real agent** (Claude Code, `autoVerify: require`), asked to fix "+1 adds 2":
+- It called `app_start`, which brought up all three processes.
+- It fixed `counter.js`, opened `/counter`, clicked +1 and read the count.
+- It moved to validating with `verified: {pages: 1, actions: 1, consoleErrors: 0, urls: [/counter]}`.
+- The pane showed its steps, and the board's check of `/` and `/counter` passed.
+
+It edited before reproducing rather than after.
+
+**The honest limit.** A page-load check catches crashes, console errors and failed requests, not a wrong number: it passed on the unfixed page too. Behaviour is caught by the agent's own browser testing and by the project's e2e suite, which the board runs at review. So the brief now asks for an e2e test when a suite exists.
+
 ## 5. What comparable harnesses have (research, September 2026)
 
 Sources were read directly where the network allowed; cursor.com,
