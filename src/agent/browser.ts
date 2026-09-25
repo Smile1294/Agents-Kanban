@@ -39,6 +39,17 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 
 export const VIEWPORT = { width: 1280, height: 800 } as const
+/** At most this often a watched tab sends the viewer a frame. */
+export const FRAME_INTERVAL_MS = 250
+
+/** One picture of a watched tab, for the board's live browser pane. */
+export interface BrowserFrame {
+  /** Base64 JPEG. */
+  data: string
+  url: string
+  at: number
+  action?: string
+}
 /** Screenshots kept on disk per card. The newest are the ones worth opening. */
 export const KEEP_SHOTS = 20
 
@@ -78,6 +89,13 @@ interface Tab {
   /** Index into `events` where the current page was opened — its errors are
    *  the ones after this, which is what the card reports as the end state. */
   openedAt: number
+  /** The live screencast, while somebody is watching this tab. */
+  cast?: Pw
+  lastFrameAt?: number
+  pendingFrame?: ReturnType<typeof setTimeout>
+  /** The last thing done to the page, carried on each frame — "what did it
+   *  just do" is half of watching an agent test. */
+  lastAction?: string
   shots: number
 }
 
@@ -188,6 +206,7 @@ export class BrowserPool {
   private browser: Pw | undefined
   private launching: Promise<Pw> | undefined
   private readonly tabs = new Map<string, Tab>()
+  private readonly watchers = new Set<{ match: (key: string) => boolean; fn: (key: string, f: BrowserFrame) => void }>()
 
   /** Options may be a function, read when the browser launches and when a
    *  URL is checked — so a changed setting applies without a reload. */
@@ -269,7 +288,60 @@ export class BrowserPool {
       if (r.status() >= 400) add({ kind: 'http', text: `${r.status()} ${r.request().method()} ${r.url()}` })
     })
     this.tabs.set(key, tab)
+    if ([...this.watchers].some((w) => w.match(key))) void this.startCast(key, tab)
     return tab
+  }
+
+  /**
+   * Watch every tab whose key matches — including ones opened LATER — as a
+   * stream of JPEG frames. Chromium's screencast sends a frame only when the
+   * page repaints, so an idle page costs nothing; frames are capped at
+   * `FRAME_INTERVAL_MS` apart, with the last one always delivered (a dropped
+   * final frame would leave the viewer on a state the page is no longer in).
+   * Returns the unsubscribe; a tab nobody matches any more stops casting.
+   */
+  watch(match: (key: string) => boolean, fn: (key: string, f: BrowserFrame) => void): () => void {
+    const w = { match, fn }
+    this.watchers.add(w)
+    for (const [key, tab] of this.tabs) if (match(key)) void this.startCast(key, tab)
+    return () => {
+      this.watchers.delete(w)
+      for (const [key, tab] of this.tabs) {
+        if (tab.cast && ![...this.watchers].some((o) => o.match(key))) void this.stopCast(tab)
+      }
+    }
+  }
+
+  private async startCast(key: string, tab: Tab): Promise<void> {
+    if (tab.cast || tab.page.isClosed()) return
+    try {
+      const cdp = await tab.context.newCDPSession(tab.page)
+      tab.cast = cdp
+      const deliver = (data: string) => {
+        tab.lastFrameAt = Date.now()
+        const frame: BrowserFrame = { data, url: tab.page.url(), at: tab.lastFrameAt, ...(tab.lastAction ? { action: tab.lastAction } : {}) }
+        for (const w of this.watchers) if (w.match(key)) { try { w.fn(key, frame) } catch { /* a viewer's failure is its own */ } }
+      }
+      cdp.on('Page.screencastFrame', (e: { data: string; sessionId: number }) => {
+        cdp.send('Page.screencastFrameAck', { sessionId: e.sessionId }).catch(() => {})
+        const since = Date.now() - (tab.lastFrameAt ?? 0)
+        if (tab.pendingFrame) clearTimeout(tab.pendingFrame)
+        if (since >= FRAME_INTERVAL_MS) deliver(e.data)
+        else tab.pendingFrame = setTimeout(() => { tab.pendingFrame = undefined; deliver(e.data) }, FRAME_INTERVAL_MS - since)
+      })
+      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: 960, maxHeight: 600 })
+    } catch (e) {
+      tab.cast = undefined
+      this.opts.log?.(`Browser screencast could not start: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  private async stopCast(tab: Tab): Promise<void> {
+    const cdp = tab.cast
+    tab.cast = undefined
+    if (tab.pendingFrame) { clearTimeout(tab.pendingFrame); tab.pendingFrame = undefined }
+    await cdp?.send('Page.stopScreencast').catch(() => {})
+    await cdp?.detach().catch(() => {})
   }
 
   /** What arrived since the last time the agent was told, as a suffix line. */
@@ -291,6 +363,7 @@ export class BrowserPool {
     if (!allowed.ok) throw new Error(allowed.message)
     const tab = await this.tab(key)
     tab.openedAt = tab.events.length
+    tab.lastAction = `open ${allowed.url}`
     const res = await tab.page.goto(allowed.url, { waitUntil: 'load', timeout: 30_000 }).catch((e: Error) => e)
     if (res instanceof Error) {
       const first = res.message.split('\n')[0] ?? ''
@@ -335,6 +408,12 @@ export class BrowserPool {
 
   async act(key: string, a: Action): Promise<string> {
     const tab = this.requireTab(key)
+    tab.lastAction = a.action === 'fill' ? `fill ${a.target} = "${a.text.slice(0, 40)}"`
+      : a.action === 'press' ? `press ${a.key}`
+      : a.action === 'scroll' ? `scroll ${a.dy}`
+      : a.action === 'wait' ? `wait ${a.target ?? a.ms ?? ''}`
+      : a.action === 'select' ? `select ${a.target} = ${a.value}`
+      : `${a.action} ${a.target}`
     const page = tab.page
     const loc = (t: string) => page.locator(t).first()
     const timeout = { timeout: 8000 }
@@ -394,6 +473,7 @@ export class BrowserPool {
     const tab = this.tabs.get(key)
     if (!tab) return false
     this.tabs.delete(key)
+    await this.stopCast(tab)
     await tab.context.close().catch(() => {})
     if (!this.tabs.size) await this.shutdown()
     return true

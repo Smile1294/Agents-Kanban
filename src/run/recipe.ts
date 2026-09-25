@@ -42,7 +42,30 @@ export interface RunStep {
   serves?: boolean
 }
 
+/**
+ * One thing a FRESH worktree needs before anything can run in it.
+ *
+ * A worktree is a checkout of tracked files, and everything an app needs that
+ * is NOT tracked is missing: `vendor/`, `node_modules/`, `.env`, a local
+ * SQLite file. So `php artisan serve` in a new worktree died on its first
+ * line, and the board reported "the app did not start" about a setup step
+ * nobody had run. Each of these is run once, in order, and only when the
+ * thing it makes is absent — a second start costs nothing.
+ */
+export type PrepareStep =
+  | { name: string; command: string }
+  /** Copy a file the worktree lacks (the main checkout's `.env`). Done in
+   *  code, not a shell, so it behaves the same on every platform. */
+  | { name: string; copy: { from: string; to: string } }
+  /** Create an empty file (a fresh SQLite database). */
+  | { name: string; touch: string }
+
 export interface RunRecipe {
+  /** Run before `steps`, in order, each to completion. See `PrepareStep`. */
+  prepare?: PrepareStep[]
+  /** Environment for every step — `APP_URL` for the port chosen here, so a
+   *  Laravel app's redirects and asset URLs point at THIS server. */
+  env?: Record<string, string>
   steps: RunStep[]
   /** The port the app will answer on, when it can be known before starting. */
   port?: number
@@ -195,6 +218,88 @@ export async function waitForPort(
   }
 }
 
+/** KEY=VALUE lines of a dotenv file. Quotes stripped, comments skipped. */
+export async function readDotEnv(file: string): Promise<Record<string, string>> {
+  const text = await fs.readFile(file, 'utf8').catch(() => '')
+  const out: Record<string, string> = {}
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line)
+    if (!m) continue
+    out[m[1]!] = m[2]!.replace(/^(['"])(.*)\1$/, '$2')
+  }
+  return out
+}
+
+/** The `.env` the worktree HAS, or the one setup will give it. */
+async function envSource(worktree: string, repoRoot?: string): Promise<string | undefined> {
+  const own = path.join(worktree, '.env')
+  if (await isFile(own)) return own
+  const main = repoRoot && path.resolve(repoRoot) !== path.resolve(worktree) ? path.join(repoRoot, '.env') : undefined
+  if (main && (await isFile(main))) return main
+  const example = path.join(worktree, '.env.example')
+  return (await isFile(example)) ? example : undefined
+}
+
+async function effectiveEnv(worktree: string, repoRoot?: string): Promise<Record<string, string>> {
+  const src = await envSource(worktree, repoRoot)
+  return src ? readDotEnv(src) : {}
+}
+
+/**
+ * What a fresh worktree needs before it can run — see `PrepareStep`. Each is
+ * included only when the thing it makes is missing.
+ *
+ * The `.env` comes from the MAIN checkout when it has one (its database
+ * credentials and keys are the ones that work on this machine), else from
+ * `.env.example` followed by `key:generate`. A SQLite database is created and
+ * migrated only when it is the worktree's OWN file and does not exist yet —
+ * a shared MySQL/Postgres database is never migrated from here, because that
+ * would change the main checkout's data behind its back.
+ */
+export async function prepareFor(worktree: string, repoRoot: string | undefined, laravel: boolean): Promise<PrepareStep[]> {
+  const steps: PrepareStep[] = []
+  const has = (rel: string) => exists(path.join(worktree, rel))
+  let freshKey = false
+  if (laravel && !(await has('.env'))) {
+    const main = repoRoot && path.resolve(repoRoot) !== path.resolve(worktree) ? path.join(repoRoot, '.env') : undefined
+    if (main && (await isFile(main))) {
+      steps.push({ name: '.env from the main checkout', copy: { from: main, to: path.join(worktree, '.env') } })
+    } else if (await has('.env.example')) {
+      steps.push({ name: '.env from .env.example', copy: { from: path.join(worktree, '.env.example'), to: path.join(worktree, '.env') } })
+      freshKey = true
+    }
+  }
+  if ((await has('composer.json')) && !(await has('vendor'))) {
+    steps.push({ name: 'composer install', command: 'composer install --no-interaction --prefer-dist --no-progress' })
+  }
+  if ((await has('package.json')) && !(await has('node_modules'))) {
+    const cmd = (await has('pnpm-lock.yaml')) ? 'pnpm install --frozen-lockfile'
+      : (await has('yarn.lock')) ? 'yarn install --frozen-lockfile'
+      : (await has('bun.lockb')) || (await has('bun.lock')) ? 'bun install'
+      : (await has('package-lock.json')) ? 'npm ci'
+      // No lockfile committed: install WITHOUT writing one, or the worktree
+      // grows an untracked package-lock.json that the move into review then
+      // commits as part of the agent's work. Found on a real Laravel app.
+      : 'npm install --no-package-lock'
+    steps.push({ name: cmd, command: cmd })
+  }
+  if (laravel) {
+    const dotenv = await effectiveEnv(worktree, repoRoot)
+    if (freshKey || !dotenv.APP_KEY) steps.push({ name: 'key:generate', command: 'php artisan key:generate --force' })
+    const conn = (dotenv.DB_CONNECTION ?? '').toLowerCase()
+    const dbFile = dotenv.DB_DATABASE
+    const ownSqlite = conn === 'sqlite' && (!dbFile || !path.isAbsolute(dbFile))
+    const sqlitePath = path.join(worktree, dbFile && !path.isAbsolute(dbFile) ? dbFile : path.join('database', 'database.sqlite'))
+    if (ownSqlite && !(await exists(sqlitePath))) {
+      steps.push({ name: 'a fresh SQLite database', touch: sqlitePath })
+      steps.push({ name: 'migrate', command: 'php artisan migrate --force --no-interaction' })
+    }
+  }
+  return steps
+}
+
 /** Does this package.json declare a script by that name? */
 async function npmScript(dir: string, names: string[]): Promise<string | undefined> {
   const text = await fs.readFile(path.join(dir, 'package.json'), 'utf8').catch(() => undefined)
@@ -265,17 +370,34 @@ export async function detect(env: RunEnv): Promise<RunRecipe | undefined> {
   // 3. Laravel without a per-worktree launcher. The port MUST be chosen here:
   //    the main checkout is normally already on 8000, and a second server that
   //    silently lands on another port is a page showing the wrong code.
+  //    Everything the app runs as goes up together: the server, the asset
+  //    watcher, and the queue worker — Laravel 11+ defaults to the `database`
+  //    queue, so without a worker every dispatched job sits unprocessed and a
+  //    feature that sends a mail or builds an export looks broken.
   if (await exists(path.join(worktree, 'artisan'))) {
     const port = await freePort(8000)
+    const prepare = await prepareFor(worktree, env.repoRoot, true)
+    const dotenv = await effectiveEnv(worktree, env.repoRoot)
     const steps: RunStep[] = []
     const dev = await npmScript(worktree, ['dev'])
     if (dev) steps.push({ name: 'npm run dev', command: `npm run ${dev}` })
+    const queue = (dotenv.QUEUE_CONNECTION ?? 'database').toLowerCase()
+    const worker = queue !== 'sync' && queue !== 'null'
+    if (worker) steps.push({ name: 'queue', command: 'php artisan queue:listen --tries=1' })
     steps.push({ name: 'artisan serve', command: `php artisan serve --port=${port}`, serves: true })
+    const parts = [
+      ...(prepare.length ? [`setup: ${prepare.map((p) => p.name).join(', ')}`] : []),
+      `artisan serve on ${port}`,
+      ...(dev ? [`npm run ${dev}`] : []),
+      ...(worker ? [`queue worker (${queue})`] : []),
+    ]
     return {
+      ...(prepare.length ? { prepare } : {}),
+      env: { APP_URL: `http://localhost:${port}` },
       steps,
       port,
       url: `http://localhost:${port}`,
-      why: dev ? `Laravel + npm run ${dev}, on port ${port}` : `Laravel, on port ${port}`,
+      why: `Laravel — ${parts.join(' · ')}`,
     }
   }
 
@@ -283,9 +405,11 @@ export async function detect(env: RunEnv): Promise<RunRecipe | undefined> {
   //    tool picks, so it is discovered by watching, never assumed.
   const script = await npmScript(worktree, ['dev', 'start', 'serve'])
   if (script) {
+    const prepare = await prepareFor(worktree, env.repoRoot, false)
     return {
+      ...(prepare.length ? { prepare } : {}),
       steps: [{ name: `npm run ${script}`, command: `npm run ${script}`, serves: true }],
-      why: `package.json — npm run ${script}`,
+      why: `package.json — ${prepare.length ? `setup: ${prepare.map((p) => p.name).join(', ')} · ` : ''}npm run ${script}`,
     }
   }
 

@@ -375,13 +375,17 @@ button[disabled] { cursor: default; }
 
 /* ------------------------------------------------------------------ chat */
 
-.chat-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+/* Wraps: with the live browser pane open the head is half as wide, and a row
+   of ten buttons that cannot wrap squeezed the card's TITLE to nothing — the
+   one thing on this row that says which session this is. The title keeps a
+   real minimum; the buttons move to a second line instead. */
+.chat-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 /* A disabled button in this row USED to be a blink — `busy` clears itself when
    the merge returns. A merge waiting for review does not: Merge stays dead
    until the user commits or aborts it, so a control that still looks clickable
    is one they will press and press again. The tooltip says why. */
 .chat-head button[disabled] { opacity: 0.45; cursor: default; }
-.chat-titles { min-width: 0; }
+.chat-titles { min-width: 0; flex: 1 1 220px; }
 .chat-title { font-weight: 600; font-size: 1.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-titles .labels { margin-top: 4px; }
 
@@ -1577,3 +1581,19 @@ mark.hl {
 .fold-dot.sec-needs { background: var(--warn); }
 .fold-dot.sec-running { background: var(--run); }
 .fold-dot.sec-test { background: var(--violet); }
+
+/* ------------------------------------------------------- live browser pane */
+
+.chat-split { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.chat-split > .main { flex: 1 1 55%; min-width: 0; }
+.browser-pane {
+  flex: 1 1 45%; min-width: 0; max-width: 60%; display: flex; flex-direction: column;
+  border-left: 1px solid var(--line); background: var(--panel);
+}
+.browser-pane-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--line); min-width: 0; }
+.browser-pane-url { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 0.85em; }
+.browser-pane-img { display: none; width: 100%; height: auto; object-fit: contain; object-position: top; background: #fff; }
+.browser-pane-img.on { display: block; }
+.browser-pane-action { padding: 4px 8px; color: var(--faint); font-size: 0.85em; font-family: var(--vscode-editor-font-family); }
+.browser-pane-empty { padding: 16px; color: var(--faint); font-size: 0.9em; }
+.browser-pane-empty.hidden { display: none; }

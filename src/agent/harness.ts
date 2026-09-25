@@ -100,9 +100,14 @@ export function bindHarness(deps: HarnessDeps, worktree: () => string | undefine
   const shots: string[] = []
   let lastErrors = 0
   let lastUrl: string | undefined
+  const visited: string[] = []
   const settle = () => {
     lastErrors = deps.browser.errorsOnPage?.(runKey) ?? lastErrors
     lastUrl = deps.browser.url?.(runKey) ?? lastUrl
+    if (lastUrl && /^https?:/.test(lastUrl) && !visited.includes(lastUrl)) {
+      visited.push(lastUrl)
+      if (visited.length > 6) visited.shift()
+    }
   }
   const dir = () => {
     const d = worktree()
@@ -201,7 +206,10 @@ export function bindHarness(deps: HarnessDeps, worktree: () => string | undefine
       if (!pages) return undefined
       // The page may have logged more since the last call (a timer, a poll).
       settle()
-      return { pages, actions, screenshots: [...shots], consoleErrors: lastErrors, ...(lastUrl ? { url: lastUrl } : {}), at: Date.now() }
+      return {
+        pages, actions, screenshots: [...shots], consoleErrors: lastErrors,
+        ...(lastUrl ? { url: lastUrl } : {}), ...(visited.length ? { urls: [...visited] } : {}), at: Date.now(),
+      }
     },
   }
 }
@@ -339,7 +347,9 @@ export function harnessBrief(required = false): string[] {
     ...(required
       ? ['On this board it is REQUIRED: a change to files a browser shows cannot move to review until you have opened it.']
       : []),
-    'When you move to review the board also runs its own check (the page and any e2e suite) and shows the result.',
+    'When you move to review the board also runs its own check (the pages you opened, and the project\'s e2e suite',
+    'if it has one — test:e2e, e2e, playwright…) and shows the result. A page load cannot see a wrong NUMBER, so if',
+    'there is such a suite, add or update a test for what you changed: that is what makes the check able to say bad.',
     '',
   ]
 }

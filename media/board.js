@@ -201,6 +201,23 @@
    *  (the next frame would take them). */
   const sentThumbs = new Map()
   /**
+   * The live browser pane beside a chat: which card it follows, and the last
+   * frame. Frames arrive on their own channel (`browserFrame`), several a
+   * second while the page changes, and are written straight into the pane's
+   * <img> — never through render(), which would rebuild the chat under the
+   * reader for every picture. Remembered like a closed panel.
+   */
+  let browserFor = ''
+  let browserFrame = null
+  const browserOn = () => disclosed['chat:browser'] === true
+  function followBrowser() {
+    const want = view.mode === 'chat' && browserOn() ? view.selectedKey : ''
+    if (want === browserFor) return
+    if (want !== browserFor) browserFrame = null
+    browserFor = want
+    post('watchBrowser', { id: want, on: !!want })
+  }
+  /**
    * Choices made in an AskUserQuestion picker but not yet sent, keyed by
    * request id and then by question text.
    *
@@ -370,6 +387,10 @@
         mentionFetching = false
         if (mentionAt(draft)) render()
       }
+    } else if (d.type === 'browserFrame') {
+      if (d.id !== browserFor || typeof d.data !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(d.data)) return
+      browserFrame = { data: d.data, url: String(d.url || ''), action: d.action ? String(d.action) : '', source: d.source === 'check' ? 'check' : 'agent', at: Number(d.at) || Date.now() }
+      paintBrowserFrame()
     } else if (d.type === 'sentImages') {
       // The bytes a sent message carried, asked for by its "Show".
       if (typeof d.messageId === 'string' && Array.isArray(d.urls)) {
@@ -606,7 +627,14 @@
 
     const shell = el('div', 'shell')
     shell.append(renderRail())
-    shell.append(searching ? renderSearch() : (view.mode === 'chat' ? renderChat() : renderKanban()))
+    if (!searching && view.mode === 'chat' && browserOn() && view.selectedKey) {
+      const split = el('div', 'chat-split')
+      split.append(renderChat(), renderBrowserPane())
+      shell.append(split)
+    } else {
+      shell.append(searching ? renderSearch() : (view.mode === 'chat' ? renderChat() : renderKanban()))
+    }
+    followBrowser()
     root.append(shell)
 
     forEachScroll((n) => { const k = n.getAttribute('data-scroll'); if (scrolled[k]) n.scrollTop = scrolled[k] })
@@ -2174,6 +2202,43 @@
 
   // ------------------------------------------------------------------ chat
 
+  /** The pane: what the agent's browser (or the board's own check) shows now. */
+  function renderBrowserPane() {
+    const pane = el('aside', 'browser-pane')
+    const head = el('div', 'browser-pane-head')
+    head.append(el('span', 'browser-pane-src', '🖥'))
+    head.append(el('span', 'browser-pane-url', ''))
+    const close = el('button', 'ctl', '×')
+    close.title = 'Hide the live browser'
+    close.onclick = () => { disclosed['chat:browser'] = false; post('disclosure', { key: 'chat:browser', open: false }); render() }
+    head.append(close)
+    pane.append(head)
+    const img = el('img', 'browser-pane-img')
+    img.alt = 'The agent\'s browser'
+    pane.append(img)
+    pane.append(el('div', 'browser-pane-action', ''))
+    pane.append(el('div', 'browser-pane-empty',
+      'Nothing to show yet. This follows the agent\'s own browser (browser_open) and the board\'s check when the card reaches review — it appears here as soon as a page is open.'))
+    // Painted after it is in the tree, from the last frame, so a rebuild of
+    // the chat keeps the picture instead of blanking it.
+    setTimeout(paintBrowserFrame, 0)
+    return pane
+  }
+
+  function paintBrowserFrame() {
+    const pane = root.querySelector('.browser-pane')
+    if (!pane || !browserFrame) return
+    const img = pane.querySelector('.browser-pane-img')
+    if (img) img.src = 'data:image/jpeg;base64,' + browserFrame.data
+    const url = pane.querySelector('.browser-pane-url')
+    if (url) url.textContent = (browserFrame.source === 'check' ? 'Board check · ' : 'Agent · ') + browserFrame.url
+    const act = pane.querySelector('.browser-pane-action')
+    if (act) act.textContent = browserFrame.action ? '↳ ' + browserFrame.action : ''
+    const empty = pane.querySelector('.browser-pane-empty')
+    if (empty && empty.classList) empty.classList.add('hidden')
+    if (img && img.classList) img.classList.add('on')
+  }
+
   function renderChat() {
     const main = el('main', 'main chat')
     const c = selected()
@@ -2237,6 +2302,17 @@
           : 'Merge this branch back into the repository — pick the branch to merge into'
         merge.onclick = () => post('merge', { id: c.key })
         head.append(merge)
+      }
+      // The live browser: the agent's page as it tests, beside the chat.
+      if (c.worktree) {
+        const bb = el('button', browserOn() ? 'on' : null, '🖥 Browser')
+        bb.title = browserOn() ? 'Hide the live browser' : 'Watch the agent\'s browser live, beside the chat'
+        bb.onclick = () => {
+          disclosed['chat:browser'] = !browserOn()
+          post('disclosure', { key: 'chat:browser', open: disclosed['chat:browser'] })
+          render()
+        }
+        head.append(bb)
       }
       const arch = el('button', null, c.archived ? 'Unarchive' : 'Archive')
       arch.onclick = () => post('archive', { id: c.key, archived: !c.archived })

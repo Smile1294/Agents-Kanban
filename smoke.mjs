@@ -578,6 +578,10 @@ for (const msg of [
   { type: 'sendAutoCheck', id: 'nope' },
   { type: 'runAutoCheck', id: 'nope' },
   { type: 'runAutoCheck' },
+  // The live browser pane, for a card with no browser, and switched off again.
+  { type: 'watchBrowser', id: 'nope', on: true },
+  { type: 'watchBrowser', id: 'nope', on: false },
+  { type: 'watchBrowser', on: 'yes' },
   // The background-agent scan runs on the render path for every card, so it has
   // to survive a workspace whose sessions never spawned one — which is most of
   // them — without contributing a card field or an error.

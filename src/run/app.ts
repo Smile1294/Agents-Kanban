@@ -26,7 +26,9 @@
  * Plain Node, no `vscode`: unit-tested against real child processes.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import type { RunRecipe } from './recipe.ts'
+import type { PrepareStep, RunRecipe } from './recipe.ts'
+import { promises as fs } from 'node:fs'
+import * as path from 'node:path'
 import { freeTcpPort, isListening } from './recipe.ts'
 
 /** Lines kept per app. Enough for a stack trace and the boot banner above it. */
@@ -78,6 +80,56 @@ export function announcedUrl(line: string): { url: string; port: number } | unde
   // `0.0.0.0` is where it LISTENS, not somewhere a browser can go.
   const url = m[0].replace('0.0.0.0', 'localhost').replace(/\[::1?\]/, 'localhost').replace(/\/$/, '')
   return { url, port }
+}
+
+/** The longest the setup of a fresh worktree may take: `composer install`
+ *  and `npm ci` on a cold cache are minutes. */
+export const PREPARE_TIMEOUT_MS = 15 * 60_000
+
+/**
+ * Run a recipe's setup, in order, each to completion (`PrepareStep`). Every
+ * line goes to `onLine`, so the agent reading `app_logs` and the user reading
+ * the output channel see WHICH step failed and why — "the app did not start"
+ * about an `npm ci` that failed is the report this exists to replace.
+ */
+export async function runPrepare(
+  steps: readonly PrepareStep[], cwd: string, env: Record<string, string>, onLine: (line: string) => void,
+  timeoutMs = PREPARE_TIMEOUT_MS,
+): Promise<{ ok: true } | { ok: false; step: string; detail: string }> {
+  const deadline = Date.now() + timeoutMs
+  for (const step of steps) {
+    onLine(`# setup: ${step.name}`)
+    try {
+      if ('copy' in step) {
+        await fs.copyFile(step.copy.from, step.copy.to)
+        continue
+      }
+      if ('touch' in step) {
+        await fs.mkdir(path.dirname(step.touch), { recursive: true })
+        await fs.writeFile(step.touch, '', { flag: 'a' })
+        continue
+      }
+    } catch (e) {
+      return { ok: false, step: step.name, detail: e instanceof Error ? e.message : String(e) }
+    }
+    onLine(`$ ${step.command}`)
+    const code = await new Promise<number | 'timeout'>((resolve) => {
+      const child = spawn(step.command, {
+        cwd, shell: true, detached: process.platform !== 'win32',
+        env: { ...process.env, ...env, FORCE_COLOR: '0', CI: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      const feed = (prefix: string) => (c: Buffer) => { for (const l of c.toString().split(/\r?\n/)) if (l.trim()) onLine(prefix + l) }
+      child.stdout?.on('data', feed(''))
+      child.stderr?.on('data', feed('! '))
+      const timer = setTimeout(() => { void killTree(child).then(() => resolve('timeout')) }, Math.max(1000, deadline - Date.now()))
+      child.on('error', (e) => onLine(`! ${e.message}`))
+      child.on('close', (c) => { clearTimeout(timer); resolve(c ?? 1) })
+    })
+    if (code !== 0) {
+      return { ok: false, step: step.name, detail: code === 'timeout' ? 'timed out' : `exited with code ${code}` }
+    }
+  }
+  return { ok: true }
 }
 
 export interface StartOptions {
@@ -154,6 +206,26 @@ export class AppProcesses {
       partial: new Map(),
     }
     this.apps.set(key, app)
+
+    // A fresh worktree first gets what it lacks (`vendor/`, `node_modules/`,
+    // `.env`, a SQLite file) — logged into the same buffer, so `app_logs`
+    // shows `npm ci` failing rather than a server that "did not start".
+    Object.assign(env, recipe.env ?? {})
+    if (recipe.prepare?.length) {
+      app.status.detail = `setting up: ${recipe.prepare.map((p) => p.name).join(', ')}`
+      const pushLine = (l: string) => {
+        app.log.push(l)
+        if (app.log.length > LOG_LINES) app.log.splice(0, app.log.length - LOG_LINES)
+      }
+      const prep = await runPrepare(recipe.prepare, cwd, env, pushLine)
+      if (this.apps.get(key) !== app) return { ...app.status }
+      if (!prep.ok) {
+        app.status.state = 'failed'
+        app.status.detail = `setup step "${prep.step}" failed: ${prep.detail}`
+        return { ...app.status }
+      }
+      delete app.status.detail
+    }
 
     let announced: { url: string; port: number } | undefined
     const push = (stream: string, chunk: Buffer | string) => {

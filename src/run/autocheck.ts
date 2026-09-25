@@ -77,6 +77,10 @@ export async function runAutoCheck(
   card: string,
   worktree: string,
   changed: readonly string[],
+  /** Pages to open besides `/` — the ones the agent visited and the test
+   *  plan links to. Only their PATH is used, on the app the board started:
+   *  a port in an agent's URL may belong to a server that is gone. */
+  paths: readonly string[] = [],
 ): Promise<AutoCheck> {
   const at = Date.now()
   const ui = uiFilesIn(changed)
@@ -104,21 +108,37 @@ export async function runAutoCheck(
     out.skipped = 'UI files changed, but the board cannot tell how to start this app (set agentsKanban.runCommand)'
   }
 
-  // 2. The page, in a context of its own — never the agent's tab.
+  // 2. The pages, in a context of their own — never the agent's tab. `/`
+  //    first, then every page the change is about; errors are counted per
+  //    page, and the screenshot is of the last one (the most specific).
   if (url) {
     const key = `autocheck:${card}`
+    const origin = new URL(url).origin
+    const want = ['/', ...paths.map(pathOf).filter((p): p is string => !!p)]
+    const unique = [...new Set(want)].slice(0, 6)
+    out.pages = []
+    out.pageErrors = 0
     try {
-      await deps.browser.open(key, url)
-      await new Promise((r) => setTimeout(r, 800))
-      out.pageErrors = deps.browser.errorsOnPage(key)
-      const errs = deps.browser.console(key)
-      if (out.pageErrors) out.errorLines = errs.split('\n').filter((l) => l.startsWith('- ')).slice(0, 8)
+      for (const p of unique) {
+        try {
+          await deps.browser.open(key, origin + p)
+        } catch (e) {
+          out.ok = false
+          out.pageError = `${p}: ${e instanceof Error ? e.message.split('\n')[0]! : String(e)}`
+          continue
+        }
+        await new Promise((r) => setTimeout(r, 800))
+        const n = deps.browser.errorsOnPage(key)
+        out.pages.push({ path: p, errors: n })
+        out.pageErrors += n
+        if (n) {
+          const lines = deps.browser.console(key).split('\n').filter((l) => l.startsWith('- ')).map((l) => `${p} ${l}`)
+          out.errorLines = [...(out.errorLines ?? []), ...lines].slice(0, 8)
+        }
+      }
       const shot = await deps.browser.screenshot(key, {}).catch(() => undefined)
       if (shot?.saved) out.screenshot = shot.saved
       if (out.pageErrors) out.ok = false
-    } catch (e) {
-      out.ok = false
-      out.pageError = e instanceof Error ? e.message.split('\n')[0]! : String(e)
     } finally {
       await deps.browser.close(key).catch(() => false)
     }
@@ -135,6 +155,17 @@ export async function runAutoCheck(
     if (!r.ok) out.ok = false
   }
   return out
+}
+
+/** A URL's path and query, or a path as given; undefined for anything else. */
+function pathOf(raw: string): string | undefined {
+  if (raw.startsWith('/')) return raw
+  try {
+    const u = new URL(raw)
+    return /^https?:$/.test(u.protocol) ? u.pathname + u.search : undefined
+  } catch {
+    return undefined
+  }
 }
 
 async function runScript(

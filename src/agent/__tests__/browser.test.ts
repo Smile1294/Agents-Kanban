@@ -95,6 +95,25 @@ try {
   try { await pool.snapshot('card-9') } catch (e) { noTab = String(e) }
   ok(/browser_open first/.test(noTab), 'acting before opening says what to do')
 
+  // Watching: a live stream of the page, for the board's browser pane — started
+  // on a tab opened AFTER the watch began, carrying the last action.
+  const frames: Array<{ key: string; url: string; action?: string; data: string }> = []
+  const stop = pool.watch((k) => k === 'card-live', (k, f) => frames.push({ key: k, ...f }))
+  await pool.open('card-live', `http://localhost:${port}/`)
+  await new Promise((r) => setTimeout(r, 700))
+  ok(frames.length >= 1 && frames[0]!.url.startsWith(`http://localhost:${port}`) && frames[0]!.data.startsWith('/9j/'),
+     `a watched tab streams JPEG frames of the page (${frames.length})`)
+  await pool.act('card-live', { action: 'fill', target: '#new', text: 'watched' })
+  await pool.act('card-live', { action: 'click', target: '#add' })
+  await new Promise((r) => setTimeout(r, 700))
+  ok(frames.some((f) => f.action === 'click #add'), `each frame carries what was just done (${frames.at(-1)?.action})`)
+  ok(frames.every((f) => f.key === 'card-live'), 'and only the matched tab is streamed')
+  stop()
+  const before = frames.length
+  await pool.act('card-live', { action: 'click', target: '#add' })
+  await new Promise((r) => setTimeout(r, 600))
+  ok(frames.length === before, 'nothing is sent once the watch is stopped')
+
   ok(await pool.close('card-1') && !pool.has('card-1'), 'close drops the card\'s page')
 } finally {
   await pool.shutdown()

@@ -107,17 +107,54 @@ const r4 = await detect({
 ok(asked[0] === 8000, `a free port is looked for from 8000 up (asked from ${asked[0]})`)
 ok(r4?.port === 8042 && /--port=8042/.test(r4.steps.find((s) => s.serves)?.command ?? ''),
    `and the server is TOLD that port rather than left to pick: ${r4?.steps.find((s) => s.serves)?.command}`)
-ok(r4?.steps.length === 2, `the asset watcher is started too (${r4?.steps.length} steps)`)
+ok(r4?.steps.length === 3, `the asset watcher and the queue worker are started too (${r4?.steps.map((s) => s.command).join(' | ')})`)
 ok(r4?.steps.filter((s) => s.serves).length === 1,
    'but only one step is the one to wait on — a watcher never answers on the app port')
-ok(r4?.steps[0]?.command === 'npm run dev' && r4?.steps[1]?.serves === true,
+ok(r4?.steps[0]?.command === 'npm run dev' && r4?.steps[2]?.serves === true,
    'and the watcher goes first, so the server comes up against built assets')
+ok(!!r4?.steps.some((s) => s.command === 'php artisan queue:listen --tries=1'),
+   'Laravel 11+ queues on `database` by default, so a worker is started — listen, so it picks up the agent\'s edits')
+ok(r4?.env?.APP_URL === 'http://localhost:8042', 'APP_URL is this server, so redirects and assets point at the worktree')
+ok(!!r4?.prepare?.some((p) => 'command' in p && p.command === 'npm install --no-package-lock'),
+   'a fresh worktree installs node_modules before anything runs — without writing a lockfile the review move would commit')
 
 // A Laravel project with no `dev` script gets one step, not an npm command that
 // does not exist.
 const bare = await mkWorktree('S4-bare-laravel', { artisan: '#!/usr/bin/env php\n' })
 const r5 = await detect({ worktree: bare, home: bareHome, pathEnv: '', freePort: async () => 8001 })
-ok(r5?.steps.length === 1, 'no dev script means no npm step')
+ok(!!r5?.steps.every((s) => !s.command.startsWith('npm')), 'no dev script means no npm step')
+
+// The setup a real fresh Laravel worktree needs, from the main checkout.
+{
+  const main = await mkWorktree('main-checkout', {
+    artisan: '#!/usr/bin/env php\n',
+    '.env': 'APP_KEY=base64:abc\nDB_CONNECTION=sqlite\nQUEUE_CONNECTION=sync\n',
+  })
+  const wt = await mkWorktree('S9-fresh-laravel', {
+    artisan: '#!/usr/bin/env php\n', 'composer.json': '{}', 'package.json': JSON.stringify({ scripts: { dev: 'vite' } }),
+    'package-lock.json': '{}', '.env.example': 'APP_KEY=\n',
+  })
+  const r = await detect({ worktree: wt, repoRoot: main, home: bareHome, pathEnv: '', freePort: async () => 8100 })
+  const names = (r?.prepare ?? []).map((p) => p.name)
+  ok(names[0] === '.env from the main checkout', `the main checkout's .env is copied — its credentials are the ones that work here (${names.join(', ')})`)
+  ok(names.includes('composer install') && names.includes('npm ci'), 'vendor/ and node_modules/ are installed, npm ci for a lockfile')
+  ok(!names.includes('key:generate'), 'the copied .env already has a key, so none is generated')
+  ok(names.includes('a fresh SQLite database') && names.includes('migrate'), 'the worktree gets its OWN SQLite database, migrated')
+  ok(!r?.steps.some((s) => /queue/.test(s.command)), 'QUEUE_CONNECTION=sync needs no worker')
+  ok(/setup: .*composer install/.test(r?.why ?? '') && /artisan serve on 8100/.test(r?.why ?? ''), `and the button says all of it: ${r?.why}`)
+
+  const own = await mkWorktree('S10-own-env', {
+    artisan: '#!/usr/bin/env php\n', '.env': 'APP_KEY=x\nDB_CONNECTION=mysql\n',
+  })
+  await fs.mkdir(path.join(own, 'vendor'), { recursive: true })
+  const r2 = await detect({ worktree: own, repoRoot: main, home: bareHome, pathEnv: '', freePort: async () => 8101 })
+  ok(!r2?.prepare?.length, 'a worktree that already has everything is not set up again')
+  ok(!(r2?.prepare ?? []).some((p) => p.name === 'migrate'), 'and a shared MySQL database is never migrated from here')
+
+  const example = await mkWorktree('S11-example-only', { artisan: '#!/usr/bin/env php\n', '.env.example': 'APP_KEY=\nDB_CONNECTION=mysql\n' })
+  const r3 = await detect({ worktree: example, home: bareHome, pathEnv: '', freePort: async () => 8102 })
+  ok((r3?.prepare ?? []).map((p) => p.name).join(',') === '.env from .env.example,key:generate', 'with no main .env, the example is copied and a key generated')
+}
 
 // ---------------------------------------------------------------------------
 // 6. A plain Node project. The port is whatever the tool picks, so none is

@@ -915,6 +915,25 @@ try {
   ok(comp.jumpBg, 'the jump buttons carry a background and shadow — they overlay the text')
   await compPage.close()
 
+  /* The live browser pane halves the chat's width. A head row of buttons that
+     could not wrap then squeezed the card TITLE to 0px — measured on a real
+     render — so the title keeps a real width and the buttons wrap instead. */
+  const pane = await browser.newPage({ viewport: { width: 1400, height: 760 } })
+  const withPane = {
+    ...chatState, disclosures: { 'chat:browser': true },
+    cards: chatState.cards.map((c) => (c.key === 'a' ? { ...c, worktree: '/tmp/wt', agent: { kind: 'working', contextTokens: 1 } } : c)),
+  }
+  await pane.setContent(page$(withPane))
+  await pane.waitForSelector('.browser-pane', { timeout: 5000 })
+  const m = await pane.evaluate(() => ({
+    title: document.querySelector('.chat-title')?.getBoundingClientRect().width ?? 0,
+    pane: document.querySelector('.browser-pane')?.getBoundingClientRect().width ?? 0,
+    chat: document.querySelector('.chat-split > .main')?.getBoundingClientRect().width ?? 0,
+  }))
+  ok(m.pane > 300 && m.chat > 400, `the browser pane and the chat share the width (${Math.round(m.chat)}px chat, ${Math.round(m.pane)}px pane)`)
+  ok(m.title >= 150, `and the card title keeps a readable width beside it (${Math.round(m.title)}px)`)
+  await pane.close()
+
 } finally {
   await browser.close()
 }

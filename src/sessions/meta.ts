@@ -108,6 +108,8 @@ export interface AutoCheck {
   /** Errors while the page loaded, and the first lines of them. */
   pageErrors?: number
   errorLines?: string[]
+  /** Every page the check opened, with its errors. */
+  pages?: { path: string; errors: number }[]
   screenshot?: string
   e2e?: { command: string; ok: boolean; tail: string[]; durationMs: number; timedOut?: boolean }
 }
@@ -128,6 +130,11 @@ export function parseAutoCheck(raw: unknown): AutoCheck | undefined {
   const pageError = str(r.pageError); if (pageError) out.pageError = pageError
   if (typeof r.pageErrors === 'number' && r.pageErrors >= 0) out.pageErrors = Math.floor(r.pageErrors)
   const el = strs(r.errorLines, 8); if (el?.length) out.errorLines = el
+  if (Array.isArray(r.pages)) {
+    out.pages = (r.pages as Array<Record<string, unknown>>)
+      .filter((p) => p && typeof p.path === 'string' && typeof p.errors === 'number')
+      .slice(0, 8).map((p) => ({ path: String(p.path).slice(0, 300), errors: Math.max(0, Math.floor(Number(p.errors))) }))
+  }
   const shot = str(r.screenshot, 1000); if (shot && targetIsClean(shot)) out.screenshot = shot
   const e = r.e2e as Record<string, unknown> | undefined
   if (e && typeof e === 'object' && typeof e.command === 'string' && typeof e.ok === 'boolean') {
@@ -157,6 +164,9 @@ export interface Verification {
   consoleErrors: number
   /** That page. */
   url?: string
+  /** Every page it opened (newest last, at most six) — the board's own check
+   *  visits these too, so it tests the pages the change is about, not `/`. */
+  urls?: string[]
   at: number
 }
 
@@ -173,6 +183,7 @@ export function parseVerification(raw: unknown): Verification | undefined {
   return {
     pages, actions, consoleErrors, screenshots,
     ...(typeof r.url === 'string' && r.url && targetIsClean(r.url) ? { url: r.url.slice(0, 500) } : {}),
+    ...(Array.isArray(r.urls) ? { urls: r.urls.filter((u): u is string => typeof u === 'string' && targetIsClean(u)).slice(-6).map((u) => u.slice(0, 500)) } : {}),
     at: typeof r.at === 'number' ? r.at : Date.now(),
   }
 }

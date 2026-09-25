@@ -59,7 +59,10 @@ try {
   const prompt = autoCheckPrompt(fail)
   ok(/undefinedCall/.test(prompt) && /npm run test:e2e` failed/.test(prompt) && /move back to "validating"/.test(prompt),
      'the message for the agent carries both failures and how to hand back')
-  ok(JSON.stringify(parseAutoCheck(JSON.parse(JSON.stringify(fail)))) === JSON.stringify(fail), 'the result survives a store round trip unchanged')
+  const canon = (v: unknown): string => JSON.stringify(v, (_k, x) => (x && typeof x === 'object' && !Array.isArray(x)
+    ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => a.localeCompare(b))) : x))
+  ok(canon(parseAutoCheck(JSON.parse(JSON.stringify(fail)))) === canon(fail), 'the result survives a store round trip unchanged')
+  ok((fail.pages ?? []).length === 1 && fail.pages![0]!.path === '/', 'each page opened is listed with its errors')
 
   // Nothing a browser shows, and no suite: nothing is started.
   const none = await project('<h1>x</h1>')

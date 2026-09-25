@@ -44,7 +44,7 @@ import { coalesce } from './board/coalesce.ts'
 import { describeImages, imageLoadNote, sanitiseImages } from './agent/images.ts'
 import { BrowserPool } from './agent/browser.ts'
 import type { HarnessDeps } from './agent/harness.ts'
-import { AppProcesses } from './run/app.ts'
+import { AppProcesses, runPrepare } from './run/app.ts'
 import { autoCheckPrompt, runAutoCheck } from './run/autocheck.ts'
 import { ReviewDrafts, reviewPrompt } from './board/review-comments.ts'
 import { attentionFor, attentionSummary, type AttentionItem } from './board/attention.ts'
@@ -3087,6 +3087,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   /** Cards whose auto-check is running right now, for the card to say so. */
   const autoChecking = new Set<string>()
+  /** Live browser panes, one per surface: the stop function of each watch. */
+  const browserViews = new Map<string, () => void>()
   async function runCardAutoCheck(key: string, dir: string | undefined, base: string | undefined): Promise<void> {
     const w = ws
     if (!w?.worktrees || !dir || autoChecking.has(key)) return
@@ -3096,7 +3098,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     refreshAll()
     try {
       const changed = await w.worktrees.changedFiles(dir, base ?? 'HEAD').catch(() => [] as string[])
-      const result = await runAutoCheck({ apps: agentApps, browser: agentBrowser, recipe: deps.recipe }, key, dir, changed)
+      // The pages the change is ABOUT: the ones the agent opened, and the
+      // local links its test plan names.
+      const before = (await w.store.card(key)).testPlan
+      const paths = [
+        ...(before?.verified?.urls ?? []),
+        ...(before?.links ?? []).filter((l) => l.kind === 'url' && /^https?:\/\/(localhost|127\.0\.0\.1)/.test(l.target)).map((l) => l.target),
+      ]
+      const result = await runAutoCheck({ apps: agentApps, browser: agentBrowser, recipe: deps.recipe }, key, dir, changed, paths)
       // Onto the plan as it stands NOW — the agent may have rewritten it
       // while the check ran — and only if it is still in review.
       const card = await w.store.card(key)
@@ -4734,6 +4743,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       refreshAll()
     },
 
+    /**
+     * The live browser pane beside a chat. Matches the card's CURRENT run's
+     * tab (resolved per frame, so a resume or an adopted session id is
+     * followed) and the board's own auto-check tab, and sends each frame to
+     * the one surface that asked. A reply that throws means the view is gone.
+     */
+    watchBrowser(key, on, sink, reply) {
+      browserViews.get(sink)?.()
+      browserViews.delete(sink)
+      if (!on || !key) return
+      const run = () => ws?.manager?.byKey(key)
+      const stop = agentBrowser.watch(
+        (k) => k === run()?.runId || k === `autocheck:${key}` || k === `autocheck:${run()?.sessionId ?? key}`,
+        (k, f) => {
+          try {
+            reply({ type: 'browserFrame', id: key, source: k.startsWith('autocheck:') ? 'check' : 'agent', ...f })
+          } catch {
+            stop()
+            browserViews.delete(sink)
+          }
+        },
+      )
+      browserViews.set(sink, stop)
+    },
+
     /** Send the board's failed auto-check to the agent, as one message. */
     async sendAutoCheck(key) {
       const card = await requireWs().store.card(key)
@@ -5140,8 +5174,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       log.info(`Run app in ${dir} — ${recipe.why}`)
+      // A fresh worktree's setup first (dependencies, `.env`, a SQLite file),
+      // to completion — the terminals below all need it, and three of them
+      // racing one `composer install` is how a first start goes wrong.
+      if (recipe.prepare?.length) {
+        const prep = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: `Setting up the worktree — ${recipe.prepare.map((p) => p.name).join(', ')}` },
+          () => runPrepare(recipe.prepare!, dir, recipe.env ?? {}, (l) => log.info(`[setup] ${l}`)),
+        )
+        if (!prep.ok) {
+          await vscode.window.showErrorMessage(
+            `Could not set up the worktree: "${prep.step}" ${prep.detail}. Its output is in the Agents Kanban output channel.`,
+            { modal: true },
+          )
+          return
+        }
+      }
       for (const step of recipe.steps) {
-        const term = vscode.window.createTerminal({ name: step.name, cwd: dir })
+        const term = vscode.window.createTerminal({ name: step.name, cwd: dir, ...(recipe.env ? { env: recipe.env } : {}) })
         // Only the serving step is brought forward. Showing each in turn leaves
         // the user looking at an asset watcher while the server logs scroll
         // past unseen behind it.

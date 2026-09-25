@@ -969,6 +969,26 @@ for (const label of ['calc.js', 'Run the tests', 'Local server']) {
   ok(passed.text().includes('Auto-check ✓ page loads · 0 errors') && !findButton(passed.root, 'Send failure to agent'), 'a pass is a tick, with nothing to send')
 }
 
+// The live browser pane: the agent's page beside the chat, streamed on its own
+// channel and painted into the pane without rebuilding the chat.
+{
+  const bv = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [WT_CARD] })
+  findButton(bv.root, '🖥 Browser')?.onclick()
+  ok(bv.posted.some((m) => m.type === 'watchBrowser' && m.id === WT_CARD.key && m.on === true), 'opening the pane asks the host to stream THIS card\'s browser')
+  ok(bv.text().includes('Nothing to show yet'), 'and says what it will show before a page is open')
+  for (const fn of bv.listeners) fn({ data: { type: 'browserFrame', id: WT_CARD.key, source: 'agent', data: '/9j/AAAA', url: 'http://localhost:8100/todos', action: 'click #add', at: 1 } })
+  const img = walkAll(bv.root).find((n) => (n.className || '').includes('browser-pane-img'))
+  ok(img?.src === 'data:image/jpeg;base64,/9j/AAAA', 'a frame is painted into the pane')
+  ok(bv.text().includes('Agent · http://localhost:8100/todos') && bv.text().includes('↳ click #add'), 'with the page it is on and what it just did')
+  for (const fn of bv.listeners) fn({ data: { type: 'browserFrame', id: 'someone-else', data: '/9j/BBBB', url: 'x', at: 2 } })
+  ok(img?.src === 'data:image/jpeg;base64,/9j/AAAA', 'a frame for another card is ignored')
+  for (const fn of bv.listeners) fn({ data: { type: 'browserFrame', id: WT_CARD.key, data: '"><script>', url: 'x', at: 3 } })
+  ok(img?.src === 'data:image/jpeg;base64,/9j/AAAA', 'and one that is not base64 is refused')
+  const x = walkAll(bv.root).find((n) => n.tagName === 'button' && n.textContent === '×' && (n.title || '').includes('live browser'))
+  x?.onclick()
+  ok(bv.posted.some((m) => m.type === 'watchBrowser' && m.on === false), 'closing the pane stops the stream')
+}
+
 // A session with no plan must not grow an empty panel.
 const unplanned = run({ ...base, mode: 'chat', selectedKey: 'abc-123', cards: [WT_CARD], transcript: [] })
 ok(!unplanned.text().includes('How to test this'), 'no plan, no panel')

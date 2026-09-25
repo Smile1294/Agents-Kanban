@@ -572,6 +572,9 @@ export interface BoardHost {
   sendReview(id: string): Promise<void>
   /** Send the board's failed auto-check to the agent; run it again by hand. */
   sendAutoCheck(id: string): Promise<void>
+  /** Stream the card's browser (the agent's, or the board's own check) to
+   *  ONE surface, as `browserFrame` messages, until turned off. */
+  watchBrowser?(id: string, on: boolean, sink: StateSink, reply: (m: object) => void): void
   runAutoCheck(id: string): Promise<void>
   discardReview(id: string): Promise<void>
   move(key: string, phase: string): Promise<void>
@@ -799,7 +802,12 @@ async function routeBoardMessage(
        already has — the model catalogue — and a freshly loaded view has none of
        it. Without this, a reload leaves an empty model picker until the next
        backend switch. */
-    case 'ready': host.onReady?.(sink); await refresh(); break
+    case 'ready':
+      // A reloaded view holds no browser pane, so it is watching nothing.
+      host.watchBrowser?.('', false, sink, reply)
+      host.onReady?.(sink)
+      await refresh()
+      break
     case 'init': await host.init(); break
     case 'openFolder':
       if (editorOnly('Opening a folder happens in the editor.')) break
@@ -946,6 +954,12 @@ async function routeBoardMessage(
       reply({ type: 'sentImages', id: id(), messageId, urls })
       break
     }
+    case 'watchBrowser':
+      // Frames are ~30KB JPEGs several times a second — the editor's own
+      // postMessage carries them; the relay (4MB messages, polled) must not.
+      if (msg.on === true && editorOnly('The live browser view is shown in the editor.')) break
+      host.watchBrowser?.(id(), msg.on === true, sink, reply)
+      break
     case 'sendReview': if (id()) await host.sendReview(id()); break
     case 'sendAutoCheck': if (id()) await host.sendAutoCheck(id()); break
     case 'runAutoCheck': if (id()) await host.runAutoCheck(id()); break
