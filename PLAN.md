@@ -401,6 +401,19 @@ Working:
   [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §3.
 - **Draw on an image before sending it** — numbered boxes and arrows, pen,
   labels; flattened into the image, and the message says the marks are yours.
+  A sent message's images can be shown again ("Show" on its row).
+- **"Try again from here" puts the WHOLE worktree back.** The host checkpoints
+  the worktree in git before every message (`src/git/checkpoints.ts`, private
+  refs, nothing in the tree or the index); a rewind restores changed files,
+  removes created ones and moves the branch back past later commits.
+- **The test plan carries what the browser saw** — pages, actions,
+  screenshots, errors on the last page — recorded by the host, never claimed
+  by the agent.
+- **Review comments on the diff**, from the gutter "+" of any file in a
+  worktree, sent back to the agent as one numbered message.
+- **"Needs you"** — every card waiting on the user, blocking first, on the
+  board, in the rail and in the status bar.
+- **A per-message spend cap** (`agentsKanban.maxSpendPerMessageUsd`).
 - **One button to run a session's app.** Detects the project's own per-worktree
   launcher, provisions it if it has never been provisioned, waits for the port
   to actually answer, then opens the browser on it. See
@@ -646,11 +659,11 @@ carries its own "Open work" section with the items that land there.
 
 ### The harness roadmap
 
-[docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §6 ranks what comes after the
-browser tools, the history fixes and image annotation: verification evidence on
-the card, an element picker, the remaining image gaps, whole-tree checkpoints
-in a private ref, a critic before review, best-of-N, and per-worktree setup
-scripts. §4 lists what was found and not yet fixed.
+[docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §6 ranks what is left, from
+research into what people switch harnesses for (§5a): a second agent reviewing
+before the human (on the other runtime), PR/CI feedback with capped auto-fix,
+plan as an editable gate, push approvals to the phone, best-of-N, trying the
+work in the main checkout, and the element picker.
 
 ### Runtimes: what is not done
 

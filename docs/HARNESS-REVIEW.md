@@ -6,9 +6,11 @@ features, review what is missing; let agents control the project themselves
 history; let me highlight things in images; check online for must-have harness
 features and optimisations; then implement in phases."*
 
-The first three phases are **built** on branch
-`claude/self-checkout-harness-overview-cvpkyy`, one commit each (§3). Everything
-after §5 is the roadmap: ranked, with the files each item would touch.
+Two rounds are **built** on branch `claude/self-checkout-harness-overview-cvpkyy`,
+one commit per piece: phases 1–3 (§3), then every finding fixed plus phases 4 and
+7 and three features from the research (§4). §5a is the research on what people
+switch tools for; §6 is the roadmap that is left, ranked, with the files each
+item touches.
 
 ---
 
@@ -131,39 +133,52 @@ beyond "reproduce it in the browser", the agent called `app_start` →
 
 ---
 
-## 4. Findings that are not fixed yet
+## 4. Second round — the findings fixed, phases 4, 6 and 7, and three from the research
 
-### 4.1 History
+Every finding the first round listed as unfixed is fixed, each in its own
+commit on this branch, each with a gate that was shown to fail.
 
-- **Rewind may restore only part of the worktree.** `forkAt` restores files in
-  the anchor's snapshot; a file first edited *after* the anchor keeps the
-  discarded edits, and "created" entries (null backup) are skipped. Verify
-  against a real CLI's `rewindFiles` behaviour before changing it
-  (`sessions/checkpoints.ts`).
-- In-flight runs: the newest prompts have no message id until the run ends, so
-  no fork button on them mid-run.
-- `transcriptWindows` stays keyed by the old id after `adoptKey`/fork, so a
-  widened window resets.
+| Was | Now |
+|---|---|
+| **Rewind restored only part of the worktree**: files first edited after the anchor, files the discarded turns created, and anything Bash changed were left as they were | **Whole-worktree checkpoints** (`src/git/checkpoints.ts`). Before every message it sends, the host snapshots the worktree under the message's id. It uses a temporary index seeded from the real one, `write-tree`, and a commit whose parent is HEAD, stored on `refs/agentskanban/checkpoints/<branch>/<id>`. Nothing touches the working tree, the index or the branch. A rewind makes the worktree match exactly: it restores changed and deleted files, removes created ones, never touches ignored ones, and moves the branch back past commits made after the anchor. The modal says all of that first. Older messages fall back to the file-history path. |
+| No fork button on prompts of a run still in flight | Prompt rows carry their transcript id from the moment they are sent. The host mints a uuid and puts it on the streamed user message, and the CLI writes the row under exactly that uuid (verified against a real CLI). |
+| `transcriptWindows` reset after a key change | The widened window follows the card's key. |
+| Codex sessions showed 📎 and silently turned images into a note | No 📎 on an agent that cannot take images. A paste there says why. |
+| Remote Control silently dropped a message over 4MB | On a relay page, a message over the cap is refused *before* the draft is cleared. `check-contract.mjs` pins the view's constant to `msgMaxBytes`. |
+| The transcript showed an image **count** only | **Show** on a prompt row reads that one message's images back from Claude Code's own file, on the click, in the editor only, and never into state. |
+| No warning as images approached the 32MB request limit | The composer warns at 60% of the limit, counting browser screenshots in tool results and resetting at a compaction. |
+| `smoke.mjs` failed on a machine with a real `claude` on PATH | The cause was a **real bug**: `askTestPlan` aimed at an unknown key resumed a session id nobody had and started a real CLI. It is now a no-op, and smoke asserts that its message sweep starts no run. |
 
-### 4.2 Images
+Built on top:
 
-- **Codex sessions still show 📎**; `capabilities.images` is never read, the
-  images become a note to the model.
-- **Remote Control drops a message over 4MB** (`remote-contract.json`
-  `msgMaxBytes`) without telling the phone — one or two full screenshots.
-- The transcript shows a **count**, never a thumbnail. The bytes are in Claude
-  Code's JSONL, so a thumbnail could be loaded on demand (never per repaint).
-- Every turn re-sends every earlier image; nothing on the board warns as a
-  conversation approaches the API's 32MB request limit.
+- **Phase 4: verification as evidence.** The harness counts, where the calls
+  happen, the pages opened, the actions taken, the screenshots saved and the
+  errors on the page left open. `set_phase` stamps that record on the test
+  plan as `verified`, and drops any `verified` the agent wrote itself. The
+  review panel shows it as numbers ("2 pages · 4 actions · 2 screenshots ·
+  1 error on the last page"), amber when errors are not zero, with a button per
+  screenshot.
+- **Phase 6: the image gaps** and **phase 7: whole-tree checkpoints**, in the table above.
+- **Research #1: review comments on the diff.** A VS Code comment controller
+  offers the gutter "+" on files inside a card's worktree, so on the right side
+  of every diff. A comment becomes a draft on that card. "Send to agent" resumes
+  it with ONE numbered message, ordered like the diff, each comment with the
+  lines it was written on quoted.
+- **Research #5: "Needs you".** Everything waiting on the user, derived once
+  per board pass from the cards: questions and permissions, failed,
+  interrupted and stalled runs, and work ready to test. Blocking items come
+  first, and each row shows how long it has waited. It is drawn on the board
+  and in the rail, and the status bar leads with it.
+- **Research #9: a spend cap.** `agentsKanban.maxSpendPerMessageUsd`, measured
+  from the spend when the user last sent a message. Past it, the turn is
+  interrupted (the session stays open) and the card says why. Dollar meters
+  only.
 
-### 4.3 Elsewhere
-
-- `smoke.mjs`'s update-button block fails on a machine that has a real
-  `claude` on PATH (this container): an earlier step leaves an agent live, so
-  the updater stops at "an agent is running on this Claude Code". Environmental
-  and pre-existing; it needs the smoke to stop its agents before that block.
-
----
+**Verified with a second real agent run** (Claude Code CLI, a counter page
+whose +1 added 2):
+- The live prompt id matched the transcript row's id.
+- The test plan came back with `verified: { pages: 1, actions: 1, consoleErrors: 0 }` stamped by the host.
+- Rewinding to the first message restored `index.html` and moved the branch back past the agent's commit, leaving `git status` clean.
 
 ## 5. What comparable harnesses have (research, September 2026)
 
@@ -205,82 +220,92 @@ conductor.build and vibekanban.com were known only from search excerpts.
 
 ---
 
+## 5a. What people SWITCH harnesses for (research, September 2026)
+
+A second pass, asking which features people publicly say made them change
+tools. Evidence is mostly vendor numbers, reviews and a few posts. cursor.com,
+ampcode.com, conductor.build and news.ycombinator.com were only reachable
+through search excerpts, so treat quoted figures as the vendors' own claims.
+
+Three changes in the market that shape the ranking:
+- **Vibe Kanban's company shut down on 10 April 2026** ([post](https://www.vibekanban.com/blog/shutdown)). The project is community-maintained, and Nimbalyst is courting its users. A VS Code-native kanban has an opening.
+- **Amp removed Handoff** in its May 2026 rebuild ([ampcode.com/news/neo](https://ampcode.com/news/neo)). It is no longer a reason to switch, and fork/rewind covers it here.
+- **Cursor 3 made an agents window, worktrees and `/best-of-n` its main interface** ([changelog](https://cursor.com/changelog/3-0)), and GitHub Agent HQ runs Claude, Codex and Copilot side by side ([blog](https://github.blog/news-insights/company-news/welcome-home-agents/)). Parallel agents on a dashboard are now table stakes; the review and feedback loops are what set tools apart.
+
+Ranked by "people switch for this" against the effort to build it here:
+
+| # | Feature | Who has it | Here |
+|---|---|---|---|
+| 1 | **Line comments on the diff, sent back as one batch** | Vibe Kanban, Conductor, Copilot "fix batch" | **BUILT** (§4) |
+| 2 | **A second agent reviews before the human**, ideally on a different model | Jules critic, Amp Oracle, Anthropic Code Review (substantive comments on 54% of PRs, up from 16% — [blog](https://claude.com/blog/code-review)), `codex-plugin-cc` | Next (§6). This board already runs **both** runtimes, which is rare, and cross-model review is where the gain is reported. |
+| 3 | **CI/PR status fed back to the agent, with fixes** | Bugbot Autofix (share fixed before merge 52%→76% — [blog](https://cursor.com/blog/bugbot-updates-june-2026)), Conductor Checks, Devin Review | Next (§6) |
+| 4 | **Plan mode with an editable plan as a gate** ("the most slept-on feature in Claude Code" — Boris Cherny) | Claude Code, Cursor, Kiro specs | Next (§6) |
+| 5 | **An attention inbox, with push approvals** | Claude Code Remote Control, community ntfy/Telegram bridges | Inbox **BUILT** (§4); push to the phone via the relay is next |
+| 6 | **Best-of-N with side-by-side comparison** | Cursor `/best-of-n`, Codex `--attempts`, Agent HQ | §6. Mixed reviews: it helps on hard bugs and is overkill otherwise |
+| 7 | **Try the agent's work in the main checkout** | Conductor Spotlight, Sculptor Pairing Mode | §6 |
+| 8 | **Memory, knowledge and playbooks** | Claude Code auto memory, Devin Knowledge/Playbooks, DeepWiki | Partly (codemap). Playbooks are §6 |
+| 9 | **Budgets** | Cursor spend limits (after the usage-billing backlash) | Per-message cap **BUILT** (§4); a daily cap is next |
+| 10 | **Scheduled and suggested tasks** | Jules Suggested Tasks | Scheduling exists; suggested cards are §6 |
+| 11 | **Sandbox or container per card** (Claude Code's sandbox cut prompts by 84%) | Claude Code `/sandbox`, container-use, Sculptor | §6 |
+| 12 | **Plugin and MCP management** | Claude Code plugins | §6 |
+
 ## 6. Roadmap — the next phases, ranked
 
 Each phase is one branch-sized piece. "Touches" names the files; the gate is
-what must go red if it is broken.
+what must go red if it breaks.
 
-### Phase 4 — verification becomes evidence on the card
+### Phase 8 — a second agent reviews before you do (research #2)
 
-- Record, per run, what the agent verified: pages opened, screenshots taken,
-  console error count at the end. Show it in the review panel beside
-  `howToTest` ("3 screenshots · 0 console errors"). The error count is a number
-  that can say bad; "tested in browser ✓" is not.
-- Render screenshots as thumbnails in the transcript's tool rows, loaded on
-  demand from extension storage through `asWebviewUri` (never inline in state).
-- Touches: `agent/harness.ts` (a per-run ledger), `SessionMeta` + `parseMeta`
-  (round-trip test), `media/board.js` review panel. Gate: a meta round-trip test
-  and a smoke assertion that the panel shows the count.
+- **What it does:** on the move into review (a setting: off, on, or "above N changed lines"), the host starts a read-only reviewer session on the same worktree, on the *other* runtime or model where one is installed, with the diff against base.
+- **What you see:** its findings land as the same drafts as review comments (§4), so the card says "Codex reviewed: 3 findings" and you choose Send to agent or Discard. Each review shows its cost.
+- **What it reuses:** `split()`'s routing picks the reviewer (`agent/routing.ts`); `board/review-comments.ts` holds the findings.
+- **Tool gating:** the reviewer gets a `post_finding(file, line, text)` board tool instead of Edit/Write, and its permission gate is read-only.
+- **Gate:** a manager test that a reviewer run cannot write to the worktree.
 
-### Phase 5 — an element picker for the user
+### Phase 9 — PR and CI feedback (research #3)
 
-- "Pick element" in the agent's browser (headed) or on a screenshot: click an
-  element, the composer gets its selector, role/name and bounding box as text,
-  plus the cropped screenshot. The research is unanimous that structured
-  context beats pixels.
-- Touches: `agent/browser.ts` (an `elementAt(x, y)` evaluate), a composer chip
-  in `media/board.js`.
+- **What it does:** an optional "Open PR" path beside the local merge, using `gh pr create` from the worktree branch.
+- **What you see:** a checks badge with a number ("2 failing · 14m ago"), never just a dot.
+- **How it polls:** the host runs `gh pr checks` on the existing 5s tick, only for cards that have a PR, backing off when nothing changes.
+- **Fixing CI:** "Fix CI" resumes the agent with the failing log (`gh run view --log-failed`, keeping the tail). Auto-fix is capped at N attempts, host-side.
+- **Touches:** `git/worktree.ts`, a new `git/github.ts`, `extension.ts`.
 
-### Phase 6 — the remaining image gaps (§4.2)
+### Phase 10 — plan as a gate (research #4)
 
-- Hide 📎 for a runtime without `capabilities.images` (send the capability in
-  `composer`), check the total against the relay's 4MB before posting from a
-  remote page, and on-demand thumbnails of sent images in the transcript.
+- **What it does:** cards in Planning run with `permissionMode: 'plan'`. The plan is captured from `ExitPlanMode` into the sidecar, never the repository, and shown as an editable checklist.
+- **What you see:** "Approve & implement" resumes the session with the edited plan. Each item can become a subtask through `split()`.
+- **At review:** the move into review lists which items were done and which were skipped.
 
-### Phase 7 — whole-tree checkpoints
+### Phase 11 — push approvals to the phone (research #5)
 
-- Before each turn, snapshot the worktree (tracked + untracked, not ignored)
-  into `refs/agentskanban/checkpoints/<session>/<n>` with `git stash create` /
-  `git write-tree` on a temporary index. Rewind restores from the ref, so Bash
-  side effects and files created after the anchor are covered (fixes §4.1's
-  partial restore). Nothing is written to the working tree or a branch.
-- Touches: `git/worktree.ts`, `extension.ts` `forkAt`. Gate: a real-git test
-  where a Bash-created file disappears on rewind.
+- **What it does:** Web Push or ntfy from the relay for the "Needs you" items, answered through the same `board/questions.ts` path.
+- **Where it lives:** mostly in the relay repository, plus one event type in the contract.
 
-### Phase 8 — a critic before review
+### Phase 12 — best-of-N (research #6)
 
-- Optional per board: on the move into review, spawn a short read-only review
-  session (cheaper model, `Read`/`Grep` + the diff) whose findings land on the
-  card as notes; the move is not blocked. Uses the existing routing and the
-  `split_task` machinery for "another agent", not a new mechanism.
+- **What you see:** "Run ×N" on a new card creates N sibling cards from the same brief with different routes, grouped as a stack.
+- **The compare view:** diff stat, test-plan result, `verified`, spend and duration per candidate. "Keep this one" merges it and archives the rest, removing worktrees only after you confirm. The total cost is shown before launch.
 
-### Phase 9 — best-of-N
+### Phase 13 — try it in the main checkout (research #7)
 
-- "Run ×N" on a new session: N sibling cards from the same prompt (optionally
-  different agents/models, via the existing routing), grouped under one parent,
-  with a compare view of their diffs and test plans; merging one archives the
-  rest.
+- **What it does:** "Try in main" is refused if the main checkout is dirty (the merge modal).
+- **How it works:** it records the main checkout's HEAD on a private ref, then syncs *tracked* files from the worktree as they change. "Stop trying" puts the main checkout back exactly as it was.
+- **The invariant:** it must never leave the main checkout dirty, or merge stops working. The gate is a real-git test.
 
-### Phase 10 — setup scripts per worktree
+### Phase 14 — the element picker
 
-- `agentsKanban.setupCommand` (or `.agentskanban` config in extension storage)
-  run once when a worktree is created — install dependencies, copy `.env` from
-  the main checkout — so agents do not spend turns on it. Output kept like
-  `app_logs`.
+- **What it does:** "Pick element" on a screenshot or in the headed browser. The composer gets the element's selector, role, name and bounding box as text, plus the cropped screenshot. The research is unanimous that structured context beats pixels.
+- **Touches:** `agent/browser.ts` (an `elementAt(x, y)` evaluate), a composer chip.
 
 ### Smaller, worthwhile
 
-- Cache-hit rate beside the spend readout (the usage records already carry
-  `cache_read_input_tokens`).
-- Stop agent-started apps when a card is archived or merged, not only when its
-  worktree is removed.
-- `browser_resize` / device emulation for responsive checks; `storageState`
-  capture so an agent can test behind a login you performed once.
-- Optionally let a runtime use `@playwright/mcp` instead of the built-in tools
-  for sites that need its larger surface — but keep the built-in set as the
-  default: it is small (context cost), per-card isolated, and loopback-fenced.
-
----
+- A **daily** spend cap beside the per-message one.
+- **Setup scripts per worktree** (`agentsKanban.setupCommand`, run once when a worktree is created, output kept like `app_logs`), so agents stop spending turns on `npm ci`.
+- **Playbooks:** saved card templates (brief, route, flags) on the new-card menu, feeding scheduled runs too.
+- **The CLI's own sandbox** as a per-card flag, checked on `init` the way ultracode is.
+- **Cache-hit rate** beside the spend readout.
+- **Stop agent-started apps** when a card is archived or merged, not only when its worktree is removed.
+- `browser_resize` / device emulation, and `storageState` capture for testing behind a login.
 
 ## 7. Optimisations
 
