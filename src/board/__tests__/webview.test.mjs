@@ -903,6 +903,53 @@ for (const label of ['calc.js', 'Run the tests', 'Local server']) {
   ok(!none.text().includes('Needs you'), 'nothing waiting draws nothing')
 }
 
+// The Overview layout: every card in one list, sectioned by what it NEEDS —
+// the board with ten cards planned and five running, read as "who needs me".
+{
+  const now = Date.now()
+  const OCOLS = [
+    { id: 'planning', name: 'Planning', category: 'unstarted' },
+    { id: 'implementing', name: 'Implementing', category: 'started' },
+    { id: 'validating', name: 'Validating', category: 'review' },
+    { id: 'complete', name: 'Complete', category: 'done', humanOnly: true },
+  ]
+  const planned = Array.from({ length: 10 }, (_, i) => ({ key: 'p' + i, sessionId: 'p' + i, title: 'Planned ' + i, phase: 'planning', tags: [], updated: now - i }))
+  const running = Array.from({ length: 5 }, (_, i) => ({ key: 'r' + i, sessionId: 'r' + i, title: 'Running ' + i, phase: 'implementing', tags: [], updated: now,
+    agent: { kind: 'working', tool: 'Edit', contextTokens: 1, lastEventAt: now } }))
+  const toTest = [
+    { key: 't1', sessionId: 't1', title: 'Test me', phase: 'validating', tags: [], updated: now, testPlan: { summary: 'Adds CSV export', steps: [], links: [], at: now,
+      verified: { pages: 1, actions: 2, screenshots: [], consoleErrors: 0, at: now } } },
+    { key: 't2', sessionId: 't2', title: 'Test me too', phase: 'validating', tags: [], updated: now, testPlan: { summary: 'x', steps: [], links: [], at: now } },
+  ]
+  const blocked = { key: 'q', sessionId: 'q', title: 'Asks something', phase: 'implementing', tags: [], updated: now, agent: { kind: 'needsInput', contextTokens: 1 } }
+  const st = { ...base, columns: OCOLS, cards: [...planned, ...running, ...toTest, blocked] }
+  const b = run(st)
+  findButton(b.root, 'Overview')?.onclick()
+  ok(b.posted.some((m) => m.type === 'disclosure' && m.key === 'board:overview' && m.open === true), 'the layout choice is remembered like a closed panel')
+  const t = b.text()
+  ok(t.includes('1 needs you') && t.includes('5 running now') && t.includes('2 ready to test') && t.includes('10 not started / idle'),
+     'the counts read as what to do, not as columns')
+  ok(t.indexOf('Needs you') < t.indexOf('Running now') && t.indexOf('Running now') < t.indexOf('Ready to test'), 'what blocks comes first')
+  ok(t.includes('Running 0') && t.includes('Edit') && t.includes('Adds CSV export') && t.includes('0 errors'),
+     'running rows show what the agent is doing; test rows show the plan and the browser evidence')
+  const ovText = () => walkAll(b.root).find((n) => (n.className || '') === 'overview')?.textContent ?? ''
+  ok(!ovText().includes('Planned 3'), 'the backlog is folded by default, so ten planned cards are one line')
+  const plannedHead = walkAll(b.root).find((n) => (n.className || '').includes('overview-section sec-planned'))
+  plannedHead.open = true; plannedHead.ontoggle()
+  ok(ovText().includes('Planned 3'), 'and opens on a click')
+  walkAll(b.root).find((n) => (n.className || '') === 'ov-row')?.onclick()
+  ok(b.posted.some((m) => m.type === 'select'), 'a row opens its card')
+
+  // Columns fold to a bar, and stay a drop target.
+  const c = run(st)
+  const head = walkAll(c.root).find((n) => (n.className || '') === 'column-head' && n.textContent.includes('Planning'))
+  head.onclick()
+  ok(c.posted.some((m) => m.type === 'disclosure' && m.key === 'col:planning' && m.open === false), 'a column folds, remembered')
+  const boardText = walkAll(c.root).find((n) => (n.className || '') === 'board')?.textContent ?? ''
+  ok(!boardText.includes('Planned 3') && walkAll(c.root).filter((n) => (n.className || '').includes('fold-dot')).length === 10,
+     'folded, it shows a dot per card instead of ten cards')
+}
+
 // A session with no plan must not grow an empty panel.
 const unplanned = run({ ...base, mode: 'chat', selectedKey: 'abc-123', cards: [WT_CARD], transcript: [] })
 ok(!unplanned.text().includes('How to test this'), 'no plan, no panel')

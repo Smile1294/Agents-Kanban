@@ -1374,11 +1374,130 @@
     return box
   }
 
+  /** Which layout the board screen uses. A view preference, kept like a
+   *  closed panel (`disclosed`, told to the host) so it outlives the window. */
+  const overviewOn = () => disclosed['board:overview'] === true
+  function setOverview(on) {
+    disclosed['board:overview'] = on
+    post('disclosure', { key: 'board:overview', open: on })
+    render()
+  }
+
+  /**
+   * Where a card stands, in the words that decide what the USER does next —
+   * not its column. Ten cards in Planning and five in Implementing is a board
+   * you read column by column; "3 need you, 5 are running, 2 are ready to test,
+   * 10 are waiting to be started" is one you can act on. Same order as the
+   * host's attention list, so the two never disagree about what is urgent.
+   */
+  function sectionOf(c) {
+    const a = c.agent
+    const col = s.columns.find((x) => x.id === c.phase)
+    const cat = col ? col.category : ''
+    if (a && (a.kind === 'needsInput' || a.kind === 'error')) return 'needs'
+    if (!a && (c.interrupted || c.stalled)) return 'needs'
+    if (a && (a.kind === 'working' || a.kind === 'starting' || a.kind === 'waiting')) return 'running'
+    if (a && a.kind === 'queued') return 'queued'
+    if (cat === 'review') return 'test'
+    if (cat === 'completed' || cat === 'done' || (col && col.humanOnly && cat !== 'review')) return 'done'
+    return 'planned'
+  }
+  const SECTIONS = [
+    { id: 'needs', name: 'Needs you', icon: '🔔', open: true },
+    { id: 'running', name: 'Running now', icon: '⚙', open: true },
+    { id: 'test', name: 'Ready to test', icon: '🧪', open: true },
+    { id: 'queued', name: 'Queued', icon: '⏳', open: true },
+    { id: 'planned', name: 'Not started / idle', icon: '📋', open: false },
+    { id: 'done', name: 'Done', icon: '✓', open: false },
+  ]
+
+  /** The board as one list, sectioned by what each card needs. */
+  function renderOverview(visible) {
+    const wrap = el('div', 'overview')
+    wrap.setAttribute('data-scroll', 'overview')
+    const by = {}
+    for (const c of visible) (by[sectionOf(c)] = by[sectionOf(c)] || []).push(c)
+    const counts = el('div', 'overview-counts')
+    for (const sec of SECTIONS) {
+      const n = (by[sec.id] || []).length
+      if (!n) continue
+      counts.append(el('span', 'overview-count sec-' + sec.id, n + ' ' + sec.name.toLowerCase()))
+    }
+    wrap.append(counts)
+    for (const sec of SECTIONS) {
+      const list = by[sec.id] || []
+      if (!list.length) continue
+      // Oldest waiting first where it is waiting; most recent first elsewhere.
+      list.sort((x, y) => sec.id === 'needs' || sec.id === 'test'
+        ? (x.stalled || x.interrupted || x.updated) - (y.stalled || y.interrupted || y.updated)
+        : y.updated - x.updated)
+      const box = disclosure(el('details', 'overview-section sec-' + sec.id), 'ov:' + sec.id, sec.open)
+      const sum = el('summary', 'overview-head')
+      sum.append(el('span', 'overview-icon', sec.icon), el('span', 'overview-name', sec.name), el('span', 'n', String(list.length)))
+      box.append(sum)
+      if (box.open) for (const c of list) box.append(renderOverviewRow(c, sec.id))
+      wrap.append(box)
+    }
+    if (!visible.length) wrap.append(el('div', 'empty', 'No sessions'))
+    return wrap
+  }
+
+  function renderOverviewRow(c, section) {
+    const row = el('div', 'ov-row')
+    row.onclick = () => setView({ selectedKey: c.key, mode: 'chat' })
+    const main = el('div', 'ov-main')
+    const title = el('div', 'ov-title')
+    title.append(el('span', 'nm', c.title))
+    if (c.parentTitle) title.append(el('span', 'ov-parent', '↳ ' + c.parentTitle))
+    main.append(title)
+    const line = el('div', 'ov-line')
+    line.append(phaseChip(c.phase))
+    const a = c.agent
+    if (a && section === 'running') {
+      // The same live row a card carries, registered for the fast path, so the
+      // overview ticks as the agents work without rebuilding the list.
+      const strip = agentRow(a)
+      syncStrips.push({ key: c.key, node: strip })
+      line.append(strip)
+    } else {
+      line.append(el('span', 'ov-why', overviewWhy(c)))
+    }
+    main.append(line)
+    row.append(main)
+    const side = el('div', 'ov-side')
+    const v = c.testPlan && c.testPlan.verified
+    if (v) side.append(el('span', 'ov-badge' + (v.consoleErrors ? ' bad' : ''), '🌐 ' + v.consoleErrors + (v.consoleErrors === 1 ? ' error' : ' errors')))
+    const ac = c.testPlan && c.testPlan.autoCheck
+    if (ac) side.append(el('span', 'ov-badge' + (ac.ok ? '' : ' bad'), ac.ok ? '✓ auto-check' : '✖ auto-check'))
+    if (c.reviewComments) side.append(el('span', 'ov-badge', '💬 ' + c.reviewComments))
+    side.append(el('span', 'ov-age', ago(c.updated)))
+    side.append(kebab(c))
+    row.append(side)
+    return row
+  }
+
+  /** One line for a card that is not running: what it is waiting for. */
+  function overviewWhy(c) {
+    const a = c.agent
+    if (a && a.kind === 'needsInput') return a.question ? 'asks: ' + String(a.question).slice(0, 120) : 'is waiting for your answer'
+    if (a && a.kind === 'error') return 'failed: ' + String(a.message || 'the run ended with an error').split('\n')[0].slice(0, 120)
+    if (a && a.kind === 'queued') return 'waiting for a free agent slot'
+    if (c.interrupted) return 'cut off ' + ago(c.interrupted) + ' when the editor closed'
+    if (c.stalled) return 'stopped without handing its work back'
+    if (c.testPlan && c.testPlan.summary) return c.testPlan.summary
+    if (a && a.kind === 'done') return a.summary ? String(a.summary).slice(0, 140) : 'finished its turn'
+    return c.branch ? '⎇ ' + c.branch.replace(/^task\//, '') : 'not started'
+  }
+
   function renderKanban() {
     const main = el('main', 'main')
     main.append(renderToolbar())
-    const needs = renderAttention(false)
+    const needs = overviewOn() ? null : renderAttention(false)
     if (needs) main.append(needs)
+    if (overviewOn()) {
+      main.append(renderOverview(s.cards.filter(matches)))
+      return main
+    }
     const board = el('div', 'board')
     const visible = s.cards.filter(matches)
     for (const col of s.columns) board.append(renderColumn(col, visible.filter((c) => c.phase === col.id)))
@@ -1398,6 +1517,17 @@
     if (s.running) parts.push(s.running + ' running')
     if (s.waiting) parts.push(s.waiting + ' waiting on you')
     bar.append(el('div', 'count', parts.join(' · ') || s.cards.length + ' sessions'))
+    // Columns or one sectioned list: the second is for a board with more cards
+    // in flight than columns can show at once.
+    const seg = el('div', 'seg')
+    const cols = el('button', 'ctl' + (overviewOn() ? '' : ' on'), 'Columns')
+    cols.title = 'Cards in their columns'
+    cols.onclick = () => setOverview(false)
+    const ov = el('button', 'ctl' + (overviewOn() ? ' on' : ''), 'Overview')
+    ov.title = 'Every card in one list, by what it needs: waiting on you, running, ready to test, queued, not started'
+    ov.onclick = () => setOverview(true)
+    seg.append(cols, ov)
+    bar.append(seg)
     bar.append(focusButton())
     return bar
   }
@@ -1415,8 +1545,18 @@
 
   function renderColumn(col, cards) {
     const locked = col.humanOnly || col.locked
-    const c = el('section', 'column' + (locked ? ' locked' : ''))
+    // A column can be folded to a slim bar with its count — ten cards in
+    // Planning need not push the running ones off the screen. Kept like a
+    // closed panel. Still a drop target while folded.
+    const folded = disclosed['col:' + col.id] === false
+    const c = el('section', 'column' + (locked ? ' locked' : '') + (folded ? ' folded' : ''))
     const head = el('div', 'column-head')
+    head.title = folded ? 'Show ' + col.name : 'Fold ' + col.name + ' to a bar'
+    head.onclick = () => {
+      disclosed['col:' + col.id] = folded
+      post('disclosure', { key: 'col:' + col.id, open: folded })
+      render()
+    }
     head.append(el('span', 'dot cat-' + (col.category || 'unknown')))
     head.append(el('span', null, col.name))
     if (col.humanOnly) {
@@ -1428,9 +1568,19 @@
     c.append(head)
 
     const list = el('div', 'cards')
+    if (folded) {
+      list.classList.add('folded-list')
+      // Who is in there, at a glance, without the cards: a dot per card
+      // coloured by what it needs.
+      for (const x of cards) {
+        const d = el('span', 'fold-dot sec-' + sectionOf(x))
+        d.title = x.title
+        list.append(d)
+      }
+    }
     list.setAttribute('data-scroll', 'col:' + col.id)
-    if (!cards.length) list.append(el('div', 'empty', locked ? '—' : 'No sessions'))
-    for (const x of cards) list.append(renderCard(x))
+    if (!folded && !cards.length) list.append(el('div', 'empty', locked ? '—' : 'No sessions'))
+    if (!folded) for (const x of cards) list.append(renderCard(x))
 
     if (col.id !== '__orphan') {
       list.addEventListener('dragover', (e) => {
