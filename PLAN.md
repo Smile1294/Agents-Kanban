@@ -414,6 +414,12 @@ Working:
 - **"Needs you"** — every card waiting on the user, blocking first, on the
   board, in the rail and in the status bar.
 - **A per-message spend cap** (`agentsKanban.maxSpendPerMessageUsd`).
+- **An Overview layout and folding columns** — every card in one list by what
+  it needs (needs you, running now, ready to test, queued, not started).
+- **The board tests the work itself at review time** (`agentsKanban.autoVerify`):
+  starts the app, opens it in its own browser, records load errors and a
+  screenshot, runs the project's e2e suite; `require` also refuses a UI change
+  the agent never opened.
 - **One button to run a session's app.** Detects the project's own per-worktree
   launcher, provisions it if it has never been provisioned, waits for the port
   to actually answer, then opens the browser on it. See

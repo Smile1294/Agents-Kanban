@@ -180,6 +180,47 @@ whose +1 added 2):
 - The test plan came back with `verified: { pages: 1, actions: 1, consoleErrors: 0 }` stamped by the host.
 - Rewinding to the first message restored `index.html` and moved the branch back past the agent's commit, leaving `git status` clean.
 
+## 4b. Third round — seeing many tasks at once, and testing as part of the flow
+
+**The problem.** With ten cards in Planning, five in Implementing and two in
+testing, the board had to be read column by column to answer the only
+question that matters: which of these need me?
+
+- **The Overview layout** (toolbar: Columns | Overview) lists every card once,
+  sectioned by what it **needs**, not where it sits: needs you, running now,
+  ready to test, queued, not started, done.
+  - Counts sit at the top: "1 needs you · 5 running now · 2 ready to test · 10 not started".
+  - A running row carries the live agent strip (current tool, age of the last frame, context), kept current by the fast path.
+  - A test row carries the plan summary, the browser evidence and the auto-check.
+  - Not started and done begin folded, so ten planned cards are one line.
+- **Columns fold.** In the Columns layout, a column header folds its column to
+  a slim bar with a count and a coloured dot per card. It is still a drop target.
+- Both choices are remembered like any closed panel.
+
+**Browser testing as part of the standard flow** (`agentsKanban.autoVerify`):
+- **`check` (default).** When a card moves into review, the host itself:
+  - starts the app in the worktree,
+  - opens it in its own Chromium context,
+  - records every error while it loads, and a screenshot,
+  - runs the project's own e2e suite if it declares one (`test:e2e`, `e2e`,
+    `test:browser`, `playwright`…), with the app's URL in `BASE_URL` / `PLAYWRIGHT_BASE_URL`.
+- **Where the result goes.** It lands on the test plan as `autoCheck`, apart
+  from the agent's own `verified` record. A failure shows up in several places:
+  - "Needs you" and the Overview, as "failed the board's auto-check";
+  - a warning notification;
+  - a **Send failure to agent** button that resumes the agent with exactly what failed.
+
+  It never resumes an agent by itself.
+- **`require`.** A diff that touches files a browser shows cannot reach review
+  until the agent has opened one. This is refused in code, and the brief says
+  so up front.
+- **`off`.** No automatic check.
+
+Code: `src/run/autocheck.ts` (tested against real processes and Chromium: a
+page that throws on load fails, a failing suite fails with its output, an app
+that dies on boot fails with its log, and a change with no UI files is skipped
+without starting anything), plus `renderOverview` in `media/board.js`.
+
 ## 5. What comparable harnesses have (research, September 2026)
 
 Sources were read directly where the network allowed; cursor.com,
