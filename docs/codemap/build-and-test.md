@@ -187,6 +187,7 @@ without one.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `test/dom.mjs`: the stub canvas RECORDS the drawing calls the annotation editor makes (`_ops`), so a test can assert a box was stroked where it was dragged.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `playwright-core` is a fourth bundle external (it finds its driver relative to its own package), shipped in the .vsix; `browser.test.ts` joins the gates that need a Chromium.
 - 2026-09-24 · main · harness: `vscode.extensions` (seeded by `ctl.extensions`) and toasts/modals recorded in `calls`; smoke: the stale-CLI footer and update row through the real view, and the update button against a stand-in `claude` — including the exit-0 `DISABLE_UPDATES` refusal reported as a modal.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `scripts/preflight.mjs`

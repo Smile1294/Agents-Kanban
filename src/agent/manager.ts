@@ -13,7 +13,7 @@ import { normaliseTitle, resolveEffort, resolveThinking, type EffortLevel, type 
 import { summariseTool, type Entry, type SessionStore } from '../sessions/store.ts'
 import type { AgentState, BoardConfig } from '../board/config.ts'
 import { type PermissionRequest } from './session.ts'
-import type { AttachedImage } from './images.ts'
+import { MAX_IMAGES, type AttachedImage } from './images.ts'
 import {
   boardToolNames, createBoardServer, type BoardChange, type BoardNotice, type BoardToolContext,
   type ScheduleActOutcome, type ScheduleCreateOutcome,
@@ -660,7 +660,7 @@ export class AgentManager extends EventEmitter {
         title: opts.title ?? titleFrom(prompt),
         state: { kind: 'queued', since: Date.now() },
         worktreePath: '', branch: '',
-        live: [{ kind: 'prompt', at: Date.now(), text: prompt }],
+        live: [{ kind: 'prompt', at: Date.now(), text: prompt, ...(opts.images?.length ? { images: opts.images.length } : {}) }],
         history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
         ...(opts.parent ? { parent: opts.parent } : {}),
         // A queued card already knows its backend, so the composer describes
@@ -984,6 +984,22 @@ export class AgentManager extends EventEmitter {
         this.touch()
         return
       }
+      /* Still waiting for a slot: no process to send to, and no session to
+         resume — its key is a `run-…` id Claude Code has never heard of. This
+         used to fall through to the resume below with `resume: 'run-…'`, which
+         started a bogus second run and lost the images. The message joins the
+         queued first turn instead, which is what "send" means to a card that
+         has not started yet. */
+      const queued = this.queue.find((q) => q.runId === live.runId)
+      if (queued) {
+        queued.prompt = `${queued.prompt}\n\n${text}`
+        if (images.length) {
+          queued.opts = { ...queued.opts, images: [...(queued.opts.images ?? []), ...images].slice(0, MAX_IMAGES) }
+        }
+        live.live.push({ kind: 'prompt', at: Date.now(), text, ...(images.length ? { images: images.length } : {}) })
+        this.touch()
+        return
+      }
     }
     // The previous run for this session has finished. Drop its card before
     // starting the resumed one, or the board renders two entries under the same
@@ -994,6 +1010,12 @@ export class AgentManager extends EventEmitter {
     const existing = await this.opts.store.get(key)
     await this.start(text, {
       resume: key,
+      // The images. Omitted here, every image sent to a session whose turn had
+      // ended — which is the NORMAL case, since the CLI stops on each turn's
+      // result — was dropped without a word: the host had already accepted
+      // them, so no toast; the row showed no count; and an image-only message
+      // reached the model as an empty prompt.
+      ...(images.length ? { images: [...images] } : {}),
       ...(existing?.title ? { title: existing.title } : {}),
       ...(providerFor ? { providerFor } : {}),
       ...(chosen ? { chosen } : {}),

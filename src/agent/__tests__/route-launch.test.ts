@@ -33,9 +33,15 @@ import type { KnowledgeVerdict } from '../../board/codemap.ts'
 
 // --- the fake runtimes -------------------------------------------------------
 const specs: RunSpec[] = []
+/** What each run's FIRST turn was handed — the prompt and how many images. */
+const firstTurns: Array<{ prompt: string; images: number }> = []
 const fakeRun = () => {
   const e = new EventEmitter()
   Object.assign(e, {
+    run(prompt: string, images: readonly unknown[] = []) {
+      firstTurns.push({ prompt, images: images.length })
+      return new Promise(() => {})
+    },
     send() {}, stop() {}, interrupt() {}, get state() { return { kind: 'working' } },
     get lastEvent() { return Date.now() }, get sessionId() { return undefined },
     respondPermission() {}, dispose() {},
@@ -264,6 +270,41 @@ ok(recorded() === 'spawn-model',
   const claimed = await ctx.knowledgeCheck()
   ok(claimed.ok && claimed.areas.includes('beta'),
      `an area file added in the worktree claims a new directory (${claimed.ok ? claimed.areas.join(', ') : 'refused'})`)
+}
+
+// --- a follow-up to a session whose turn has ENDED keeps its images ----------
+// The normal case, not an edge: the CLI stops on each turn's result, so almost
+// every follow-up is a resume. `send()` dropped the images on that path, with
+// no toast, no count on the row, and an empty prompt for an image-only message.
+{
+  const img = { name: 'shot.png', mediaType: 'image/png' as const, data: 'iVBORw0KGgo=' }
+  meta.set('sess-ended', { title: 'Ended one', phase: 'validating', tags: [] })
+  const before = firstTurns.length
+  await mgr.send('sess-ended', 'what is wrong in this screenshot?', [img, img])
+  await new Promise((r) => setTimeout(r, 200))
+  const turn = firstTurns.slice(before).find((t) => t.prompt === 'what is wrong in this screenshot?')
+  ok(!!turn && turn.images === 2, `a resumed session's first turn carries the images (${turn ? turn.images : 'no turn'})`)
+  const resumed = specs.find((sp) => sp.resume === 'sess-ended')
+  ok(!!resumed, 'and it really is a resume of that session')
+}
+
+// --- a message to a QUEUED card joins its first turn --------------------------
+{
+  const small = new AgentManager({
+    store: store as never, worktrees: new WorktreeService(root), board: DEFAULT_BOARD,
+    defaults: { runtime: 'claude' }, permissionMode: 'acceptEdits', maxConcurrent: 0,
+  })
+  const img = { name: 'a.png', mediaType: 'image/png' as const, data: 'iVBORw0KGgo=' }
+  const runId = await small.start('first ask', {})
+  const specsBefore = specs.length
+  await small.send(runId, 'and also this', [img])
+  const card = small.byKey(runId)!
+  ok(card.state.kind === 'queued', 'the card is still waiting for a slot')
+  ok(specs.length === specsBefore, 'no bogus resume of a run id was started')
+  ok(card.live.filter((e) => e.kind === 'prompt').length === 2
+     && (card.live[1] as { images?: number }).images === 1,
+     'the follow-up is on the card, with its image count')
+  small.stopAll()
 }
 
 mgr.stopAll()

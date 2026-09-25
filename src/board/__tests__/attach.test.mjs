@@ -243,5 +243,111 @@ const paste = (root, files) => {
   ok((t.match(/attached/g) || []).length === 2, 'and a message with none says nothing about images')
 }
 
+// ---------------------------------------------------------------------------
+// 12. A type the API does not take is RE-ENCODED here, not refused on the host
+// after the draft has been cleared. BMP under 1568px used to pass straight
+// through as image/bmp, and `sanitiseImages` then dropped it with only a toast.
+{
+  const b = run(chat)
+  paste(b.root, [fakeImageFile('scan.bmp', 'image/bmp', { width: 400, height: 300, data: 'BMPDATA' })])
+  byClass(b.root, 'send').onclick()
+  const img = b.posted.find((m) => m.type === 'send')?.images?.[0]
+  ok(img?.mediaType === 'image/png' && img?.data === 'SCALED', `a BMP goes as a PNG the host will accept (${img?.mediaType})`)
+}
+
+// 13. A small file that is simply too big is re-encoded rather than sent to be refused.
+{
+  const b = run(chat)
+  paste(b.root, [fakeImageFile('huge.png', 'image/png', { width: 900, height: 700, data: 'A'.repeat(3_600_000) })])
+  byClass(b.root, 'send').onclick()
+  const img = b.posted.find((m) => m.type === 'send')?.images?.[0]
+  ok(img?.data === 'SCALED', 'an over-cap PNG under 1568px is re-encoded, not passed on to be dropped')
+}
+
+// 14. What does not attach is SAID: a decode failure, the cap, a duplicate.
+{
+  const b = run(chat)
+  paste(b.root, [{ name: 'photo.heic', type: 'image/heic', _dataUrl: 'data:image/heic;base64,HEIC' }])
+  ok(/Could not attach photo\.heic: this format cannot be read here/.test(b.root.textContent),
+     'an image Chromium cannot decode says so, naming the file and the fix')
+  paste(b.root, [fakeImageFile('a.png', 'image/png', { data: 'SAME' })])
+  paste(b.root, [fakeImageFile('b.png', 'image/png', { data: 'SAME' })])
+  ok(allByClass(b.root, 'attachment').length === 1 && /b\.png: it is already attached/.test(b.root.textContent),
+     'the same bytes twice attach once, and the second is explained')
+  const many = Array.from({ length: 10 }, (_, i) => fakeImageFile(`m${i}.png`, 'image/png', { data: `M${i}` }))
+  paste(b.root, many)
+  ok(allByClass(b.root, 'attachment').length === 8 && /3 not attached — at most 8/.test(b.root.textContent),
+     `past the cap the rest are counted out loud (${allByClass(b.root, 'attachment').length} attached)`)
+}
+
+// ---------------------------------------------------------------------------
+// 15. The annotation editor: draw on a screenshot so the model knows WHICH
+// button "this button" is. It lives outside #root, survives the repaints an
+// agent at work produces, flattens its marks into the bytes that are sent, and
+// tells the model the marks are the user's.
+{
+  const b = run(chat)
+  paste(b.root, [fakeImageFile('ui.png', 'image/png', { width: 800, height: 600, data: 'UI' })])
+  byClass(b.root, 'attachment-thumb').onclick()
+  const overlay = () => walk(b.document.body).find((n) => (n.className || '').split(' ').includes('annot-overlay'))
+  ok(!!overlay(), 'clicking a thumbnail opens the editor, on document.body')
+  ok(!walk(b.root).some((n) => (n.className || '').includes('annot-overlay')), 'and NOT inside #root, which every repaint replaces')
+  const canvas = walk(overlay()).find((n) => n.tagName === 'canvas')
+  ok(canvas.width === 800 && canvas.height === 600, 'the canvas is the image at its own size — marks are in image pixels')
+  // Drawn at HALF size on screen: pointer positions must be scaled up to
+  // image pixels, or every mark lands in the top-left quarter.
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 400, height: 300 })
+  // A box, dragged.
+  canvas.onpointerdown({ clientX: 50, clientY: 50 })
+  canvas.onpointermove({ clientX: 150, clientY: 125 })
+  b.deliver(chat) // an agent frame arrives mid-stroke
+  ok(!!overlay(), 'a repaint mid-stroke leaves the editor alone')
+  canvas.onpointerup({})
+  ok(canvas._ops.some((o) => o[0] === 'strokeRect' && o[3] === 200 && o[4] === 150), 'the drag drew a 200×150 box where it was dragged')
+  ok(canvas._ops.some((o) => o[0] === 'fillText' && o[1] === '1'), 'and numbered it 1')
+  // A click without a drag is not a mark.
+  canvas.onpointerdown({ clientX: 500, clientY: 500 }); canvas.onpointerup({})
+  const done = walk(overlay()).find((n) => n.tagName === 'button' && n.textContent === 'Done')
+  done.onclick()
+  ok(!overlay(), 'Done closes the editor')
+  ok(!!byClass(b.root, 'attachment-badge'), 'the chip is badged as annotated')
+  byClass(b.root, 'send').onclick()
+  const sent = b.posted.find((m) => m.type === 'send')
+  ok(sent?.images?.[0]?.data === 'SCALED', 'the FLATTENED image is what is sent — the model sees pixels only')
+  ok(/\[I drew on image 1 \(numbered marks 1–1\)/.test(sent?.text ?? ''),
+     `and the message says the marks are the user's, numbered (${sent?.text})`)
+}
+
+// 16. Reopening edits the marks rather than drawing over a flattened copy; and
+// removing every mark gives back the image as it arrived.
+{
+  const b = run(chat)
+  paste(b.root, [fakeImageFile('ui.png', 'image/png', { width: 800, height: 600, data: 'ORIG' })])
+  const open = () => byClass(b.root, 'attachment-thumb').onclick()
+  const overlay = () => walk(b.document.body).find((n) => (n.className || '').split(' ').includes('annot-overlay'))
+  const button = (label) => walk(overlay()).find((n) => n.tagName === 'button' && n.textContent === label)
+  open()
+  let canvas = walk(overlay()).find((n) => n.tagName === 'canvas')
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600 })
+  button('➚').onclick()
+  canvas.onpointerdown({ clientX: 10, clientY: 10 }); canvas.onpointermove({ clientX: 200, clientY: 90 }); canvas.onpointerup({})
+  button('Done').onclick()
+  open()
+  canvas = walk(overlay()).find((n) => n.tagName === 'canvas')
+  ok(canvas._ops.some((o) => o[0] === 'lineTo' && o[1] === 200 && o[2] === 90), 'reopening redraws the arrow from its vectors')
+  button('Undo').onclick()
+  button('Done').onclick()
+  byClass(b.root, 'send').onclick()
+  const sent = b.posted.find((m) => m.type === 'send')
+  ok(sent?.images?.[0]?.data === 'ORIG' && !/I drew on/.test(sent?.text ?? ''),
+     'with every mark undone, the original bytes go and nothing claims there were marks')
+  // Cancel keeps what was there.
+  paste(b.root, [fakeImageFile('x.png', 'image/png', { data: 'X' })])
+  open()
+  walk(overlay()).find((n) => n.tagName === 'canvas').onpointerdown({ clientX: 1, clientY: 1 })
+  button('Cancel').onclick()
+  ok(!overlay() && !byClass(b.root, 'attachment-badge'), 'Cancel closes without marking the image')
+}
+
 console.log(fails ? `\n${fails} FAILURES` : '\nPASS — a pasted image reaches the message, downscaled, and survives the repaints')
 process.exit(fails ? 1 : 0)

@@ -186,6 +186,15 @@
    */
   let attachments = []
   let attachSeq = 0
+  /** Why the last image did not attach — a decode failure, the cap, a
+   *  duplicate. Shown under the composer until the next attach or send, since
+   *  a paste that silently does nothing reads as a broken paste. */
+  let attachNote = ''
+  /** The open annotation editor, or null. Module-level and mounted on
+   *  `document.body`, OUTSIDE `#root`: render() replaces the root several times
+   *  a second while an agent works, and a canvas rebuilt mid-stroke takes the
+   *  stroke with it. See `openAnnotator`. */
+  let annot = null
   /**
    * Choices made in an AskUserQuestion picker but not yet sent, keyed by
    * request id and then by question text.
@@ -3053,16 +3062,23 @@
       // point of attaching a screenshot.
       if (!text && !attachments.length) return
       const images = attachments.map((a) => ({ name: a.name, mediaType: a.mediaType, data: a.data }))
+      // Say that the markings are the USER's. Drawn into the pixels they are
+      // indistinguishable from the app's own UI — a red box could be an error
+      // state — so the model is told which images carry them and how they are
+      // numbered, which is what lets "#2 is misaligned" land on a place.
+      const said = annotationHint(attachments)
+      const sent = said ? (text ? text + '\n\n' + said : said) : text
       draft = ''; ta.value = ''; composerH = null; stick = true
       attachments = []
-      if (c) post('send', { id: c.key, text, images })
-      else post('newSession', { text, images })
+      attachNote = ''
+      if (c) post('send', { id: c.key, text: sent, images })
+      else post('newSession', { text: sent, images })
       render()
     }
     row.append(ta, clip)
     if (mic) row.append(mic)
     row.append(send)
-    if (attachments.length) wrap.append(renderAttachments())
+    if (attachments.length || attachNote) wrap.append(renderAttachments())
     wrap.append(row)
     // A dictation error or an empty transcript, shown where the mic is, and
     // only for a few seconds — repaints do not repaint it away instantly
@@ -3433,22 +3449,35 @@
    *  strip below the send button reads as something already sent. */
   function renderAttachments() {
     const strip = el('div', 'attachments')
-    for (const a of attachments) {
-      const chip = el('div', 'attachment')
+    attachments.forEach((a, i) => {
+      const chip = el('div', 'attachment' + (a.marks ? ' annotated' : ''))
       const img = el('img', 'attachment-thumb')
       img.src = a.dataUrl
       img.alt = a.name
-      img.title = a.name + (a.w ? '  ' + a.w + '×' + a.h : '')
+      img.title = 'Image ' + (i + 1) + ': ' + a.name + (a.w ? '  ' + a.w + '×' + a.h : '') +
+        '\nClick to draw on it — box, arrow, pen or a label — and point at what you mean.'
+      // The whole thumbnail opens the editor: the chip is 48px and a separate
+      // pencil inside it would be a target nobody hits.
+      img.onclick = () => openAnnotator(a.id)
       chip.append(img)
+      const edit = el('button', 'attachment-edit', '✎')
+      edit.title = a.marks ? 'Edit your markings on ' + a.name : 'Draw on ' + a.name
+      edit.onclick = () => openAnnotator(a.id)
+      chip.append(edit)
+      if (a.marks) chip.append(el('span', 'attachment-badge', String(i + 1)))
       const x = el('button', 'attachment-x', '×')
       x.title = 'Remove ' + a.name
       x.onclick = () => { attachments = attachments.filter((o) => o.id !== a.id); render() }
       chip.append(x)
       strip.append(chip)
+    })
+    if (attachments.length) {
+      const marked = attachments.filter((a) => a.marks).length
+      strip.append(el('span', 'attachments-note',
+        attachments.length + (attachments.length === 1 ? ' image' : ' images') + ' will be sent with this message' +
+        (marked ? ' · ' + marked + ' with your markings' : ' · click one to draw on it')))
     }
-    const note = el('span', 'attachments-note',
-      attachments.length + (attachments.length === 1 ? ' image' : ' images') + ' will be sent with this message')
-    strip.append(note)
+    if (attachNote) strip.append(el('span', 'attachments-note warn', attachNote))
     return strip
   }
 
@@ -3463,7 +3492,6 @@
    * decoding entirely.
    */
   function addImageFiles(files) {
-    const MAX_EDGE = 1568
     const MAX_AT_ONCE = 8
     /* The room is worked out ONCE, before anything is read.
        It used to be `attachments.length + queued >= MAX`, which double-counts:
@@ -3473,49 +3501,374 @@
        depended on decode timing, which is the worst kind of limit. */
     const room = Math.max(0, MAX_AT_ONCE - attachments.length)
     const take = []
+    let over = 0
+    let notImages = 0
     for (const f of files) {
-      if (String(f.type || '').indexOf('image/') !== 0) continue
-      if (take.length >= room) break
+      if (String(f.type || '').indexOf('image/') !== 0) { notImages++; continue }
+      if (take.length >= room) { over++; continue }
       take.push(f)
     }
+    // Every file that does not attach is SAID. A paste that did nothing reads
+    // as a broken paste, and the old path skipped all three of these silently.
+    const notes = []
+    if (over) notes.push(over + ' not attached — at most ' + MAX_AT_ONCE + ' images per message')
+    if (notImages && !take.length) notes.push('only images can be attached')
+    attachNote = notes.join(' · ')
+    if (notes.length && !take.length) render()
+    const failed = (name, why) => { attachNote = (attachNote ? attachNote + ' · ' : '') + 'Could not attach ' + name + ': ' + why; render() }
     for (const file of take) {
+      const name = file.name || 'pasted-image.png'
       const reader = new FileReader()
       reader.onload = () => {
         const img = new Image()
         img.onload = () => {
-          const scale = Math.min(1, MAX_EDGE / Math.max(img.width, img.height))
-          let dataUrl = String(reader.result)
-          let w = img.width, h = img.height
-          if (scale < 1) {
-            w = Math.round(img.width * scale)
-            h = Math.round(img.height * scale)
-            const canvas = document.createElement('canvas')
-            canvas.width = w; canvas.height = h
-            const ctx = canvas.getContext('2d')
-            ctx.drawImage(img, 0, 0, w, h)
-            // PNG for a screenshot: text and UI edges are what these are FOR,
-            // and JPEG at any quality smears exactly those.
-            dataUrl = canvas.toDataURL('image/png')
-          }
-          const comma = dataUrl.indexOf(',')
-          const header = dataUrl.slice(0, comma)
+          const out = encodeForModel(img, String(reader.result), String(file.type || ''))
+          if (!out) { failed(name, 'it is too large even after scaling down'); return }
+          // The same bytes twice is one image the model pays for twice.
+          if (attachments.some((a) => a.data === out.data)) { failed(name, 'it is already attached'); return }
           attachments = attachments.concat([{
-            id: 'att-' + (++attachSeq),
-            name: file.name || 'pasted-image.png',
-            mediaType: (/data:([^;]+)/.exec(header) || [])[1] || 'image/png',
-            data: dataUrl.slice(comma + 1),
-            dataUrl: dataUrl,
-            w: w, h: h,
+            id: 'att-' + (++attachSeq), name: name,
+            mediaType: out.mediaType, data: out.data, dataUrl: out.dataUrl, w: out.w, h: out.h,
           }])
           render()
         }
-        // A file that is not decodable is not an image, whatever it claims.
-        img.onerror = () => {}
+        // A file Chromium cannot decode — HEIC off an iPhone is the usual one —
+        // is not an image to this board, whatever its type says. Said, not dropped.
+        img.onerror = () => failed(name, 'this format cannot be read here — save it as PNG or JPEG')
         img.src = String(reader.result)
       }
-      reader.onerror = () => {}
+      reader.onerror = () => failed(name, 'the file could not be read')
       reader.readAsDataURL(file)
     }
+  }
+
+  /** What the host accepts (`agent/images.ts`): four types, 3.5MB of base64. */
+  const SENDABLE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
+  const MAX_B64 = 3500000
+  const MAX_IMAGE_EDGE = 1568
+
+  /**
+   * Turn a decoded image into bytes the host will accept, or null.
+   *
+   * Three things the old path let through to be refused on the host AFTER the
+   * draft had been cleared, so the image was gone with only a toast to say so:
+   * a type the API does not take (BMP, SVG, AVIF, TIFF, `image/jpg`), a
+   * downscale that always wrote PNG (a 1568px photo as PNG is often over the
+   * cap), and a small file that was simply large. So: anything not sendable
+   * as-is goes through the canvas; PNG first because text and UI edges are
+   * what screenshots are FOR, JPEG when PNG is too big, then smaller.
+   *
+   * The downscale is not cosmetic either: an image costs roughly w×h/750
+   * tokens, and past 1568px on the long edge the service scales it down
+   * anyway — so those tokens buy detail the model never sees.
+   */
+  function encodeForModel(img, sourceUrl, type) {
+    const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(img.width || 1, img.height || 1))
+    const comma = sourceUrl.indexOf(',')
+    const srcType = (/data:([^;,]+)/.exec(sourceUrl.slice(0, comma)) || [])[1] || type
+    if (scale === 1 && SENDABLE_TYPES.includes(srcType) && sourceUrl.length - comma - 1 <= MAX_B64) {
+      return { mediaType: srcType, data: sourceUrl.slice(comma + 1), dataUrl: sourceUrl, w: img.width, h: img.height }
+    }
+    let w = Math.max(1, Math.round(img.width * scale))
+    let h = Math.max(1, Math.round(img.height * scale))
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const canvas = document.createElement('canvas')
+      canvas.width = w; canvas.height = h
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h)
+      for (const t of attempt === 0 ? ['image/png', 'image/jpeg'] : ['image/jpeg']) {
+        const url = t === 'image/jpeg' ? canvas.toDataURL(t, 0.88) : canvas.toDataURL(t)
+        const cut = url.indexOf(',')
+        if (url.length - cut - 1 <= MAX_B64) {
+          return { mediaType: (/data:([^;,]+)/.exec(url.slice(0, cut)) || [])[1] || t, data: url.slice(cut + 1), dataUrl: url, w: w, h: h }
+        }
+      }
+      w = Math.max(1, Math.round(w * 0.75)); h = Math.max(1, Math.round(h * 0.75))
+    }
+    return null
+  }
+
+  /** The sentence that tells the model which images carry the user's own
+   *  markings, and how they are numbered. Empty when none do. */
+  function annotationHint(list) {
+    const parts = []
+    list.forEach((a, i) => {
+      if (!a.marks) return
+      const n = a.numbered || 0
+      parts.push('image ' + (i + 1) + (n ? ' (numbered marks 1–' + n + ')' : ''))
+    })
+    if (!parts.length) return ''
+    return '[I drew on ' + parts.join(' and ') + ' to point at what I mean — the boxes, arrows, ' +
+      'strokes and labels in those images are my annotations, not part of the app.]'
+  }
+
+  // ——— The annotation editor ———
+  //
+  // Reported as "I want to highlight stuff in the images so it understands".
+  // A screenshot with a sentence underneath makes the model guess WHICH button
+  // "this button" is; a box drawn around it does not. The marks are flattened
+  // into the image that is sent (the model sees pixels, nothing else survives
+  // the trip), and the vectors are kept on the attachment so reopening it
+  // edits them instead of drawing over a flattened copy.
+
+  const ANNOT_COLORS = ['#ff3b30', '#ffcc00', '#34c759', '#0a84ff']
+  const ANNOT_TOOLS = [
+    { id: 'box', label: '▭', title: 'Box — drag around what you mean (numbered)' },
+    { id: 'arrow', label: '➚', title: 'Arrow — drag from the tail to what it points at (numbered)' },
+    { id: 'pen', label: '✎', title: 'Pen — draw freehand' },
+    { id: 'text', label: 'T', title: 'Label — click where the text goes' },
+  ]
+
+  function openAnnotator(id) {
+    const a = attachments.find((o) => o.id === id)
+    if (!a || annot) return
+    const base = new Image()
+    annot = {
+      id: id, tool: 'box', color: ANNOT_COLORS[0],
+      shapes: (a.shapes || []).map((sh) => Object.assign({}, sh)),
+      drag: null, base: base, ready: false, pendingText: null,
+      w: a.w || 1, h: a.h || 1, overlay: null, canvas: null, input: null,
+    }
+    base.onload = () => { if (annot && annot.base === base) { annot.ready = true; drawAnnot() } }
+    base.onerror = () => closeAnnotator(false)
+    buildAnnotator(a)
+    base.src = a.original || a.dataUrl
+  }
+
+  function lineWidth() { return Math.max(3, Math.round(Math.max(annot.w, annot.h) / 320)) }
+
+  function buildAnnotator(a) {
+    const overlay = el('div', 'annot-overlay')
+    const panel = el('div', 'annot-panel')
+    const bar = el('div', 'annot-bar')
+    const toolBtns = []
+    for (const t of ANNOT_TOOLS) {
+      const b = el('button', 'ctl annot-tool' + (annot.tool === t.id ? ' on' : ''), t.label)
+      b.title = t.title
+      b.onclick = () => {
+        annot.tool = t.id
+        for (const o of toolBtns) o.classList.remove('on')
+        b.classList.add('on')
+      }
+      toolBtns.push(b)
+      bar.append(b)
+    }
+    bar.append(el('span', 'annot-sep'))
+    const swatches = []
+    for (const col of ANNOT_COLORS) {
+      const sw = el('button', 'ctl annot-swatch' + (annot.color === col ? ' on' : ''))
+      sw.style.background = col
+      sw.title = 'Colour'
+      sw.onclick = () => {
+        annot.color = col
+        for (const o of swatches) o.classList.remove('on')
+        sw.classList.add('on')
+      }
+      swatches.push(sw)
+      bar.append(sw)
+    }
+    bar.append(el('span', 'annot-sep'))
+    const undo = el('button', 'ctl', 'Undo')
+    undo.title = 'Undo the last mark (Ctrl+Z)'
+    undo.onclick = () => { annot.shapes.pop(); drawAnnot() }
+    const clear = el('button', 'ctl', 'Clear')
+    clear.title = 'Remove every mark'
+    clear.onclick = () => { annot.shapes = []; drawAnnot() }
+    bar.append(undo, clear, el('span', 'annot-grow'))
+    const cancel = el('button', 'ctl', 'Cancel')
+    cancel.onclick = () => closeAnnotator(false)
+    const done = el('button', 'ctl primary', 'Done')
+    done.title = 'Put the markings into the image that is sent'
+    done.onclick = () => closeAnnotator(true)
+    bar.append(cancel, done)
+
+    const stage = el('div', 'annot-stage')
+    const canvas = document.createElement('canvas')
+    canvas.className = 'annot-canvas'
+    canvas.width = annot.w
+    canvas.height = annot.h
+    stage.append(canvas)
+
+    const textRow = el('div', 'annot-text-row')
+    const input = el('input', 'annot-text')
+    input.placeholder = 'Label text, then Enter'
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitText() }
+      if (e.key === 'Escape') { e.preventDefault(); annot.pendingText = null; textRow.classList.remove('on'); drawAnnot() }
+    }
+    textRow.append(input)
+
+    const hint = el('div', 'annot-hint',
+      'Drag to draw on ' + a.name + '. Boxes and arrows are numbered — say "#1 is misaligned" in your message.')
+    panel.append(bar, stage, textRow, hint)
+    overlay.append(panel)
+    // A click on the backdrop is not a cancel: a stroke that ends off the
+    // canvas lands there, and losing the drawing to a slip is a control that
+    // loses your work.
+    const pos = (e) => {
+      const r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0, width: annot.w, height: annot.h }
+      const x = ((e.clientX - (r.left || 0)) * annot.w) / (r.width || annot.w)
+      const y = ((e.clientY - (r.top || 0)) * annot.h) / (r.height || annot.h)
+      return [Math.max(0, Math.min(annot.w, x)), Math.max(0, Math.min(annot.h, y))]
+    }
+    canvas.onpointerdown = (e) => {
+      if (!annot) return
+      const [x, y] = pos(e)
+      if (annot.tool === 'text') {
+        annot.pendingText = { x: x, y: y }
+        textRow.classList.add('on')
+        input.value = ''
+        if (input.focus) input.focus()
+        drawAnnot()
+        return
+      }
+      if (canvas.setPointerCapture && e.pointerId !== undefined) { try { canvas.setPointerCapture(e.pointerId) } catch (_) { /* not captured is fine */ } }
+      annot.drag = annot.tool === 'pen'
+        ? { t: 'pen', c: annot.color, pts: [[x, y]] }
+        : { t: annot.tool, c: annot.color, x1: x, y1: y, x2: x, y2: y }
+      drawAnnot()
+    }
+    canvas.onpointermove = (e) => {
+      if (!annot || !annot.drag) return
+      const [x, y] = pos(e)
+      if (annot.drag.t === 'pen') annot.drag.pts.push([x, y])
+      else { annot.drag.x2 = x; annot.drag.y2 = y }
+      drawAnnot()
+    }
+    canvas.onpointerup = () => {
+      if (!annot || !annot.drag) return
+      const d = annot.drag
+      annot.drag = null
+      // A click without a drag is not a mark; a zero-size box would still get
+      // a number, and "#3" pointing at nothing is worse than no #3.
+      const big = d.t === 'pen' ? d.pts.length > 1 : Math.abs(d.x2 - d.x1) + Math.abs(d.y2 - d.y1) > 6
+      if (big) annot.shapes.push(d)
+      drawAnnot()
+    }
+    annot.onKey = (e) => {
+      if (!annot) return
+      if (e.key === 'Escape' && !annot.pendingText) { e.preventDefault(); closeAnnotator(false) }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) { e.preventDefault(); annot.shapes.pop(); drawAnnot() }
+    }
+    document.addEventListener('keydown', annot.onKey)
+    function commitText() {
+      const t = String(input.value || '').trim()
+      if (t && annot.pendingText) annot.shapes.push({ t: 'text', c: annot.color, x: annot.pendingText.x, y: annot.pendingText.y, text: t.slice(0, 120) })
+      annot.pendingText = null
+      textRow.classList.remove('on')
+      drawAnnot()
+    }
+    annot.overlay = overlay
+    annot.canvas = canvas
+    annot.input = input
+    document.body.append(overlay)
+  }
+
+  /** The number each box and arrow carries, in the order they were drawn. */
+  function numberOf(shapes, idx) {
+    let n = 0
+    for (let i = 0; i <= idx; i++) if (shapes[i].t === 'box' || shapes[i].t === 'arrow') n++
+    return n
+  }
+
+  function drawShapes(ctx, shapes, lw) {
+    shapes.forEach((sh, i) => {
+      ctx.strokeStyle = sh.c
+      ctx.fillStyle = sh.c
+      ctx.lineWidth = lw
+      ctx.lineCap = 'round'
+      ctx.lineJoin = 'round'
+      if (sh.t === 'box') {
+        ctx.strokeRect(Math.min(sh.x1, sh.x2), Math.min(sh.y1, sh.y2), Math.abs(sh.x2 - sh.x1), Math.abs(sh.y2 - sh.y1))
+      } else if (sh.t === 'arrow') {
+        const ang = Math.atan2(sh.y2 - sh.y1, sh.x2 - sh.x1)
+        const head = lw * 4
+        ctx.beginPath(); ctx.moveTo(sh.x1, sh.y1); ctx.lineTo(sh.x2, sh.y2); ctx.stroke()
+        ctx.beginPath()
+        ctx.moveTo(sh.x2, sh.y2)
+        ctx.lineTo(sh.x2 - head * Math.cos(ang - 0.45), sh.y2 - head * Math.sin(ang - 0.45))
+        ctx.lineTo(sh.x2 - head * Math.cos(ang + 0.45), sh.y2 - head * Math.sin(ang + 0.45))
+        ctx.closePath(); ctx.fill()
+      } else if (sh.t === 'pen') {
+        ctx.beginPath()
+        sh.pts.forEach((p, j) => { if (j) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]) })
+        ctx.stroke()
+      } else if (sh.t === 'text') {
+        const size = lw * 6
+        ctx.font = 'bold ' + size + 'px sans-serif'
+        ctx.lineWidth = Math.max(2, lw / 1.5)
+        ctx.strokeStyle = '#000'
+        ctx.strokeText(sh.text, sh.x, sh.y)
+        ctx.fillText(sh.text, sh.x, sh.y)
+      }
+      if (sh.t === 'box' || sh.t === 'arrow') {
+        // The number, in a filled disc at the start of the mark, so it reads on
+        // any background and survives the downscale.
+        const r = lw * 3.2
+        const cx = sh.x1, cy = sh.y1
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill()
+        ctx.fillStyle = '#fff'
+        ctx.font = 'bold ' + Math.round(r * 1.25) + 'px sans-serif'
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        ctx.fillText(String(numberOf(shapes, i)), cx, cy + 1)
+        ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic'
+      }
+    })
+  }
+
+  function drawAnnot() {
+    if (!annot || !annot.canvas) return
+    const ctx = annot.canvas.getContext('2d')
+    if (annot.ready) ctx.drawImage(annot.base, 0, 0, annot.w, annot.h)
+    const lw = lineWidth()
+    drawShapes(ctx, annot.drag ? annot.shapes.concat([annot.drag]) : annot.shapes, lw)
+    if (annot.pendingText && ctx.arc) {
+      ctx.fillStyle = annot.color
+      ctx.beginPath(); ctx.arc(annot.pendingText.x, annot.pendingText.y, lw, 0, Math.PI * 2); ctx.fill()
+    }
+  }
+
+  /** Close the editor. `keep` flattens the marks into the attachment's bytes;
+   *  the untouched original and the vectors stay on it for the next edit. */
+  function closeAnnotator(keep) {
+    if (!annot) return
+    const s0 = annot
+    annot = null
+    document.removeEventListener('keydown', s0.onKey)
+    if (s0.overlay) s0.overlay.remove()
+    if (!keep) { render(); return }
+    const a = attachments.find((o) => o.id === s0.id)
+    if (!a) { render(); return }
+    const original = a.original || a.dataUrl
+    const originalType = a.originalType || a.mediaType
+    if (!s0.shapes.length) {
+      // Every mark removed: back to the image as it arrived.
+      const cut = original.indexOf(',')
+      attachments = attachments.map((o) => o.id !== a.id ? o : Object.assign({}, o, {
+        dataUrl: original, data: original.slice(cut + 1), mediaType: originalType,
+        shapes: [], marks: 0, numbered: 0,
+      }))
+      render()
+      return
+    }
+    // Redraw from the ORIGINAL, never from what is on screen: the preview
+    // carries the pending-label dot, and a flattened copy of a flattened copy
+    // is how markings pile up on re-edit.
+    const out = document.createElement('canvas')
+    out.width = s0.w; out.height = s0.h
+    const ctx = out.getContext('2d')
+    if (s0.ready) ctx.drawImage(s0.base, 0, 0, s0.w, s0.h)
+    drawShapes(ctx, s0.shapes, Math.max(3, Math.round(Math.max(s0.w, s0.h) / 320)))
+    let url = out.toDataURL('image/png')
+    if (url.length - url.indexOf(',') - 1 > MAX_B64) url = out.toDataURL('image/jpeg', 0.88)
+    const cut = url.indexOf(',')
+    const numbered = s0.shapes.filter((sh) => sh.t === 'box' || sh.t === 'arrow').length
+    attachments = attachments.map((o) => o.id !== a.id ? o : Object.assign({}, o, {
+      original: original, originalType: originalType,
+      dataUrl: url, data: url.slice(cut + 1),
+      mediaType: (/data:([^;,]+)/.exec(url.slice(0, cut)) || [])[1] || 'image/png',
+      shapes: s0.shapes, marks: s0.shapes.length, numbered: numbered,
+    }))
+    render()
   }
 
   function fmtTokens(n) {

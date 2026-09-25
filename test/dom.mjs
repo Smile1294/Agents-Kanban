@@ -244,7 +244,17 @@ export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
       // alternative is that the whole paste path is untestable — and a throw
       // in there is a silently blank panel.
       if (tag === 'canvas') {
-        n.getContext = () => ({ drawImage() { n._drawn = true } })
+        // The drawing calls the annotation editor makes, RECORDED rather than
+        // painted: a test asserts that a box was stroked, not what it looks
+        // like (layout.test.mjs is where pixels are measured).
+        n._ops = []
+        const rec = (name) => (...args) => { n._ops.push([name, ...args]) }
+        n.getContext = () => ({
+          drawImage() { n._drawn = true },
+          strokeRect: rec('strokeRect'), fillText: rec('fillText'), strokeText: rec('strokeText'),
+          beginPath: rec('beginPath'), moveTo: rec('moveTo'), lineTo: rec('lineTo'),
+          stroke: rec('stroke'), fill: rec('fill'), closePath: rec('closePath'), arc: rec('arc'),
+        })
         n.toDataURL = (type) => `data:${type || 'image/png'};base64,SCALED`
       }
       return n

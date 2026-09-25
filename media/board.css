@@ -130,7 +130,7 @@ button[disabled] { cursor: default; }
   align-items: stretch;
   min-height: auto;
 }
-.kebab, .pick, .codeblock-copy, .prompt-retry, .attachment-x, .subtask-of {
+.kebab, .pick, .codeblock-copy, .prompt-retry, .attachment-x, .attachment-edit, .subtask-of {
   min-height: 0;
   display: inline-block;
 }
@@ -715,6 +715,59 @@ button[disabled] { cursor: default; }
   border-radius: 9px; font-size: 12px; cursor: pointer;
 }
 .attachments-note { color: var(--faint); font-size: 0.8em; }
+.attachments-note.warn { color: var(--warn); }
+.attachment-thumb { cursor: pointer; }
+.attachment.annotated .attachment-thumb { border-color: var(--vscode-focusBorder); }
+/* The pencil and the badge sit on the thumbnail like the ×, and like the × they
+   are glyphs on a 48px chip, not standard controls. */
+.attachment-edit {
+  position: absolute; bottom: -6px; right: -6px;
+  width: 18px; height: 18px; min-height: 0; padding: 0; line-height: 16px; text-align: center;
+  border-radius: 9px; font-size: 11px; cursor: pointer;
+}
+.attachment-badge {
+  position: absolute; top: -6px; left: -6px;
+  min-width: 16px; height: 16px; line-height: 16px; padding: 0 4px; border-radius: 8px;
+  font-size: 10px; text-align: center;
+  background: var(--vscode-focusBorder); color: var(--vscode-editor-background);
+}
+
+/* The annotation editor. Fixed over the whole webview and mounted OUTSIDE
+   #root, so a repaint mid-stroke cannot take the stroke with it. */
+.annot-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+}
+.annot-panel {
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: calc(100vw - 32px); max-height: calc(100vh - 32px);
+  padding: 10px; border-radius: var(--radius);
+  background: var(--panel); border: 1px solid var(--line);
+  min-width: 0; min-height: 0;
+}
+.annot-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.annot-tool.on, .annot-swatch.on { outline: 2px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.annot-swatch { width: var(--ctl-h); padding: 0; border: 1px solid var(--line); }
+.annot-sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 2px; }
+.annot-grow { flex: 1; }
+.annot-stage {
+  min-width: 0; min-height: 0; flex: 1; overflow: auto;
+  display: flex; align-items: center; justify-content: center;
+}
+.annot-canvas {
+  display: block; max-width: 100%; max-height: calc(100vh - 150px);
+  cursor: crosshair; touch-action: none;
+  border: 1px solid var(--line);
+}
+.annot-text-row { display: none; }
+.annot-text-row.on { display: flex; }
+.annot-text {
+  flex: 1; height: var(--ctl-h); padding: 0 8px;
+  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-focusBorder); border-radius: 4px;
+}
+.annot-hint { color: var(--faint); font-size: 0.85em; }
 .attach { flex: none; }
 /* What a sent message carried. The bytes are not kept, so this is a note. */
 .prompt-images { color: var(--faint); font-size: 0.85em; margin-top: 4px; }
