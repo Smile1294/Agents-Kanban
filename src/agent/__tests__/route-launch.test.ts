@@ -25,6 +25,7 @@ const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails
 
 import { registerRuntime, type AgentRuntime, type RunSpec } from '../runtime.ts'
 import { AgentManager } from '../manager.ts'
+import { hasCheckpoint } from '../../git/checkpoints.ts'
 import { WorktreeService } from '../../git/worktree.ts'
 import { DEFAULT_BOARD } from '../../board/config.ts'
 import type { SpawnCatalogue } from '../routing.ts'
@@ -291,6 +292,11 @@ ok(recorded() === 'spawn-model',
   const row = mgr.list().find((a) => a.sessionId === 'sess-ended')?.live[0] as { id?: string } | undefined
   ok(!!turn?.messageId && row?.id === turn.messageId,
      `the first prompt row carries the id its message is written under (${row?.id} / ${turn?.messageId})`)
+  // And the worktree was checkpointed under that id before the message went,
+  // so a rewind to it can put back everything the turns after it change.
+  const ran = mgr.list().find((a) => a.sessionId === 'sess-ended')
+  ok(!!ran && !!turn?.messageId && await hasCheckpoint(ran.worktreePath, ran.branch, turn.messageId),
+     'a whole-worktree checkpoint exists for the first message')
 }
 
 // --- a message to a QUEUED card joins its first turn --------------------------

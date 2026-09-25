@@ -14,6 +14,7 @@ import {
   applyRestore, checkpointMapFor, claudeHome, historyDirFor, planRestore,
   sessionFileFor, waitForQuiescent, type CheckpointMap,
 } from './sessions/checkpoints.ts'
+import { dropCheckpoints, hasCheckpoint, planCheckpointRestore, restoreCheckpoint, type RestorePlan } from './git/checkpoints.ts'
 import {
   agentStatus, readTaskNotifications, scanBackgroundAgents, type SessionAgents,
 } from './sessions/subagents.ts'
@@ -3347,6 +3348,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // The app an agent left running there goes first: a dev server whose
       // directory has been deleted is a port held by nothing anyone can see.
       await agentApps.stop(wt.dir)
+      // Its rewind points go with it: there is no worktree left to rewind, and
+      // each checkpoint pins a tree's objects in the repository.
+      await dropCheckpoints(wt.dir, wt.branch).catch(() => 0)
       await w.worktrees.remove(wt.dir, { force: true, keepBranch: true })
       // '' and not undefined: stripUndefined() would drop the key and leave the
       // card pointing at a directory that no longer exists.
@@ -4824,6 +4828,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return checkpointMapFor(text.split('\n'), messageId)
       }
       const mapNow = live ? undefined : await readMap()
+      /* The board's OWN checkpoint for this message, when it took one
+         (`git/checkpoints.ts`): the whole worktree, not just the files an
+         Edit touched before the anchor. It wins over the CLI's file history —
+         that one left files first edited after the anchor, files the
+         discarded turns created, and anything Bash changed, all as they were.
+         The plan is computed now so the modal can say exactly what happens;
+         for a live run it is recomputed after the stop, like the map. */
+      const gitPlanNow = wt && !live ? await planCheckpointRestore(wt.dir, wt.branch, messageId) : undefined
+      const hasGitCp = wt ? await hasCheckpoint(wt.dir, wt.branch, messageId) : false
+      const planLine = (p: RestorePlan) => [
+        `The whole worktree goes back to how it was: ${p.restore.length} file${p.restore.length === 1 ? '' : 's'} restored` +
+          (p.remove.length ? `, ${p.remove.length} created since removed` : '') + ' (ignored files such as node_modules are left alone).',
+        p.commitsAfter ? `The branch moves back ${p.commitsAfter} commit${p.commitsAfter === 1 ? '' : 's'} made after that message (still in the reflog).` : '',
+      ].filter(Boolean).join(' ')
 
       const choice = await vscode.window.showWarningMessage(
         `Start over from "${snippet}"?`,
@@ -4835,6 +4853,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               `session stays in Claude Code's history, untouched.`,
             live ? 'The run in progress is stopped first.' : '',
             !wt ? 'This session has no worktree, so no files are restored.'
+              : gitPlanNow ? planLine(gitPlanNow)
+              : live && hasGitCp ? 'The whole worktree is restored to how it was when you sent it (ignored files are left alone).'
               : live ? 'The worktree files are restored to how they were when you sent it.'
               : mapNow === undefined
                 ? 'No file checkpoints exist at this point (this session ran before they were recorded), so the files keep their current state.'
@@ -4870,7 +4890,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // missing backup is a note afterwards, not a reason to skip the rest.
       let restored: string[] = []
       let failedFiles: { rel: string; reason: string }[] = []
-      if (wt && map) {
+      let gitRestore: RestorePlan | undefined
+      if (wt && hasGitCp) {
+        try {
+          gitRestore = await restoreCheckpoint(wt.dir, wt.branch, messageId)
+          if (gitRestore) restored = [...gitRestore.restore, ...gitRestore.remove]
+        } catch (e) {
+          failedFiles = [{ rel: 'the worktree', reason: e instanceof Error ? e.message.split('\n')[0]! : String(e) }]
+        }
+      }
+      if (wt && map && !gitRestore && !failedFiles.length) {
         const plan = planRestore(wt.dir, historyDirFor(claudeHome(), card.id), map)
         const out = await applyRestore(plan.copies)
         restored = out.restored
@@ -4898,7 +4927,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         refreshAll()
 
         const notes: string[] = []
-        if (restored.length) {
+        if (gitRestore) {
+          notes.push(`Restored the whole worktree: ${gitRestore.restore.length} file${gitRestore.restore.length === 1 ? '' : 's'} put back` +
+            (gitRestore.remove.length ? `, ${gitRestore.remove.length} created since removed` : '') +
+            (gitRestore.commitsAfter ? `, branch moved back ${gitRestore.commitsAfter} commit${gitRestore.commitsAfter === 1 ? '' : 's'}` : '') + '.')
+        } else if (restored.length) {
           notes.push(`Restored ${restored.length} tracked file${restored.length === 1 ? '' : 's'} to how they were.`)
         } else if (wt && map && !Object.keys(map).length) {
           notes.push('No files had been touched by that point, so nothing needed restoring.')
@@ -4908,7 +4941,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             (failedFiles.length > 3 ? ` and ${failedFiles.length - 3} more` : '') +
             ` (${failedFiles[0]?.reason ?? 'unknown'}).`)
         }
-        if (map === undefined && wt) {
+        if (map === undefined && wt && !gitRestore) {
           notes.push('No file checkpoints existed at that point, so the files kept their current state.')
         }
         const text = `Forked at "${snippet}". ` + (notes.length ? notes.join(' ') : 'Send the corrected instruction to continue here.')

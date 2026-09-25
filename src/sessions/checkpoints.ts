@@ -24,6 +24,12 @@
  * this does not, which is why the board can offer it offline and test it
  * hermetically). A file the discarded turns CREATED is not in the snapshot
  * map and is left alone, exactly as the CLI leaves it.
+ *
+ * This is now the FALLBACK. A message the board sent itself has a whole-
+ * worktree checkpoint in git (`git/checkpoints.ts`), which `forkAt` prefers:
+ * this map only knows files an Edit/Write touched before the anchor, so it
+ * left later-first-edited files, created files and Bash changes as they were.
+ * Sessions and messages from before that exist still rewind through here.
  */
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'

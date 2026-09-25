@@ -221,6 +221,7 @@ started column while the title is still the guess.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the manager takes a whole-worktree checkpoint (`takeCheckpoint`) under the message id before the first message of a run and before each follow-up; `discardIfUntouched` drops them with the worktree.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `REQUEST_MAX_BYTES` and `imageLoadNote()` in `images.ts` — the composer warns at 60% of the API's 32MB request limit, naming /compact or a fresh session.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · prompt rows carry their transcript id from the moment they are sent: `messageIdFor()` mints a uuid when the runtime declares `capabilities.messageIds`, and `AgentSession` puts it on the streamed user message, which the CLI writes under exactly that uuid (verified against a real CLI) — so "Try again from here" works on a run in flight.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `send()` to a session whose turn had ended — the normal follow-up — dropped every image on the resume path; it now passes them, and a message to a still-QUEUED card joins its first turn instead of starting a bogus resume of a `run-…` id; the queued card's prompt row carries its image count. `route-launch.test.ts` drives both.

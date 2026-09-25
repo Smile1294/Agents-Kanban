@@ -32,6 +32,7 @@ import {
   type ProposalNote, MAX_STATED,
 } from '../board/decomposition.ts'
 import { knowledgeCheck, loadCodemap } from '../board/codemap.ts'
+import { dropCheckpoints, takeCheckpoint } from '../git/checkpoints.ts'
 import { bindHarness, harnessBrief, type Harness, type HarnessDeps } from './harness.ts'
 import {
   agentKeyOf, describeSpawnAgents, resolveRoute,
@@ -990,6 +991,9 @@ export class AgentManager extends EventEmitter {
         // every repaint, and a few megabytes of base64 per frame is exactly the
         // per-token cost this board has a postmortem about.
         const id = this.messageIdFor(live.runtime)
+        // The worktree as this message finds it, so a rewind to it later puts
+        // back EVERYTHING the following turns changed (`git/checkpoints.ts`).
+        if (id && live.worktreePath) await takeCheckpoint(live.worktreePath, live.branch, id)
         live.live.push({
           kind: 'prompt', at: Date.now(), text,
           ...(id ? { id } : {}),
@@ -1613,7 +1617,11 @@ export class AgentManager extends EventEmitter {
     })
 
     const first = agent.live[0]
-    void session.run(prompt, opts.images ?? [], first?.kind === 'prompt' ? first.id : undefined).catch(() => finish())
+    const firstMessageId = first?.kind === 'prompt' ? first.id : undefined
+    // Before the first message too — it is the one a "start over" most often
+    // names, and the worktree may already hold a previous run's work.
+    if (firstMessageId) await takeCheckpoint(agent.worktreePath, agent.branch, firstMessageId)
+    void session.run(prompt, opts.images ?? [], firstMessageId).catch(() => finish())
   }
 
   /**
@@ -1817,6 +1825,7 @@ export class AgentManager extends EventEmitter {
       if (!(await this.opts.worktrees.isClean(agent.worktreePath))) return
       if (agent.base && (await this.opts.worktrees.aheadOf(agent.worktreePath, agent.base)) > 0) return
       await this.opts.harness?.apps.stop(agent.worktreePath)
+      await dropCheckpoints(agent.worktreePath, agent.branch).catch(() => 0)
       await this.opts.worktrees.remove(agent.worktreePath, { force: true })
     } catch {
       // Keeping a stale worktree is the safe way to fail here.

@@ -191,6 +191,7 @@ from `run-…` to the session id when `system/init` arrives, and
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `checkpoints.ts` is now the rewind FALLBACK — `forkAt` prefers the board's own git checkpoint (`git/checkpoints.ts`), which restores the whole worktree.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `sentImages(id, messageId)` — a sent message's images read back as data URLs on a click (four types, `MAX_SENT`), and `imageBytes(id)` — the base64 the next request would re-send (tool-result screenshots included, reset at a compaction), both off the transcript read; the parse cache carries `imageBytes`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the transcript window and its total are both in ENTRIES (the total was the message count, so tool-heavy sessions drew a "Load earlier" pill with nothing above, the pill stuck busy, and search hits flashed the wrong row); the parse cache holds the whole transcript and a window is a slice (Load earlier and search no longer re-read the file); `withRunNotes`; a seeded tool-heavy session in `store.test.ts` catches the unit mismatch.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `readTranscript` stamps

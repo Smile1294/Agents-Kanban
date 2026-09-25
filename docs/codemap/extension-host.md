@@ -320,6 +320,7 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `forkAt` restores from the git checkpoint when one exists for the anchor (modal names files restored, files removed, commits undone), falling back to Claude Code's file history; removing a worktree drops its checkpoints.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · composer gains `imagesUnsupported` (the selected session's runtime has `capabilities.images` false) and `imageLoadNote` (not-running path only, off the cached parse); a `sentImages` webview message (editor-only) answers with one message's images on its own channel.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `askTestPlan` is a no-op without a worktree to resume into (an unknown key used to resume a session id nobody had — a real CLI process, and on a machine with `claude` on PATH a live agent that failed smoke's update-button block); the widened transcript window follows a card's key change in `applyRedirects`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · an ENDED run (done/error, with a session id) is drawn off disk like any other session plus its own notes (`withRunNotes`) — it used to stay on its launch-time `history`, so after any run there was no "Load earlier", search missed older messages, fork buttons were missing on the newest prompts, and its rows changed on reload; `loadOlderTranscript`, `openHit` and search treat only in-flight runs as fixed; `transcriptHead` is counted before the notes go in.
