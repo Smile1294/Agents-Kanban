@@ -195,6 +195,11 @@
    *  a second while an agent works, and a canvas rebuilt mid-stroke takes the
    *  stroke with it. See `openAnnotator`. */
   let annot = null
+  /** Images of SENT messages, fetched on a click and kept here, keyed by
+   *  `<session>|<messageId>`: `'loading'` or an array of data URLs. Never in
+   *  state (the bytes would ride every repaint) and never in the DOM alone
+   *  (the next frame would take them). */
+  const sentThumbs = new Map()
   /**
    * Choices made in an AskUserQuestion picker but not yet sent, keyed by
    * request id and then by question text.
@@ -364,6 +369,13 @@
         mentionFiles = d.files
         mentionFetching = false
         if (mentionAt(draft)) render()
+      }
+    } else if (d.type === 'sentImages') {
+      // The bytes a sent message carried, asked for by its "Show".
+      if (typeof d.messageId === 'string' && Array.isArray(d.urls)) {
+        sentThumbs.set(String(d.id) + '|' + d.messageId,
+          d.urls.filter((u) => typeof u === 'string' && /^data:image\/(png|jpeg|gif|webp);base64,/.test(u)))
+        render()
       }
     } else if (d.type === 'searchResults') {
       // The answer to a transcript search. The host echoes the query it
@@ -695,10 +707,18 @@
    *  is exactly the moment its duration appears). Text uses its LENGTH rather
    *  than its content because live rows only ever grow, and length changes
    *  exactly when content does. */
+  function thumbSig(k) {
+    const t = sentThumbs.get(k)
+    return t === undefined ? '-' : t === 'loading' ? 'l' : String(t.length)
+  }
+
   function rowSig(e) {
     if (!e) return '?'
     switch (e.kind) {
-      case 'prompt': return 'p:' + (e.id || '') + ':' + (e.text || '').length + ':' + (e.images || 0)
+      // The sent-image thumbnails are drawn by the row, so their state is part
+      // of its identity: a row patched past them would keep "Show" forever.
+      case 'prompt': return 'p:' + (e.id || '') + ':' + (e.text || '').length + ':' + (e.images || 0) +
+        (e.images && e.id ? ':' + thumbSig(String(view.selectedKey) + '|' + e.id) : '')
       case 'text': return 't:' + (e.model || '') + ':' + (e.text || '').length
       case 'thinking': return 'h:' + (e.text || '').length
       case 'tool': return 'o:' + (e.id || '') + ':' + (e.name || '') + ':' + (e.summary || '') + ':' + (e.status || '') + ':' + (e.children ? e.children.length : 0)
@@ -2733,6 +2753,7 @@
        at the new model's input price. Rendered beside the picker that
        triggered it, in the same amber used for the provider note. */
     if (s.composer.modelSwitchNote) bar.append(noteChip(s.composer.modelSwitchNote))
+    if (s.composer.imageLoadNote) bar.append(noteChip(s.composer.imageLoadNote))
     /* WHAT THIS SESSION RUNS ON: one entry per agent-and-backend combination.
        This was two pickers — an agent picker and, before that, a backend
        picker — and splitting them made the user do the cross product in their
@@ -2993,7 +3014,10 @@
       addImageFiles(Array.prototype.slice.call(files))
     }
 
-    const clip = el('button', 'attach ctl ctl-lg ctl-icon', '📎')
+    // No 📎 on an agent that cannot receive an image: it would become a note
+    // to the model while looking sent. It DISAPPEARS, like effort on Haiku.
+    const clip = s.composer && s.composer.imagesUnsupported ? null : el('button', 'attach ctl ctl-lg ctl-icon', '📎')
+    if (clip) {
     clip.title = 'Attach an image'
     clip.onclick = () => {
       const picker = el('input')
@@ -3002,6 +3026,7 @@
       picker.multiple = true
       picker.onchange = () => addImageFiles(Array.prototype.slice.call(picker.files || []))
       picker.click()
+    }
     }
 
     /* The mic: dictation into the draft. TWO paths, named by `voice.mode`.
@@ -3068,6 +3093,13 @@
       // numbered, which is what lets "#2 is misaligned" land on a place.
       const said = annotationHint(attachments)
       const sent = said ? (text ? text + '\n\n' + said : said) : text
+      const outgoing = c ? { type: 'send', id: c.key, text: sent, images } : { type: 'newSession', text: sent, images }
+      if (overRemoteCap(outgoing)) {
+        attachNote = 'Too large to send from this page in one message (' +
+          (JSON.stringify(outgoing).length / 1e6).toFixed(1) + 'MB, the limit is 4MB) — remove an image, or send them one at a time.'
+        render()
+        return
+      }
       draft = ''; ta.value = ''; composerH = null; stick = true
       attachments = []
       attachNote = ''
@@ -3075,7 +3107,8 @@
       else post('newSession', { text: sent, images })
       render()
     }
-    row.append(ta, clip)
+    row.append(ta)
+    if (clip) row.append(clip)
     if (mic) row.append(mic)
     row.append(send)
     if (attachments.length || attachNote) wrap.append(renderAttachments())
@@ -3493,6 +3526,13 @@
    */
   function addImageFiles(files) {
     const MAX_AT_ONCE = 8
+    const cur = s.composer && s.composer.imagesUnsupported
+    if (cur) {
+      attachNote = cur + ' cannot receive images in this board, so nothing was attached. ' +
+        'Pick Claude Code on the agent chip to send screenshots.'
+      render()
+      return
+    }
     /* The room is worked out ONCE, before anything is read.
        It used to be `attachments.length + queued >= MAX`, which double-counts:
        each file's decode appends to `attachments`, so once decoding completes
@@ -3541,6 +3581,20 @@
       reader.readAsDataURL(file)
     }
   }
+
+  /**
+   * The largest message the RELAY carries (remote-contract.json `msgMaxBytes`;
+   * `scripts/check-contract.mjs` pins this literal to it). A bigger one — two
+   * full screenshots — was queued by the page, refused by the relay and never
+   * reached the machine, while the composer had already cleared the draft. So
+   * off the editor (a relay or headless page is http(s); a VS Code webview is
+   * `vscode-webview:`, which has no such cap) an over-size send is refused
+   * HERE, before anything is cleared, and says what to do.
+   */
+  const REMOTE_MSG_MAX_BYTES = 4000000
+  const overRemoteCap = (msg) =>
+    typeof location !== 'undefined' && /^https?:$/.test(String(location.protocol || '')) &&
+    JSON.stringify(msg).length > REMOTE_MSG_MAX_BYTES
 
   /** What the host accepts (`agent/images.ts`): four types, 3.5MB of base64. */
   const SENDABLE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
@@ -4282,6 +4336,33 @@
           const note = el('div', 'prompt-images',
             '🖼 ' + e.images + (e.images === 1 ? ' image' : ' images') + ' attached')
           head.append(body, note)
+          // What was sent, on request: the bytes live in Claude Code's own
+          // file, so they are read back once, on a click, for this row only.
+          const tkey = String(view.selectedKey) + '|' + e.id
+          const got = e.id ? sentThumbs.get(tkey) : undefined
+          if (e.id && got === undefined) {
+            const show = el('button', 'prompt-images-show', 'Show')
+            show.title = 'Show the images that went with this message'
+            show.onclick = () => {
+              sentThumbs.set(tkey, 'loading')
+              post('sentImages', { id: view.selectedKey, messageId: e.id })
+              render()
+            }
+            note.append(' · ', show)
+          } else if (got === 'loading') {
+            note.append(' · loading…')
+          } else if (Array.isArray(got)) {
+            if (!got.length) note.append(' · no longer in the transcript file')
+            const strip = el('div', 'prompt-thumbs')
+            for (const u of got) {
+              const im = el('img', 'prompt-thumb')
+              im.src = u
+              im.alt = 'sent image'
+              im.onclick = () => im.classList.contains('big') ? im.classList.remove('big') : im.classList.add('big')
+              strip.append(im)
+            }
+            if (got.length) head.append(strip)
+          }
         } else {
           head.append(body)
         }

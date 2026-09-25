@@ -359,6 +359,12 @@ export interface UiState {
     model: string
     effort: string
     thinking: string
+    /** The label of this session's agent when it cannot take images (Codex).
+     *  The view then drops the 📎 and says so on a paste, instead of sending
+     *  images that become a note to the model. */
+    imagesUnsupported?: string
+    /** Set when the conversation's images near the API's request limit. */
+    imageLoadNote?: string
     /**
      * The models to offer, with the two facts that make a list of ids a
      * CHOICE: how much context each one has, and what it costs.
@@ -645,6 +651,8 @@ export interface BoardHost {
    * query back (`q`) so the view can drop an answer to a superseded search.
    */
   searchTranscript(q: string): Promise<SearchAnswer>
+  /** The images one sent message carried, read back on a click. */
+  sentImages(key: string, messageId: string): Promise<string[]>
   /** Widen the selected session's transcript window by one slice, so the view
    *  can show OLDER messages above the loaded tail. Called from the "load
    *  earlier" pill; the host owns the window and re-reads on demand. */
@@ -914,6 +922,16 @@ async function routeBoardMessage(
       // session, which is never something a repaint does.
       const answer = await host.searchTranscript(String(msg.q ?? ''))
       reply({ type: 'searchResults', ...answer })
+      break
+    }
+    case 'sentImages': {
+      // A few MB of base64 for ONE message, on a click — never state, and
+      // never over the relay, whose messages are capped at 4MB.
+      if (editorOnly('Sent images are shown in the editor.')) break
+      const messageId = typeof msg.messageId === 'string' ? msg.messageId : ''
+      if (!messageId) break
+      const urls = await host.sentImages(id(), messageId)
+      reply({ type: 'sentImages', id: id(), messageId, urls })
       break
     }
     case 'moreTranscript': await host.loadOlderTranscript(id()); await refresh(); break

@@ -135,6 +135,26 @@ const TOOLS_ID = 'aaaaaaaa-0000-0000-0000-000000000009'
   await fs.writeFile(path.join(projectDir, `${TOOLS_ID}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n')
 }
 
+// A session whose prompt carried two images and one thing that is not.
+const IMAGES_ID = 'aaaaaaaa-0000-0000-0000-00000000000a'
+{
+  const projectDir = path.join(claudeHome, 'projects', repo.replace(/[^a-zA-Z0-9]/g, '-'))
+  const common = { sessionId: IMAGES_ID, cwd: repo, isSidechain: false, userType: 'external', version: '2.0.0', gitBranch: 'main' }
+  await fs.writeFile(path.join(projectDir, `${IMAGES_ID}.jsonl`), [
+    { ...common, type: 'user', uuid: 'iu1', parentUuid: null, timestamp: new Date(2e12).toISOString(),
+      message: { role: 'user', content: [
+        { type: 'text', text: 'what is wrong here?' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+        { type: 'image', source: { type: 'base64', media_type: 'image/svg+xml', data: 'PHN2Zz4=' } },
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: '/9j/4AAQ' } },
+      ] } },
+    { ...common, type: 'assistant', uuid: 'ia1', parentUuid: 'iu1', timestamp: new Date(2e12 + 1000).toISOString(),
+      message: { id: 'msg_i1', model: 'claude-opus-5', role: 'assistant', type: 'message',
+        content: [{ type: 'text', text: 'The button.' }],
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } },
+  ].map((l) => JSON.stringify(l)).join('\n') + '\n')
+}
+
 // A Codex rollout for the SAME repo, with NO sidecar entry — which is exactly
 // the state of every adopted session on a real board: the runtime is known only
 // from the foreign scan, never from metadata we wrote.
@@ -172,7 +192,7 @@ const list = await store.list()
 ok(Array.isArray(list), 'list() returns sessions from Claude Code without throwing')
 // An ASSERTION, not a guard. If the SDK ever changes where it looks, this goes
 // red and names it rather than skipping the rest of the file.
-ok(list.filter((s) => !s.runtime || s.runtime === 'claude').length === 3,
+ok(list.filter((s) => !s.runtime || s.runtime === 'claude').length === 4,
    `the seeded Claude sessions are found — the SDK's project-directory encoding still holds (${list.length})`)
 ok(list.some((s) => s.id === SEEDED_ID), 'and it is the one that was seeded')
 
@@ -322,6 +342,18 @@ ok((await store.get('nope')) === undefined, 'unknown session id returns undefine
   const full = await store.fullTranscript(TOOLS_ID)
   ok(full.length === total && full[total - 10]!.at === tail[0]!.at,
      'a search index into the full transcript lands on the same row in the window (full[total-10] is the window\'s first)')
+}
+
+// --- the images a sent message carried, read back on request ------------------
+{
+  const urls = await store.sentImages(IMAGES_ID, 'iu1')
+  ok(urls.length === 2 && urls[0] === 'data:image/png;base64,iVBORw0KGgo=' && urls[1]!.startsWith('data:image/jpeg'),
+     `a sent message's images come back as data URLs, and a type it could not have carried does not (${urls.length})`)
+  ok((await store.sentImages(IMAGES_ID, 'nope')).length === 0, 'an unknown message is no images, not a throw')
+  ok((await store.imageBytes(IMAGES_ID)) === 28, `the bytes the next request re-sends are counted (${await store.imageBytes(IMAGES_ID)})`)
+  ok((await store.imageBytes(TOOLS_ID)) === 0, 'a session without images re-sends none')
+  ok((await store.transcript(IMAGES_ID)).some((e) => e.kind === 'prompt' && e.images === 3 && e.id === 'iu1'),
+     'and the row that offers Show carries the id it asks with')
 }
 
 // --- a finished run's own rows ride along on the disk transcript ---------------

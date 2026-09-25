@@ -6,7 +6,7 @@
    politeness, they are the boundary. */
 import {
   IMAGE_TYPES, MAX_BYTES, MAX_IMAGES, approxTokens, describeImages,
-  isImageMediaType, sanitiseImages, userContent, type AttachedImage,
+  isImageMediaType, sanitiseImages, userContent, type AttachedImage, imageLoadNote,
 } from '../images.ts'
 
 let fails = 0
@@ -114,6 +114,11 @@ ok(approxTokens([]) === 0, 'no images cost nothing')
 ok(approxTokens([img({ data: 'A'.repeat(1_500_000) })]) > 500,
    `a megabyte-and-a-half screenshot is a four-figure token cost (${approxTokens([img({ data: 'A'.repeat(1_500_000) })])})`)
 ok(describeImages(1) === '1 image' && describeImages(3) === '3 images', 'singular and plural')
+
+// The request-size warning: silent well below the limit, a sentence that names
+// the fix well before it.
+ok(imageLoadNote(5_000_000) === undefined, 'a few MB of images says nothing')
+ok(/re-sends 25\.0MB.*\/compact/.test(imageLoadNote(25_000_000) ?? ''), 'near the 32MB request limit it says so, and what to do')
 
 console.log(fails ? `\n${fails} FAILURES` : '\nPASS — attachments reach the model as image blocks, or are refused out loud')
 process.exit(fails ? 1 : 0)

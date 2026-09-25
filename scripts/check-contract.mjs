@@ -111,6 +111,14 @@ const local = [
   ['viewerOk', contract.viewerOk, grab(messagesSrc, 'VIEWER_OK'), 'src/remote/messages.ts VIEWER_OK'],
   ['viewersMax', contract.viewersMax, grabNumber(pusherSrc, 'VIEWERS_MAX'), 'src/remote/pusher.ts VIEWERS_MAX'],
 ]
+// The view's own copy: board.js is a plain script, so it cannot import the
+// TypeScript constant, and a drift here means the page refuses a message the
+// relay would carry, or clears a draft the relay will drop.
+{
+  const boardSrc = await sourceOf('media/board.js')
+  const m = /const REMOTE_MSG_MAX_BYTES = (\d+)/.exec(boardSrc)
+  local.push(['msgMaxBytes', contract.msgMaxBytes, m ? Number(m[1]) : undefined, 'media/board.js REMOTE_MSG_MAX_BYTES'])
+}
 for (const [field, want, got, where] of local) {
   ok(got === want, `contract ${field} matches ${where}`)
   if (got !== undefined && got !== want) {

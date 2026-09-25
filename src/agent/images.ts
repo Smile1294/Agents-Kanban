@@ -44,6 +44,25 @@ export const MAX_EDGE = 1568
  *  lower because several of them share one turn. */
 export const MAX_BYTES = 3_500_000
 
+/** The API refuses a request larger than this, and every turn re-sends the
+ *  whole conversation — images included. */
+export const REQUEST_MAX_BYTES = 32_000_000
+
+/**
+ * A sentence for the composer when a conversation's images are approaching
+ * the request limit, or undefined. Measured on the base64 that would be
+ * re-sent (the transcript's own count), warned at 60% so there is room for
+ * the next paste, and it says what to do — a fresh session or a compaction —
+ * because "request too large" from the API names neither.
+ */
+export function imageLoadNote(base64Bytes: number, adding = 0): string | undefined {
+  const total = base64Bytes + adding
+  if (total < REQUEST_MAX_BYTES * 0.6) return undefined
+  const mb = (n: number) => (n / 1e6).toFixed(1)
+  return `This conversation re-sends ${mb(base64Bytes)}MB of images on every turn; the API refuses requests over ` +
+    `${mb(REQUEST_MAX_BYTES)}MB. Compact it (/compact) or start a fresh session before adding more.`
+}
+
 /** At most this many on one message. A paste-happy moment should not silently
  *  spend 30k tokens of context before the sentence starts. */
 export const MAX_IMAGES = 8

@@ -570,6 +570,10 @@ for (const msg of [
   // session that has no worktree and no run to resume — which is what a stale
   // webview, or a second click after the card moved, sends.
   { type: 'askTestPlan', id: 'nope' },
+  // Sent-image thumbnails, asked for by a row that may be stale or forged.
+  { type: 'sentImages', id: 'nope', messageId: 'u-nope' },
+  { type: 'sentImages', id: 'nope' },
+  { type: 'sentImages', messageId: 42 },
   // The background-agent scan runs on the render path for every card, so it has
   // to survive a workspace whose sessions never spawned one — which is most of
   // them — without contributing a card field or an error.

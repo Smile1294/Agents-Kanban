@@ -349,5 +349,56 @@ const paste = (root, files) => {
   ok(!overlay() && !byClass(b.root, 'attachment-badge'), 'Cancel closes without marking the image')
 }
 
+// ---------------------------------------------------------------------------
+// 17. An agent that cannot receive images gets no 📎, and a paste says so —
+// Codex turned them into a note to the model while the bar looked like it sent.
+{
+  const codex = { ...chat, composer: { ...chat.composer, imagesUnsupported: 'Codex' } }
+  const b = run(codex)
+  ok(!byClass(b.root, 'attach'), 'no attach button on a Codex session')
+  paste(b.root, [fakeImageFile('shot.png', 'image/png', { data: 'CX' })])
+  ok(allByClass(b.root, 'attachment').length === 0 && /Codex cannot receive images/.test(b.root.textContent),
+     'a pasted image is not attached, and the composer says why')
+  ok(!!byClass(run(chat).root, 'attach'), 'while a Claude Code session keeps its 📎')
+}
+
+// ---------------------------------------------------------------------------
+// 18. On a relay page a message over the relay's 4MB cap is refused BEFORE the
+// draft is cleared — the relay dropped it silently, and the images were gone.
+{
+  const big = () => [fakeImageFile('a.png', 'image/png', { data: 'A'.repeat(2_500_000) }),
+                     fakeImageFile('b.png', 'image/png', { data: 'B'.repeat(2_500_000) })]
+  const remote = renderBoardWith(src, chat, { layout: 'board', protocol: 'https:' })
+  paste(remote.root, big())
+  byClass(remote.root, 'send').onclick()
+  ok(!remote.posted.some((m) => m.type === 'send'), 'nothing is posted from a relay page over the cap')
+  ok(allByClass(remote.root, 'attachment').length === 2 && /Too large to send from this page/.test(remote.root.textContent),
+     'and the images stay attached, with the reason and the fix')
+  const editor = run(chat)
+  paste(editor.root, big())
+  byClass(editor.root, 'send').onclick()
+  ok(editor.posted.some((m) => m.type === 'send'), 'the editor has no such cap, so the same message goes')
+}
+
+// ---------------------------------------------------------------------------
+// 19. A SENT message's images can be looked at again: "Show" asks the host for
+// that one message's bytes, and the answer is drawn — and kept — by the view.
+{
+  const b = run({ ...chat, transcript: [{ kind: 'prompt', at: 1, text: 'look', images: 2, id: 'u-1' }] })
+  const show = walk(b.root).find((n) => n.tagName === 'button' && n.textContent === 'Show')
+  ok(!!show, 'a prompt row that carried images offers Show')
+  show.onclick()
+  const asked = b.posted.find((m) => m.type === 'sentImages')
+  ok(asked?.messageId === 'u-1' && asked?.id === 'abc', 'Show asks for THAT message of THAT session')
+  ok(/loading…/.test(b.root.textContent), 'and says it is loading')
+  for (const fn of b.listeners) fn({ data: { type: 'sentImages', id: 'abc', messageId: 'u-1', urls: ['data:image/png;base64,QQ==', 'data:image/jpeg;base64,Qg==', 'javascript:alert(1)'] } })
+  const thumbs = allByClass(b.root, 'prompt-thumb')
+  ok(thumbs.length === 2 && thumbs[0].src === 'data:image/png;base64,QQ==', `the images are drawn, and a non-image URL is not (${thumbs.length})`)
+  b.deliver({ ...chat, transcript: [{ kind: 'prompt', at: 1, text: 'look', images: 2, id: 'u-1' }] })
+  ok(allByClass(b.root, 'prompt-thumb').length === 2, 'and they survive the next repaint')
+  const noId = run({ ...chat, transcript: [{ kind: 'prompt', at: 1, text: 'x', images: 1 }] })
+  ok(!walk(noId.root).some((n) => n.tagName === 'button' && n.textContent === 'Show'), 'a row with no message id has nothing to fetch, so no Show')
+}
+
 console.log(fails ? `\n${fails} FAILURES` : '\nPASS — a pasted image reaches the message, downscaled, and survives the repaints')
 process.exit(fails ? 1 : 0)

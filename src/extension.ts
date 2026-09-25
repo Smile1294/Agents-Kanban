@@ -40,7 +40,7 @@ import {
   parseOrchestrationLevel, type OrchestrationLevel,
 } from './board/decomposition.ts'
 import { coalesce } from './board/coalesce.ts'
-import { describeImages, sanitiseImages } from './agent/images.ts'
+import { describeImages, imageLoadNote, sanitiseImages } from './agent/images.ts'
 import { BrowserPool } from './agent/browser.ts'
 import type { HarnessDeps } from './agent/harness.ts'
 import { AppProcesses } from './run/app.ts'
@@ -3512,6 +3512,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Filled in below when the selected session has a conversation and the
       // picker moved off the model that conversation was on.
       modelSwitchNote: undefined as string | undefined,
+      imagesUnsupported: undefined as string | undefined,
+      imageLoadNote: undefined as string | undefined,
       // The mic's gate: absent until some path answered — the built-in
       // gate, or the lazy whisper probe. The first paint of the board never
       // waits on two `--version` spawns.
@@ -3891,6 +3893,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // nothing extra — and there is one place that knows how spend is
         // derived, not two.
         composer.meter = await ws.store.meter(selectedKey)
+        // Off the same cached parse. Only here, on the not-running path: a
+        // live run's file changes every turn and re-reading it per repaint is
+        // the cost this board has a postmortem about.
+        const load = imageLoadNote(await ws.store.imageBytes(selectedKey))
+        if (load) composer.imageLoadNote = load
       }
     }
 
@@ -4059,6 +4066,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           'change here applies to the next session.'
       }
     }
+
+    /* Whether THIS session's agent can take an image at all. Codex takes
+       `local_image` by path and this board writes nothing to disk, so its
+       images became a note to the model while the 📎 stayed on the bar — a
+       control that could not take effect. Named, so the view can say which
+       agent cannot, and the attach affordance disappears rather than greying. */
+    const composerRt = getRuntime(parseRuntimeId(composer.runtime) ?? DEFAULT_RUNTIME)
+    if (composerRt && !composerRt.capabilities.images) composer.imagesUnsupported = composerRt.label
 
     // ONE call, after everything that can decide which list is in force.
     composer.models = sendModels(effectiveCatalogue, effectiveProfile, sink)
@@ -4263,6 +4278,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      * never overshoot — the store slices at the tail either way, but the
      * cap keeps `transcriptMore` honest when the very last slice lands.
      */
+    async sentImages(key: string, messageId: string): Promise<string[]> {
+      if (!ws || !key) return []
+      const sid = ws.manager?.byKey(key)?.sessionId ?? key
+      return ws.store.sentImages(sid, messageId)
+    },
+
     async loadOlderTranscript(key: string): Promise<void> {
       if (!ws || !key) return
       const run = ws.manager?.byKey(key)

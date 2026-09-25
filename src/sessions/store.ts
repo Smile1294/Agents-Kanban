@@ -317,6 +317,9 @@ export function withRunNotes(disk: readonly Entry[], live: readonly Entry[]): En
   return out
 }
 
+/** Images `sentImages` returns for one message — the composer's own cap. */
+const MAX_SENT = 8
+
 export const TRANSCRIPT_LIMIT = 400
 
 /**
@@ -357,7 +360,7 @@ export class SessionStore {
    */
   private readonly transcripts = new Map<
     string,
-    { at: number; key: string; total: number; entries: Entry[]; usage: UsageTotals }
+    { at: number; key: string; total: number; entries: Entry[]; usage: UsageTotals; imageBytes: number }
   >()
 
   /**
@@ -667,6 +670,49 @@ export class SessionStore {
    * therefore the SAME indices `transcript()` slices, which is what lets a
    * search hit land on the row it names.
    */
+  /**
+   * The images one sent message carried, as data URLs — for the transcript's
+   * "Show" on a prompt row, and ONLY for that. The transcript keeps the count,
+   * never the bytes (they would ride every repaint), so the bytes are read back
+   * from Claude Code's own file on a click. Cheap to call rarely and never on
+   * the render path: it reads the whole session. Pre-compaction messages are
+   * recovered the same way the transcript recovers them. At most `MAX_SENT`
+   * are returned; a message the file does not have is `[]`, never a throw.
+   */
+  async sentImages(id: string, messageId: string): Promise<string[]> {
+    if (await this.runtimeOf(id)) return []
+    const { getSessionMessages } = await loadSdk()
+    let all: Awaited<ReturnType<typeof getSessionMessages>>
+    try {
+      all = await getSessionMessages(id, { includeSystemMessages: true })
+    } catch {
+      return []
+    }
+    const recovery = await recoverPreCompaction(id, all)
+    const msgs = recovery ? [...recovery.recovered, ...all] : all
+    const m = msgs.find((x) => x.uuid === messageId && x.type === 'user')
+    const content = (m?.message as { content?: unknown } | undefined)?.content
+    if (!Array.isArray(content)) return []
+    const out: string[] = []
+    for (const b of content as Array<{ type?: unknown; source?: { type?: unknown; media_type?: unknown; data?: unknown } }>) {
+      if (b?.type !== 'image' || b.source?.type !== 'base64') continue
+      const mt = typeof b.source.media_type === 'string' ? b.source.media_type : ''
+      const data = typeof b.source.data === 'string' ? b.source.data : ''
+      // The four types a message can carry; anything else is not drawn.
+      if (!/^image\/(png|jpeg|gif|webp)$/.test(mt) || !/^[A-Za-z0-9+/=]+$/.test(data)) continue
+      out.push(`data:${mt};base64,${data}`)
+      if (out.length >= MAX_SENT) break
+    }
+    return out
+  }
+
+  /** Base64 bytes of the images the next request of this session would
+   *  re-send (see `readTranscript`). Off the same cached parse — free. */
+  async imageBytes(id: string): Promise<number> {
+    if (await this.runtimeOf(id)) return 0
+    return (await this.parse(id, TRANSCRIPT_LIMIT)).imageBytes
+  }
+
   async fullTranscript(id: string): Promise<Entry[]> {
     const rt = await this.runtimeOf(id)
     if (rt) return (await rt.transcript(id)) as Entry[]
@@ -744,7 +790,7 @@ export class SessionStore {
   private async parse(
     id: string,
     limit: number,
-  ): Promise<{ total: number; entries: Entry[]; usage: UsageTotals }> {
+  ): Promise<{ total: number; entries: Entry[]; usage: UsageTotals; imageBytes: number }> {
     const now = Date.now()
     const key = await this.fileKey(id)
     const hit = this.transcripts.get(id)
@@ -754,10 +800,11 @@ export class SessionStore {
     const fresh = hit && (key ? hit.key === key : now - hit.at < SCAN_TTL_MS)
     // The cache holds the WHOLE parse and a window is a slice of it, so
     // widening the window ("Load earlier") costs a slice, not a re-read.
-    const window = (full: { total: number; entries: Entry[]; usage: UsageTotals }) => ({
+    const window = (full: { total: number; entries: Entry[]; usage: UsageTotals; imageBytes: number }) => ({
       total: full.total,
       entries: full.entries.length > limit ? full.entries.slice(full.entries.length - limit) : full.entries,
       usage: full.usage,
+      imageBytes: full.imageBytes,
     })
     if (fresh) {
       // Touched, so the sweep below measures IDLE time rather than age. An
@@ -788,7 +835,7 @@ export class SessionStore {
    *  ENTRIES — see `transcriptTotal`. */
   private async readTranscript(
     id: string,
-  ): Promise<{ total: number; entries: Entry[]; usage: UsageTotals }> {
+  ): Promise<{ total: number; entries: Entry[]; usage: UsageTotals; imageBytes: number }> {
     const { getSessionMessages } = await loadSdk()
     let all: Awaited<ReturnType<typeof getSessionMessages>>
     try {
@@ -808,7 +855,7 @@ export class SessionStore {
       // could not even observe it.
       all = await getSessionMessages(id, { includeSystemMessages: true })
     } catch {
-      return { total: 0, entries: [], usage: emptyTotals() }
+      return { total: 0, entries: [], usage: emptyTotals(), imageBytes: 0 }
     }
     // A compaction is the one place the SDK's reader does not give the
     // transcript that is on disk. It keeps only the ancestry chain of the
@@ -863,9 +910,24 @@ export class SessionStore {
      *  looks like it has stopped when it has not. */
     const bySubagent = new Map<string, Entry[]>()
 
+    // Base64 of every image the NEXT request would carry: each turn re-sends
+    // the whole conversation, images included, and the API refuses a request
+    // over 32MB. A compaction summary replaces what came before it, so the
+    // count restarts there. Tool results count too — a browser screenshot is
+    // an image the model saw, and it rides every later turn like a paste does.
+    let imageBytes = 0
+    const countImages = (content: unknown): void => {
+      if (!Array.isArray(content)) return
+      for (const b of content as Array<{ type?: unknown; source?: { data?: unknown }; content?: unknown }>) {
+        if (b?.type === 'image' && typeof b.source?.data === 'string') imageBytes += b.source.data.length
+        else if (b?.type === 'tool_result') countImages(b.content)
+      }
+    }
     for (const m of msgs) {
       const body = (m.message ?? {}) as { content?: unknown }
       const at = stampOf(m)
+      if (isCompactSummary(m, compactUuids)) imageBytes = 0
+      else if (!m.parent_tool_use_id) countImages(body.content)
       // The compact summary is the model's own recap, not something anyone
       // said. Claude Code's CLI never shows it as a chat message, and neither
       // does this board: it renders as one muted divider, the same one the
@@ -949,7 +1011,7 @@ export class SessionStore {
     // The total is in ENTRIES, the unit every window and every search index is
     // in. Slicing the top level (in `parse`) also keeps a Task's subagent
     // children with their Task, which a message-level cut could separate.
-    return { total: entries.length, entries, usage }
+    return { total: entries.length, entries, usage, imageBytes }
   }
 
   async setPhase(id: string, phase: string): Promise<void> {

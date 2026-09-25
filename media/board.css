@@ -130,7 +130,7 @@ button[disabled] { cursor: default; }
   align-items: stretch;
   min-height: auto;
 }
-.kebab, .pick, .codeblock-copy, .prompt-retry, .attachment-x, .attachment-edit, .subtask-of {
+.kebab, .pick, .codeblock-copy, .prompt-retry, .attachment-x, .attachment-edit, .prompt-images-show, .subtask-of {
   min-height: 0;
   display: inline-block;
 }
@@ -771,6 +771,16 @@ button[disabled] { cursor: default; }
 .attach { flex: none; }
 /* What a sent message carried. The bytes are not kept, so this is a note. */
 .prompt-images { color: var(--faint); font-size: 0.85em; margin-top: 4px; }
+.prompt-images-show {
+  min-height: 0; height: auto; padding: 0; border: none; background: none;
+  color: var(--vscode-textLink-foreground); font-size: inherit; cursor: pointer;
+}
+.prompt-thumbs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.prompt-thumb {
+  height: 72px; width: auto; max-width: 200px; object-fit: cover; cursor: zoom-in;
+  border: 1px solid var(--line); border-radius: 4px;
+}
+.prompt-thumb.big { height: auto; max-width: 100%; max-height: 70vh; cursor: zoom-out; }
 .prompt-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
 /* "Try again from here": a quiet ghost under the prompt bubble, so it reads as
    part of the row rather than a board control. Inherits the `button` base

@@ -221,7 +221,7 @@ export async function renderBoard(state, opts = {}) {
   return renderBoardWith(await boardSource(), state, opts)
 }
 
-export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
+export function renderBoardWith(src, state, { layout = 'compact', protocol } = {}) {
   const root = makeNode('div')
   const posted = []
   const listeners = []
@@ -277,6 +277,9 @@ export function renderBoardWith(src, state, { layout = 'compact' } = {}) {
     window: { addEventListener: (t, fn) => { if (t === 'message') listeners.push(fn) } },
     acquireVsCodeApi: () => ({ postMessage: (m) => posted.push(m) }),
     Date, Math, Number, JSON, console, Set, Array, Object, String, Map, Intl, Buffer, prompt: () => null,
+    // Where the page is served from: absent is the editor's webview; a test
+    // passes 'https:' to be a relay page, whose messages have a size cap.
+    ...(protocol ? { location: { protocol } } : {}),
     /* A CONTROLLABLE timer. `setInterval` is not a V8 intrinsic, so it is
        simply absent from a `vm` context — board.js guards on
        `typeof setInterval === 'function'`, so the ticker was never even
