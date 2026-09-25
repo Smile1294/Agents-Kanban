@@ -872,6 +872,17 @@ for (const label of ['calc.js', 'Run the tests', 'Local server']) {
   ok(!planned.text().includes('Checked in a browser'), 'a plan with no record claims nothing')
 }
 
+// Review comments waiting on a card: counted, and sendable in one go.
+{
+  const rv = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [{ ...WT_CARD, reviewComments: 3 }] })
+  ok(rv.text().includes('3 review comments waiting to be sent'), 'the card says how many review comments are waiting')
+  findButton(rv.root, 'Send to agent')?.onclick()
+  ok(rv.posted.some((m) => m.type === 'sendReview' && m.id === WT_CARD.key), 'Send to agent sends that card\'s review')
+  findButton(rv.root, 'Discard')?.onclick()
+  ok(rv.posted.some((m) => m.type === 'discardReview' && m.id === WT_CARD.key), 'and Discard is there too')
+  ok(!run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [WT_CARD] }).text().includes('review comment'), 'no drafts, no panel')
+}
+
 // A session with no plan must not grow an empty panel.
 const unplanned = run({ ...base, mode: 'chat', selectedKey: 'abc-123', cards: [WT_CARD], transcript: [] })
 ok(!unplanned.text().includes('How to test this'), 'no plan, no panel')

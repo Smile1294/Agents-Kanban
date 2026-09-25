@@ -273,6 +273,7 @@ browser because the host half IS the extension.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `server/stub.mjs` gains the Comments API so the headless board activates with the review-comment controller.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the view refuses a message over the relay's `msgMaxBytes` on an http(s) page instead of letting the relay drop it after the draft was cleared; the constant is pinned to the contract by `check-contract.mjs`.
 - 2026-09-24 · main · `server/stub.mjs` gained `vscode.extensions` (empty) for the host's Claude Code version check.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · **a relay URL on

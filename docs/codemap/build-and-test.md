@@ -187,6 +187,7 @@ without one.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · both vscode stubs gain the Comments API (`comments.createCommentController`, `Range`, `MarkdownString`, `CommentMode`, `CommentThreadCollapsibleState`; the harness records controllers on `ctl.commentControllers`) and `workspace.textDocuments`; smoke drives a review comment through the real bundle.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `test/dom.mjs` takes `protocol` to be served from http(s) like a relay page; `check-contract.mjs` also pins `media/board.js` `REMOTE_MSG_MAX_BYTES` to `msgMaxBytes`; the smoke sweep sends forged `sentImages`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · smoke: the message sweep must start no run (`askTestPlan` without a worktree), which also makes the update-button block pass on a machine with a real `claude` on PATH.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `test/dom.mjs`: the stub canvas RECORDS the drawing calls the annotation editor makes (`_ops`), so a test can assert a box was stroked where it was dragged.

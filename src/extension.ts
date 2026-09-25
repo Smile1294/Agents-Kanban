@@ -45,6 +45,7 @@ import { describeImages, imageLoadNote, sanitiseImages } from './agent/images.ts
 import { BrowserPool } from './agent/browser.ts'
 import type { HarnessDeps } from './agent/harness.ts'
 import { AppProcesses } from './run/app.ts'
+import { ReviewDrafts, reviewPrompt } from './board/review-comments.ts'
 import {
   COMMON_DEV_PORTS, detect as detectRun, isListening, readWtRegistry, waitForPort,
 } from './run/recipe.ts'
@@ -3022,6 +3023,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      the tools off or on is read when the manager is made, which is once per
      window. Both are torn down with the extension — an agent-started dev
      server surviving a window reload is a port held by nobody. */
+  /* Review comments (board/review-comments.ts): drafts per card, and the VS
+     Code comment threads that show them, by draft id. Module-of-activate
+     state like the apps, because a draft outlives any one webview. */
+  const reviewDrafts = new ReviewDrafts()
+  const reviewThreads = new Map<string, vscode.CommentThread>()
+  /** The card whose worktree holds this file, if any. The live list first (a
+   *  run's worktree is known before the store has indexed it), then the store. */
+  async function cardForPath(fsPath: string): Promise<{ key: string; dir: string } | undefined> {
+    if (!ws) return undefined
+    const within = (dir: string) => {
+      const rel = path.relative(dir, fsPath)
+      return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel)
+    }
+    for (const a of ws.manager?.list() ?? []) {
+      if (a.worktreePath && within(a.worktreePath)) return { key: a.sessionId ?? a.runId, dir: a.worktreePath }
+    }
+    for (const s of await ws.store.list().catch(() => [])) {
+      if (s.worktree && within(s.worktree)) return { key: s.id, dir: s.worktree }
+    }
+    // The sidecar too: a card can exist before (or without) a transcript the
+    // store indexes, and the board draws it from here all the same.
+    const metas = await ws.store.allMeta().catch(() => ({} as Record<string, { worktree?: string }>))
+    for (const [key, m] of Object.entries(metas)) {
+      if (m?.worktree && within(m.worktree)) return { key, dir: m.worktree }
+    }
+    return undefined
+  }
+  // Registered unconditionally, like every command: the "+" appears only on
+  // files inside an agent's worktree, which the provider decides per document.
+  const reviewCtl = vscode.comments.createCommentController('agentsKanban.review', 'Agents Kanban review')
+  reviewCtl.options = { prompt: 'Comment for the agent', placeHolder: 'What should the agent change here?' }
+  reviewCtl.commentingRangeProvider = {
+    provideCommentingRanges: async (doc) => {
+      if (doc.uri.scheme !== 'file' || !(await cardForPath(doc.uri.fsPath))) return []
+      return [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)]
+    },
+  }
+  context.subscriptions.push(reviewCtl)
   const agentApps = new AppProcesses()
   const agentBrowser = new BrowserPool(() => ({
     executable: cfg().get<string>('browserExecutable') || undefined,
@@ -3637,6 +3676,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         worktree: a.worktreePath,
         ...(a.parent ?? m?.parent ? { parent: (a.parent ?? m?.parent)! } : {}),
         ...(testPlan ? { testPlan } : {}),
+        ...(reviewDrafts.count(key) ? { reviewComments: reviewDrafts.count(key) } : {}),
         ...(a.queued?.length ? { queued: a.queued } : {}),
         ...agentBadge(a.sessionId),
         agent: toUiAgent(a),
@@ -3669,6 +3709,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(s.worktree ? { worktree: s.worktree } : {}),
         ...(s.parent ? { parent: s.parent } : {}),
         ...(s.testPlan ? { testPlan: s.testPlan } : {}),
+        ...(reviewDrafts.count(s.id) ? { reviewComments: reviewDrafts.count(s.id) } : {}),
         ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
         ...agentBadge(s.id),
         // Only reachable in THIS loop, and that is the point: these are the
@@ -3743,6 +3784,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
        its real session id) came back with its window reset to one slice. Only
        for keys that resolve to a DIFFERENT live key; a vanished one keeps its
        entry, which the next lookup simply never asks for. */
+    for (const k of reviewDrafts.cards()) {
+      const to = followKey(k, pass.keys, resolve)
+      if (to && to !== k) reviewDrafts.rekey(k, to)
+    }
     for (const [k, win] of [...transcriptWindows]) {
       const to = followKey(k, pass.keys, resolve)
       if (to && to !== k && !transcriptWindows.has(to)) {
@@ -4611,6 +4656,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(chosen ? { chosen } : {}),
       }))
       mode = 'chat'
+      refreshAll()
+    },
+
+    /** Send every review comment on a card to its agent, as ONE message,
+     *  and take the threads down — they are the agent's now. */
+    async sendReview(key) {
+      const drafts = reviewDrafts.take(key)
+      if (!drafts.length) return
+      for (const d of drafts) { reviewThreads.get(d.id)?.dispose(); reviewThreads.delete(d.id) }
+      const review = ws?.board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
+      await this.sendMessage(key, reviewPrompt(drafts, review))
+      refreshAll()
+    },
+
+    async discardReview(key) {
+      for (const d of reviewDrafts.take(key)) { reviewThreads.get(d.id)?.dispose(); reviewThreads.delete(d.id) }
       refreshAll()
     },
 
@@ -5845,6 +5906,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
     }),
     vscode.commands.registerCommand('agentsKanban.openBoard', () => enterBoard()),
+    vscode.commands.registerCommand('agentsKanban.reviewComment.add', async (reply: vscode.CommentReply) => {
+      const at = await cardForPath(reply.thread.uri.fsPath)
+      const range = reply.thread.range
+      if (!at || !range) {
+        vscode.window.showWarningMessage('This file is not in an agent\'s worktree, so there is no agent to send a comment to.', { modal: true })
+        return
+      }
+      const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === reply.thread.uri.toString())
+      const quote = doc?.getText(new vscode.Range(range.start.line, 0, range.end.line, Number.MAX_SAFE_INTEGER))
+      const draft = reviewDrafts.add(at.key, {
+        file: path.relative(at.dir, reply.thread.uri.fsPath),
+        line: range.start.line + 1,
+        ...(range.end.line > range.start.line ? { endLine: range.end.line + 1 } : {}),
+        text: reply.text,
+        ...(quote ? { quote } : {}),
+      })
+      if (!draft) {
+        vscode.window.showWarningMessage('That comment is empty, or this card already has the most review comments one message can carry.', { modal: true })
+        return
+      }
+      reply.thread.comments = [...reply.thread.comments, {
+        body: new vscode.MarkdownString(draft.text),
+        mode: vscode.CommentMode.Preview,
+        author: { name: 'You → the agent' },
+        contextValue: draft.id,
+      }]
+      reply.thread.label = 'Review comment — send it from the board, with the others'
+      reply.thread.canReply = false
+      reviewThreads.set(draft.id, reply.thread)
+      refreshAll()
+    }),
+    vscode.commands.registerCommand('agentsKanban.reviewComment.delete', (comment: vscode.Comment) => {
+      const id = comment?.contextValue
+      if (!id) return
+      for (const card of reviewDrafts.cards()) reviewDrafts.remove(card, id)
+      reviewThreads.get(id)?.dispose()
+      reviewThreads.delete(id)
+      refreshAll()
+    }),
+    vscode.commands.registerCommand('agentsKanban.sendReview', async () => {
+      const cards = reviewDrafts.cards()
+      const key = selectedKey && reviewDrafts.count(selectedKey) ? selectedKey : cards.length === 1 ? cards[0] : undefined
+      if (!key) {
+        vscode.window.showInformationMessage(cards.length
+          ? 'Open the card whose comments you want to send — several cards have review comments.'
+          : 'There are no review comments to send. Add one from the + in the gutter of a file in an agent\'s worktree.')
+        return
+      }
+      await host.sendReview(key)
+    }),
     vscode.commands.registerCommand('agentsKanban.toggleFocus', () => host.toggleFocus()),
     vscode.commands.registerCommand('agentsKanban.newSession', async () => {
       const text = await vscode.window.showInputBox({

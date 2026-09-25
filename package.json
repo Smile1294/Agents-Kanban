@@ -44,6 +44,19 @@
         "icon": "$(link-external)"
       },
       {
+        "command": "agentsKanban.reviewComment.add",
+        "title": "Add review comment for the agent"
+      },
+      {
+        "command": "agentsKanban.reviewComment.delete",
+        "title": "Delete review comment",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentsKanban.sendReview",
+        "title": "Agents Kanban: Send Review Comments to the Agent"
+      },
+      {
         "command": "agentsKanban.openSettings",
         "title": "Agents Kanban: Settings \u2014 Agents, Backends and Logins"
       },
@@ -420,6 +433,30 @@
       }
     },
     "menus": {
+      "comments/commentThread/context": [
+        {
+          "command": "agentsKanban.reviewComment.add",
+          "group": "inline",
+          "when": "commentController == agentsKanban.review"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "agentsKanban.reviewComment.delete",
+          "group": "inline",
+          "when": "commentController == agentsKanban.review"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "agentsKanban.reviewComment.add",
+          "when": "false"
+        },
+        {
+          "command": "agentsKanban.reviewComment.delete",
+          "when": "false"
+        }
+      ],
       "view/title": [
         {
           "command": "agentsKanban.openBoard",

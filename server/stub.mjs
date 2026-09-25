@@ -93,6 +93,24 @@ export function makeVscodeStub(ctl) {
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     QuickPickItemKind: { Separator: -1, Default: 0 },
     StatusBarAlignment: { Left: 1, Right: 2 },
+    /* The Comments API — review comments on an agent's diff. A REAL controller
+       record rather than a no-op, so a test can ask for the commenting ranges
+       of a document and drive a reply through the command, as VS Code would.
+       `ctl.commentControllers` is the handle. */
+    Range: class {
+      constructor(sl, sc, el, ec) { this.start = { line: sl, character: sc }; this.end = { line: el, character: ec } }
+    },
+    MarkdownString: class { constructor(v) { this.value = v ?? '' } },
+    CommentMode: { Editing: 0, Preview: 1 },
+    CommentThreadCollapsibleState: { Collapsed: 0, Expanded: 1 },
+    comments: {
+      createCommentController: (id, label) => {
+        const c = { id, label, options: undefined, commentingRangeProvider: undefined, disposed: false,
+          createCommentThread: (uri, range, comments) => ({ uri, range, comments, dispose() { this.disposed = true } }),
+          dispose() { c.disposed = true } }
+        return c
+      },
+    },
     window: {
       createWebviewPanel: (id) => {
         calls.push('createWebviewPanel:' + id)

@@ -2057,6 +2057,7 @@
     if (c && c.interrupted && !c.agent) main.append(renderInterrupted(c, true))
     if (c && c.subtasks && c.subtasks.length) main.append(renderSubtasks(c))
     if (c && c.testPlan) main.append(renderTestPlan(c))
+    if (c && c.reviewComments) main.append(renderReviewDrafts(c))
     // Above the review panel and NOT gated on `c.worktree`: the merge is on the
     // user's own branch, so it is true of the repository whatever card happens
     // to be open, including one that never had a worktree.
@@ -2410,6 +2411,24 @@
    * open in the editor, commands open a terminal already in the worktree, URLs
    * open in the browser. All of it against the AGENT's checkout, not yours.
    */
+  /** Review comments left on this card's diff and not sent yet. They are
+   *  written in the editor (the + in a diff's gutter) and sent from here, all
+   *  at once, as one numbered message the agent answers point by point. */
+  function renderReviewDrafts(c) {
+    const box = el('div', 'review-drafts')
+    box.append(el('span', 'review-drafts-icon', '💬'))
+    box.append(el('span', 'review-drafts-label',
+      c.reviewComments + (c.reviewComments === 1 ? ' review comment' : ' review comments') + ' waiting to be sent'))
+    const send = el('button', 'primary', 'Send to agent')
+    send.title = 'Send every comment to the agent as one message, and resume it'
+    send.onclick = () => post('sendReview', { id: c.key })
+    const drop = el('button', null, 'Discard')
+    drop.title = 'Delete these comments without sending them'
+    drop.onclick = () => post('discardReview', { id: c.key })
+    box.append(send, drop)
+    return box
+  }
+
   function renderTestPlan(c) {
     const p = c.testPlan
     const box = disclosure(el('details', 'testplan'), 'testplan', true)

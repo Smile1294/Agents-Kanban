@@ -206,6 +206,8 @@ export interface UiCard {
   decomposition?: { line: string; stated?: string; refused: boolean }
   /** How to test this session's work, if the agent said. */
   testPlan?: TestPlan
+  /** Review comments drafted on this card's diff and not yet sent. */
+  reviewComments?: number
   /**
    * When a run was cut off by the extension host going away — a reload, a
    * reinstall, a crash. The process is gone and cannot be re-attached; the
@@ -562,6 +564,9 @@ export interface BoardHost {
   select(id: string | undefined, sink?: StateSink): void
   newSession(prompt: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
   sendMessage(id: string, text: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
+  /** Send a card's review comments to its agent as one message. */
+  sendReview(id: string): Promise<void>
+  discardReview(id: string): Promise<void>
   move(key: string, phase: string): Promise<void>
   stop(key: string): Promise<void>
   /** End this turn, keep the session. Distinct from stop(), which ends the run. */
@@ -934,6 +939,8 @@ async function routeBoardMessage(
       reply({ type: 'sentImages', id: id(), messageId, urls })
       break
     }
+    case 'sendReview': if (id()) await host.sendReview(id()); break
+    case 'discardReview': if (id()) await host.discardReview(id()); break
     case 'moreTranscript': await host.loadOlderTranscript(id()); await refresh(); break
     case 'openHit': {
       // The index is a number the VIEW is echoing back from a search hit, so it

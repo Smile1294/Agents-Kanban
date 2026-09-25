@@ -777,6 +777,30 @@ await settle()
 ok(stub.calls.includes('exec:vscode.diff'), 'a changed-file row opens a diff')
 ok(!stub.calls.includes('disposePanel:agentsKanban.panel'), 'and the board is still open after that too')
 ok(L.panel === false && L.auxBar === false, 'with the window still its own')
+
+// Review comments on the agent's diff: the "+" is offered on a file INSIDE a
+// card's worktree and nowhere else; a comment becomes a draft counted on that
+// card; Discard takes it down. (Send resumes the agent, which the hermetic
+// smoke never does; the prompt it sends is unit-tested in review-comments.test.)
+{
+  const ctlr = (ctl.commentControllers ?? []).find((c) => c.id === 'agentsKanban.review')
+  ok(!!ctlr, 'a review comment controller is registered')
+  const inside = await ctlr.commentingRangeProvider.provideCommentingRanges({ uri: stub.vscode.Uri.file(path.join(repo, 'README.md')), lineCount: 3 })
+  const outside = await ctlr.commentingRangeProvider.provideCommentingRanges({ uri: stub.vscode.Uri.file(path.join(os.tmpdir(), 'elsewhere.txt')), lineCount: 3 })
+  ok(inside.length === 1 && outside.length === 0, `the + is offered in a card's worktree and not outside it (${inside.length}/${outside.length})`)
+  const thread = { uri: stub.vscode.Uri.file(path.join(repo, 'README.md')), range: new stub.vscode.Range(0, 0, 0, 0), comments: [], disposed: false, dispose() { this.disposed = true } }
+  await stub.cmds.get('agentsKanban.reviewComment.add')({ thread, text: 'Say what this repo is for.' })
+  ok(thread.comments.length === 1 && thread.canReply === false, 'the comment is shown on its thread')
+  ok(!thread.disposed, 'and stays up until it is sent or discarded')
+  // SEEDED has worktree metadata but no transcript, so it is not a drawn card;
+  // the count on a card is asserted in webview.test.mjs. Discard is keyed by
+  // the same card key the draft was filed under, so it finding the thread is
+  // the proof the comment landed on THIS card.
+  await send({ type: 'discardReview', id: 'some-other-card' })
+  ok(!thread.disposed, 'discarding ANOTHER card leaves this one alone')
+  await send({ type: 'discardReview', id: SEEDED })
+  ok(thread.disposed === true, 'Discard on its own card deletes the draft and takes the thread down')
+}
 await settle()
 record(await act(() => ctl.clickActivityIcon()))
 ok(L.panel === true && L.auxBar === true, 'and the icon closes it afterwards, as before')

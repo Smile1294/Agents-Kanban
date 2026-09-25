@@ -1253,6 +1253,11 @@ details.thinking summary::-webkit-details-marker { display: none; }
   flex-direction: column;
   gap: 8px;
 }
+.review-drafts {
+  display: flex; align-items: center; gap: 8px; margin: 8px 14px; padding: 6px 10px;
+  border: 1px solid var(--vscode-focusBorder); border-radius: var(--radius); background: var(--panel);
+}
+.review-drafts-label { flex: 1; min-width: 0; }
 .testplan-verified { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 0.9em; margin: 4px 0; }
 .testplan-verified.bad { color: var(--warn); }
 .testplan-summary { font-size: 0.88em; line-height: 1.5; }
