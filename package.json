@@ -205,6 +205,12 @@
           "default": "",
           "markdownDescription": "URL to open once `agentsKanban.runCommand` is serving, e.g. `http://localhost:3000`. Leave empty to use the port the detected launcher assigned. Only used alongside a custom `runCommand`."
         },
+        "agentsKanban.maxSpendPerMessageUsd": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Pause an agent when the work for ONE message you sent has cost more than this many dollars (0 = no cap). The session stays open; your next message starts a new allowance. Applies to dollar-priced sessions only — a subscription (Codex on ChatGPT) has no dollar figure to cap."
+        },
         "agentsKanban.agentBrowser": {
           "type": "boolean",
           "default": true,

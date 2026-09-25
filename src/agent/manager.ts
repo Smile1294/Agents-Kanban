@@ -104,6 +104,13 @@ export interface ManagerOptions {
    * the brief does not mention them.
    */
   harness?: HarnessDeps
+  /**
+   * The most one user message may spend, in dollars, read FRESH on every meter
+   * reading (a changed setting applies to the turn in flight). Undefined or 0
+   * is no cap. Only a `usd` meter is capped: a subscription has no dollars to
+   * count, and inventing some would be a cap on a number that is not spend.
+   */
+  spendCapUsd?: () => number | undefined
   worktrees: WorktreeService
   board: BoardConfig
   defaults: AgentDefaults
@@ -398,6 +405,12 @@ export interface RunningAgent {
   /** This run's app and browser tools, bound once. Its browser closes when the
    *  run ends; the app belongs to the worktree and outlives it. */
   harness?: Harness
+  /** The session's total spend when the user last sent a message — what the
+   *  per-message cap is measured from. Every message is a new allowance,
+   *  because sending one is the user deciding to spend more. */
+  spendMark?: number
+  /** The cap already stopped this message's work; do not stop it twice. */
+  capped?: boolean
   /** Which agent program is running this. Fixed for the life of the session:
    *  the transcript, the model ids and the login all belong to it. */
   runtime: RuntimeId
@@ -991,6 +1004,9 @@ export class AgentManager extends EventEmitter {
         // every repaint, and a few megabytes of base64 per frame is exactly the
         // per-token cost this board has a postmortem about.
         const id = this.messageIdFor(live.runtime)
+        // A new message is a new allowance under the spend cap.
+        live.spendMark = live.meter?.kind === 'usd' ? live.meter.spentUsd : live.priorUsd
+        live.capped = false
         // The worktree as this message finds it, so a rewind to it later puts
         // back EVERYTHING the following turns changed (`git/checkpoints.ts`).
         if (id && live.worktreePath) await takeCheckpoint(live.worktreePath, live.branch, id)
@@ -1532,7 +1548,10 @@ export class AgentManager extends EventEmitter {
     // `spend`, so a Codex card gets a rate-limit meter and no dollar figure
     // rather than a made-up zero.
     session.on('meter', (raw: unknown) => {
-      if (this.settleMeter(agent, raw, 'meter')) this.touch()
+      if (this.settleMeter(agent, raw, 'meter')) {
+        this.checkSpendCap(agent)
+        this.touch()
+      }
     })
     /* The agent committed. Declared in both event interfaces, emitted by both
        runtimes, and listened for by NOTHING — so the Changes panel kept showing
@@ -1890,6 +1909,24 @@ export class AgentManager extends EventEmitter {
   }
 
   /** Stop this turn, keep the session. The common case, and it was unreachable. */
+  /** Stop a message's work that has spent past the cap. The session stays
+   *  open (an interrupt, not a stop), and the card says why and what to do. */
+  private checkSpendCap(agent: RunningAgent): void {
+    const cap = this.opts.spendCapUsd?.()
+    const m = agent.meter
+    if (!cap || agent.capped || m?.kind !== 'usd') return
+    if (!overSpendCap(m.spentUsd, agent.spendMark ?? agent.priorUsd, cap)) return
+    agent.capped = true
+    const key = agent.sessionId ?? agent.runId
+    agent.live.push({
+      kind: 'notice', at: Date.now(), urgency: 'blocked',
+      message: `Paused: this message's work reached the $${cap.toFixed(2)} cap (agentsKanban.maxSpendPerMessageUsd). ` +
+        'The session is still open — send a message to carry on, which starts a new allowance.',
+    })
+    this.emit('notice', agent, { key, message: `"${agent.title}" was paused at the $${cap.toFixed(2)} spend cap.`, urgency: 'blocked' })
+    void this.interrupt(key).catch((e) => this.opts.log?.(`Spend cap: could not interrupt ${key}: ${e}`))
+  }
+
   async interrupt(key: string): Promise<void> {
     const a = this.byKey(key)
     if (!a) return
@@ -2000,6 +2037,12 @@ export class AgentManager extends EventEmitter {
  *   immediately, so telling the agent how eagerly to split would be inviting it
  *   to call a tool that can only answer no.
  */
+/** Has one message's work spent its cap? `mark` is the session's total when
+ *  the message was sent. A cap of 0 or less is no cap. */
+export function overSpendCap(spentUsd: number, markUsd: number, capUsd: number): boolean {
+  return capUsd > 0 && spentUsd - markUsd >= capUsd
+}
+
 export function buildBrief(
   board: BoardConfig,
   title: string,

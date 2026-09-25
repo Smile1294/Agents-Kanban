@@ -221,6 +221,7 @@ started column while the title is still the guess.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · per-message spend cap: `ManagerOptions.spendCapUsd` (read fresh on every meter), `RunningAgent.spendMark` (the total when the user last sent a message) and `capped`; `checkSpendCap` interrupts — never stops — a message's work once `overSpendCap`, says so on the card and emits a `notice`; `usd` meters only. `route-launch.test.ts` drives meter readings through a real launch.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · verification evidence: `Harness.ledger()` counts, where the calls happen, pages opened, actions, screenshots and the errors on the page left open (`BrowserPool.errorsOnPage`, `url`); `set_phase` stamps it on the test plan as `verified` and DROPS any `verified` the agent wrote itself.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the manager takes a whole-worktree checkpoint (`takeCheckpoint`) under the message id before the first message of a run and before each follow-up; `discardIfUntouched` drops them with the worktree.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `REQUEST_MAX_BYTES` and `imageLoadNote()` in `images.ts` — the composer warns at 60% of the API's 32MB request limit, naming /compact or a fresh session.

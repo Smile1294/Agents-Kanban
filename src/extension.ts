@@ -3104,6 +3104,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       w.manager = new AgentManager({
         store: w.store,
         ...(harness ? { harness } : {}),
+        // Read on every meter reading, so a changed cap applies to the turn in flight.
+        spendCapUsd: () => cfg().get<number>('maxSpendPerMessageUsd') || undefined,
         worktrees: w.worktrees,
         board: w.board,
         defaults: { model, effort, thinking, ultracode, fastMode, runtime },

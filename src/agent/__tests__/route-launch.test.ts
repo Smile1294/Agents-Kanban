@@ -24,7 +24,7 @@ let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
 
 import { registerRuntime, type AgentRuntime, type RunSpec } from '../runtime.ts'
-import { AgentManager } from '../manager.ts'
+import { AgentManager, overSpendCap } from '../manager.ts'
 import { hasCheckpoint } from '../../git/checkpoints.ts'
 import { WorktreeService } from '../../git/worktree.ts'
 import { DEFAULT_BOARD } from '../../board/config.ts'
@@ -36,14 +36,18 @@ import type { KnowledgeVerdict } from '../../board/codemap.ts'
 const specs: RunSpec[] = []
 /** What each run's FIRST turn was handed — the prompt and how many images. */
 const firstTurns: Array<{ prompt: string; images: number; messageId?: string }> = []
+/** Every run the fake runtimes started, and how many times each was interrupted. */
+const runs: Array<EventEmitter & { interrupts: number }> = []
 const fakeRun = () => {
-  const e = new EventEmitter()
+  const e = new EventEmitter() as EventEmitter & { interrupts: number }
+  e.interrupts = 0
+  runs.push(e)
   Object.assign(e, {
     run(prompt: string, images: readonly unknown[] = [], messageId?: string) {
       firstTurns.push({ prompt, images: images.length, ...(messageId ? { messageId } : {}) })
       return new Promise(() => {})
     },
-    send() {}, stop() {}, interrupt() {}, get state() { return { kind: 'working' } },
+    send() {}, stop() {}, interrupt() { e.interrupts += 1; return Promise.resolve() }, get state() { return { kind: 'working' } },
     get lastEvent() { return Date.now() }, get sessionId() { return undefined },
     respondPermission() {}, dispose() {},
   })
@@ -317,6 +321,37 @@ ok(recorded() === 'spawn-model',
      'the follow-up is on the card, with its image count')
   small.stopAll()
 }
+
+// --- the per-message spend cap ------------------------------------------------
+{
+  let cap: number | undefined = 1
+  const capped = new AgentManager({
+    store: store as never, worktrees: new WorktreeService(root), board: DEFAULT_BOARD,
+    defaults: { runtime: 'claude' }, permissionMode: 'acceptEdits', maxConcurrent: 4,
+    spendCapUsd: () => cap,
+  })
+  const notices: string[] = []
+  capped.on('notice', (_a: unknown, n: { message: string }) => notices.push(n.message))
+  const runId = await capped.start('an expensive job', {})
+  await new Promise((r) => setTimeout(r, 200))
+  const run = runs[runs.length - 1]!
+  run.emit('meter', { kind: 'usd', spentUsd: 0.6, priced: true })
+  ok(run.interrupts === 0, 'under the cap, nothing happens')
+  run.emit('meter', { kind: 'usd', spentUsd: 1.2, priced: true })
+  await new Promise((r) => setTimeout(r, 20))
+  ok(run.interrupts === 1, 'past the cap, the turn is interrupted — the session stays open')
+  ok(capped.byKey(runId)!.live.some((e) => e.kind === 'notice' && /\$1\.00 cap/.test((e as { message: string }).message)),
+     'and the card says why, and what to do')
+  ok(notices.some((m) => /spend cap/.test(m)), 'and the user is told')
+  run.emit('meter', { kind: 'usd', spentUsd: 1.5, priced: true })
+  ok(run.interrupts === 1, 'it does not stop the same message twice')
+  run.emit('meter', { kind: 'plan', usedPercent: 99 })
+  cap = 0
+  ok(run.interrupts === 1, 'and a subscription meter or a cap of 0 is never capped')
+  capped.stopAll()
+}
+ok(overSpendCap(2.5, 1.0, 1.5) && !overSpendCap(2.4, 1.0, 1.5) && !overSpendCap(99, 0, 0),
+   'the cap is measured from the spend when the message was sent')
 
 mgr.stopAll()
 await fs.rm(root, { recursive: true, force: true })
