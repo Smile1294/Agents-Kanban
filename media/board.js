@@ -322,7 +322,11 @@
       // a second click would double-widen. `syncRows` is the previous frame's
       // drawn rows, so the comparison runs against what was up when the click
       // happened.
-      if (moreFetching && (ourTranscript().length > syncRows.length || syncKey !== view.selectedKey)) {
+      // A frame that says there is NOTHING more above also answers it: the
+      // widened window reached the top, or the host had nothing older. Without
+      // this a click that brought back the same rows left the pill "busy" and
+      // dead until the user switched sessions.
+      if (moreFetching && (ourTranscript().length > syncRows.length || syncKey !== view.selectedKey || !s.transcriptMore)) {
         moreFetching = false
       }
       // Carried over when the host omitted it. Never the other way round: an
@@ -2141,6 +2145,9 @@
       if (moreFetching) return
       moreFetching = true
       post('moreTranscript', { id: view.selectedKey })
+      // A floor under the debounce: an answer that never arrives (a host that
+      // threw) must not leave the pill dead for the rest of the session.
+      setTimeout(() => { if (moreFetching) { moreFetching = false; render() } }, 15000)
       // The click consumed the frame budget; re-render locally so the busy
       // state is visible without waiting for the round trip.
       render()

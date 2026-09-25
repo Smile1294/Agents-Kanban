@@ -164,6 +164,7 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the "Load earlier" pill is released by a frame that says nothing more is above (`!transcriptMore`), and by a 15s floor — it used to stay busy and dead when a click brought back the same rows.
 - 2026-09-24 · main · the model menu's footer names the Claude Code version that listed it, and `cliUpdateRow()` adds an "Update Claude Code to X…" action row (posts `updateClaude`) only when `composer.cliUpdate` says a newer CLI is known; settings.js gives the Claude card an Update button (`updateCli`), primary with an explanation when a newer version is known.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · the pairing-code field
   offers **Generate** and stopped inviting an invented code. The relay board's

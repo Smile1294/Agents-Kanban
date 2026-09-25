@@ -30,7 +30,7 @@ import {
 import { WorktreeService, findRepoRoot, realResolveInWorktree, type PendingMerge, type WorktreeReview } from './git/worktree.ts'
 import { MetaStore, EFFORT_LEVELS, MODELS, resolveEffort, resolveOrchestration, resolveThinking, targetIsClean, windowLabel, type EffortLevel, type SessionMeta, type ThinkingMode } from './sessions/meta.ts'
 import { MODEL_WINDOWS, normaliseModel, rateFor, type ModelBook, type ModelFacts } from './sessions/usage.ts'
-import { SessionStore, TRANSCRIPT_LIMIT, interruptedSessions, type Entry } from './sessions/store.ts'
+import { SessionStore, TRANSCRIPT_LIMIT, interruptedSessions, withRunNotes, type Entry } from './sessions/store.ts'
 import { searchEntries } from './sessions/search.ts'
 import { listSlashCommands, type SlashCommand } from './sessions/commands.ts'
 import { DEFAULT_BOARD, isReviewColumn, isSettledColumn, splitByAge, stalledSince, type BoardConfig } from './board/config.ts'
@@ -282,6 +282,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      run that had already printed "Finished". */
   const isLive = (a: { state: { kind: string } }) =>
     ['starting', 'working', 'needsInput', 'waiting'].includes(a.state.kind)
+  /** A run that has ENDED and has a session file to show for it. Its chat is
+   *  read off disk like any other session's (see `withRunNotes`) — only a run
+   *  still in flight, queued, or open after an interrupt is drawn from its own
+   *  `history + live`, because only then is the disk copy behind. A run that
+   *  never got a session id has nothing on disk and keeps its live rows. */
+  const hasEnded = (a: { state: { kind: string }; sessionId?: string }) =>
+    !!a.sessionId && (a.state.kind === 'done' || a.state.kind === 'error')
   let busy: string | undefined
   let commands: SlashCommand[] = []
 
@@ -3804,7 +3811,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let transcriptHead: number | undefined
     let streaming: string | undefined
     if (selectedKey) {
-      const a = ws.manager?.byKey(selectedKey)
+      const run = ws.manager?.byKey(selectedKey)
+      // An ended run takes the not-running path below, with its own notes.
+      const a = run && !hasEnded(run) ? run : undefined
       if (a) {
         // Claude Code writes this run into the same transcript as it goes, so
         // reading it back would contain this run too — and `a.live` is the
@@ -3847,10 +3856,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           transcript = await ws.store.transcript(selectedKey, transcriptWindows.get(selectedKey))
           const total = await ws.store.transcriptTotal(selectedKey)
           transcriptMore = transcript.length < total
+          // Counted BEFORE the run's notes go in: `total` and the window are
+          // both disk entries, and the notes are not in either.
+          const drawnFromDisk = transcript.length
+          if (run) transcript = withRunNotes(transcript, run.live)
           // Messages above the rendered window. A search hit carries an index
           // into the FULL transcript; the view subtracts this from it to land
           // the flash on the row actually drawn.
-          transcriptHead = Math.max(0, total - transcript.length)
+          transcriptHead = Math.max(0, total - drawnFromDisk)
         }
         // The METERS are for every surface: they come off the same cached parse
         // and they are two numbers, not a conversation.
@@ -4190,7 +4203,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const q = qRaw.trim().slice(0, 200)
       if (!ws || !q) return { q, matches: [], more: 0 }
       const stored = await ws.store.list({ includeArchived: true })
-      const live = ws.manager?.list() ?? []
+      // Only runs still in flight are searched through their own copy; an ended
+      // run's full history is on disk, and its launch-time `history` is one
+      // window of it — searching that is how older messages went unfound.
+      const live = (ws.manager?.list() ?? []).filter((a) => !hasEnded(a))
       const rows: SearchRow[] = []
       const push = (key: string, title: string | undefined, entries: readonly Entry[]): void => {
         for (const h of searchEntries(entries, q)) {
@@ -4237,7 +4253,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      */
     async loadOlderTranscript(key: string): Promise<void> {
       if (!ws || !key) return
-      if (ws.manager?.byKey(key)) return // running: history is fixed at launch
+      const run = ws.manager?.byKey(key)
+      if (run && !hasEnded(run)) return // in flight: history is fixed at launch
       const win = transcriptWindows.get(key) ?? TRANSCRIPT_LIMIT
       const total = await ws.store.transcriptTotal(key)
       transcriptWindows.set(key, Math.min(win + TRANSCRIPT_LIMIT, total))
@@ -4258,7 +4275,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       selectHere(key)
       if (!ws) return
       const a = ws.manager?.byKey(key)
-      if (a) return
+      if (a && !hasEnded(a)) return
       const total = await ws.store.transcriptTotal(key)
       // Full index F is inside a tail window of `win` messages iff
       // F >= total - win; a stale index clamps rather than overshoots.

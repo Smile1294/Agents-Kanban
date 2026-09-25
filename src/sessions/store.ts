@@ -282,6 +282,41 @@ const SCAN_TTL_MS = 1000
  * in slices — and the first slice must be this number, or the store's default
  * and the host's window would drift apart on day one.
  */
+/**
+ * The rows only a RUN knows — its phase moves, its "Done · $x · 3m" result, its
+ * errors and notices — laid back into a transcript read off disk, by time.
+ *
+ * Why this exists: a run that has FINISHED is still in the manager's list (so
+ * its card keeps its state), and the chat used to keep drawing it from
+ * `history + live` — `history` being the transcript as it stood when the run
+ * LAUNCHED, capped at one window. So after any run: no "Load earlier" (the
+ * window was fixed at launch), search missed everything older, the fork button
+ * was missing on the prompts just sent (live prompt rows carry no message id),
+ * and the rows below vanished on the next reload or follow-up, because only
+ * the live copy had them. Reported as "the history works strangely". A
+ * finished run now renders off disk like any other session — ids, paging and
+ * search all come from the same parse — and these rows ride along on top.
+ *
+ * Only rows at or after the window's first entry are kept, so paging does not
+ * pile a run's notes onto the top of an older window. Ties go after the disk
+ * row (a result follows the answer it summarises).
+ */
+export function withRunNotes(disk: readonly Entry[], live: readonly Entry[]): Entry[] {
+  const notes = live.filter((e) => e.kind === 'phase' || e.kind === 'result' || e.kind === 'error' || e.kind === 'notice')
+  if (!notes.length) return disk as Entry[]
+  const from = disk[0]?.at ?? 0
+  const keep = notes.filter((n) => n.at >= from)
+  if (!keep.length) return disk as Entry[]
+  const out: Entry[] = []
+  let j = 0
+  for (const e of disk) {
+    while (j < keep.length && keep[j]!.at < e.at) out.push(keep[j++]!)
+    out.push(e)
+  }
+  while (j < keep.length) out.push(keep[j++]!)
+  return out
+}
+
 export const TRANSCRIPT_LIMIT = 400
 
 /**
@@ -322,7 +357,7 @@ export class SessionStore {
    */
   private readonly transcripts = new Map<
     string,
-    { at: number; key: string; limit: number; total: number; entries: Entry[]; usage: UsageTotals }
+    { at: number; key: string; total: number; entries: Entry[]; usage: UsageTotals }
   >()
 
   /**
@@ -598,13 +633,19 @@ export class SessionStore {
   }
 
   /**
-   * How many messages the session's file holds in TOTAL, whatever window
-   * `transcript()` renders. This is the "is there more above?" answer for
-   * upward pagination: a loaded window shorter than this has older entries.
+   * How many ENTRIES the whole transcript has, whatever window `transcript()`
+   * renders. This is the "is there more above?" answer for upward pagination:
+   * a loaded window shorter than this has older entries.
    *
-   * Free once the transcript has been read — it comes off the same parse
-   * cache, and the total is a property of the FILE, not of the window, so any
-   * fresh cache entry answers it whatever limit it was parsed for.
+   * ENTRIES, not messages — and that was a shipped bug. It used to be the
+   * file's message count while the window it was compared with is an entry
+   * list, and the two are different units: a tool_result-only user message
+   * renders as nothing, a system record renders as nothing, one assistant
+   * message renders as up to three rows. In a tool-heavy session entries run
+   * at about half the messages, so every such session drew "Load earlier" with
+   * nothing earlier, a click returned the same rows, the pill stuck on busy,
+   * and a search hit flashed the wrong row (`transcriptHead` was in messages,
+   * the hit's index in entries). One unit, end to end, fixes all three.
    */
   async transcriptTotal(id: string): Promise<number> {
     const rt = await this.runtimeOf(id)
@@ -619,17 +660,17 @@ export class SessionStore {
 
   /**
    * The WHOLE transcript, for search — which is explicitly over the full
-   * conversation, not the loaded tail. Deliberately NOT cached: `parse`'s
-   * cache holds one window per session, and a search that replaced the
-   * selected session's render-window parse with a full one would make every
-   * repaint re-read a file nobody wrote to (the cache keys on the limit).
-   * Searching every session is an on-demand action whose cost is reading
-   * every session's file once; that cost must not tax the render path.
+   * conversation, not the loaded tail. Off the same cache as the render path:
+   * the cache now holds the whole parse and every window is a slice of it, so
+   * a search no longer evicts the selected session's window (the old cache
+   * keyed on the limit, which is why this used to bypass it). Its indices are
+   * therefore the SAME indices `transcript()` slices, which is what lets a
+   * search hit land on the row it names.
    */
   async fullTranscript(id: string): Promise<Entry[]> {
     const rt = await this.runtimeOf(id)
     if (rt) return (await rt.transcript(id)) as Entry[]
-    return (await this.readTranscript(id, Number.POSITIVE_INFINITY)).entries
+    return (await this.parse(id, Number.POSITIVE_INFINITY)).entries
   }
 
   /**
@@ -711,21 +752,28 @@ export class SessionStore {
     // the age of the parse is irrelevant. Only a session the index does not
     // list — a run in its first moment — falls back to the scan's own window.
     const fresh = hit && (key ? hit.key === key : now - hit.at < SCAN_TTL_MS)
-    if (fresh && hit.limit === limit) {
+    // The cache holds the WHOLE parse and a window is a slice of it, so
+    // widening the window ("Load earlier") costs a slice, not a re-read.
+    const window = (full: { total: number; entries: Entry[]; usage: UsageTotals }) => ({
+      total: full.total,
+      entries: full.entries.length > limit ? full.entries.slice(full.entries.length - limit) : full.entries,
+      usage: full.usage,
+    })
+    if (fresh) {
       // Touched, so the sweep below measures IDLE time rather than age. An
       // entry in constant use — the selected session, on every repaint — was
       // otherwise dropped and fully re-parsed every five minutes for no reason.
       hit.at = now
-      return hit
+      return window(hit)
     }
-    const read = await this.readTranscript(id, limit)
+    const read = await this.readTranscript(id)
     for (const [k, v] of this.transcripts) {
       // Swept by age, not by key: an untouched session's parse is still valid,
       // but holding every transcript this window ever showed is a leak.
       if (k !== id && now - v.at >= TRANSCRIPT_TTL_MS) this.transcripts.delete(k)
     }
-    this.transcripts.set(id, { at: now, key, limit, ...read })
-    return read
+    this.transcripts.set(id, { at: now, key, ...read })
+    return window(read)
   }
 
   /** A session file's identity, as the index reports it. Empty when the index
@@ -736,9 +784,10 @@ export class SessionStore {
     return `${info.lastModified}:${info.fileSize ?? '?'}`
   }
 
+  /** The whole transcript as entries. Windowing is `parse()`'s job, over
+   *  ENTRIES — see `transcriptTotal`. */
   private async readTranscript(
     id: string,
-    limit: number,
   ): Promise<{ total: number; entries: Entry[]; usage: UsageTotals }> {
     const { getSessionMessages } = await loadSdk()
     let all: Awaited<ReturnType<typeof getSessionMessages>>
@@ -778,7 +827,6 @@ export class SessionStore {
     // messages too old to render — which now includes the pre-compaction ones:
     // the spend before a compaction was still spent.
     const usage = summariseUsage(msgs as readonly UsageMessage[], this.book)
-    const windowed = msgs.length > limit ? msgs.slice(msgs.length - limit) : msgs
     const entries: Entry[] = []
     /* WHEN each message was written, not when this parse ran.
      *
@@ -815,7 +863,7 @@ export class SessionStore {
      *  looks like it has stopped when it has not. */
     const bySubagent = new Map<string, Entry[]>()
 
-    for (const m of windowed) {
+    for (const m of msgs) {
       const body = (m.message ?? {}) as { content?: unknown }
       const at = stampOf(m)
       // The compact summary is the model's own recap, not something anyone
@@ -898,10 +946,10 @@ export class SessionStore {
         if (kids?.length) e.children = kids
       }
     }
-    // The total is the whole file's message count — older than the rendered
-    // window — and is the pagination answer: more can be loaded when the window
-    // is shorter than this. It costs nothing extra; the merged list is in hand.
-    return { total: msgs.length, entries, usage }
+    // The total is in ENTRIES, the unit every window and every search index is
+    // in. Slicing the top level (in `parse`) also keeps a Task's subagent
+    // children with their Task, which a message-level cut could separate.
+    return { total: entries.length, entries, usage }
   }
 
   async setPhase(id: string, phase: string): Promise<void> {

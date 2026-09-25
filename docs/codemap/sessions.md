@@ -36,9 +36,14 @@ transcript. Codex's store is read by `codex-store.ts`, owned by
 **`src/sessions/store.ts`**. `SessionStore` — every runtime's sessions merged
 with our metadata: `list({includeArchived})` (cached index scan; the render
 path), `get`, `card` (a `BoardSession` with phase, tags, test plan, parent,
-fanout), `transcript` / `fullTranscript` (windowed to `TRANSCRIPT_LIMIT` = 400
-from the tail, upward pagination by the host, the total counting RECOVERED
-pre-compaction messages too), `usage`, `meter`, `adoptKey(from,
+fanout), `transcript` / `fullTranscript` / `transcriptTotal` — ONE cached
+parse of the whole file into entries, windowed to the last `TRANSCRIPT_LIMIT`
+= 400 ENTRIES (never messages: a tool_result-only message draws nothing, so the
+two units differ by ~2x and mixing them drew a false, stuck "Load earlier"),
+the total in entries too and counting RECOVERED pre-compaction rows; upward
+pagination by the host; a search index is an index into the same list,
+`withRunNotes(disk, live)` (an ENDED run's phase/result/error/notice rows laid
+back into its disk transcript by time), `usage`, `meter`, `adoptKey(from,
 to)` (carries metadata from a `run-…` key to the real session id), `patch`,
 `setPhase`, `setTestPlan` / `clearTestPlan`, `archive`, `delete` (verified
 against the OWNING runtime's listing), `rename`, `childrenOf`, `setModelBook`,
@@ -186,6 +191,7 @@ from `run-…` to the session id when `system/init` arrives, and
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the transcript window and its total are both in ENTRIES (the total was the message count, so tool-heavy sessions drew a "Load earlier" pill with nothing above, the pill stuck busy, and search hits flashed the wrong row); the parse cache holds the whole transcript and a window is a slice (Load earlier and search no longer re-read the file); `withRunNotes`; a seeded tool-heavy session in `store.test.ts` catches the unit mismatch.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `readTranscript` stamps
   each entry with the time the MESSAGE was written, not the time the parse ran.
   Every rehydrated entry carried `Date.now()`, so a session read back off disk

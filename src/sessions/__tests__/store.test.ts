@@ -14,6 +14,7 @@
    project directory is the fiddly part and is the reason this is worth copying
    rather than inventing: the session's cwd with every character that is not a
    letter or a digit replaced by `-`, applied to the REALPATH. */
+import { withRunNotes } from '../store.ts'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -100,6 +101,40 @@ const COMPACTED_ID = 'aaaaaaaa-0000-0000-0000-000000000001'
   ].map((l) => JSON.stringify(l)).join('\n') + '\n')
 }
 
+// A TOOL-HEAVY session: one prompt, 30 tool_use/tool_result pairs, one answer.
+// 62 messages but 32 rows — a tool_result-only user message draws nothing, it
+// only settles its tool row. The window and "is there more above?" must agree
+// on which of those two numbers they mean; they did not, which drew "Load
+// earlier" over sessions with nothing earlier and left the pill stuck busy.
+const TOOLS_ID = 'aaaaaaaa-0000-0000-0000-000000000009'
+{
+  const projectDir = path.join(claudeHome, 'projects', repo.replace(/[^a-zA-Z0-9]/g, '-'))
+  const common = {
+    sessionId: TOOLS_ID, cwd: repo,
+    isSidechain: false, userType: 'external', version: '2.0.0', gitBranch: 'main',
+  }
+  const t = (n: number) => new Date(2e12 + n * 1000).toISOString()
+  const lines: unknown[] = [
+    { ...common, type: 'user', uuid: 'tu0', parentUuid: null, timestamp: t(0),
+      message: { role: 'user', content: 'read every file' } },
+  ]
+  let parent = 'tu0'
+  for (let i = 1; i <= 30; i++) {
+    lines.push({ ...common, type: 'assistant', uuid: `ta${i}`, parentUuid: parent, timestamp: t(2 * i),
+      message: { id: `msg_t${i}`, model: 'claude-opus-5', role: 'assistant', type: 'message',
+        content: [{ type: 'tool_use', id: `toolu_${i}`, name: 'Read', input: { file_path: `/f${i}` } }],
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })
+    lines.push({ ...common, type: 'user', uuid: `tr${i}`, parentUuid: `ta${i}`, timestamp: t(2 * i + 1),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `toolu_${i}`, content: 'x' }] } })
+    parent = `tr${i}`
+  }
+  lines.push({ ...common, type: 'assistant', uuid: 'tfin', parentUuid: parent, timestamp: t(99),
+    message: { id: 'msg_tfin', model: 'claude-opus-5', role: 'assistant', type: 'message',
+      content: [{ type: 'text', text: 'Read them all.' }],
+      usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })
+  await fs.writeFile(path.join(projectDir, `${TOOLS_ID}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n')
+}
+
 // A Codex rollout for the SAME repo, with NO sidecar entry — which is exactly
 // the state of every adopted session on a real board: the runtime is known only
 // from the foreign scan, never from metadata we wrote.
@@ -137,7 +172,7 @@ const list = await store.list()
 ok(Array.isArray(list), 'list() returns sessions from Claude Code without throwing')
 // An ASSERTION, not a guard. If the SDK ever changes where it looks, this goes
 // red and names it rather than skipping the rest of the file.
-ok(list.filter((s) => !s.runtime || s.runtime === 'claude').length === 2,
+ok(list.filter((s) => !s.runtime || s.runtime === 'claude').length === 3,
    `the seeded Claude sessions are found — the SDK's project-directory encoding still holds (${list.length})`)
 ok(list.some((s) => s.id === SEEDED_ID), 'and it is the one that was seeded')
 
@@ -272,6 +307,43 @@ const noUsage = await store.usage('00000000-0000-0000-0000-000000000000')
 ok(noUsage.costUsd === 0 && noUsage.responses === 0, 'and an unknown session costs nothing rather than throwing')
 ok((await store.get('nope')) === undefined, 'unknown session id returns undefined')
 
+// --- the window and its total are in the SAME unit -----------------------------
+{
+  const total = await store.transcriptTotal(TOOLS_ID)
+  const whole = await store.transcript(TOOLS_ID)
+  ok(total === 32 && whole.length === 32,
+     `a tool-heavy session totals its ROWS, not its messages (${total} total, ${whole.length} rows, 62 messages)`)
+  const tail = await store.transcript(TOOLS_ID, 10)
+  ok(tail.length === 10 && tail.length < total, 'a 10-row window says there is more above')
+  const widened = await store.transcript(TOOLS_ID, total)
+  ok(widened.length === total, 'and widened to the total it shows everything — so "more above" becomes false')
+  ok(tail[tail.length - 1]!.kind === 'text' && tail.every((e) => e.kind !== 'tool' || e.status === 'ok'),
+     'the tail is the newest rows, with every tool settled by its result')
+  const full = await store.fullTranscript(TOOLS_ID)
+  ok(full.length === total && full[total - 10]!.at === tail[0]!.at,
+     'a search index into the full transcript lands on the same row in the window (full[total-10] is the window\'s first)')
+}
+
+// --- a finished run's own rows ride along on the disk transcript ---------------
+{
+  const disk = [
+    { kind: 'prompt' as const, at: 100, text: 'go', id: 'u1' },
+    { kind: 'text' as const, at: 200, text: 'done it' },
+  ]
+  const live = [
+    { kind: 'prompt' as const, at: 100, text: 'go' },
+    { kind: 'phase' as const, at: 150, from: 'planning', to: 'implementing' },
+    { kind: 'text' as const, at: 200, text: 'done it' },
+    { kind: 'result' as const, at: 210, text: 'Done' } as never,
+    { kind: 'notice' as const, at: 50, urgency: 'info' as const, message: 'older than the window' },
+  ]
+  const merged = withRunNotes(disk, live)
+  ok(merged.map((e) => e.kind).join(',') === 'prompt,phase,text,result',
+     `a finished run's phase move and result are laid back in, by time, and its text is NOT doubled (${merged.map((e) => e.kind).join(',')})`)
+  ok((merged[0] as { id?: string }).id === 'u1', 'the prompt is the DISK row, with the id the fork button needs')
+  ok(withRunNotes(disk, []) === disk, 'no notes is the disk transcript untouched')
+}
+
 // --- a compacted session keeps its older messages, hides the summary ---------
 //
 // The SDK's reader keeps only the ancestry chain of the newest message, and
@@ -296,8 +368,10 @@ ok((await store.get('nope')) === undefined, 'unknown session id returns undefine
      && notices[0]!.kind === 'notice'
      && notices[0]!.message === 'Claude compacted the conversation here.',
      `one muted divider marks the compaction, not the summary text (${notices.length} notice)`)
-  ok((await store.transcriptTotal(COMPACTED_ID)) === 5,
-     'and the total counts the older messages, so upward pagination can reach them')
+  // Four ROWS from five messages — the boundary record draws nothing — and
+  // the total is in rows, the unit the window is in.
+  ok((await store.transcriptTotal(COMPACTED_ID)) === 4,
+     `and the total counts the older rows, so upward pagination can reach them (${await store.transcriptTotal(COMPACTED_ID)})`)
   const u = await store.usage(COMPACTED_ID)
   const pre = costOfUsage('claude-opus-5',
     { input_tokens: 30, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
