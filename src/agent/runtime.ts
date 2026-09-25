@@ -122,6 +122,17 @@ export interface RuntimeCapabilities {
    * needs in order to be one file.
    */
   boardTools: 'inProcess' | 'stdio'
+  /**
+   * Whether a message id handed to `run`/`send` becomes that message's id in
+   * the runtime's own transcript. Claude Code honours a client `uuid` on a
+   * streamed user message (verified against a real CLI: the JSONL row carries
+   * exactly the uuid sent), so a prompt row can carry its fork anchor the
+   * moment it is sent — without it, "Try again from here" was missing on
+   * every prompt of a run still in flight. Absent means the id is not used,
+   * and the manager then leaves the row without one rather than offering a
+   * fork at an id the runtime never heard of.
+   */
+  messageIds?: boolean
 }
 
 /** Where a runtime's executable was found, and what it says it is. */
@@ -425,8 +436,10 @@ export interface AgentRun extends EventEmitter {
   readonly resolvedProvider: string | undefined
   readonly meter: Meter
 
-  run(firstPrompt: string, images?: readonly AttachedImage[]): Promise<void>
-  send(text: string, images?: readonly AttachedImage[]): void
+  /** `messageId`: the id to give this message in the runtime's transcript,
+   *  when `capabilities.messageIds` says it can. */
+  run(firstPrompt: string, images?: readonly AttachedImage[], messageId?: string): Promise<void>
+  send(text: string, images?: readonly AttachedImage[], messageId?: string): void
   clearQueue(): number
   interrupt(): Promise<void>
   answerPermission(

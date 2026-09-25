@@ -69,6 +69,7 @@ export const claudeRuntime: AgentRuntime = {
     thinkingToggle: true,
     durableHistory: true,
     boardTools: 'inProcess',
+    messageIds: true,
   },
 
   /** Where the CLI is, and WHICH VERSION it is. The version is not decoration:

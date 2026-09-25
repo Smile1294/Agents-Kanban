@@ -221,6 +221,7 @@ started column while the title is still the guess.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · prompt rows carry their transcript id from the moment they are sent: `messageIdFor()` mints a uuid when the runtime declares `capabilities.messageIds`, and `AgentSession` puts it on the streamed user message, which the CLI writes under exactly that uuid (verified against a real CLI) — so "Try again from here" works on a run in flight.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `send()` to a session whose turn had ended — the normal follow-up — dropped every image on the resume path; it now passes them, and a message to a still-QUEUED card joins its first turn instead of starting a bogus resume of a `run-…` id; the queued card's prompt row carries its image count. `route-launch.test.ts` drives both.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · agents can look at their own work: `harness.ts` (app_start/app_logs/app_stop + seven browser_* tools, on the board server, auto-allowed, always defined) and `browser.ts` (`BrowserPool` on `playwright-core`, loopback-only by default, console/network errors reported with each step, screenshots as image blocks and saved to extension storage); the brief says so when a harness exists; the browser closes with the run, the app stays for the test plan.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `AUTO_ALLOW_BUILTIN` lost

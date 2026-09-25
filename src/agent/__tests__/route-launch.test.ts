@@ -34,12 +34,12 @@ import type { KnowledgeVerdict } from '../../board/codemap.ts'
 // --- the fake runtimes -------------------------------------------------------
 const specs: RunSpec[] = []
 /** What each run's FIRST turn was handed — the prompt and how many images. */
-const firstTurns: Array<{ prompt: string; images: number }> = []
+const firstTurns: Array<{ prompt: string; images: number; messageId?: string }> = []
 const fakeRun = () => {
   const e = new EventEmitter()
   Object.assign(e, {
-    run(prompt: string, images: readonly unknown[] = []) {
-      firstTurns.push({ prompt, images: images.length })
+    run(prompt: string, images: readonly unknown[] = [], messageId?: string) {
+      firstTurns.push({ prompt, images: images.length, ...(messageId ? { messageId } : {}) })
       return new Promise(() => {})
     },
     send() {}, stop() {}, interrupt() {}, get state() { return { kind: 'working' } },
@@ -55,7 +55,7 @@ const fakeRun = () => {
    stub answers the parts of the contract `launch()` actually calls. */
 const descriptor = (id: 'claude' | 'codex', providerProfiles: boolean): AgentRuntime => ({
   id, label: id, vendor: 'test', blurb: '', installHint: 'n/a',
-  capabilities: { providerProfiles, boardTools: 'stdio', thinkingToggle: providerProfiles },
+  capabilities: { providerProfiles, boardTools: 'stdio', thinkingToggle: providerProfiles, messageIds: id === 'claude' },
   async detect() { return { command: '/bin/true' } },
   async login() { return { kind: 'signedIn' as const } },
   async models() { return { models: [] } },
@@ -286,6 +286,11 @@ ok(recorded() === 'spawn-model',
   ok(!!turn && turn.images === 2, `a resumed session's first turn carries the images (${turn ? turn.images : 'no turn'})`)
   const resumed = specs.find((sp) => sp.resume === 'sess-ended')
   ok(!!resumed, 'and it really is a resume of that session')
+  // The fork anchor: the id the runtime is told to give the message is the id
+  // on the row the board draws, so "Try again from here" works mid-run.
+  const row = mgr.list().find((a) => a.sessionId === 'sess-ended')?.live[0] as { id?: string } | undefined
+  ok(!!turn?.messageId && row?.id === turn.messageId,
+     `the first prompt row carries the id its message is written under (${row?.id} / ${turn?.messageId})`)
 }
 
 // --- a message to a QUEUED card joins its first turn --------------------------

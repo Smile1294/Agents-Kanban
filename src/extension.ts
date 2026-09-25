@@ -3732,6 +3732,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // and no surface is ever handed it. It ends when something is selected.
     selectedKey = next
     watches.followAll((k) => followKey(k, pass.keys, resolve))
+    /* The widened "Load earlier" window is keyed like everything else, so it
+       follows the key too — otherwise a card that changed key (a run adopting
+       its real session id) came back with its window reset to one slice. Only
+       for keys that resolve to a DIFFERENT live key; a vanished one keeps its
+       entry, which the next lookup simply never asks for. */
+    for (const [k, win] of [...transcriptWindows]) {
+      const to = followKey(k, pass.keys, resolve)
+      if (to && to !== k && !transcriptWindows.has(to)) {
+        transcriptWindows.delete(k)
+        transcriptWindows.set(to, win)
+      }
+    }
   }
 
   /**
@@ -4683,6 +4695,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      */
     async askTestPlan(key) {
       const w = requireWs()
+      /* Only where there is a worktree to resume INTO — the rule the button is
+         drawn by. A stale webview, a second click after the card moved, or an
+         unknown key used to fall through to `sendMessage`, which resumed a
+         session id Claude Code has never heard of: a real CLI process, a
+         `--resume nope` failure, and on a machine with `claude` on PATH a live
+         run nobody asked for (it is what left an agent "running" under the
+         smoke's update-button check). */
+      if (!key) return
+      const run = w.manager?.byKey(key)
+      const dir = run?.worktreePath || (await w.store.get(key))?.worktree
+      if (!dir) return
       const review = w.board.columns.find((c) => c.category === 'review')
       if (!review) {
         vscode.window.showInformationMessage('This board has no review column to hand work back to.')

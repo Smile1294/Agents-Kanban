@@ -6,6 +6,7 @@
  * The board shows it throughout — a starting agent with no card would look like
  * nothing happened.
  */
+import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { loadSdk, type Options } from './sdk.ts'
 import { prepareComposerWorktree, type WorktreeService } from '../git/worktree.ts'
@@ -950,6 +951,18 @@ export class AgentManager extends EventEmitter {
     return this.opts.store.rename(agent.sessionId, title)
   }
 
+  /**
+   * A transcript id for a message about to be sent, when the runtime will use
+   * it as the message's own id (`capabilities.messageIds`). A prompt row with
+   * an id is a fork anchor, so "Try again from here" is offered on it at once
+   * — before, only prompts read back off disk had one, and every prompt of a
+   * run still in flight had no button. A runtime that would ignore the id
+   * gets none, rather than a button that forks at nothing.
+   */
+  private messageIdFor(runtime: RuntimeId): string | undefined {
+    return getRuntime(runtime)?.capabilities.messageIds ? randomUUID() : undefined
+  }
+
   /** Write the decision onto the parent's card. Never fatal: a record that
    *  cannot be stored must not stop a split that was approved. */
   private async recordDecomposition(key: string, record: DecompositionRecord): Promise<void> {
@@ -976,11 +989,13 @@ export class AgentManager extends EventEmitter {
         // the images themselves: this array is serialised to the webview on
         // every repaint, and a few megabytes of base64 per frame is exactly the
         // per-token cost this board has a postmortem about.
+        const id = this.messageIdFor(live.runtime)
         live.live.push({
           kind: 'prompt', at: Date.now(), text,
+          ...(id ? { id } : {}),
           ...(images.length ? { images: images.length } : {}),
         })
-        s.send(text, images)
+        s.send(text, images, id)
         this.touch()
         return
       }
@@ -1225,6 +1240,9 @@ export class AgentManager extends EventEmitter {
     const runtime: RuntimeId =
       (opts.resume ? prior?.runtime : undefined) ?? opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME
 
+    // The first message's transcript id, chosen HERE so the row carries its
+    // fork anchor from the moment it is drawn (see `messageIdFor`).
+    const firstId = this.messageIdFor(runtime)
     const agent: RunningAgent = {
       runId, runtime, title, history, priorUsd,
       state: { kind: 'starting' },
@@ -1232,6 +1250,7 @@ export class AgentManager extends EventEmitter {
       ...(wt.base ? { base: wt.base } : {}),
       live: [{
         kind: 'prompt', at: Date.now(), text: prompt,
+        ...(firstId ? { id: firstId } : {}),
         ...(opts.images?.length ? { images: opts.images.length } : {}),
       }],
       contextTokens: 0,
@@ -1593,7 +1612,8 @@ export class AgentManager extends EventEmitter {
       finish()
     })
 
-    void session.run(prompt, opts.images ?? []).catch(() => finish())
+    const first = agent.live[0]
+    void session.run(prompt, opts.images ?? [], first?.kind === 'prompt' ? first.id : undefined).catch(() => finish())
   }
 
   /**

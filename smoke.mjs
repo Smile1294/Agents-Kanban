@@ -601,6 +601,13 @@ for (const msg of [
   await send(msg)
 }
 ok(stub.errors.length === before, `no errors from the inbound message sweep (${stub.errors.slice(before).join('; ') || 'clean'})`)
+// And nothing in it STARTED a run. `askTestPlan` aimed at an unknown key used
+// to resume a session id Claude Code has never heard of — a real CLI process,
+// and with `claude` on PATH a live agent that outlived the sweep (it is what
+// made the update-button block below fail on such a machine).
+await send({ type: 'ready' })
+ok(!(latestState().cards ?? []).some((c) => String(c.title).startsWith('Your run ended with this card')),
+   'the sweep started no run — askTestPlan without a worktree is a no-op')
 
 // The diff's left-hand side is served by a content provider registered at
 // activation. A wrong API name there throws before anything else runs — which

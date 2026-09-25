@@ -81,12 +81,15 @@ class MessageQueue {
   /** `content` is a plain string for a text-only message, or an array of
    *  content blocks when the message carries attachments. Both are valid
    *  `MessageParam` content; see agent/images.ts. */
-  push(content: string | unknown[]): void {
+  push(content: string | unknown[], uuid?: string): void {
     this.pending.push({
       type: 'user',
       message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
+      // The CLI writes the transcript row under THIS uuid, which is what lets
+      // the board offer "Try again from here" on a prompt still in flight.
+      ...(uuid ? { uuid } : {}),
     } as SDKUserMessage)
     this.wake?.()
   }
@@ -419,9 +422,9 @@ export class AgentSession extends EventEmitter implements AgentRun {
   }
 
   /** Start the session. Resolves when the run finishes. */
-  async run(firstPrompt: string, images: readonly AttachedImage[] = []): Promise<void> {
+  async run(firstPrompt: string, images: readonly AttachedImage[] = [], messageId?: string): Promise<void> {
     this.setState({ kind: 'starting' })
-    this.queue.push(userContent(firstPrompt, images))
+    this.queue.push(userContent(firstPrompt, images), messageId)
 
     const options: Options = {
       cwd: this.opts.cwd,
@@ -991,8 +994,8 @@ export class AgentSession extends EventEmitter implements AgentRun {
    * while. `pending` is what the UI shows in that gap; the SDK drains our own
    * queue the instant we push, so watching that queue showed nothing, ever.
    */
-  send(text: string, images: readonly AttachedImage[] = []): void {
-    this.queue.push(userContent(text, images))
+  send(text: string, images: readonly AttachedImage[] = [], messageId?: string): void {
+    this.queue.push(userContent(text, images), messageId)
     // The queue readout is about what the agent still has to answer, so an
     // images-only follow-up is described rather than shown as a blank line.
     this.pending.push(text.trim() || `(${describeImages(images.length)})`)
