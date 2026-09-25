@@ -320,6 +320,7 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the board pass derives `attention` once from the cards it built; the slice carries it (omitted when empty) and the status bar leads with `attentionSummary` (`$(bell) 2 waiting on you · 3 more need you`).
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · review comments: a `agentsKanban.review` comment controller (registered unconditionally) whose `commentingRangeProvider` offers the + only on files inside a card's worktree (`cardForPath`: live runs, the store, then the sidecar); `agentsKanban.reviewComment.add` / `.delete` (comment menus, hidden from the palette) and `agentsKanban.sendReview`; host `sendReview` / `discardReview`; cards carry `reviewComments`; drafts follow a card's key in `applyRedirects`. First use of `vscode.comments`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `forkAt` restores from the git checkpoint when one exists for the anchor (modal names files restored, files removed, commits undone), falling back to Claude Code's file history; removing a worktree drops its checkpoints.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · composer gains `imagesUnsupported` (the selected session's runtime has `capabilities.images` false) and `imageLoadNote` (not-running path only, off the cached parse); a `sentImages` webview message (editor-only) answers with one message's images on its own channel.

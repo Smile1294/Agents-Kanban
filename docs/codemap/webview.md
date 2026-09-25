@@ -164,6 +164,7 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `renderAttention` — "🔔 Needs you (N)" at the top of the kanban board and the rail (`in-rail` variant), blocking first, each row opening its card, ages at minute resolution in `chromeSig`; `.attention-item` joins the row-shaped opt-out list.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `renderReviewDrafts` — "N review comments waiting to be sent · Send to agent · Discard" on the card page, from `reviewComments`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · the "How to test this" panel draws `verified`: "Checked in a browser: N pages · N actions · N screenshots · N errors on the last page" (amber when errors > 0) and a button per screenshot.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · images, second round: no 📎 (and a paste is refused, saying why) when `composer.imagesUnsupported` names an agent that cannot take images; off the editor (an http(s) page) a send over `REMOTE_MSG_MAX_BYTES` — the relay's `msgMaxBytes`, pinned by `check-contract.mjs` — is refused BEFORE the draft is cleared; a prompt row that carried images offers "Show", which asks for that one message's bytes (`sentImages`) and keeps them in module-level `sentThumbs` (in `rowSig`, so the fast path redraws the row); `composer.imageLoadNote` renders as a note chip.

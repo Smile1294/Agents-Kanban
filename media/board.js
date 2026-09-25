@@ -698,6 +698,9 @@
       !!s.transcriptMore, sliceIsOurs(), s.vanished || '',
       cards, composer, s.columns || [], s.commands || [],
       s.disclosures || {}, s.review || null, s.pendingMerge || null,
+      // The attention strip is chrome; its ages are drawn by ago(), so they
+      // enter at minute resolution like every other age here.
+      (s.attention || []).map((i) => [i.key, i.kind, i.why, Math.floor((i.since || 0) / 60000)]),
     ])
   }
 
@@ -1148,6 +1151,10 @@
     }
     head.append(ts)
     rail.append(head)
+    // Not beside the board's own copy: the kanban screen already has it at the
+    // top, and the same list twice side by side reads as two different lists.
+    const needs = view.mode === 'kanban' && !searching ? null : renderAttention(true)
+    if (needs) rail.append(needs)
 
     const search = el('input', 'search')
     // Announces itself to the focus-restore, like the ask picker's free-text
@@ -1334,9 +1341,44 @@
 
   // ---------------------------------------------------------------- kanban
 
+  /**
+   * What waits on the user, across every card — built by the host
+   * (`board/attention.ts`), blocking first. A question on a card scrolled out
+   * of view was a blocked agent nobody noticed; this is the one place that
+   * lists them all. Each row opens its card; the AGE is drawn, not a dot.
+   */
+  const ATTENTION_ICON = { question: '❓', failed: '⛔', interrupted: '⚡', stalled: '⏸', review: '🧪' }
+  function renderAttention(inRail) {
+    const items = s.attention || []
+    if (!items.length) return null
+    const box = disclosure(el('details', 'attention' + (inRail ? ' in-rail' : '') +
+      (items.some((i) => i.kind === 'question' || i.kind === 'failed') ? ' urgent' : '')), 'attention', true)
+    const sum = el('summary', 'attention-head')
+    sum.append(el('span', 'attention-bell', '🔔'))
+    sum.append(el('span', 'attention-title', 'Needs you (' + items.length + ')'))
+    box.append(sum)
+    const list = el('div', 'attention-list')
+    const shown = items.slice(0, inRail ? 4 : 8)
+    for (const it of shown) {
+      const row = el('button', 'attention-item kind-' + it.kind)
+      row.title = it.title + ' ' + it.why
+      row.onclick = () => { closeSearch(); setView({ selectedKey: it.key, mode: 'chat' }) }
+      row.append(el('span', 'attention-icon', ATTENTION_ICON[it.kind] || '•'))
+      row.append(el('span', 'attention-name', it.title))
+      row.append(el('span', 'attention-why', it.why))
+      if (it.since) row.append(el('span', 'attention-age', ago(it.since)))
+      list.append(row)
+    }
+    if (items.length > shown.length) list.append(el('div', 'attention-more', 'and ' + (items.length - shown.length) + ' more'))
+    box.append(list)
+    return box
+  }
+
   function renderKanban() {
     const main = el('main', 'main')
     main.append(renderToolbar())
+    const needs = renderAttention(false)
+    if (needs) main.append(needs)
     const board = el('div', 'board')
     const visible = s.cards.filter(matches)
     for (const col of s.columns) board.append(renderColumn(col, visible.filter((c) => c.phase === col.id)))

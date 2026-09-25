@@ -122,7 +122,7 @@ button[disabled] { cursor: default; }
    twenty model rows squeezed into a 320px list at 24px each, two lines of text
    crushed into one — measured by layout.test.mjs as a "two lines" row of 24px. */
 .menu-item, .review-file, .merge-file, .control-item, .subtask, .slash-item,
-.mention-item, .ask-opt {
+.mention-item, .ask-opt, .attention-item {
   justify-content: flex-start;
   /* `stretch`, the flex default the base rule's `center` took away: a menu
      row is a COLUMN, and its label only ellipsises if it is stretched to the
@@ -1253,6 +1253,22 @@ details.thinking summary::-webkit-details-marker { display: none; }
   flex-direction: column;
   gap: 8px;
 }
+.attention { margin: 6px 14px 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.attention.urgent { border-color: var(--warn); }
+.attention.in-rail { margin: 6px 8px; }
+.attention-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px; cursor: pointer; font-weight: 600; }
+.attention-list { display: flex; flex-direction: column; padding: 0 4px 4px; min-width: 0; }
+.attention-item {
+  display: flex; gap: 6px; min-width: 0;
+  padding: 3px 6px; background: none; border: none; text-align: left; cursor: pointer; color: var(--vscode-foreground);
+}
+.attention-item:hover { background: var(--vscode-list-hoverBackground); }
+.attention-name { font-weight: 600; flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attention-why { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.attention.in-rail .attention-why { display: none; }
+.attention.in-rail .attention-name { max-width: none; flex: 1; min-width: 0; }
+.attention-age { flex: none; color: var(--faint); font-size: 0.85em; }
+.attention-more { color: var(--faint); font-size: 0.85em; padding: 2px 6px; }
 .review-drafts {
   display: flex; align-items: center; gap: 8px; margin: 8px 14px; padding: 6px 10px;
   border: 1px solid var(--vscode-focusBorder); border-radius: var(--radius); background: var(--panel);

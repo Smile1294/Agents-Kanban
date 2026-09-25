@@ -46,6 +46,7 @@ import { BrowserPool } from './agent/browser.ts'
 import type { HarnessDeps } from './agent/harness.ts'
 import { AppProcesses } from './run/app.ts'
 import { ReviewDrafts, reviewPrompt } from './board/review-comments.ts'
+import { attentionFor, attentionSummary, type AttentionItem } from './board/attention.ts'
 import {
   COMMON_DEV_PORTS, detect as detectRun, isListening, readWtRegistry, waitForPort,
 } from './run/recipe.ts'
@@ -282,6 +283,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      result, and "in the list" used to count as live — so an agent whose
      outcome the parser had not seen read "may still be working" under a
      run that had already printed "Finished". */
+  /** The last board pass's attention list, for the status bar. */
+  let lastAttention: AttentionItem[] = []
   const isLive = (a: { state: { kind: string } }) =>
     ['starting', 'working', 'needsInput', 'waiting'].includes(a.state.kind)
   /** A run that has ENDED and has a session file to show for it. Its chat is
@@ -3731,6 +3734,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // on the child alone — see SessionMeta.parent — so the parent's half is
     // derived here rather than kept as a second copy that can disagree.
     linkSubtasks(cards, ws.board)
+    // What waits on the user, derived ONCE per pass from the cards just built,
+    // so every surface draws the same list and it cannot disagree with them.
+    const attention = attentionFor(cards, ws.board)
+    // Read by the status bar, which the paint path refreshes after each pass.
+    lastAttention = attention
 
     /* Board-level: the same three levels whatever is selected. The RESOLVED
        level is per session, so it is set in the slice. */
@@ -3746,6 +3754,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       agentsBySession,
       live,
       olderHidden: aged.hidden,
+      attention,
     }
   }
 
@@ -4130,6 +4139,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const kind = (k: string) => live.filter((a) => a.state.kind === k).length
     return {
       ready: true, mode: watch.mode, columns: ws.board.columns, cards, composer, showArchived,
+      ...(pass.attention?.length ? { attention: pass.attention } : {}),
       ...(pass.olderHidden ? { olderHidden: pass.olderHidden } : {}),
       ...(showOlder ? { showOlder: true } : {}),
       ...(ws.repoRoot ? {} : { noRepo: true }),
@@ -5879,7 +5889,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const live = ws?.manager?.list() ?? []
     const waiting = live.filter((a) => a.state.kind === 'needsInput').length
     const running = live.filter((a) => ['working', 'starting', 'waiting'].includes(a.state.kind)).length
-    statusItem.text = waiting
+    // The board's own list when a pass has built one — it also knows about
+    // stalled, cut-off and ready-to-test cards, which the live list cannot.
+    const needs = attentionSummary(lastAttention)
+    statusItem.text = needs
+      ? `$(bell) ${needs}`
+      : waiting
       ? `$(kanban) ${waiting} waiting on you`
       : running
         ? `$(kanban) ${running} running`

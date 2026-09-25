@@ -883,6 +883,26 @@ for (const label of ['calc.js', 'Run the tests', 'Local server']) {
   ok(!run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [], cards: [WT_CARD] }).text().includes('review comment'), 'no drafts, no panel')
 }
 
+// "Needs you": everything waiting on the user, on the board and in the rail,
+// each row opening its card.
+{
+  const att = [
+    { key: 'abc-123', title: 'Fix login', kind: 'question', why: 'is waiting for your answer', since: Date.now() - 5 * 60000 },
+    { key: 'zz', title: 'Other', kind: 'review', why: 'is ready for you to test' },
+  ]
+  const kb = run({ ...base, mode: 'kanban', attention: att })
+  ok(kb.text().includes('Needs you (2)') && kb.text().includes('is waiting for your answer'), 'the board lists what waits on you')
+  ok(kb.text().includes('5m'), 'with the age of what has been waiting')
+  ok((kb.text().match(/Needs you \(2\)/g) || []).length === 1, 'once on the kanban screen, not also in the rail beside it')
+  const rowBtn = walkAll(kb.root).find((n) => (n.className || '').includes('attention-item'))
+  rowBtn?.onclick()
+  ok(kb.text().includes('Fix login'), 'a row opens its card')
+  ok(run({ ...base, mode: 'chat', selectedKey: 'abc-123', attention: att, transcript: [] }).text().includes('Needs you (2)'),
+     'and in the rail while a chat is open')
+  const none = run({ ...base, mode: 'kanban' })
+  ok(!none.text().includes('Needs you'), 'nothing waiting draws nothing')
+}
+
 // A session with no plan must not grow an empty panel.
 const unplanned = run({ ...base, mode: 'chat', selectedKey: 'abc-123', cards: [WT_CARD], transcript: [] })
 ok(!unplanned.text().includes('How to test this'), 'no plan, no panel')

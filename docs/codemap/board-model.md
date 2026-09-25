@@ -6,12 +6,14 @@ paths:
   - src/board/questions.ts
   - src/board/codemap.ts
   - src/board/review-comments.ts
+  - src/board/attention.ts
 tests:
   - src/board/__tests__/config.test.ts
   - src/board/__tests__/questions.test.ts
   - src/board/__tests__/ask.test.mjs
   - src/board/__tests__/codemap.test.ts
   - src/board/__tests__/review-comments.test.ts
+  - src/board/__tests__/attention.test.ts
   - src/board/__tests__/permission-detail.test.ts
 last_verified: 2026-09-07
 ---
@@ -125,6 +127,7 @@ repository → nothing is required, so the extension stays generic.
 
 ## Recent changes
 
+- 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/board/attention.ts` — `attentionFor(cards, board)`: every card waiting on the user (a question or permission, a failed run, an interrupted one, a stalled one, work ready to test with no unsent review comments), blocking first then oldest; `attentionSummary` for the status bar. Derived from the cards, never stored. Test: `attention.test.ts`.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/board/review-comments.ts` — `ReviewDrafts` (per card, bounded, `rekey` when a card's key changes, `take` for a send) and `reviewPrompt` (ONE numbered message, ordered like the diff, each comment with the lines it was written on quoted). Test: `review-comments.test.ts`.
 - 2026-09-10 · claude/frontend-sync-chat-freeze-wb6a2s · `summarise()`,
   `permissionDetail()` and `PERMISSION_DETAIL_MAX` moved here from `panel.ts`

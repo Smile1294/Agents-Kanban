@@ -275,6 +275,8 @@ export interface UiCard {
 }
 
 export interface UiState {
+  /** Everything waiting on the user, blocking first (`board/attention.ts`). */
+  attention?: import('./attention.ts').AttentionItem[]
   ready: boolean
   /** No folder is open, so there is nothing to show yet. */
   noWorkspace?: boolean
