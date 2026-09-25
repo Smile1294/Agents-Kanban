@@ -392,6 +392,15 @@ Working:
   it is downscaled in the webview and sent inside the message as an image
   content block, so nothing is written to disk. See
   [`src/agent/images.ts`](src/agent/images.ts)
+- **Agents look at their own work.** `app_start` / `app_logs` / `app_stop`
+  start the Run recipe as child processes in the agent's worktree (output kept,
+  port never scanned for), and seven `browser_*` tools drive a headless
+  Chromium per run — ARIA snapshot, screenshots the model sees (also saved for
+  the user), actions, eval, and console/network errors reported with each step.
+  Loopback only unless the user widens it. See
+  [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §3.
+- **Draw on an image before sending it** — numbered boxes and arrows, pen,
+  labels; flattened into the image, and the message says the marks are yours.
 - **One button to run a session's app.** Detects the project's own per-worktree
   launcher, provisions it if it has never been provisioned, waits for the port
   to actually answer, then opens the browser on it. See
@@ -634,6 +643,14 @@ was first written — scheduled runs, per-session model choice, transcript searc
 the orchestration dial, per-piece routing — were removed rather than struck
 through; §8 describes them. Each area file in [docs/codemap/](docs/codemap/README.md)
 carries its own "Open work" section with the items that land there.
+
+### The harness roadmap
+
+[docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §6 ranks what comes after the
+browser tools, the history fixes and image annotation: verification evidence on
+the card, an element picker, the remaining image gaps, whole-tree checkpoints
+in a private ref, a critic before review, best-of-N, and per-worktree setup
+scripts. §4 lists what was found and not yet fixed.
 
 ### Runtimes: what is not done
 
