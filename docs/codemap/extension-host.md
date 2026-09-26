@@ -320,6 +320,8 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `queueStore` on workspace state (`agentsKanban.queue`); `rebuild()` makes the manager and calls `restoreQueue()` when a saved queue exists; the 60s heartbeat calls `manager.checkDue()`; `UiLimit.source`.
+
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · the `agentsKanban.usageLimits` enum (`resume`/`pause`/`off`) replaces the `resumeAfterLimit` boolean, passed as `limitMode` (read at every decision); `uiParked` carries `stoppedTasks` to the card.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · usage limits: `resumeAfterLimit` setting and `providerFor: sessionProviderFor` into the manager; `rebuild()` makes the manager and calls `restoreParked()` when any card is parked; the board pass builds `UiState.limits` (`UiLimit`, `accountLabel`) and `CardState.parked` (which suppresses `stalled`); `resumeParked`/`holdParked` host methods and dispatch cases; the status bar says `Usage limit · back HH:MM` when nothing needs you; the 60s tick repaints while anything is limited.

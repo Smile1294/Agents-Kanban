@@ -410,7 +410,10 @@ Working:
   the same limit. `agentsKanban.usageLimits` is `resume` / `pause` / `off`.
   Background agents that die with a limited run are named in its resume, so
   the agent relaunches them instead of waiting. `usage_status` lets an agent
-  read its budget. See
+  read its budget. It survives the machine: the queue and parked cards are
+  saved across restarts, a laptop that slept through the reset is caught by a
+  wall-clock check within a minute, and a resume that fails offline retries in
+  five minutes. See
   [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §4d.
 - **Draw on an image before sending it** — numbered boxes and arrows, pen,
   labels; flattened into the image, and the message says the marks are yours.

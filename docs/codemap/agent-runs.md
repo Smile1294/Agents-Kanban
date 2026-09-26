@@ -196,6 +196,14 @@ every decision: `off` makes `park()`, `heldUntil()` and the first-turn
 re-queue no-ops (readings are still kept); `pause` parks with `auto: false`.
 `park()` reads `backgroundTasks()` off the run BEFORE its first await — the
 run is still registered then, and its background agents die with it.
+`checkDue(now)` wakes accounts whose reset passed by the WALL clock (timers
+stop while a laptop sleeps); the host calls it every minute. A run the board
+resumed that fails with `isOfflineError` text is parked again with
+`offlineReading` (5 min, an attempt). The QUEUE is saved through
+`queueStore` on every change (`saveQueue`, `SavedQueueEntry` — no image bytes,
+no provider env, profile id only; a no-op once `stopped`, so `stopAll()`
+keeps it) and `restoreQueue()` puts each entry back through `start()` with a
+`restored` notice; `parseSavedQueue` parses it.
 
 ## How it works
 
@@ -271,6 +279,8 @@ started column while the title is still the guess.
 - Nothing re-runs a parent once its subtasks land.
 
 ## Recent changes
+
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · resilience: `checkDue()` (wall-clock wake, for a timer that slept), the queue persisted across restarts (`queueStore`, `saveQueue`, `restoreQueue`, `parseSavedQueue`, `LaunchOptions.restored`), and an offline failure of a board-started resume re-parks for a retry (`isOfflineError`, `offlineReading`, `LimitReading.source: 'offline'`).
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `agentsKanban.usageLimits` (`resume`/`pause`/`off`, `ManagerOptions.limitMode`) replaces `resumeAfterLimit`; `park()` records the background agents still running (`AgentRun.backgroundTasks()` → `ParkedRecord.stoppedTasks`) and the resume names them (`resumePrompt`); `AgentSession` routes `rate_limit_event` and `api_retry` BEFORE the subagent early-return, so a subagent's 429 retry reaches the tracker.
 

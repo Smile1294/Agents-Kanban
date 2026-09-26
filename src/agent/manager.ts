@@ -22,12 +22,12 @@ import {
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
 import type { ModelBook } from '../sessions/usage.ts'
 import {
-  DEFAULT_RUNTIME, getRuntime, parseMeter, type AgentRun, type Meter, type RuntimeId,
+  DEFAULT_RUNTIME, getRuntime, parseMeter, parseRuntimeId, type AgentRun, type Meter, type RuntimeId,
 } from './runtime.ts'
 import { startBoardBridge, type BoardBridge } from './board-bridge.ts'
 import type { Schedule, ScheduleDraft } from '../board/schedules.ts'
 import {
-  aimSentence, checkProposal, DEFAULT_ORCHESTRATION, policyFor,
+  aimSentence, checkProposal, DEFAULT_ORCHESTRATION, parseOrchestrationLevel, policyFor,
   type DecompositionRecord, type OrchestrationLevel, type OrchestrationPolicy,
   type ProposalNote, MAX_STATED,
 } from '../board/decomposition.ts'
@@ -37,7 +37,7 @@ import { uiFilesIn } from '../run/autocheck.ts'
 import { bindHarness, harnessBrief, type Harness, type HarnessDeps } from './harness.ts'
 import {
   accountKey, limitFromErrorText, limitFromPlanMeter, limitFromRetry, LimitTracker, MAX_AUTO_RESUMES,
-  MAX_STOPPED_TASKS, parseClaudeRateLimit, parseParked, resumePrompt, windowName,
+  isOfflineError, MAX_STOPPED_TASKS, offlineReading, parseClaudeRateLimit, parseParked, resumePrompt, windowName,
   type LimitMode, type LimitReading, type ParkedRecord,
 } from './limits.ts'
 import {
@@ -128,6 +128,13 @@ export interface ManagerOptions {
    * on whichever profile is active when its account comes back.
    */
   providerFor?: (key: string) => Promise<LaunchOptions['providerFor']>
+  /**
+   * Where the QUEUE is kept between VS Code sessions (workspace state). The
+   * queue is otherwise in memory, so every run waiting for a slot or for its
+   * account's limit vanished — prompt and all, without a word — when the
+   * window closed or the laptop shut down. Absent means not kept.
+   */
+  queueStore?: { load(): unknown; save(entries: SavedQueueEntry[]): unknown }
   worktrees: WorktreeService
   board: BoardConfig
   defaults: AgentDefaults
@@ -418,6 +425,65 @@ export interface LaunchOptions {
   /** The user pressed Resume on a parked card: start it even though its
    *  account is limited. Set by `start()`, never by a caller. */
   ignoreLimit?: boolean
+  /** Brought back from the saved queue after a restart (`restoreQueue`): when
+   *  it was first queued, and how many images could not be kept. */
+  restored?: { queuedAt: number; imagesDropped: number }
+}
+
+/**
+ * One queued run as it is SAVED — what `start()` froze, minus what must not be
+ * written down: images (megabytes of base64; their count is kept and the card
+ * says they were dropped) and the provider's ENVIRONMENT, which carries API
+ * keys. The profile id is kept and resolved again through `resolveProvider`.
+ */
+export interface SavedQueueEntry {
+  prompt: string
+  queuedAt: number
+  title?: string
+  resume?: string
+  parent?: string
+  base?: string
+  runtime?: RuntimeId
+  provider?: string
+  orchestration?: OrchestrationLevel
+  chosen?: RunSettings
+  images?: number
+}
+
+/** Read the saved queue back. Parsed, never cast: it outlives the extension
+ *  version that wrote it. An entry without a prompt is dropped. */
+export function parseSavedQueue(raw: unknown): SavedQueueEntry[] {
+  if (!Array.isArray(raw)) return []
+  const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
+  const out: SavedQueueEntry[] = []
+  for (const e of raw) {
+    if (!e || typeof e !== 'object') continue
+    const m = e as Record<string, unknown>
+    const prompt = str(m.prompt)
+    if (!prompt) continue
+    const c = m.chosen && typeof m.chosen === 'object' ? m.chosen as Record<string, unknown> : undefined
+    const chosen: RunSettings | undefined = c ? {
+      ...(str(c.model) ? { model: str(c.model)! } : {}),
+      ...(resolveEffort(c.effort, undefined) ? { effort: resolveEffort(c.effort, undefined)! } : {}),
+      ...(c.thinking === 'enabled' || c.thinking === 'disabled' ? { thinking: c.thinking } : {}),
+      ...(c.ultracode === true ? { ultracode: true } : {}),
+      ...(c.fastMode === true ? { fastMode: true } : {}),
+    } : undefined
+    out.push({
+      prompt,
+      queuedAt: typeof m.queuedAt === 'number' && Number.isFinite(m.queuedAt) ? m.queuedAt : Date.now(),
+      ...(str(m.title) ? { title: str(m.title)! } : {}),
+      ...(str(m.resume) ? { resume: str(m.resume)! } : {}),
+      ...(str(m.parent) ? { parent: str(m.parent)! } : {}),
+      ...(str(m.base) ? { base: str(m.base)! } : {}),
+      ...(parseRuntimeId(m.runtime) ? { runtime: parseRuntimeId(m.runtime)! } : {}),
+      ...(str(m.provider) ? { provider: str(m.provider)! } : {}),
+      ...(parseOrchestrationLevel(m.orchestration) ? { orchestration: parseOrchestrationLevel(m.orchestration)! } : {}),
+      ...(chosen && Object.keys(chosen).length ? { chosen } : {}),
+      ...(typeof m.images === 'number' && m.images > 0 ? { images: Math.floor(m.images) } : {}),
+    })
+  }
+  return out
 }
 
 export interface RunningAgent {
@@ -721,6 +787,7 @@ export class AgentManager extends EventEmitter {
             kind: 'notice' as const, at: Date.now(), urgency: 'info' as const,
             message: `Waiting: this account is at its usage limit until ${clock(held)}. The board starts this when it resets.`,
           }] : []),
+          ...(opts.restored ? [restoredNotice(opts.restored)] : []),
         ],
         history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
         ...(opts.parent ? { parent: opts.parent } : {}),
@@ -729,6 +796,7 @@ export class AgentManager extends EventEmitter {
         // can read a queued parent's whole agent.
         ...(opts.providerFor ? { provider: opts.providerFor.profile.id } : {}),
       })
+      this.saveQueue()
       this.touch()
       return runId
     }
@@ -1078,6 +1146,7 @@ export class AgentManager extends EventEmitter {
           queued.opts = { ...queued.opts, images: [...(queued.opts.images ?? []), ...images].slice(0, MAX_IMAGES) }
         }
         live.live.push({ kind: 'prompt', at: Date.now(), text, ...(images.length ? { images: images.length } : {}) })
+        this.saveQueue()
         this.touch()
         return
       }
@@ -1333,6 +1402,9 @@ export class AgentManager extends EventEmitter {
       ...(opts.resume && this.pendingResume.has(opts.resume) ? { resumeAttempt: this.pendingResume.get(opts.resume)! } : {}),
     }
     if (opts.resume) this.pendingResume.delete(opts.resume)
+    // Said on the card it launches as too, not only while it waited: a queued
+    // card is replaced by this one when its slot frees.
+    if (opts.restored) agent.live.push(restoredNotice(opts.restored))
     this.agents.set(runId, agent)
     // Written under the RUN id, before Claude Code has assigned a session id.
     // A subtask that is only joined to its parent once the id arrives spends
@@ -1704,6 +1776,13 @@ export class AgentManager extends EventEmitter {
       // runtime, gateway and model shares.
       const r = limitFromErrorText(message, Date.now())
       if (r) agent.limitHit = this.recordLimit(this.accountOf(agent), r)
+      // A resume the BOARD started, failing because the machine is offline —
+      // a laptop that woke at the reset time with no network yet. Parked
+      // again for a short retry rather than left as a dead card whose park
+      // the launch already cleared. Bounded like any automatic resume.
+      else if (!agent.limitHit && agent.resumeAttempt !== undefined && isOfflineError(message)) {
+        agent.limitHit = this.recordLimit(this.accountOf(agent), offlineReading(message, Date.now()))
+      }
       if (agent.limitHit) void this.park(agent)
       // A run that failed before Claude Code ever gave it a session id never got
       // as far as working. Its worktree is a dead checkout and a dead branch
@@ -1971,6 +2050,7 @@ export class AgentManager extends EventEmitter {
       const i = this.queue.findIndex((q) => !this.heldUntil(q.opts, now))
       if (i < 0) break
       const next = this.queue.splice(i, 1)[0]!
+      this.saveQueue()
       // `launch()` never throws; it reports. See the catch there — there is one
       // place that knows how to describe a failed launch, not two.
       await this.launch(next.runId, next.prompt, next.opts)
@@ -2089,7 +2169,7 @@ export class AgentManager extends EventEmitter {
     this.bridges.delete(a.runId)
     this.agents.delete(a.runId)
     const i = this.queue.findIndex((q) => q.runId === a.runId)
-    if (i >= 0) this.queue.splice(i, 1)
+    if (i >= 0) { this.queue.splice(i, 1); this.saveQueue() }
     this.touch()
     // Stopping frees a slot too, and nothing else was going to notice. Guarded
     // by `this.stopped` inside `drain()`, because `stopAll()` shares this
@@ -2130,6 +2210,8 @@ export class AgentManager extends EventEmitter {
     // The queue goes too. It is in memory, so a run still in it was never going
     // to survive the host anyway; leaving entries there only gave a late drain
     // something to find.
+    // NOT saved: the stored copy is what brings these back after the restart
+    // this very call is part of (`saveQueue` is a no-op once `stopped`).
     this.queue.length = 0
     for (const t of this.wakeTimers.values()) clearTimeout(t)
     this.wakeTimers.clear()
@@ -2216,13 +2298,13 @@ export class AgentManager extends EventEmitter {
 
   /** The account's reset time came: lift it, start what it held, resume what
    *  it parked. */
-  async wake(account: string): Promise<void> {
+  async wake(account: string, now = Date.now()): Promise<void> {
     if (this.stopped) return
-    const until = this.limits.limitedUntil(account, Date.now())
+    const until = this.limits.limitedUntil(account, now)
     // A later reading moved the reset past this timer (or past the setTimeout
     // cap): wait for that one instead.
-    if (until && until > Date.now() + 1000) { this.scheduleWake(account); return }
-    this.limits.lift(account, Date.now())
+    if (until && until > now + 1000) { this.scheduleWake(account); return }
+    this.limits.lift(account, now)
     this.emit('limit', account, this.limits.get(account))
     this.touch()
     void this.drain()
@@ -2251,7 +2333,11 @@ export class AgentManager extends EventEmitter {
       ...(stoppedTasks.length ? { stoppedTasks } : {}),
     }
     const when = `${r.estimated ? 'about ' : ''}${clock(until)}`
-    const message = auto
+    const message = r.source === 'offline'
+      ? auto
+        ? `Could not resume: the service was unreachable (${r.detail?.replace(/^unreachable when the board resumed it — /, '') ?? 'offline'}). The board tries again at ${when}.`
+        : `Could not resume: the service was unreachable, ${attempts} times in a row, so the board has stopped trying by itself. Press Resume once you are back online.`
+      : auto
       ? `Paused at the account's usage limit (${parked.reason}). The board resumes this session at ${when}.`
       : attempts >= MAX_AUTO_RESUMES
         ? `Paused at the account's usage limit again — ${attempts} automatic resumes ran straight into it, so the board has stopped resuming by itself. Expected back at ${when}; press Resume when you want it to carry on.`
@@ -2328,6 +2414,92 @@ export class AgentManager extends EventEmitter {
     }
     if (n) this.touch()
     return n
+  }
+
+  /**
+   * Wake every account whose reset has passed BY THE WALL CLOCK.
+   *
+   * `setTimeout` runs on a monotonic clock that stops while the machine
+   * sleeps (Linux CLOCK_MONOTONIC, macOS uptime), so a wake due at 15:02 on a
+   * laptop closed from 14:00 to 18:00 fires at 19:02 — hours late, with the
+   * card still saying "Resumes 15:02". The host calls this from its
+   * once-a-minute heartbeat, which compares against `Date.now()`.
+   */
+  checkDue(now = Date.now()): string[] {
+    const due: string[] = []
+    for (const [account, r] of this.limits.all()) {
+      if (r.status !== 'limited' || !r.resetsAt || r.resetsAt + AgentManager.WAKE_GRACE_MS > now) continue
+      if (!this.wakeTimers.has(account)) continue
+      clearTimeout(this.wakeTimers.get(account))
+      this.wakeTimers.delete(account)
+      due.push(account)
+      void this.wake(account, now)
+    }
+    return due
+  }
+
+  /** Write the queue down, so a restart does not lose it. */
+  private saveQueue(): void {
+    if (this.stopped || !this.opts.queueStore) return
+    const entries: SavedQueueEntry[] = this.queue.map((q) => {
+      const card = this.agents.get(q.runId)
+      const since = card?.state.kind === 'queued' ? card.state.since : undefined
+      const o = q.opts
+      return {
+        prompt: q.prompt,
+        queuedAt: o.restored?.queuedAt ?? since ?? Date.now(),
+        ...(o.title ? { title: o.title } : {}),
+        ...(o.resume ? { resume: o.resume } : {}),
+        ...(o.parent ? { parent: o.parent } : {}),
+        ...(o.base ? { base: o.base } : {}),
+        ...(o.runtime ? { runtime: o.runtime } : {}),
+        ...(o.providerFor ? { provider: o.providerFor.profile.id } : {}),
+        ...(o.orchestration ? { orchestration: o.orchestration } : {}),
+        ...(o.chosen ? { chosen: o.chosen } : {}),
+        ...(o.images?.length ? { images: o.images.length } : {}),
+      }
+    })
+    try {
+      void Promise.resolve(this.opts.queueStore.save(entries)).catch((e) => this.opts.log?.(`Could not save the queue: ${e}`))
+    } catch (e) {
+      this.opts.log?.(`Could not save the queue: ${e}`)
+    }
+  }
+
+  /**
+   * Bring back what was queued when VS Code last closed. Each entry goes
+   * through `start()` again — held by its account's limit, or waiting for a
+   * slot, or started now if neither applies — with a notice on its card that
+   * it survived a restart, and how many images could not be kept.
+   */
+  async restoreQueue(): Promise<number> {
+    const saved = parseSavedQueue(this.opts.queueStore?.load())
+    if (!saved.length) return 0
+    for (const e of saved) {
+      const providerFor = e.provider ? await this.opts.resolveProvider?.(e.provider).catch(() => undefined) : undefined
+      await this.start(e.prompt, {
+        ...(e.title ? { title: e.title } : {}),
+        ...(e.resume ? { resume: e.resume } : {}),
+        ...(e.parent ? { parent: e.parent } : {}),
+        ...(e.base ? { base: e.base } : {}),
+        ...(e.runtime ? { runtime: e.runtime } : {}),
+        ...(providerFor ? { providerFor } : {}),
+        ...(e.orchestration ? { orchestration: e.orchestration } : {}),
+        ...(e.chosen ? { chosen: e.chosen } : {}),
+        restored: { queuedAt: e.queuedAt, imagesDropped: e.images ?? 0 },
+      }).catch((err) => this.opts.log?.(`Could not restore a queued run: ${err}`))
+    }
+    this.saveQueue()
+    return saved.length
+  }
+}
+
+/** What a restored card says about itself. */
+function restoredNotice(r: { queuedAt: number; imagesDropped: number }): Entry {
+  return {
+    kind: 'notice', at: Date.now(), urgency: 'info',
+    message: `Kept in the queue across a VS Code restart (first queued ${clock(r.queuedAt)}).` +
+      (r.imagesDropped ? ` ${r.imagesDropped} attached image${r.imagesDropped === 1 ? ' was' : 's were'} not kept — attach ${r.imagesDropped === 1 ? 'it' : 'them'} again if the task needs ${r.imagesDropped === 1 ? 'it' : 'them'}.` : ''),
   }
 }
 

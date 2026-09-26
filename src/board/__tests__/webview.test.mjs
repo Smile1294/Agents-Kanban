@@ -767,6 +767,9 @@ ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.int
     cards: [{ ...parkedCard, parked: { ...parkedCard.parked, stoppedTasks: ['Research the payments API', 'Audit the flaky tests'] } }] }).text()
   ok(chatView.includes('Stopped with it') && chatView.includes('Research the payments API') && chatView.includes('Audit the flaky tests'),
      'the chat view names the background agents the limit stopped')
+  const offline = run({ ...base, limits: [{ ...limits[0], source: 'offline', estimated: true, windows: [] }] }).text()
+  ok(/could not be reached when the board resumed — trying again ~/.test(offline) && !offline.includes('at its usage limit'),
+     'an account that was unreachable at a resume says so, not "at its usage limit"')
   ok(!run({ ...base, limits: [{ ...limits[0], status: 'ok', windows: [] }] }).root.querySelector('.limits'),
      'no reading worth drawing, no strip')
 }

@@ -772,7 +772,11 @@ run, since each session needs a worktree.
   die with a limited run's process: `park()` reads `backgroundTasks()` BEFORE
   its first await and the resume names them, or the agent waits for reports
   that will never come. Limit frames route before the subagent early-return,
-  like money.
+  like money. Timers stop while a laptop SLEEPS, so a wake is also checked
+  against the wall clock (`checkDue`, from the host's heartbeat); the QUEUE is
+  saved on every change and `stopAll()` must not clear the saved copy (it is
+  the restart it exists for); and it never stores image bytes or a provider's
+  environment, which carries keys.
 
 ## Testing conventions
 

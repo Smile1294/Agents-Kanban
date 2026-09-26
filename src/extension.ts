@@ -8,7 +8,7 @@
 import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
 import * as vscode from 'vscode'
-import { AgentManager, followKey, type RunningAgent, type RunSettings } from './agent/manager.ts'
+import { AgentManager, followKey, parseSavedQueue, type RunningAgent, type RunSettings } from './agent/manager.ts'
 import { loadSdk, resolveClaudeExecutable, type Options as AgentOptions } from './agent/sdk.ts'
 import {
   applyRestore, checkpointMapFor, claudeHome, historyDirFor, planRestore,
@@ -287,6 +287,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      run that had already printed "Finished". */
   /** The last board pass's attention list, for the status bar. */
   let lastAttention: AttentionItem[] = []
+  /** Where the manager keeps its queue between sessions. */
+  const QUEUE_KEY = 'agentsKanban.queue'
   /** The last pass's limit readings, for the status bar. */
   let lastLimits: UiLimit[] = []
   /** "Claude Code · DeepSeek" for `claude|dsk`. */
@@ -1720,6 +1722,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // A card counting down to its account's reset is a readout that moves
       // while nothing streams; the minute it is drawn at is this tick.
       if (lastLimits.some((l) => l.status === 'limited')) refreshAll()
+      // By the WALL clock: a timer set before the laptop slept fires late by
+      // however long the lid was shut. This catches it within a minute.
+      const due = ws?.manager?.checkDue() ?? []
+      if (due.length) log.info(`Usage limit reset passed while the timer slept: waking ${due.map(accountLabel).join(', ')}.`)
     },
     60_000,
   )
@@ -2908,11 +2914,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Cards parked at a usage limit before the restart: the manager is lazy,
     // so it is made here only when there is one — its timer has to be armed
     // again or the card waits forever for a wake nobody scheduled.
+    // And the QUEUE: runs that were waiting for a slot or for their account
+    // when the window closed. In memory only, they were lost with it.
     if (repoRoot) {
       const metas = await ws.store.allMeta().catch(() => ({} as Record<string, SessionMeta>))
       if (Object.values(metas).some((m) => m.parked)) {
         const n = await ensureManager().restoreParked().catch((e) => { log.warn(`Could not re-arm parked cards: ${String(e)}`); return 0 })
         if (n) log.info(`${n} card(s) parked at a usage limit; their resume timers are set again.`)
+      }
+      if (parseSavedQueue(state.get<unknown>(QUEUE_KEY)).length) {
+        const n = await ensureManager().restoreQueue().catch((e) => { log.warn(`Could not restore the queue: ${String(e)}`); return 0 })
+        if (n) log.info(`${n} queued run(s) brought back from before the restart.`)
       }
     }
     log.info(
@@ -3190,6 +3202,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Read at every decision, so changing it applies at once — including
         // to a resume that is already scheduled.
         limitMode: () => parseLimitMode(cfg().get<string>('usageLimits')),
+        // Workspace state, not the sidecar: a queued run has no session yet,
+        // and this is per folder like the queue itself.
+        queueStore: {
+          load: () => state.get<unknown>(QUEUE_KEY),
+          save: (entries) => state.update(QUEUE_KEY, entries),
+        },
         providerFor: (key) => sessionProviderFor(key),
         worktrees: w.worktrees,
         board: w.board,
@@ -3852,7 +3870,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     for (const m of Object.values(metas)) if (m.parked) parkedOn.set(m.parked.account, (parkedOn.get(m.parked.account) ?? 0) + 1)
     const limits: UiLimit[] = (ws.manager?.limits.all() ?? []).map(([account, r]) => ({
       account, label: accountLabel(account), status: r.status, windows: r.windows, at: r.at,
-      parked: parkedOn.get(account) ?? 0,
+      parked: parkedOn.get(account) ?? 0, source: r.source,
       ...(r.resetsAt ? { resetsAt: r.resetsAt } : {}),
       ...(r.estimated ? { estimated: true } : {}),
       ...(r.detail ? { detail: r.detail } : {}),

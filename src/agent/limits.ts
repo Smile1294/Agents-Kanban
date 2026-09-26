@@ -54,7 +54,7 @@ export interface LimitReading {
   estimated?: boolean
   windows: LimitWindow[]
   /** Which signal produced this. */
-  source: 'claude' | 'plan' | 'error' | 'retry' | 'restored'
+  source: 'claude' | 'plan' | 'error' | 'retry' | 'restored' | 'offline'
   /** The vendor's own words, when there are any. Shown verbatim. */
   detail?: string
   at: number
@@ -256,6 +256,38 @@ function offsetMs(at: number, tz?: string): number {
     } catch { /* not a zone Intl knows: fall through */ }
   }
   return -new Date(at).getTimezoneOffset() * 60_000
+}
+
+// ---------------------------------------------------------------------------
+// Offline when the board resumes
+// ---------------------------------------------------------------------------
+
+/**
+ * The network, not the account. A laptop that wakes up at the reset time
+ * usually has no Wi-Fi (or VPN) for the first minute, and the board's resume
+ * fails with a connection error — measured on a real CLI:
+ * "API Error: Connection refused — a firewall or proxy may be blocking it
+ * (ECONNREFUSED)", "API Error: Couldn't connect through your proxy
+ * (ERR_PROXY_TUNNEL)". Read ONLY for a run the board resumed by itself: there
+ * it means "try again shortly", and anywhere else it is an error to show.
+ */
+const OFFLINE_TEXT = /connection (refused|error|reset|timed out)|couldn['’]t connect|could not connect|unable to connect|\bE(CONNREFUSED|CONNRESET|NOTFOUND|AI_AGAIN|TIMEDOUT|NETUNREACH|HOSTUNREACH)\b|ERR_PROXY_TUNNEL|getaddrinfo|fetch failed|socket hang up|network (is )?unreachable|you appear to be offline/i
+
+export function isOfflineError(text: string): boolean {
+  return !!text && OFFLINE_TEXT.test(text) && !LIMIT_TEXT.test(text)
+}
+
+/** How long after an offline resume the board tries again. Counts as one of
+ *  the `MAX_AUTO_RESUMES`, so a machine that stays offline stops being tried. */
+export const OFFLINE_RETRY_MS = 5 * 60_000
+
+/** The reading an offline resume leaves on its account: held for the retry
+ *  interval (anything else started on it now would fail the same way). */
+export function offlineReading(text: string, now: number): LimitReading {
+  return {
+    status: 'limited', resetsAt: now + OFFLINE_RETRY_MS, estimated: true, windows: [], source: 'offline', at: now,
+    detail: `unreachable when the board resumed it — ${text.split('\n')[0]!.replace(/^API Error:\s*/i, '').slice(0, 160)}`,
+  }
 }
 
 // ---------------------------------------------------------------------------

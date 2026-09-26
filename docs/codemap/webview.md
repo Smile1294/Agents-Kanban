@@ -164,6 +164,8 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · the limits strip says "could not be reached when the board resumed — trying again" for an `offline` reading.
+
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `renderParked(c, true)` names the background agents the limit stopped (`parked.stoppedTasks`).
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · usage limits in the view: `renderLimits()` above the board (per account, each window's fill as a number, `backAt()` time + countdown, `~` for an estimate, how many cards resume), `renderParked(c, full)` on the card and at the top of the chat (Resume now → `resumeParked`, Don't resume → `holdParked`), parked cards go to the Queued section, and `chromeSig()` carries the limits at minute resolution plus the current minute while anything is limited. `.limits` / `.parked` in board.css.

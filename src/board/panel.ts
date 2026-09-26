@@ -298,6 +298,8 @@ export interface UiLimit {
   at: number
   /** Cards parked on it. */
   parked: number
+  /** Which signal: `offline` is the network at a resume, not the account. */
+  source?: string
 }
 
 export interface UiState {

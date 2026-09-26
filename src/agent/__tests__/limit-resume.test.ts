@@ -82,9 +82,13 @@ const store = {
 }
 
 let mode: LimitMode = 'resume'
-const BG = { profile: { id: 'bg', kind: 'gateway' as const, label: 'BG', baseUrl: 'https://x' }, env: { set: {}, clear: [] } }
+const profile = (id: string) => ({ profile: { id, kind: 'gateway' as const, label: id, baseUrl: 'https://x' }, env: { set: {}, clear: [] } })
+const BG = profile('bg')
+const NET = profile('net')
+const Q = profile('q')
+const PROFILES: Record<string, ReturnType<typeof profile>> = { bg: BG, net: NET, q: Q }
 AgentManager.WAKE_GRACE_MS = 0
-const make = () => new AgentManager({
+const make = (over: Partial<ConstructorParameters<typeof AgentManager>[0]> = {}) => new AgentManager({
   store: store as never,
   worktrees: new WorktreeService(root),
   board: DEFAULT_BOARD,
@@ -93,7 +97,9 @@ const make = () => new AgentManager({
   maxConcurrent: 8,
   limitMode: () => mode,
   // The host's `sessionProviderFor`: a parked card resumes on ITS backend.
-  providerFor: async (key: string) => key === 'sess-bg' ? BG : undefined,
+  providerFor: async (key: string) => key === 'sess-bg' ? BG : key === 'sess-net' ? NET : undefined,
+  resolveProvider: async (id: string) => PROFILES[id],
+  ...over,
 })
 const mgr = make()
 const until = (cond: () => boolean, ms = 8000) => (async () => {
@@ -267,6 +273,81 @@ ok((await mgr.resumeParked({ key: 'sess-A' }, true)).length === 1 && runs.length
   })
   ok(after.byKey(heldAfter)?.state.kind === 'queued', 'and new work for that account is held from the first moment')
   after.stopAll()
+}
+
+// --- 9. offline when the board resumes: parked again, retried shortly ---------------
+{
+  const n = runs.length
+  await mgr.start('Net.', { runtime: 'claude', providerFor: NET })
+  const r = runs[n]!
+  r.emit('sessionId', 'sess-net')
+  r.emit('state', { kind: 'error', message: 'x' })
+  r.emit('error', `Claude AI usage limit reached|${Math.floor(Date.now() / 1000) + 1}`)
+  await sleep(100)
+  ok(await until(() => runs.some((x) => x.spec.resume === 'sess-net')), 'the card resumes at the reset')
+  const again = runs.find((x) => x.spec.resume === 'sess-net')!
+  again.emit('sessionId', 'sess-net')
+  again.emit('state', { kind: 'error', message: 'x' })
+  // What a real CLI printed with nowhere to connect to.
+  again.emit('error', 'API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)')
+  await sleep(100)
+  const p = meta.get('sess-net')?.parked as ParkedRecord | undefined
+  ok(!!p && /^unreachable when the board resumed it/.test(p.reason) && p.attempts === 1 && p.auto && p.until > Date.now() + 4 * 60_000,
+     `a resume that fails OFFLINE is parked again for a retry in minutes, as an attempt (${JSON.stringify(p)})`)
+  ok(mgr.limits.get('claude|net')?.source === 'offline', 'and its account is marked unreachable, not "at its limit"')
+  const note = mgr.list().filter((x) => x.sessionId === 'sess-net').flatMap((x) => x.live).find((e) => e.kind === 'notice' && /Could not resume/.test((e as { message: string }).message))
+  ok(!!note, 'the card says it could not resume, and when it tries again')
+
+  // The same error on a run the USER started is an error to show, not a retry.
+  const m = runs.length
+  await mgr.start('Plain.', { runtime: 'claude', providerFor: profile('plain') })
+  const plain = runs[m]!
+  plain.emit('sessionId', 'sess-plain')
+  plain.emit('state', { kind: 'error', message: 'x' })
+  plain.emit('error', 'API Error: Connection refused (ECONNREFUSED)')
+  await sleep(100)
+  ok(!meta.get('sess-plain')?.parked, 'an offline error on a run nobody resumed automatically is NOT parked')
+
+  // --- 10. the laptop slept through the timer ---------------------------------------
+  ok(mgr.checkDue().length === 0, 'a reset still ahead by the wall clock wakes nothing')
+  const before = runs.filter((x) => x.spec.resume === 'sess-net').length
+  const due = mgr.checkDue(Date.now() + 6 * 60_000)
+  ok(due.join() === 'claude|net', `a reset that passed by the WALL clock wakes its account at once, whatever the timer thinks (${due.join()})`)
+  ok(await until(() => runs.filter((x) => x.spec.resume === 'sess-net').length === before + 1), 'and the parked card is resumed')
+}
+
+// --- 11. the queue survives a restart ------------------------------------------------
+{
+  let saved: unknown
+  const queueStore = { load: () => saved, save: (e: unknown) => { saved = JSON.parse(JSON.stringify(e)) } }
+  const heldLimit = () => ({ status: 'limited' as const, resetsAt: Date.now() + 60 * 60_000, windows: [], source: 'claude' as const, at: Date.now() })
+  const first = make({ queueStore })
+  first.recordLimit('claude|q', heldLimit())
+  await first.start('Queued across a restart.', { runtime: 'claude', providerFor: Q, images: [{ mediaType: 'image/png', data: 'aGk=' } as never] })
+  const s1 = saved as Array<Record<string, unknown>>
+  ok(s1?.length === 1 && s1[0]!.prompt === 'Queued across a restart.' && s1[0]!.provider === 'q' && s1[0]!.images === 1,
+     'a held run is written down: its prompt, its backend by id, and how many images')
+  ok(!JSON.stringify(saved).includes('aGk=') && !JSON.stringify(saved).includes('"env"'), 'but never the image bytes or the provider\'s environment (it carries keys)')
+  first.stopAll()
+  ok((saved as unknown[]).length === 1, 'the host going away does NOT clear it — that is the event it is kept for')
+
+  const second = make({ queueStore })
+  second.recordLimit('claude|q', heldLimit())
+  const n = runs.length
+  ok(await second.restoreQueue() === 1, 'after the restart it is brought back')
+  const card = second.list().find((x) => x.title.startsWith('Queued across'))
+  ok(card?.state.kind === 'queued' && runs.length === n, 'still held by its account, not started into the limit')
+  const notice = card?.live.find((e) => e.kind === 'notice' && /restart/.test((e as { message: string }).message)) as { message: string } | undefined
+  ok(!!notice && /1 attached image was not kept/.test(notice.message), `and it says it survived a restart, and that its image did not (${notice?.message})`)
+  second.stopAll()
+
+  const third = make({ queueStore })
+  await third.restoreQueue()
+  const launched = runs.at(-1)!
+  ok(launched.prompt === 'Queued across a restart.' && launched.spec.provider?.id === 'q',
+     'with nothing holding it, it starts — on the backend it was queued for')
+  ok((saved as unknown[]).length === 0, 'and leaves the saved queue empty')
+  third.stopAll()
 }
 
 mgr.stopAll()

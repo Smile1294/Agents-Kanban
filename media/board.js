@@ -1406,7 +1406,9 @@
       row.append(el('span', 'limit-icon', l.status === 'limited' ? '⏸' : l.status === 'warning' ? '⚠' : '◔'))
       row.append(el('span', 'limit-name', l.label))
       if (l.status === 'limited') {
-        const t = el('span', 'limit-back', 'at its usage limit — back ' + backAt(l.resetsAt, l.estimated))
+        const t = el('span', 'limit-back', (l.source === 'offline'
+          ? 'could not be reached when the board resumed — trying again '
+          : 'at its usage limit — back ') + backAt(l.resetsAt, l.estimated))
         t.title = (l.detail || '') + (l.estimated ? '\nThe vendor did not say when; this is the board\'s back-off guess.' : '')
         row.append(t)
         if (l.parked) row.append(el('span', 'limit-parked', l.parked + (l.parked === 1 ? ' card resumes' : ' cards resume') + ' then'))

@@ -6,8 +6,9 @@
 import {
   accountKey, BACKOFF_MS, durationMs, limitFromErrorText, limitFromPlanMeter, limitFromRetry,
   LimitTracker, nextClockTime, parseClaudeRateLimit, parseLimitMode, parseParked, resetTimeIn,
-  RESUME_PROMPT, resumePrompt,
+  RESUME_PROMPT, resumePrompt, isOfflineError, offlineReading, OFFLINE_RETRY_MS,
 } from '../limits.ts'
+import { parseSavedQueue } from '../manager.ts'
 import { AgentSession } from '../session.ts'
 
 let fails = 0
@@ -112,6 +113,39 @@ ok(limitFromRetry({ error_status: 500 }, now) === undefined, 'a 500 retry is not
   ok(parseParked({ until: 5, account: 'a' })!.auto === true, 'auto-resume is the default')
   const withTasks = parseParked({ until: 5, account: 'a', stoppedTasks: ['Research X', 42, '', 'Audit Y'] })!
   ok(withTasks.stoppedTasks?.join('|') === 'Research X|Audit Y', 'stopped background agents are read back, junk dropped')
+}
+
+// --- offline at a resume: the network, not the account --------------------------
+// The two strings are what a real Claude Code 2.1.283 printed with its API URL
+// pointed at a dead port, and through a proxy that refused the tunnel.
+for (const t of ['API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)',
+  "API Error: Couldn't connect through your proxy (ERR_PROXY_TUNNEL) — the proxy refused the tunnel: check its credentials and that it allows this host",
+  'getaddrinfo ENOTFOUND api.anthropic.com', 'TypeError: fetch failed']) {
+  ok(isOfflineError(t), `"${t.slice(0, 50)}…" is the network being down`)
+}
+ok(!isOfflineError('Claude AI usage limit reached|1790439600') && !isOfflineError('TypeError: x is undefined') && !isOfflineError(''),
+   'a limit, or an ordinary error, is not "offline"')
+{
+  const o = offlineReading('API Error: Connection refused (ECONNREFUSED)\nmore', now)
+  ok(o.status === 'limited' && o.source === 'offline' && o.estimated === true && o.resetsAt === now + OFFLINE_RETRY_MS && o.detail!.endsWith('Connection refused (ECONNREFUSED)'),
+     'an offline resume holds the account for the retry interval, marked as a guess, with the error\'s first line')
+}
+
+// --- the saved queue ----------------------------------------------------------------
+{
+  const back = parseSavedQueue([
+    { prompt: 'Fix login', queuedAt: 5, title: 'Fix login', runtime: 'codex', provider: 'dsk', orchestration: 'maximum',
+      chosen: { model: 'm', effort: 'max', thinking: 'disabled', ultracode: true, bogus: 1 }, images: 2, resume: 'sess-1' },
+    { prompt: '' }, { title: 'no prompt' }, 'junk', null,
+    { prompt: 'Other', runtime: 'gemini', orchestration: 'banana', chosen: { effort: 'ludicrous' } },
+  ])
+  ok(back.length === 2, 'entries without a prompt, and junk, are dropped')
+  ok(back[0]!.runtime === 'codex' && back[0]!.provider === 'dsk' && back[0]!.chosen?.effort === 'max' && back[0]!.chosen?.ultracode === true
+     && !('bogus' in back[0]!.chosen!) && back[0]!.images === 2 && back[0]!.resume === 'sess-1' && back[0]!.queuedAt === 5,
+     'a saved entry is read back field by field')
+  ok(back[1]!.runtime === undefined && back[1]!.orchestration === undefined && back[1]!.chosen === undefined,
+     'an unknown runtime, level or effort from another build is dropped, not cast')
+  ok(parseSavedQueue(undefined).length === 0 && parseSavedQueue({}).length === 0, 'no saved queue is an empty one')
 }
 
 // --- the resume message, and the setting ----------------------------------------
