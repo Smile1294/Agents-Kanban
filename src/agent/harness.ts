@@ -64,6 +64,8 @@ export interface Harness {
   snapshot(target?: string): Promise<ToolContent>
   screenshot(opts: { fullPage?: boolean; target?: string }): Promise<ToolContent>
   act(a: Action): Promise<ToolContent>
+  /** Several actions, one report. */
+  steps?(list: Action[]): Promise<ToolContent>
   evaluate(expression: string): Promise<ToolContent>
   console(clear?: boolean): ToolContent
   close(): Promise<ToolContent>
@@ -121,6 +123,9 @@ export function bindHarness(deps: HarnessDeps, worktree: () => string | undefine
       if (have && (have.state === 'running' || have.state === 'starting')) {
         return ok(`${describeApp(have)}\nIt was already started — use app_logs for its output, app_stop to restart it.`)
       }
+      // The browser is what comes next; launch it while the app boots, so the
+      // first browser_open does not pay ~1s for Chromium on top.
+      deps.browser.warm?.()
       const recipe = await deps.recipe(cwd)
       if (!recipe) {
         return err(
@@ -194,6 +199,12 @@ export function bindHarness(deps: HarnessDeps, worktree: () => string | undefine
       settle()
       return ok(text)
     }),
+    steps: (list) => wrap(async () => {
+      const text = await deps.browser.steps(runKey, list)
+      actions += list.length
+      settle()
+      return ok(text)
+    }),
     evaluate: (expression) => wrap(async () => {
       const text = await deps.browser.evaluate(runKey, expression)
       settle()
@@ -217,7 +228,7 @@ export function bindHarness(deps: HarnessDeps, worktree: () => string | undefine
 /** The SDK's `tool` helper, as `tools.ts` receives it. */
 type ToolFn = Awaited<ReturnType<typeof loadSdk>>['tool']
 
-const TARGET = 'A Playwright selector: CSS ("#save", "form input[name=email]"), text ("text=Sign in") or role ("role=button[name=\\"Save\\"]"). The names in browser_snapshot are what role selectors match.'
+const TARGET = 'A ref from the Controls list that browser_open, browser_snapshot and browser_act print ("e12") — the fastest and surest — or a Playwright selector: CSS ("#save"), text ("text=Sign in") or role ("role=button[name=\\"Save\\"]").'
 
 /**
  * The definitions. Always built, whatever the context, so the auto-allow list
@@ -254,16 +265,18 @@ export function buildHarnessTools(h: Harness | undefined, tool: ToolFn) {
     ),
     tool(
       'browser_open',
-      'Open a page in your own headless browser (1280x800) and report its title plus any console errors or failed requests. ' +
-        'Omit url to open the app app_start is running. Only this machine\'s addresses (localhost) can be opened.',
+      'Open a page in your own headless browser (1280x800). Waits until the page has finished loading its data, then ' +
+        'reports its title, its Controls (buttons, links, inputs) each with a ref to target, and any console errors or failed ' +
+        'requests. Omit url to open the app app_start is running. Only this machine\'s addresses (localhost) can be opened.',
       { url: z.string().optional().describe('e.g. "http://localhost:5173/settings", or ":5173/settings"') },
       async (args) => (h ? h.open(args.url) : none()),
       { searchHint: 'browser open page navigate test ui' },
     ),
     tool(
       'browser_snapshot',
-      'The page as text: its accessibility tree (headings, buttons, links, inputs, their names and states). Cheap — ' +
-        'prefer it over a screenshot to find things and to check text and state. Pass a target to look at one part.',
+      'The page as text: its accessibility tree (headings, text, buttons, links, inputs, their names and states) and the ' +
+        'Controls list with refs. Cheap — prefer it over a screenshot. You rarely need it after an action: browser_act ' +
+        'already reports what changed. Pass a target to look at one part.',
       { target: z.string().optional().describe(TARGET) },
       async (args) => (h ? h.snapshot(args.target) : none()),
       { annotations: hint },
@@ -281,12 +294,24 @@ export function buildHarnessTools(h: Harness | undefined, tool: ToolFn) {
     ),
     tool(
       'browser_act',
-      'Do one thing on the page: click, fill (optionally submit with Enter), press a key, select an option, hover, ' +
-        'check/uncheck, scroll, or wait for an element. Reports where the page ended up and any new console errors.',
+      'Use the page: click, fill (optionally submit with Enter), press a key, select an option, hover, check/uncheck, ' +
+        'scroll, or wait (for an element, for some text, or for a time). Pass ONE action, or `steps` to do several in order ' +
+        '(fill a form and submit it in one call). Each step waits for the requests it set off and for the page to settle. ' +
+        'Then reports WHAT CHANGED (lines that appeared + and disappeared −, or "The page did not change"), where the page ' +
+        'is, new controls with refs, and any console errors — so you do not need a browser_snapshot to see the result.',
       {
-        action: z.enum(['click', 'fill', 'press', 'select', 'hover', 'check', 'uncheck', 'scroll', 'wait']),
+        steps: z.array(z.object({
+          action: z.enum(['click', 'fill', 'press', 'select', 'hover', 'check', 'uncheck', 'scroll', 'wait']),
+          target: z.string().optional(),
+          text: z.string().optional(),
+          key: z.string().optional(),
+          submit: z.boolean().optional(),
+          dy: z.number().optional(),
+          ms: z.number().optional(),
+        })).optional().describe('Several actions in order, each shaped like the single-action fields below. Stops at the first that fails.'),
+        action: z.enum(['click', 'fill', 'press', 'select', 'hover', 'check', 'uncheck', 'scroll', 'wait']).optional(),
         target: z.string().optional().describe(`${TARGET} Required for all but press, scroll and a timed wait.`),
-        text: z.string().optional().describe('fill: the text to type. select: the option value or label.'),
+        text: z.string().optional().describe('fill: the text to type. select: the option value or label. wait: text to wait for.'),
         key: z.string().optional().describe('press: e.g. "Enter", "Escape", "Control+A".'),
         submit: z.boolean().optional().describe('fill: press Enter afterwards.'),
         dy: z.number().optional().describe('scroll: pixels down (negative is up).'),
@@ -294,20 +319,14 @@ export function buildHarnessTools(h: Harness | undefined, tool: ToolFn) {
       },
       async (a) => {
         if (!h) return none()
-        const need = (v: string | undefined, what: string) => {
-          if (!v) throw new Error(`${a.action} needs \`${what}\`.`)
-          return v
-        }
         try {
-          const action: Action =
-            a.action === 'click' || a.action === 'hover' || a.action === 'check' || a.action === 'uncheck'
-              ? { action: a.action, target: need(a.target, 'target') }
-              : a.action === 'fill' ? { action: 'fill', target: need(a.target, 'target'), text: a.text ?? '', ...(a.submit ? { submit: true } : {}) }
-              : a.action === 'select' ? { action: 'select', target: need(a.target, 'target'), value: need(a.text, 'text') }
-              : a.action === 'press' ? { action: 'press', key: need(a.key, 'key'), ...(a.target ? { target: a.target } : {}) }
-              : a.action === 'scroll' ? { action: 'scroll', dy: a.dy ?? 600 }
-              : { action: 'wait', ...(a.target ? { target: a.target } : {}), ...(a.ms ? { ms: a.ms } : {}) }
-          return h.act(action)
+          if (a.steps?.length) {
+            if (a.steps.length > 20) return err('At most 20 steps in one call.')
+            const list = a.steps.map(toAction)
+            return h.steps ? h.steps(list) : h.act(list[0]!)
+          }
+          if (!a.action) return err('Pass `action` (one step) or `steps` (several).')
+          return h.act(toAction(a as StepArgs))
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e))
         }
@@ -336,12 +355,30 @@ export function buildHarnessTools(h: Harness | undefined, tool: ToolFn) {
   ]
 }
 
+interface StepArgs { action: Action['action']; target?: string; text?: string; key?: string; submit?: boolean; dy?: number; ms?: number }
+
+/** One step as the model wrote it, checked into an `Action`. */
+function toAction(a: StepArgs): Action {
+  const need = (v: string | undefined, what: string) => {
+    if (!v) throw new Error(`${a.action} needs \`${what}\`.`)
+    return v
+  }
+  return a.action === 'click' || a.action === 'hover' || a.action === 'check' || a.action === 'uncheck'
+    ? { action: a.action, target: need(a.target, 'target') }
+    : a.action === 'fill' ? { action: 'fill', target: need(a.target, 'target'), text: a.text ?? '', ...(a.submit ? { submit: true } : {}) }
+    : a.action === 'select' ? { action: 'select', target: need(a.target, 'target'), value: need(a.text, 'text') }
+    : a.action === 'press' ? { action: 'press', key: need(a.key, 'key'), ...(a.target ? { target: a.target } : {}) }
+    : a.action === 'scroll' ? { action: 'scroll', dy: a.dy ?? 600 }
+    : { action: 'wait', ...(a.target ? { target: a.target } : {}), ...(a.ms ? { ms: a.ms } : {}), ...(a.text ? { text: a.text } : {}) }
+}
+
 /** The brief's paragraph. Stated only where the tools work. */
 export function harnessBrief(required = false): string[] {
   return [
     'You can LOOK at your work. If the change shows up in a UI, check it before you hand it over:',
-    '`app_start` (starts the app in this worktree), `browser_open`, then `browser_snapshot` to',
-    'find things and `browser_act` to use them. `browser_screenshot` when appearance matters.',
+    '`app_start` (starts the app in this worktree), then `browser_open` — it lists the page\'s controls with refs',
+    '("e12"). Use them with `browser_act`, several steps in one call when you can (fill, fill, click); it reports',
+    'what changed, so you rarely need `browser_snapshot`. `browser_screenshot` only when appearance matters.',
     'Console errors and failed requests are reported with every step — fix them, or say why not.',
     'Put what you checked, and the screenshot paths, in `howToTest`.',
     ...(required

@@ -347,6 +347,33 @@ Asked for: "research-based features that really prove the acceptance rate of cod
 - A security scanner (Semgrep/Bandit) as a fourth check.
 - PR/CI feedback (Phase 9).
 
+## 4f. Seventh round — the agent's browser, faster and correct
+
+Asked for: "the harness able to use the browser faster or better, especially when it is just local". I measured the tools before changing them (a benchmark driving the real `BrowserPool` through open → look → fill → fill → click → verify, against a local page with an 80ms API call and a CSS transition).
+
+**The measurement found a correctness bug first.** After a click whose handler fetched, the tool returned in 61ms, before the response arrived at about 90ms. So the agent saw the page as it was *before* its own click. The `networkidle` wait after each action was a no-op: a page that reached network-idle at load stays there. An agent that clicks "Add" and sees no item either clicks again (a duplicate) or reports a bug that is not there.
+
+**Built** (`src/agent/browser.ts`, `src/agent/harness.ts`):
+- **Settle.** After an action, wait for the requests it set off (requests older than 2.5s, like a long poll or SSE, do not count), then for the DOM to go quiet (a MutationObserver, 100ms of stillness), all capped. Typing, hovering and ticking a box skip the quiet window when nothing is in flight.
+- **Refs.** `browser_open` and `browser_snapshot` list the page's controls as `[e12] button "Add"`. `browser_act` accepts `e12`, so there are no guessed selectors. A ref that has gone (the page re-rendered) is reported with the current list.
+- **Actions report what changed.** `~` for a line that changed, `+` for one that appeared, `−` for one that disappeared, or "The page did not change". Also where the page is and new controls, so a follow-up `browser_snapshot` is rarely needed.
+- **Batches.** `browser_act` takes `steps: [...]`, so a form is one call: fill, fill, click. It stops at the first failure and says which step.
+- **`wait` takes `text`.**
+- **Warm start.** `app_start` launches Chromium while the app boots.
+- **Calmer pages.** `reducedMotion` is set and animations and transitions are cut to 1ms (not 0, so `transitionend` and `animationend` still fire). Analytics and error-reporting beacons are aborted and not reported as the app failing; CDNs are left alone.
+
+**Numbers** (the same local flow, 3 runs each):
+
+| | Tool calls | Browser time | Sees the result of its click |
+|---|---|---|---|
+| Before | 6 | ~1,250 ms | **no** |
+| After, same calls | 6 | ~1,480 ms | yes (the settle costs ~150ms per click) |
+| After, refs + batch + warm | **2** | **~710 ms** | yes |
+
+Each tool call saved is a model turn, which costs seconds and tokens, far more than the browser time.
+
+**Real agent** (Sonnet 4.6, "+1 adds 2", the counter updates through a 120ms API call): `app_start`, `browser_open`, then ONE `browser_act` batch of 3 actions. It moved to review with `verified: {pages: 1, actions: 3, consoleErrors: 0}`. 28 seconds, $0.33.
+
 ## 5. What comparable harnesses have (research, September 2026)
 
 Sources were read directly where the network allowed; cursor.com,

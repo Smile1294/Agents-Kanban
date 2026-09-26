@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs'
 import * as http from 'node:http'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { allowedUrl, BrowserPool, describeEvents, findBrowser } from '../browser.ts'
+import { allowedUrl, BrowserPool, changeBlock, describeEvents, findBrowser, TRACKERS } from '../browser.ts'
 
 let fails = 0
 const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails++ } else console.log('  ok:', m) }
@@ -23,6 +23,13 @@ ok(allowedUrl('https://example.com', true).ok, '…and allowed only when the use
 ok(!allowedUrl('file:///etc/passwd').ok, 'file: is never a page the agent opens')
 ok(!allowedUrl('javascript:alert(1)').ok, 'neither is javascript:')
 ok(describeEvents([]).startsWith('No console errors'), 'no events is SAID, not left blank')
+ok(changeBlock('a\nb', 'a\nb') === 'The page did not change.', 'a click that changed nothing SAYS so')
+ok(changeBlock('- textbox "New"\n- list', '- textbox "New": milk\n- list:\n  - listitem: milk') === 'Page changed:\n~ - textbox "New": milk\n+ - listitem: milk',
+   'a field that gained a value is one change (~); a list that only gained children is not news; the new item is +')
+ok(/− - dialog "Confirm"/.test(changeBlock('- dialog "Confirm"\n- a', '- a')), 'what disappeared is −')
+ok(TRACKERS.test('https://www.google-analytics.com/g/collect?v=2') && TRACKERS.test('https://o123.ingest.sentry.io/api/1/envelope/')
+   && !TRACKERS.test('https://cdn.jsdelivr.net/npm/alpinejs') && !TRACKERS.test('http://localhost:5173/src/main.ts'),
+   'analytics beacons are blocked; a CDN an app loads its own code from is not')
 
 // ---------------------------------------------------------------------------
 // 2. A real page.
@@ -113,6 +120,53 @@ try {
   await pool.act('card-live', { action: 'click', target: '#add' })
   await new Promise((r) => setTimeout(r, 600))
   ok(frames.length === before, 'nothing is sent once the watch is stopped')
+
+  // --- Speed AND accuracy: what the agent sees after acting ------------------
+  // The bug this guards: after a click whose handler fetches, the action
+  // returned BEFORE the response (network-idle was already reached at load, so
+  // the wait was a no-op), and the agent saw the page as it was before its own
+  // click. Measured: answered in 61ms, the item arrived at ~90ms.
+  const app = `<!doctype html><title>Shop</title>
+<style>.box{transition: opacity 2s; animation: spin 3s infinite}@keyframes spin{to{transform:rotate(1turn)}}</style>
+<div class="box" id="box">box</div>
+<form id="f"><label>Item <input id="item"></label><label>Qty <input id="qty"></label><button>Add</button></form>
+<button id="noop">Nothing</button><ul id="cart"></ul>
+<script>
+fetch('https://www.google-analytics.com/g/collect').catch(() => {})
+document.getElementById('f').onsubmit = async (e) => { e.preventDefault()
+  const r = await fetch('/api/add?i=' + encodeURIComponent(document.getElementById('item').value))
+  const li = document.createElement('li'); li.textContent = await r.text(); document.getElementById('cart').append(li) }
+</script>`
+  const slow = http.createServer((q, res) => {
+    if (q.url?.startsWith('/api/add')) { setTimeout(() => res.end('added ' + new URL(q.url!, 'http://x').searchParams.get('i')), 150); return }
+    res.setHeader('content-type', 'text/html'); res.end(app)
+  })
+  await new Promise<void>((r) => slow.listen(0, '127.0.0.1', () => r()))
+  const shop = `http://localhost:${(slow.address() as { port: number }).port}/`
+  pool.warm()
+  const opened2 = await pool.open('shop', shop)
+  ok(/\[e\d+\] textbox "Item"/.test(opened2) && /\[e\d+\] button "Add"/.test(opened2), 'open lists the page\'s controls, each with a ref')
+  ok(!/google-analytics/.test(opened2) && !/google-analytics/.test(pool.console('shop')), 'a blocked analytics beacon is neither loaded nor reported as the app failing')
+  const ref = (name: string) => new RegExp(`\\[(e\\d+)\\] \\w+ "${name}"`).exec(opened2)?.[1]
+  const batch = await pool.steps('shop', [
+    { action: 'fill', target: ref('Item')!, text: 'milk' },
+    { action: 'fill', target: ref('Qty')!, text: '2' },
+    { action: 'click', target: ref('Add')! },
+  ])
+  ok(/\+ - listitem: added milk/.test(batch), `a batch by ref reports the RESULT of its click, after the 150ms response (${batch.split('\n').find((l) => /listitem/.test(l)) ?? 'MISSING'})`)
+  ok(/Done: fill e\d+ = "milk", fill e\d+ = "2", click e\d+\./.test(batch), 'and says each step it did')
+  const noop = await pool.act('shop', { action: 'click', target: '#noop' })
+  ok(/The page did not change\./.test(noop), 'a click that does nothing says so, which is the most useful thing it can report')
+  await pool.evaluate('shop', 'document.getElementById("noop").remove(), 1')
+  const stale = await pool.act('shop', { action: 'click', target: 'e999' })
+  ok(/Step 1 \(click e999\) failed: that ref is not on the page any more/.test(stale) && /Controls \(target them by ref/.test(stale),
+     `a ref that is gone is said plainly, with the current refs (${stale.split('\n')[0]})`)
+  const waited = await pool.act('shop', { action: 'wait', text: 'added milk' })
+  ok(waited.startsWith('Done: wait for "added milk"'), 'wait can wait for text')
+  const calm = await pool.evaluate('shop', 'getComputedStyle(document.getElementById("box")).animationDuration')
+  ok(calm.startsWith('"0.001s"'), `animations are calmed to 1ms in the agent's browser, not removed (${calm.split('\n')[0]})`)
+  await pool.close('shop')
+  slow.close()
 
   ok(await pool.close('card-1') && !pool.has('card-1'), 'close drops the card\'s page')
 } finally {

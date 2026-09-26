@@ -415,6 +415,12 @@ Working:
   wall-clock check within a minute, and a resume that fails offline retries in
   five minutes. See
   [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §4d.
+- **The agent's browser is fast and sees the truth.** Each action waits for the
+  requests it set off and for the page to settle; before, a click returned
+  before its own response and showed the old page. Controls come with refs
+  (`e12`), a form is one batched call, and every action reports what changed.
+  One real check went from about 6 browser calls to 2. See
+  [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §4f.
 - **The board checks the work itself, not only the agent.** At review (and on
   demand through `run_checks`) it runs the project's own lint, typecheck and
   related tests. A failure the base branch shares is pre-existing, not the

@@ -97,7 +97,65 @@ interface Tab {
    *  just do" is half of watching an agent test. */
   lastAction?: string
   shots: number
+  /** Requests in flight, and when each started — what `settle()` waits on. */
+  inflight: Map<Pw, number>
+  /** The page's ARIA tree as the agent last saw it, so an action can report
+   *  what CHANGED rather than making the agent ask again. */
+  lastTree?: string
 }
+
+/**
+ * Hosts that are never the app under test and only slow a page down or fill
+ * the console with noise: analytics, session replay, ad and error-reporting
+ * beacons. Aborted in the agent's browser. Not CDNs — an app may load its own
+ * scripts from one, and blocking that would break the thing being tested.
+ */
+export const TRACKERS = /^https?:\/\/([^/]*\.)?(google-analytics\.com|googletagmanager\.com|analytics\.google\.com|doubleclick\.net|hotjar\.com|segment\.(io|com)|mixpanel\.com|plausible\.io|clarity\.ms|fullstory\.com|intercom\.io|intercomcdn\.com|ingest\.sentry\.io|facebook\.net|connect\.facebook\.net|amplitude\.com|heapanalytics\.com|posthog\.com)(\/|:|$)/i
+
+/**
+ * Animations and transitions shortened to 1ms in the agent's browser. A click
+ * waits for its target to stop moving, and a screenshot mid-fade shows a state
+ * the user never sees at rest. 1ms and not 0: a zero-length transition fires
+ * no `transitionend`, and UIs that wait for one would hang.
+ */
+const CALM_CSS = '*,*::before,*::after{transition-duration:1ms!important;transition-delay:0s!important;' +
+  'animation-duration:1ms!important;animation-delay:0s!important;scroll-behavior:auto!important}'
+
+/** Requests older than this do not hold `settle()` up: a long poll, an SSE
+ *  stream or a hung call would otherwise make every action wait its cap. */
+const LONG_LIVED_MS = 2500
+
+/** The interactive elements of the page, each tagged with a ref the agent can
+ *  target (`e12`). Runs IN the page. Refs are stable across calls for an
+ *  element that survives; a re-rendered element gets a new one. */
+const REFS_SCRIPT = `(() => {
+  const w = window
+  w.__akRef = w.__akRef || 0
+  const sel = 'a[href],button,input:not([type=hidden]),select,textarea,summary,[role=button],[role=link],[role=checkbox],[role=radio],[role=switch],[role=tab],[role=menuitem],[role=option],[role=combobox],[role=textbox],[contenteditable=""],[contenteditable=true],[onclick]'
+  const out = []
+  for (const el of document.querySelectorAll(sel)) {
+    if (out.length >= 150) break
+    const r = el.getBoundingClientRect()
+    const style = getComputedStyle(el)
+    if ((r.width === 0 && r.height === 0) || style.visibility === 'hidden' || style.display === 'none') continue
+    let ref = el.getAttribute('data-ak-ref')
+    if (!ref) { ref = 'e' + (++w.__akRef); el.setAttribute('data-ak-ref', ref) }
+    const tag = el.tagName.toLowerCase()
+    const type = (el.getAttribute('type') || '').toLowerCase()
+    const role = el.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'button' || type === 'submit' || type === 'button' ? 'button'
+      : tag === 'select' ? 'combobox' : tag === 'textarea' ? 'textbox' : type === 'checkbox' ? 'checkbox' : type === 'radio' ? 'radio'
+      : tag === 'input' ? 'textbox' : tag === 'summary' ? 'disclosure' : 'clickable')
+    const label = el.getAttribute('aria-label') || (el.labels && el.labels[0] && el.labels[0].innerText) || el.getAttribute('placeholder')
+      || (tag !== 'input' && tag !== 'select' && tag !== 'textarea' ? el.innerText : '') || el.getAttribute('title') || el.getAttribute('name') || ''
+    const bits = []
+    if ('value' in el && tag !== 'button' && el.value && type !== 'password') bits.push('value "' + String(el.value).slice(0, 40) + '"')
+    if (el.checked) bits.push('checked')
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') bits.push('disabled')
+    if (el.getAttribute('aria-expanded')) bits.push('expanded=' + el.getAttribute('aria-expanded'))
+    out.push('[' + ref + '] ' + role + ' "' + String(label).replace(/\\s+/g, ' ').trim().slice(0, 60) + '"' + (bits.length ? ' (' + bits.join(', ') + ')' : ''))
+  }
+  return out
+})()`
 
 /** Is this URL one the agent may open without the user having widened it? */
 export function allowedUrl(raw: string, allowExternal = false): { ok: true; url: string } | { ok: false; message: string } {
@@ -191,7 +249,61 @@ export type Action =
   | { action: 'hover'; target: string }
   | { action: 'check' | 'uncheck'; target: string }
   | { action: 'scroll'; dy: number }
-  | { action: 'wait'; target?: string; ms?: number }
+  | { action: 'wait'; target?: string; ms?: number; text?: string }
+
+function describeAction(a: Action): string {
+  switch (a.action) {
+    case 'fill': return `fill ${a.target} = "${a.text.slice(0, 30)}"${a.submit ? ' + Enter' : ''}`
+    case 'press': return `press ${a.key}${a.target ? ` in ${a.target}` : ''}`
+    case 'select': return `select ${a.value} in ${a.target}`
+    case 'scroll': return `scroll ${a.dy}`
+    case 'wait': return `wait for ${a.text ? `"${a.text}"` : a.target ?? `${a.ms ?? 1000}ms`}`
+    default: return `${a.action} ${a.target}`
+  }
+}
+
+/** The ref list, as the agent reads it. */
+export function refsBlock(refs: readonly string[], max: number): string {
+  return `Controls (target them by ref, e.g. "${refs[0]?.slice(1, refs[0].indexOf(']')) ?? 'e1'}"):\n` +
+    refs.slice(0, max).join('\n') + (refs.length > max ? `\n… ${refs.length - max} more — browser_snapshot lists them all` : '')
+}
+
+/**
+ * What changed between two ARIA trees, as lines that changed (~), appeared (+)
+ * and disappeared (−). A multiset difference, not an ordered diff: the agent needs
+ * "a listitem 'milk' appeared", and a line that only MOVED is not news.
+ * "The page did not change" is said out loud — it is the most useful thing a
+ * click that did nothing can report.
+ */
+export function changeBlock(before: string, after: string, max = 30): string {
+  if (before === after) return 'The page did not change.'
+  const count = (t: string) => {
+    const m = new Map<string, number>()
+    for (const l of t.split('\n')) { const k = l.trim(); if (k) m.set(k, (m.get(k) ?? 0) + 1) }
+    return m
+  }
+  const a = count(before), b = count(after)
+  const added: string[] = [], removed: string[] = []
+  for (const [k, n] of b) for (let i = (a.get(k) ?? 0); i < n; i++) added.push(k)
+  for (const [k, n] of a) for (let i = (b.get(k) ?? 0); i < n; i++) removed.push(k)
+  if (!added.length && !removed.length) return 'The page did not change (only reordered).'
+  // A line that gained a value or children is one CHANGE, not a removal and
+  // an addition: `textbox "New"` → `textbox "New": milk` reads as "~ …milk".
+  // One that only gained children (`list` → `list:`) is structure, not news.
+  const changed: string[] = []
+  for (let i = removed.length - 1; i >= 0; i--) {
+    const r = removed[i]!.replace(/:$/, '')
+    const j = added.findIndex((x) => x === `${r}:` || x.startsWith(`${r}: `) || x.startsWith(`${r} [`))
+    if (j < 0) continue
+    const [a2] = added.splice(j, 1)
+    removed.splice(i, 1)
+    if (a2 !== `${r}:`) changed.unshift(a2!)
+  }
+  if (!added.length && !removed.length && !changed.length) return 'The page did not change (only its structure).'
+  const shown = [...changed.map((l) => `~ ${l}`), ...added.map((l) => `+ ${l}`), ...removed.map((l) => `− ${l}`)]
+  return `Page changed:\n${shown.slice(0, max).join('\n')}` +
+    (shown.length > max ? `\n… ${shown.length - max} more lines changed — browser_snapshot for the whole page` : '')
+}
 
 /**
  * Every card's browser tab.
@@ -262,9 +374,13 @@ export class BrowserPool {
     const have = this.tabs.get(key)
     if (have && !have.page.isClosed()) return have
     const browser = await this.launch()
-    const context = await browser.newContext({ viewport: VIEWPORT, ignoreHTTPSErrors: true })
+    const context = await browser.newContext({ viewport: VIEWPORT, ignoreHTTPSErrors: true, reducedMotion: 'reduce' })
+    await context.addInitScript(`(() => { const add = () => { const s = document.createElement('style'); s.setAttribute('data-ak', 'calm'); s.textContent = ${JSON.stringify(CALM_CSS)}; (document.head || document.documentElement).appendChild(s) }; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add() })()`).catch(() => {})
+    await context.route(TRACKERS, (r: Pw) => r.abort()).catch(() => {})
     const page = await context.newPage()
-    const tab: Tab = { context, page, events: [], seen: 0, openedAt: 0, shots: have?.shots ?? 0 }
+    const tab: Tab = { context, page, events: [], seen: 0, openedAt: 0, shots: have?.shots ?? 0, inflight: new Map() }
+    page.on('request', (r: Pw) => { tab.inflight.set(r, Date.now()) })
+    page.on('requestfinished', (r: Pw) => { tab.inflight.delete(r) })
     const add = (e: Omit<PageEvent, 'at'>) => {
       tab.events.push({ ...e, at: Date.now() })
       if (tab.events.length > 500) {
@@ -279,7 +395,10 @@ export class BrowserPool {
     })
     page.on('pageerror', (e: Error) => add({ kind: 'pageerror', text: e.stack?.split('\n').slice(0, 4).join(' | ') ?? e.message }))
     page.on('requestfailed', (r: Pw) => {
+      tab.inflight.delete(r)
       const why = r.failure()?.errorText ?? 'failed'
+      // Our own tracker block is not the app failing.
+      if (TRACKERS.test(r.url())) return
       // Navigating away cancels in-flight requests; that is not the app's fault.
       if (/ERR_ABORTED/.test(why)) return
       add({ kind: 'requestfailed', text: `${r.method()} ${r.url()} — ${why}` })
@@ -372,20 +491,90 @@ export class BrowserPool {
       }
       throw new Error(`Could not open ${allowed.url}: ${first}`)
     }
-    // Most apps render after `load`; give client-side rendering a moment
-    // without waiting on a websocket that never goes idle.
-    await tab.page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {})
+    // Most apps render after `load`: wait for the requests they start and
+    // the DOM they build to go quiet (a websocket never counts).
+    await this.settle(tab, 5000)
     const status = res?.status?.()
-    return `Opened ${await this.where(tab)}${status && status >= 400 ? ` (HTTP ${status})` : ''}${this.news(tab)}`
+    tab.lastTree = await this.tree(tab)
+    const refs = await this.refs(tab)
+    return `Opened ${await this.where(tab)}${status && status >= 400 ? ` (HTTP ${status})` : ''}` +
+      (refs.length ? `\n\n${refsBlock(refs, 60)}` : '\n\nNo buttons, links or inputs on this page.') +
+      `\n\nbrowser_snapshot for the whole page as text.${this.news(tab)}`
+  }
+
+  /** Launch the browser now, in the background, so the first `browser_open`
+   *  does not pay for it. Called when an agent starts its app. */
+  warm(): void {
+    void this.launch().catch(() => {})
+  }
+
+  /**
+   * Wait for what an action set off to finish: the requests it started, then
+   * the DOM going quiet — capped, never forever.
+   *
+   * `waitForLoadState('networkidle')` after an action was a NO-OP: a page
+   * that reached network-idle once stays there, so it returned at once. A
+   * click whose handler fetched something came back BEFORE the response, the
+   * agent saw the page as it was before its own click, and either clicked
+   * again (a duplicate) or reported a bug that was not there. Measured: a
+   * click on "Add" answered in 61ms, the item arrived at ~90ms.
+   */
+  private async settle(tab: Tab, capMs = 3000, light = false): Promise<void> {
+    const t0 = Date.now()
+    const left = () => capMs - (Date.now() - t0)
+    // A handler's fetch starts in a microtask or a frame after the event.
+    await new Promise((r) => setTimeout(r, light ? 15 : 30))
+    // Typing into a field, hovering or ticking a box usually starts nothing:
+    // when nothing is in flight, do not wait out a quiet window for it.
+    if (light && ![...tab.inflight.values()].some((at) => Date.now() - at < LONG_LIVED_MS)) return
+    for (let round = 0; left() > 0 && round < 20; round++) {
+      const now = Date.now()
+      const busy = [...tab.inflight.values()].some((at) => now - at < LONG_LIVED_MS)
+      if (busy) { await new Promise((r) => setTimeout(r, 25)); continue }
+      const before = tab.inflight.size
+      const quiet = await tab.page.evaluate(`new Promise((res) => {
+        let t; const done = () => { mo.disconnect(); clearTimeout(cap); res(true) }
+        const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(done, 100) })
+        mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: true })
+        t = setTimeout(done, 100); const cap = setTimeout(done, ${Math.max(100, Math.min(1500, left()))})
+      })`).catch(() => false)
+      if (!quiet) {
+        // The page navigated under us (a form post, a link): wait for the new one.
+        await tab.page.waitForLoadState('domcontentloaded', { timeout: Math.max(100, left()) }).catch(() => {})
+        continue
+      }
+      // Nothing new started while the DOM was settling: done.
+      if (tab.inflight.size <= before && ![...tab.inflight.values()].some((at) => Date.now() - at < LONG_LIVED_MS)) return
+    }
+  }
+
+  /** The ARIA tree of the page, or '' when it cannot be read. */
+  private async tree(tab: Tab): Promise<string> {
+    return await tab.page.locator('body').ariaSnapshot({ timeout: 5000 }).catch(() => '') as string
+  }
+
+  /** The interactive elements, with refs. */
+  private async refs(tab: Tab): Promise<string[]> {
+    const r = await tab.page.evaluate(REFS_SCRIPT).catch(() => [])
+    return Array.isArray(r) ? r.filter((x): x is string => typeof x === 'string') : []
+  }
+
+  /** A target the agent wrote: a ref from the list (`e12`, `[e12]`,
+   *  `ref=e12`) or any Playwright selector. */
+  private locate(tab: Tab, target: string): Pw {
+    const ref = /^\[?(?:ref=)?(e\d+)\]?$/.exec(target.trim())
+    return tab.page.locator(ref ? `[data-ak-ref="${ref[1]}"]` : target).first()
   }
 
   /** The ARIA tree of the page (or of one element) — the cheap way to see it. */
   async snapshot(key: string, target?: string): Promise<string> {
     const tab = this.requireTab(key)
-    const loc = target ? tab.page.locator(target).first() : tab.page.locator('body')
+    const loc = target ? this.locate(tab, target) : tab.page.locator('body')
     const tree: string = await loc.ariaSnapshot({ timeout: 5000 })
+    if (!target) tab.lastTree = tree
     const cut = tree.length > 12_000 ? `${tree.slice(0, 12_000)}\n… (truncated; pass a target to look at one part)` : tree
-    return `${await this.where(tab)}\n\n${cut}${this.news(tab)}`
+    const refs = target ? [] : await this.refs(tab)
+    return `${await this.where(tab)}\n\n${cut}${refs.length ? `\n\n${refsBlock(refs, 150)}` : ''}${this.news(tab)}`
   }
 
   /** A JPEG of the viewport, the full page or one element, and where it was saved. */
@@ -393,7 +582,7 @@ export class BrowserPool {
     const tab = this.requireTab(key)
     const shotOpts = { type: 'jpeg', quality: 70, timeout: 10_000 }
     const buf: Buffer = opts.target
-      ? await tab.page.locator(opts.target).first().screenshot(shotOpts)
+      ? await this.locate(tab, opts.target).screenshot(shotOpts)
       : await tab.page.screenshot({ ...shotOpts, fullPage: opts.fullPage === true })
     let saved: string | undefined
     if (this.opts.shotsDir) {
@@ -406,8 +595,53 @@ export class BrowserPool {
     return { data: buf.toString('base64'), mimeType: 'image/jpeg', ...(saved ? { saved } : {}), where: await this.where(tab), news: this.news(tab) }
   }
 
+  /** One action, and what it changed. */
   async act(key: string, a: Action): Promise<string> {
+    return this.steps(key, [a])
+  }
+
+  /**
+   * Several actions in order — a form is fill, fill, click — stopping at the
+   * first that fails, then ONE report of what the page looks like now: what
+   * appeared and disappeared, where it is, new controls with their refs, and
+   * any errors. The report is what the agent would otherwise call
+   * `browser_snapshot` for, which is a whole model turn per action.
+   */
+  async steps(key: string, list: readonly Action[]): Promise<string> {
     const tab = this.requireTab(key)
+    const before = tab.lastTree ?? await this.tree(tab)
+    const refsBefore = new Set((await this.refs(tab)).map((l) => l.split(' ')[0]))
+    const urlBefore = tab.page.url()
+    const done: string[] = []
+    let failed: string | undefined
+    for (const [i, a] of list.entries()) {
+      try {
+        await this.step(tab, a)
+        done.push(describeAction(a))
+      } catch (e) {
+        const first = String(e instanceof Error ? e.message : e).split('\n')[0] ?? ''
+        const gone = /^\[?(?:ref=)?e\d+\]?$/.test(('target' in a && a.target) || '') && /waiting for locator|Timeout/.test(first)
+        failed = `Step ${i + 1}${list.length > 1 ? ` of ${list.length}` : ''} (${describeAction(a)}) failed: ` +
+          (gone ? `that ref is not on the page any more (it re-rendered). Use a ref from the list below.` : first)
+        break
+      }
+    }
+    const after = await this.tree(tab)
+    tab.lastTree = after
+    const refsNow = await this.refs(tab)
+    const lines: string[] = []
+    lines.push(failed ?? `Done: ${done.join(', ')}.`)
+    if (failed && done.length) lines.push(`Before that: ${done.join(', ')}.`)
+    const urlNow = tab.page.url()
+    lines.push(`${urlNow !== urlBefore ? 'Navigated to' : 'At'} ${await this.where(tab)}`)
+    lines.push(changeBlock(before, after))
+    const fresh = refsNow.filter((l) => !refsBefore.has(l.split(' ')[0]))
+    if (failed) lines.push(refsBlock(refsNow, 60))
+    else if (fresh.length) lines.push(`New controls:\n${fresh.slice(0, 20).join('\n')}`)
+    return lines.join('\n') + this.news(tab)
+  }
+
+  private async step(tab: Tab, a: Action): Promise<void> {
     tab.lastAction = a.action === 'fill' ? `fill ${a.target} = "${a.text.slice(0, 40)}"`
       : a.action === 'press' ? `press ${a.key}`
       : a.action === 'scroll' ? `scroll ${a.dy}`
@@ -415,7 +649,7 @@ export class BrowserPool {
       : a.action === 'select' ? `select ${a.target} = ${a.value}`
       : `${a.action} ${a.target}`
     const page = tab.page
-    const loc = (t: string) => page.locator(t).first()
+    const loc = (t: string) => this.locate(tab, t)
     const timeout = { timeout: 8000 }
     switch (a.action) {
       case 'click': await loc(a.target).click(timeout); break
@@ -430,12 +664,13 @@ export class BrowserPool {
       case 'uncheck': await loc(a.target).uncheck(timeout); break
       case 'scroll': await page.mouse.wheel(0, a.dy); break
       case 'wait':
-        if (a.target) await loc(a.target).waitFor({ timeout: Math.min(a.ms ?? 10_000, 30_000) })
+        if (a.text) await page.getByText(a.text).first().waitFor({ timeout: Math.min(a.ms ?? 10_000, 30_000) })
+        else if (a.target) await loc(a.target).waitFor({ timeout: Math.min(a.ms ?? 10_000, 30_000) })
         else await page.waitForTimeout(Math.min(a.ms ?? 1000, 10_000))
         break
     }
-    await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {})
-    return `Done: ${a.action}. Now at ${await this.where(tab)}${this.news(tab)}`
+    const light = (a.action === 'fill' && !a.submit) || a.action === 'hover' || a.action === 'check' || a.action === 'uncheck' || a.action === 'wait'
+    await this.settle(tab, 3000, light)
   }
 
   /** Run an expression in the page and return its JSON. */
