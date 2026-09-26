@@ -94,7 +94,7 @@ import {
 // See agent/runtimes/index.ts for why registration is explicit rather than
 // happening wherever an implementation happens to be imported first.
 import './agent/runtimes/index.ts'
-import type { LimitReading, ParkedRecord } from './agent/limits.ts'
+import { parseLimitMode, type LimitReading, type ParkedRecord } from './agent/limits.ts'
 import {
   allRuntimes, DEFAULT_RUNTIME, getRuntime, parseRuntimeId,
   type Meter, type RuntimeId, type RuntimeStatus,
@@ -298,6 +298,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   const uiParked = (p: ParkedRecord) => ({
     until: p.until, reason: p.reason, auto: p.auto, attempts: p.attempts, ...(p.estimated ? { estimated: true } : {}),
+    ...(p.stoppedTasks?.length ? { stoppedTasks: p.stoppedTasks } : {}),
   })
   const isLive = (a: { state: { kind: string } }) =>
     ['starting', 'working', 'needsInput', 'waiting'].includes(a.state.kind)
@@ -3186,8 +3187,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Read on every meter reading, so a changed cap applies to the turn in flight.
         spendCapUsd: () => cfg().get<number>('maxSpendPerMessageUsd') || undefined,
         autoVerify: () => autoVerifyMode(),
-        // Read when the limit lifts, so turning it off stops a pending resume.
-        resumeAfterLimit: () => cfg().get<boolean>('resumeAfterLimit') !== false,
+        // Read at every decision, so changing it applies at once — including
+        // to a resume that is already scheduled.
+        limitMode: () => parseLimitMode(cfg().get<string>('usageLimits')),
         providerFor: (key) => sessionProviderFor(key),
         worktrees: w.worktrees,
         board: w.board,

@@ -364,6 +364,29 @@ export interface ParkedRecord {
   /** Whether the board resumes it by itself when `until` passes. */
   auto: boolean
   estimated?: boolean
+  /**
+   * Background agents (the `Agent`/`Task` tool) that were still running when
+   * the limit stopped the run. They were children of that CLI process and died
+   * with it; the resume has to SAY so, or the agent waits for reports that
+   * will never arrive. Descriptions, capped at `MAX_STOPPED_TASKS`.
+   */
+  stoppedTasks?: string[]
+}
+
+export const MAX_STOPPED_TASKS = 8
+
+/**
+ * What the board does about an account's limit — `agentsKanban.usageLimits`.
+ *  - `resume`: park the refused run, hold the account's new work, resume when
+ *    the limit resets (the default);
+ *  - `pause`: the same, but nothing resumes by itself — you press Resume;
+ *  - `off`: only SHOW the readings. Nothing is parked or held, and a refused
+ *    run ends as the error it was.
+ */
+export type LimitMode = 'resume' | 'pause' | 'off'
+
+export function parseLimitMode(raw: unknown): LimitMode {
+  return raw === 'pause' || raw === 'off' ? raw : 'resume'
 }
 
 /** Resumes into a limit before the board stops trying by itself. A reset time
@@ -381,6 +404,9 @@ export function parseParked(raw: unknown): ParkedRecord | undefined {
     attempts: Math.max(0, Math.floor(num(p.attempts) ?? 0)),
     auto: p.auto !== false,
     ...(p.estimated === true ? { estimated: true } : {}),
+    ...(Array.isArray(p.stoppedTasks) && p.stoppedTasks.some((t) => typeof t === 'string' && t.trim())
+      ? { stoppedTasks: p.stoppedTasks.filter((t): t is string => typeof t === 'string' && !!t.trim()).slice(0, MAX_STOPPED_TASKS) }
+      : {}),
   }
 }
 
@@ -389,3 +415,21 @@ export function parseParked(raw: unknown): ParkedRecord | undefined {
 export const RESUME_PROMPT =
   'Your previous turn was cut off because this account reached its usage limit, and the limit has now reset. ' +
   'Carry on from where you stopped. If the work was already finished, say so and move the card on as usual.'
+
+/** The resume message for one parked card: `RESUME_PROMPT`, plus the
+ *  background agents that died with the run, by name — each is either work to
+ *  launch again or work to decide is no longer needed, never a report to wait
+ *  for. */
+export function resumePrompt(p: Pick<ParkedRecord, 'stoppedTasks'> | undefined): string {
+  const tasks = p?.stoppedTasks ?? []
+  if (!tasks.length) return RESUME_PROMPT
+  return [
+    RESUME_PROMPT,
+    '',
+    `When the limit stopped you, ${tasks.length === 1 ? 'this background agent was' : `these ${tasks.length} background agents were`} still running. ` +
+      'They were STOPPED with your process and will not report back:',
+    ...tasks.map((t) => `- ${t.replace(/\s+/g, ' ').slice(0, 160)}`),
+    '',
+    'Launch again any whose result you still need; do not wait for them.',
+  ].join('\n')
+}

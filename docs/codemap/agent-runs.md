@@ -167,7 +167,10 @@ warning only. `LimitTracker` keeps one reading per account, backs off
 15m×2ⁿ (cap 2h) when no reset is stated and marks it `estimated`, never lets a
 vaguer report shorten a stated reset, and clears on any non-limited reading.
 `ParkedRecord`/`parseParked` is the sidecar shape; `MAX_AUTO_RESUMES = 3`;
-`RESUME_PROMPT` allows "it was already finished". Tests: `limits.test.ts`
+`RESUME_PROMPT` allows "it was already finished"; `resumePrompt(parked)` adds
+the background agents that died with the run (`stoppedTasks`, at most
+`MAX_STOPPED_TASKS`) by name. `LimitMode`/`parseLimitMode` is
+`agentsKanban.usageLimits`: `resume` | `pause` | `off`. Tests: `limits.test.ts`
 (pure, including the real probed frame), `limit-resume.test.ts` (the real
 manager: park, hold, wake, resume, the attempt bound, restart).
 
@@ -182,13 +185,17 @@ session id is re-queued instead. `start()` and `drain()` hold any run whose
 account is limited (`heldUntil`) — per account, so one limited account never
 blocks another's queue; `ignoreLimit` (set by `start()` for a user-forced
 resume) is the only way past. `wake()` lifts, drains, and `resumeParked()`s
-every parked card of that account whose record says `auto` (the setting is
-read then) via `send()` with the host's `providerFor(key)`; each resume carries
+every parked card of that account whose record says `auto` (and only in
+`resume` mode, read then) via `send()` with `resumePrompt(p)` with the host's `providerFor(key)`; each resume carries
 its attempt number (`pendingResume` → `RunningAgent.resumeAttempt`), and the
 third resume into the limit parks with `auto: false`. Any resume clears the
 park (`parked: null`, in `launchInner`, like `switchedFrom`).
 `restoreParked()` re-arms the tracker and timers from the sidecar after a
-restart. `describeUsage()` is `usage_status`'s text.
+restart. `describeUsage()` is `usage_status`'s text. `mode()` is read at
+every decision: `off` makes `park()`, `heldUntil()` and the first-turn
+re-queue no-ops (readings are still kept); `pause` parks with `auto: false`.
+`park()` reads `backgroundTasks()` off the run BEFORE its first await — the
+run is still registered then, and its background agents die with it.
 
 ## How it works
 
@@ -264,6 +271,8 @@ started column while the title is still the guess.
 - Nothing re-runs a parent once its subtasks land.
 
 ## Recent changes
+
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `agentsKanban.usageLimits` (`resume`/`pause`/`off`, `ManagerOptions.limitMode`) replaces `resumeAfterLimit`; `park()` records the background agents still running (`AgentRun.backgroundTasks()` → `ParkedRecord.stoppedTasks`) and the resume names them (`resumePrompt`); `AgentSession` routes `rate_limit_event` and `api_retry` BEFORE the subagent early-return, so a subagent's 429 retry reaches the tracker.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · account usage limits, host-side and vendor-neutral: `limits.ts` (Claude `rate_limit_event`, Codex plan meter, any vendor's error text → one reading per `<runtime>|<profile>`), `AgentSession` emits `limit` for `rate_limit_event` and a 429 `api_retry`; the manager parks a refused run (`SessionMeta.parked`), holds that account's new runs in the queue, wakes on a per-account timer and resumes parked cards (`resumeAfterLimit`, 3-attempt bound), re-arms from the sidecar (`restoreParked`); read-only, auto-allowed `usage_status` board tool.
 

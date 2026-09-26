@@ -5,7 +5,8 @@
    stated time, and a back-off that never grows. */
 import {
   accountKey, BACKOFF_MS, durationMs, limitFromErrorText, limitFromPlanMeter, limitFromRetry,
-  LimitTracker, nextClockTime, parseClaudeRateLimit, parseParked, resetTimeIn,
+  LimitTracker, nextClockTime, parseClaudeRateLimit, parseLimitMode, parseParked, resetTimeIn,
+  RESUME_PROMPT, resumePrompt,
 } from '../limits.ts'
 import { AgentSession } from '../session.ts'
 
@@ -109,7 +110,20 @@ ok(limitFromRetry({ error_status: 500 }, now) === undefined, 'a 500 retry is not
   ok(JSON.stringify(parseParked(JSON.parse(JSON.stringify(p)))) === JSON.stringify(p), 'a parked record round-trips')
   ok(parseParked({ until: 'soon', account: 'x' }) === undefined && parseParked({ until: 5 }) === undefined, 'a bad one is rejected whole')
   ok(parseParked({ until: 5, account: 'a' })!.auto === true, 'auto-resume is the default')
+  const withTasks = parseParked({ until: 5, account: 'a', stoppedTasks: ['Research X', 42, '', 'Audit Y'] })!
+  ok(withTasks.stoppedTasks?.join('|') === 'Research X|Audit Y', 'stopped background agents are read back, junk dropped')
 }
+
+// --- the resume message, and the setting ----------------------------------------
+ok(resumePrompt(undefined) === RESUME_PROMPT && resumePrompt({}) === RESUME_PROMPT, 'nothing stopped: the plain resume')
+{
+  const t = resumePrompt({ stoppedTasks: ['Research the payments API'] })
+  ok(t.startsWith(RESUME_PROMPT) && t.includes('this background agent was') && t.includes('- Research the payments API')
+     && /will not report back/.test(t) && /Launch again/.test(t), 'one stopped agent is named, with "do not wait for it"')
+  ok(resumePrompt({ stoppedTasks: ['a', 'b'] }).includes('these 2 background agents were'), 'several are counted')
+}
+ok(parseLimitMode('pause') === 'pause' && parseLimitMode('off') === 'off' && parseLimitMode(undefined) === 'resume' && parseLimitMode('banana') === 'resume',
+   'usageLimits: pause and off are read; anything else is the default, resume')
 
 // --- the session hands both frames to the host, raw ------------------------------
 {
@@ -125,6 +139,10 @@ ok(limitFromRetry({ error_status: 500 }, now) === undefined, 'a 500 retry is not
   feed({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 10, retry_delay_ms: 5000, error_status: 429, error: 'rate_limit', uuid: 'u', session_id: 's' })
   ok(seen.length === 2 && seen[0]!.raw === real && !seen[0]!.retry, 'a rate_limit_event reaches the host with its info untouched')
   ok(seen[1]!.retry === true && limitFromRetry(seen[1]!.raw, now)!.status === 'warning', 'an api_retry reaches it marked as a retry')
+  // A SUBAGENT spends the same account: its retry must reach the host too,
+  // not vanish into the subagent routing (which returns early).
+  feed({ type: 'system', subtype: 'api_retry', attempt: 3, max_retries: 10, retry_delay_ms: 9000, error_status: 429, error: 'rate_limit', parent_tool_use_id: 'toolu_task', uuid: 'u', session_id: 's' })
+  ok(seen.length === 3 && seen[2]!.retry === true, 'a subagent\'s 429 retry reaches the host as well')
 }
 
 if (fails) { console.log(`${fails} failure(s)`); process.exit(1) }

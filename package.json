@@ -211,10 +211,16 @@
           "minimum": 0,
           "markdownDescription": "Pause an agent when the work for ONE message you sent has cost more than this many dollars (0 = no cap). The session stays open; your next message starts a new allowance. Applies to dollar-priced sessions only — a subscription (Codex on ChatGPT) has no dollar figure to cap."
         },
-        "agentsKanban.resumeAfterLimit": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "When an agent stops because its ACCOUNT reached a usage limit (a Claude or ChatGPT subscription window, a gateway's rate limit, any vendor's quota), park the card and resume it automatically once the limit resets. New tasks on that account wait in the queue meanwhile; other accounts keep running. The board stops resuming by itself after 3 resumes straight into the limit. Off: cards are still parked and show the reset time, and you press Resume."
+        "agentsKanban.usageLimits": {
+          "type": "string",
+          "enum": ["resume", "pause", "off"],
+          "enumDescriptions": [
+            "When an agent stops because its ACCOUNT reached a usage limit (a Claude or ChatGPT subscription window, a gateway's rate limit, any vendor's quota), park the card, hold that account's new tasks in the queue while other accounts keep running, and resume parked cards when the limit resets. Stops resuming by itself after 3 resumes straight into the limit.",
+            "The same, but nothing resumes by itself: parked cards show when the account is back, and you press Resume.",
+            "Only show the readings (the usage strip, the status bar). Nothing is parked or held; a run the limit refused ends as the error it was."
+          ],
+          "default": "resume",
+          "markdownDescription": "What the board does when an account runs into its usage limit. The limit is tracked by the extension, whichever company's agent is running."
         },
         "agentsKanban.autoVerify": {
           "type": "string",

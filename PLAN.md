@@ -407,7 +407,10 @@ Working:
   with the reset time (in the sidecar, so a restart re-arms it), new work for
   that account waits in the queue while other accounts keep running, and the
   board resumes parked cards when the limit resets — at most three times into
-  the same limit. `usage_status` lets an agent read its budget. See
+  the same limit. `agentsKanban.usageLimits` is `resume` / `pause` / `off`.
+  Background agents that die with a limited run are named in its resume, so
+  the agent relaunches them instead of waiting. `usage_status` lets an agent
+  read its budget. See
   [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §4d.
 - **Draw on an image before sending it** — numbered boxes and arrows, pen,
   labels; flattened into the image, and the message says the marks are yours.

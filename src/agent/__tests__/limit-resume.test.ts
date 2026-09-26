@@ -16,7 +16,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { registerRuntime, type AgentRuntime, type RunSpec } from '../runtime.ts'
 import { AgentManager } from '../manager.ts'
-import { MAX_AUTO_RESUMES, RESUME_PROMPT, type ParkedRecord } from '../limits.ts'
+import { MAX_AUTO_RESUMES, RESUME_PROMPT, type LimitMode, type ParkedRecord } from '../limits.ts'
 import { WorktreeService } from '../../git/worktree.ts'
 import { DEFAULT_BOARD } from '../../board/config.ts'
 
@@ -27,7 +27,7 @@ const ok = (c: boolean, m: string) => { if (!c) { console.log('FAIL:', m); fails
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 // --- a fake runtime that records every run ------------------------------------
-type Fake = EventEmitter & { spec: RunSpec; prompt?: string }
+type Fake = EventEmitter & { spec: RunSpec; prompt?: string; tasks?: string[] }
 const runs: Fake[] = []
 const descriptor = (id: 'claude' | 'codex', providerProfiles: boolean): AgentRuntime => ({
   id, label: id, vendor: 'test', blurb: '', installHint: 'n/a',
@@ -43,6 +43,7 @@ const descriptor = (id: 'claude' | 'codex', providerProfiles: boolean): AgentRun
       run(prompt: string) { e.prompt = prompt; return new Promise(() => {}) },
       send() {}, stop() {}, interrupt() { return Promise.resolve() }, get state() { return { kind: 'working' } },
       get lastEvent() { return Date.now() }, get sessionId() { return undefined }, dispose() {},
+      backgroundTasks() { return e.tasks ?? [] },
     })
     runs.push(e)
     return e
@@ -80,7 +81,8 @@ const store = {
   setModelBook() {},
 }
 
-let resumeSetting = true
+let mode: LimitMode = 'resume'
+const BG = { profile: { id: 'bg', kind: 'gateway' as const, label: 'BG', baseUrl: 'https://x' }, env: { set: {}, clear: [] } }
 AgentManager.WAKE_GRACE_MS = 0
 const make = () => new AgentManager({
   store: store as never,
@@ -89,7 +91,9 @@ const make = () => new AgentManager({
   defaults: { runtime: 'claude' },
   permissionMode: 'acceptEdits',
   maxConcurrent: 8,
-  resumeAfterLimit: () => resumeSetting,
+  limitMode: () => mode,
+  // The host's `sessionProviderFor`: a parked card resumes on ITS backend.
+  providerFor: async (key: string) => key === 'sess-bg' ? BG : undefined,
 })
 const mgr = make()
 const until = (cond: () => boolean, ms = 8000) => (async () => {
@@ -191,9 +195,9 @@ ok((await mgr.resumeParked({ key: 'sess-A' }, true)).length === 1 && runs.length
   ok(!meta.get('sess-rl')?.parked, 'a finished answer that talks about rate limits is NOT parked')
 }
 
-// --- 7. the setting off: parked, but not resumed -------------------------------
+// --- 7. usageLimits: pause — parked, but not resumed ---------------------------
 {
-  resumeSetting = false
+  mode = 'pause'
   const n = runs.length
   await mgr.start('Off.', { runtime: 'codex' })
   const r = runs[n]!
@@ -202,8 +206,54 @@ ok((await mgr.resumeParked({ key: 'sess-A' }, true)).length === 1 && runs.length
   r.emit('error', 'You have hit your usage limit. Try again in 2 hours.')
   await sleep(100)
   const p = meta.get('sess-off')?.parked as ParkedRecord | undefined
-  ok(!!p && p.auto === false && p.account === 'codex|', 'with resumeAfterLimit off, the card is parked and says it will not resume by itself')
-  resumeSetting = true
+  ok(!!p && p.auto === false && p.account === 'codex|', 'with usageLimits: pause, the card is parked and says it will not resume by itself')
+  ok((await mgr.resumeParked({ account: 'codex|' })).length === 0, 'and a wake leaves it parked')
+  mode = 'resume'
+}
+
+// --- 7b. usageLimits: off — shown, never acted on ------------------------------
+{
+  mode = 'off'
+  const n = runs.length
+  await mgr.start('Off entirely.', { runtime: 'codex' })
+  ok(runs.length === n + 1, 'with usageLimits: off, new work on a limited account starts anyway')
+  const r = runs[n]!
+  r.emit('sessionId', 'sess-offall')
+  r.emit('state', { kind: 'error', message: 'x' })
+  r.emit('error', 'You have hit your usage limit. Try again in 2 hours.')
+  await sleep(100)
+  ok(!meta.get('sess-offall')?.parked, 'a refused run is NOT parked — it ends as the error it was')
+  ok(mgr.limits.get('codex|')?.status === 'limited', 'but the reading is still kept, for the strip and the status bar')
+  const m = runs.length
+  await mgr.start('Brand new, off.', { runtime: 'codex' })
+  const f = runs[m]!
+  f.emit('state', { kind: 'error', message: 'x' })
+  f.emit('error', 'You have hit your usage limit. Try again in 2 hours.')
+  await sleep(100)
+  ok(!mgr.list().some((x) => x.title.startsWith('Brand new, off') && x.state.kind === 'queued'), 'and a refused first turn is not re-queued')
+  mode = 'resume'
+}
+
+// --- 7c. background agents the limit killed are NAMED on resume ----------------
+{
+  const n = runs.length
+  await mgr.start('Fan out.', { runtime: 'claude', providerFor: BG })
+  const r = runs[n]!
+  r.tasks = ['Research the payments API', 'Audit the flaky tests']
+  r.emit('sessionId', 'sess-bg')
+  r.emit('state', { kind: 'error', message: 'x' })
+  r.emit('error', `Claude AI usage limit reached|${Math.floor(Date.now() / 1000) + 1}`)
+  await sleep(100)
+  const p = meta.get('sess-bg')?.parked as ParkedRecord | undefined
+  ok(p?.stoppedTasks?.join('|') === 'Research the payments API|Audit the flaky tests',
+     `the background agents still running when the limit hit are recorded on the park (${JSON.stringify(p?.stoppedTasks)})`)
+  const notice = mgr.list().find((x) => x.sessionId === 'sess-bg')?.live.find((e) => e.kind === 'notice') as { message: string } | undefined
+  ok(/2 background agents were stopped/.test(notice?.message ?? ''), 'the card says they were stopped')
+  ok(await until(() => runs.some((x) => x.spec.resume === 'sess-bg')), 'the card resumes when the limit resets')
+  const resumedBg = runs.find((x) => x.spec.resume === 'sess-bg')!
+  ok(resumedBg.prompt!.startsWith(RESUME_PROMPT) && resumedBg.prompt!.includes('- Research the payments API')
+     && resumedBg.prompt!.includes('- Audit the flaky tests') && /will not report back/.test(resumedBg.prompt!),
+     'and the resume names each stopped agent and says not to wait for it')
 }
 
 // --- 8. a restart re-arms every parked card ------------------------------------

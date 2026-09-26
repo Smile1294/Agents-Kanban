@@ -271,11 +271,20 @@ When no reset time is stated, the board backs off: 15m, doubling, capped at 2h. 
 - **After a restart**, `restoreParked()` rebuilds each account's limit from the sidecar and re-arms its timer. A reset that passed while the editor was closed wakes about five seconds after activation.
 - **What you see:** a strip above the board with each account's windows as numbers ("5-hour 97% · 7-day 44%"), turning amber when limited, with the reset time and how many cards resume then. The status bar shows `Usage limit · back 15:02` when nothing else needs you.
 - **What the agent sees:** `usage_status`, a read-only, auto-allowed board tool that returns the same reading as sentences.
-- **Setting:** `agentsKanban.resumeAfterLimit` (default on). With it off, cards are still parked and show the time. You press Resume.
+- **Setting:** `agentsKanban.usageLimits`, read at every decision so a change applies at once:
+  - `resume` (default): park, hold, and resume by itself.
+  - `pause`: park and hold; nothing resumes until you press Resume.
+  - `off`: only show the readings (strip, status bar). Nothing is parked or held, and a refused run ends as the error it was.
+- **Subagents.**
+  - A `split_task` subtask is its own card, so it is parked, held and resumed on its own, on whichever account its route named. A subtask routed to another account starts while this one is out.
+  - Claude Code's own background agents (the `Agent`/`Task` tool) run inside the parent's process and die with it when the limit ends the run. The manager reads the live ones at park time (`AgentRun.backgroundTasks()`) and records them on the park (`stoppedTasks`). The card says they were stopped, and the resume names each one and tells the agent to relaunch the ones it still needs instead of waiting for reports that will never come.
+  - A subagent's 429 retry reaches the tracker too. Limit frames are routed before the subagent early-return, the same way money is.
 
-**Tests.** `limits.test.ts` is pure parsing, run on the real probed frame, and passes in two time zones. `limit-resume.test.ts` drives the real manager and a real git repo through park → hold → another account unaffected → first turn re-queued → wake → resume → attempt bound → setting off → restart re-arm. Breaking `park()` or the wake timer turns it red, and so does removing the parked view from `webview.test.mjs`.
+**Tests.** `limit-resume.test.ts` also covers `pause`, `off`, and a run with two background agents whose names reach the resume message. Each gate goes red when the code it guards is broken. `limits.test.ts` is pure parsing, run on the real probed frame, and passes in two time zones. `limit-resume.test.ts` drives the real manager and a real git repo through park → hold → another account unaffected → first turn re-queued → wake → resume → attempt bound → setting off → restart re-arm. Breaking `park()` or the wake timer turns it red, and so does removing the parked view from `webview.test.mjs`.
 
 **Verified live, for the part that can be.** A real Claude Code 2.1.283 turn went through the real `AgentManager`. One `rate_limit_event` reached the tracker as `claude|` with "five_hour 40%, seven_day 45%" and both reset times, and `usage_status` answered "Your account (claude|): available. 5-hour 40% used, resets 16:20; 7-day 45% used, resets 20:00."
+
+A second real run launched one background agent ("Sleep twenty seconds") and ended its turn. While the agent was still running, `backgroundTasks()` returned `["Sleep twenty seconds"]`, which is what a park would record and the resume would name. Each of its two turns delivered its own `rate_limit_event` (5-hour 41% → 42%).
 
 **Not verified live.** A real subscription limit was not hit during this work, so the `rejected` path has been tested on the recorded shape, not on a live refusal. The first real one will show whether Claude Code reports it as a result error, as a synthetic answer (`LIMIT_ANSWER`), or both. All three are handled.
 

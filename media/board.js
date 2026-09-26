@@ -1443,6 +1443,11 @@
     head.append(title)
     box.append(head)
     if (full) box.append(el('div', 'parked-why', p.reason))
+    // Background agents died with the run. Said here, and in the resume
+    // message, so nobody — the user or the agent — waits for their reports.
+    if (full && p.stoppedTasks && p.stoppedTasks.length) {
+      box.append(el('div', 'parked-why', 'Stopped with it, and named in the resume: ' + p.stoppedTasks.join(' · ')))
+    }
     const acts = el('div', 'parked-acts')
     const go = el('button', p.auto ? null : 'primary', 'Resume now')
     go.title = 'Resume the session now, even though the limit may not have reset yet'

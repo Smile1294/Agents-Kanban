@@ -763,6 +763,10 @@ ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.int
      'Resume now and Don\'t resume post for that card')
   const off = run({ ...base, cards: [{ ...parkedCard, parked: { ...parkedCard.parked, auto: false, attempts: 3, estimated: true } }] }).text()
   ok(/Usage limit · back ~/.test(off) && !off.includes("Don't resume"), 'with auto-resume off it says "back", marks a guessed time with ~, and offers only Resume')
+  const chatView = run({ ...base, mode: 'chat', selectedKey: 'abc-123', transcript: [],
+    cards: [{ ...parkedCard, parked: { ...parkedCard.parked, stoppedTasks: ['Research the payments API', 'Audit the flaky tests'] } }] }).text()
+  ok(chatView.includes('Stopped with it') && chatView.includes('Research the payments API') && chatView.includes('Audit the flaky tests'),
+     'the chat view names the background agents the limit stopped')
   ok(!run({ ...base, limits: [{ ...limits[0], status: 'ok', windows: [] }] }).root.querySelector('.limits'),
      'no reading worth drawing, no strip')
 }

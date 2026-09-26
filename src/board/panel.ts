@@ -234,7 +234,7 @@ export interface UiCard {
    * words. Suppresses `stalled` — it did not stop without saying why, the
    * limit stopped it, and the card says so.
    */
-  parked?: { until: number; reason: string; auto: boolean; attempts: number; estimated?: boolean }
+  parked?: { until: number; reason: string; auto: boolean; attempts: number; estimated?: boolean; stoppedTasks?: string[] }
   /** Background agents this session spawned, summarised for the card. Present
    *  only when it spawned any. `orphaned` is the one worth scanning for: it
    *  means agents that cannot still be working, which used to look identical to

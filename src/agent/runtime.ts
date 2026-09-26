@@ -449,6 +449,13 @@ export interface AgentRun extends EventEmitter {
   run(firstPrompt: string, images?: readonly AttachedImage[], messageId?: string): Promise<void>
   send(text: string, images?: readonly AttachedImage[], messageId?: string): void
   clearQueue(): number
+  /**
+   * Background agents this run has launched that are still running, by
+   * description. Optional: a runtime with no such concept has none. Read when
+   * a usage limit ends the run, because they die with its process and the
+   * resume must name them (`resumePrompt` in limits.ts).
+   */
+  backgroundTasks?(): string[]
   interrupt(): Promise<void>
   answerPermission(
     id: string,

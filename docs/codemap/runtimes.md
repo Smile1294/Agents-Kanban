@@ -183,6 +183,8 @@ once came back with empty transcripts that way). The settings page asks
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `AgentRun.backgroundTasks?()` — background agents still running, by description; read when a usage limit ends the run, since they die with its process. Claude Code implements it from `liveTasks`; Codex has none.
+
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `AgentRunEvents.limit?(raw, retry?)` — the account's usage limit, raw (Claude Code's `rate_limit_info`, or a 429 `api_retry`); optional to emit, since a plan-meter runtime reports through `meter` and every runtime's failed turns are read for limit text.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `RuntimeCapabilities.messageIds` (Claude Code: true) and an optional `messageId` on `AgentRun.run`/`send`.
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.

@@ -768,7 +768,11 @@ run, since each session needs a worktree.
   everybody. A reset the vendor did not state is a back-off marked
   `estimated` and drawn with `~`. And automatic resumes stop at
   `MAX_AUTO_RESUMES` — a wrong reset time must not become a loop that bills a
-  turn an hour — while the user's Resume is never bounded.
+  turn an hour — while the user's Resume is never bounded. Background agents
+  die with a limited run's process: `park()` reads `backgroundTasks()` BEFORE
+  its first await and the resume names them, or the agent waits for reports
+  that will never come. Limit frames route before the subagent early-return,
+  like money.
 
 ## Testing conventions
 

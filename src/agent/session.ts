@@ -621,6 +621,22 @@ export class AgentSession extends EventEmitter implements AgentRun {
     // text is not the agent's answer, and appending it to `this.text` would put
     // a subagent's working notes into the session summary.
     const parent = (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id
+    // The ACCOUNT's limit, before the routing too, for the same reason as the
+    // money: a subagent spends the same account, and its requests are refused
+    // or retried exactly like the main thread's. Once per turn on a
+    // subscription, `rate_limit_event` carries every window's utilisation and,
+    // when `rejected`, when the account comes back; `api_retry` on a 429 is the
+    // CLI waiting it out by itself — a warning, since the turn may yet succeed.
+    // Raw to the manager, which owns the reading (`agent/limits.ts`): this
+    // process cannot run a turn once it is limited, so the waiting is not its.
+    if (msg.type === 'rate_limit_event') {
+      this.emit('limit', (msg as { rate_limit_info?: unknown }).rate_limit_info)
+      return
+    }
+    if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'api_retry') {
+      this.emit('limit', msg, true)
+      if (parent) return
+    }
     if (parent) { this.handleSubagent(msg); return }
     // Back on the main thread, so no subagent is running any more.
     this.subagentTool = undefined
@@ -655,23 +671,12 @@ export class AgentSession extends EventEmitter implements AgentRun {
           this.checkFlagSettings(msg as unknown as { tools?: unknown })
         }
         this.trackTask(msg as unknown as Record<string, unknown>)
-        // The CLI retrying a 429 by itself: the account is being throttled, and
-        // the host shows it, but the turn may yet succeed — so a warning only.
-        if ('subtype' in msg && msg.subtype === 'api_retry') this.emit('limit', msg, true)
         // After a compaction there is no assistant message, so the meter would
         // stay pinned at the pre-compaction figure. Reset it explicitly.
         if ('subtype' in msg && msg.subtype === 'compact_boundary') {
           this.lastContextTokens = 0
           this.emit('usage', 0, this.contextWindow)
         }
-        break
-      }
-      // Once per turn on a subscription: every window's utilisation and, when
-      // `rejected`, when the account comes back. Raw to the manager, which
-      // owns the account's reading (`agent/limits.ts`) — this process cannot
-      // run a turn once it is limited, so the waiting is not its to do.
-      case 'rate_limit_event': {
-        this.emit('limit', (msg as { rate_limit_info?: unknown }).rate_limit_info)
         break
       }
       case 'stream_event': {
@@ -1024,6 +1029,12 @@ export class AgentSession extends EventEmitter implements AgentRun {
 
   /** Forget follow-ups the user no longer wants. Only those we still hold can
    *  actually be recalled; the rest is an honest best effort. */
+  /** Background agents still running, by description — what dies with this
+   *  process if it ends now. */
+  backgroundTasks(): string[] {
+    return [...this.liveTasks.values()]
+  }
+
   clearQueue(): number {
     const held = this.queue.clear()
     const shown = this.pending.length

@@ -37,7 +37,8 @@ import { uiFilesIn } from '../run/autocheck.ts'
 import { bindHarness, harnessBrief, type Harness, type HarnessDeps } from './harness.ts'
 import {
   accountKey, limitFromErrorText, limitFromPlanMeter, limitFromRetry, LimitTracker, MAX_AUTO_RESUMES,
-  parseClaudeRateLimit, parseParked, RESUME_PROMPT, windowName, type LimitReading, type ParkedRecord,
+  MAX_STOPPED_TASKS, parseClaudeRateLimit, parseParked, resumePrompt, windowName,
+  type LimitMode, type LimitReading, type ParkedRecord,
 } from './limits.ts'
 import {
   agentKeyOf, describeSpawnAgents, resolveRoute,
@@ -118,8 +119,9 @@ export interface ManagerOptions {
   spendCapUsd?: () => number | undefined
   /** `agentsKanban.autoVerify`, read at the move. Only `require` gates it. */
   autoVerify?: () => 'off' | 'check' | 'require'
-  /** `agentsKanban.resumeAfterLimit`, read when the limit lifts. Absent is on. */
-  resumeAfterLimit?: () => boolean
+  /** `agentsKanban.usageLimits`, read at every decision — park, hold, wake —
+   *  so a change applies at once. Absent is `resume`. See `LimitMode`. */
+  limitMode?: () => LimitMode
   /**
    * A parked session's OWN backend, for the automatic resume — the host's
    * `sessionProviderFor`. Without it a card parked on one profile would resume
@@ -1712,7 +1714,7 @@ export class AgentManager extends EventEmitter {
       // A FIRST turn refused by the limit has no session to park and resume —
       // but the request is still wanted. It goes back in the queue, which now
       // holds it until the account resets, rather than dying as a red card.
-      if (!agent.sessionId && agent.limitHit && !opts.resume) {
+      if (!agent.sessionId && agent.limitHit && !opts.resume && this.mode() !== 'off') {
         this.agents.delete(runId)
         void this.start(prompt, opts).catch(() => {})
       }
@@ -2167,9 +2169,14 @@ export class AgentManager extends EventEmitter {
     }).join('\n')
   }
 
+  private mode(): LimitMode {
+    return this.opts.limitMode?.() ?? 'resume'
+  }
+
   /** When a run's account holds it, or undefined when it may start. A resume
    *  the USER forced is never held: pressing Resume is deciding to try. */
   private heldUntil(opts: LaunchOptions, now: number): number | undefined {
+    if (this.mode() === 'off') return undefined
     if (opts.ignoreLimit) return undefined
     return this.limits.limitedUntil(this.accountForLaunch(opts), now)
   }
@@ -2227,25 +2234,33 @@ export class AgentManager extends EventEmitter {
    * survives a restart), say so, and let the account's timer resume it.
    */
   private async park(agent: RunningAgent): Promise<void> {
+    // FIRST, before any await: the run is still registered, and its background
+    // agents are about to die with its process. Read later, the list is gone.
+    const stoppedTasks = (this.sessions.get(agent.runId)?.backgroundTasks?.() ?? []).slice(0, MAX_STOPPED_TASKS)
     const key = agent.sessionId
     const r = agent.limitHit
-    if (!key || !r) return
+    const mode = this.mode()
+    if (!key || !r || mode === 'off') return
     const attempts = agent.resumeAttempt ?? 0
-    const auto = (this.opts.resumeAfterLimit?.() ?? true) && attempts < MAX_AUTO_RESUMES
+    const auto = mode === 'resume' && attempts < MAX_AUTO_RESUMES
     const until = r.resetsAt ?? Date.now() + 15 * 60_000
     const parked: ParkedRecord = {
       until, account: this.accountOf(agent), attempts, auto,
       reason: r.detail ?? 'usage limit reached',
       ...(r.estimated ? { estimated: true } : {}),
+      ...(stoppedTasks.length ? { stoppedTasks } : {}),
     }
     const when = `${r.estimated ? 'about ' : ''}${clock(until)}`
     const message = auto
       ? `Paused at the account's usage limit (${parked.reason}). The board resumes this session at ${when}.`
       : attempts >= MAX_AUTO_RESUMES
         ? `Paused at the account's usage limit again — ${attempts} automatic resumes ran straight into it, so the board has stopped resuming by itself. Expected back at ${when}; press Resume when you want it to carry on.`
-        : `Paused at the account's usage limit (${parked.reason}). Expected back at ${when}; automatic resume is off (agentsKanban.resumeAfterLimit).`
-    agent.live.push({ kind: 'notice', at: Date.now(), urgency: 'blocked', message })
-    this.emit('notice', agent, { key, message: `"${agent.title}": ${message}`, urgency: 'info' })
+        : `Paused at the account's usage limit (${parked.reason}). Expected back at ${when}; automatic resume is off (agentsKanban.usageLimits: pause).`
+    const lost = stoppedTasks.length
+      ? ` ${stoppedTasks.length} background agent${stoppedTasks.length === 1 ? ' was' : 's were'} stopped with it; the resume tells the agent which.`
+      : ''
+    agent.live.push({ kind: 'notice', at: Date.now(), urgency: 'blocked', message: message + lost })
+    this.emit('notice', agent, { key, message: `"${agent.title}": ${message}${lost}`, urgency: 'info' })
     await this.opts.store.patch(key, { parked }).catch((e) => this.opts.log?.(`Could not park ${key}: ${e}`))
     this.scheduleWake(parked.account)
     this.touch()
@@ -2262,14 +2277,14 @@ export class AgentManager extends EventEmitter {
     for (const [key, m] of Object.entries(metas)) {
       const p = m.parked
       if (!p || (filter.key && key !== filter.key) || (filter.account && p.account !== filter.account)) continue
-      if (!force && (!p.auto || !(this.opts.resumeAfterLimit?.() ?? true))) continue
+      if (!force && (!p.auto || this.mode() !== 'resume')) continue
       if (!force && this.limits.limitedUntil(p.account, Date.now())) continue
       const live = this.byKey(key)
       if (live && this.sessions.has(live.runId)) continue
       this.pendingResume.set(key, force ? 0 : p.attempts + 1)
       if (force) this.forcing.add(key)
       try {
-        await this.send(key, RESUME_PROMPT, [], await this.opts.providerFor?.(key))
+        await this.send(key, resumePrompt(p), [], await this.opts.providerFor?.(key))
       } finally {
         this.forcing.delete(key)
       }
