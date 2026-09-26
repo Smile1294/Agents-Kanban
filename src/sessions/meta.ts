@@ -95,6 +95,102 @@ export interface TestPlan {
   /** The BOARD's own check, run when the card reached review
    *  (`run/autocheck.ts`) — what the page did with nobody steering. */
   autoCheck?: AutoCheck
+  /** The board's QUALITY checks (`run/quality.ts`): the project's own lint,
+   *  typecheck and tests, the fail-before/pass-after proof of new tests, and
+   *  the mutation probe. Host-written; an agent-written one is dropped. */
+  quality?: QualityReport
+}
+
+/** One of the project's own checks, as the board ran it. */
+export interface QualityCheck {
+  name: 'lint' | 'typecheck' | 'tests'
+  command: string
+  ok: boolean
+  /** It fails on the BASE branch too, so it is not this change's doing. */
+  preExisting?: boolean
+  /** It failed, then passed when run again unchanged. */
+  flaky?: boolean
+  timedOut?: boolean
+  tail: string[]
+  durationMs: number
+}
+
+/**
+ * What the board found when it checked a change itself (`run/quality.ts`).
+ *
+ * `ok` means ONE thing: no check this change is responsible for fails. The
+ * proof and the mutation probe are evidence about the TESTS, shown with their
+ * numbers and never folded into `ok` — a refactor's tests rightly pass before
+ * and after, and a score an agent is refused on is a score it learns to game.
+ */
+export interface QualityReport {
+  ok: boolean
+  at: number
+  durationMs: number
+  diff: { files: number; added: number; removed: number; large: boolean }
+  checks: QualityCheck[]
+  /** New or changed test files, run on the code WITHOUT the change and with it. */
+  proof?: { tests: Array<{ file: string; failsBefore: boolean; passesAfter: boolean }>; note?: string }
+  /** Changed lines deliberately broken, one at a time, against the tests that
+   *  cover them. A survivor is a break no test noticed. */
+  mutation?: {
+    total: number
+    killed: number
+    survivors: Array<{ file: string; line: number; from: string; to: string }>
+    uncovered?: string[]
+    note?: string
+  }
+  /** What could not be checked, and why — said, never passed silently. */
+  skipped?: string[]
+}
+
+/** A stored `QualityReport`, parsed. Bounded everywhere: it rides to the
+ *  webview with the card. */
+export function parseQuality(raw: unknown): QualityReport | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Record<string, unknown>
+  if (typeof r.ok !== 'boolean') return undefined
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  const str = (v: unknown, n = 300) => (typeof v === 'string' ? v.slice(0, n) : '')
+  const strs = (v: unknown, max: number, n = 400) =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(-max).map((x) => x.slice(0, n)) : []
+  const d = (r.diff && typeof r.diff === 'object' ? r.diff : {}) as Record<string, unknown>
+  const out: QualityReport = {
+    ok: r.ok, at: num(r.at) || Date.now(), durationMs: num(r.durationMs),
+    diff: { files: num(d.files), added: num(d.added), removed: num(d.removed), large: d.large === true },
+    checks: (Array.isArray(r.checks) ? r.checks : []).filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+      .filter((c) => (c.name === 'lint' || c.name === 'typecheck' || c.name === 'tests') && typeof c.ok === 'boolean')
+      .slice(0, 6).map((c) => ({
+        name: c.name as QualityCheck['name'], command: str(c.command, 300), ok: c.ok as boolean,
+        tail: strs(c.tail, 30), durationMs: num(c.durationMs),
+        ...(c.preExisting === true ? { preExisting: true } : {}),
+        ...(c.flaky === true ? { flaky: true } : {}),
+        ...(c.timedOut === true ? { timedOut: true } : {}),
+      })),
+  }
+  const p = r.proof as Record<string, unknown> | undefined
+  if (p && typeof p === 'object' && Array.isArray(p.tests)) {
+    out.proof = {
+      tests: (p.tests as Array<Record<string, unknown>>).filter((t) => t && typeof t.file === 'string').slice(0, 10)
+        .map((t) => ({ file: str(t.file), failsBefore: t.failsBefore === true, passesAfter: t.passesAfter === true })),
+      ...(typeof p.note === 'string' ? { note: str(p.note) } : {}),
+    }
+  }
+  const m = r.mutation as Record<string, unknown> | undefined
+  if (m && typeof m === 'object') {
+    const uncovered = strs(m.uncovered, 10, 300)
+    out.mutation = {
+      total: num(m.total), killed: num(m.killed),
+      survivors: (Array.isArray(m.survivors) ? m.survivors as Array<Record<string, unknown>> : [])
+        .filter((x) => x && typeof x.file === 'string').slice(0, 10)
+        .map((x) => ({ file: str(x.file), line: num(x.line), from: str(x.from, 40), to: str(x.to, 40) })),
+      ...(uncovered.length ? { uncovered } : {}),
+      ...(typeof m.note === 'string' ? { note: str(m.note) } : {}),
+    }
+  }
+  const skipped = strs(r.skipped, 8, 300)
+  if (skipped.length) out.skipped = skipped
+  return out
 }
 
 export interface AutoCheck {
@@ -252,6 +348,7 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
   if (!summary && !steps.length && !links.length) return undefined
   const verified = parseVerification(r.verified)
   const autoCheck = parseAutoCheck(r.autoCheck)
+  const quality = parseQuality(r.quality)
   return {
     summary,
     steps,
@@ -259,6 +356,7 @@ export function normaliseTestPlan(raw: unknown): TestPlan | undefined {
     at: typeof r.at === 'number' ? r.at : Date.now(),
     ...(verified ? { verified } : {}),
     ...(autoCheck ? { autoCheck } : {}),
+    ...(quality ? { quality } : {}),
   }
 }
 

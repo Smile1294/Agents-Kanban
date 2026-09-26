@@ -774,6 +774,41 @@ ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.int
      'no reading worth drawing, no strip')
 }
 
+// 8a''. The board's quality checks on the test plan. Every line carries its
+// number, a pre-existing failure is labelled as the base branch's, and the
+// survivors of the mutation probe are named — they are the next tests to write.
+{
+  const quality = {
+    ok: false, at: Date.now(), durationMs: 41_000, diff: { files: 3, added: 520, removed: 12, large: true },
+    checks: [
+      { name: 'lint', command: 'npm run lint', ok: false, preExisting: true, tail: ['old.mjs: debugger'], durationMs: 900 },
+      { name: 'typecheck', command: 'npm run typecheck', ok: true, flaky: false, tail: [], durationMs: 3000 },
+      { name: 'tests', command: 'node --test test/cart.test.mjs', ok: false, tail: ['not ok 1 - free', 'expected true'], durationMs: 2000 },
+    ],
+    proof: { tests: [{ file: 'test/cart.test.mjs', failsBefore: true, passesAfter: true }, { file: 'test/weak.test.mjs', failsBefore: false, passesAfter: true }] },
+    mutation: { total: 5, killed: 4, survivors: [{ file: 'src/cart.mjs', line: 1, from: '>=', to: '>' }] },
+  }
+  const card = { ...WT_CARD, testPlan: { summary: 's', steps: ['x'], links: [], at: 1, quality } }
+  const v = run({ ...reviewBase, cards: [card] })
+  const t = v.text()
+  ok(t.includes('Board checks ✖') && t.includes('3 files · +520 −12 · 41s'), 'the checks head says the verdict and the size, with numbers')
+  ok(/lint\s*fails on the base branch too — pre-existing/.test(t) && t.includes('typecheck') && /tests\s*FAILED/.test(t) && t.includes('expected true'),
+     'a pre-existing failure is labelled as the base branch\'s; this change\'s failure shows its output')
+  ok(t.includes('1 of 2 new test files fail without the change and pass with it') && t.includes('test/weak.test.mjs: passes without the change'),
+     'the proof counts proven tests and names the one that does not test the change')
+  ok(t.includes('4 of 5 deliberate breaks to the changed lines were caught by a test') && t.includes('not caught: src/cart.mjs:1  >= → >'),
+     'the mutation probe gives its score and names the survivor')
+  ok(t.includes('A large change'), 'a large diff is called out')
+  findButton(v.root, 'Send findings to agent')?.onclick({ stopPropagation() {}, preventDefault() {} })
+  findButton(v.root, 'Check again')?.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(v.posted.some((m) => m.type === 'sendQuality' && m.id === WT_CARD.key) && v.posted.some((m) => m.type === 'runQuality' && m.id === WT_CARD.key),
+     'Send findings to agent and Check again post for the card')
+  const clean = { ...quality, ok: true, diff: { ...quality.diff, large: false }, checks: [{ ...quality.checks[1] }], proof: { tests: [quality.proof.tests[0]] }, mutation: { total: 3, killed: 3, survivors: [] } }
+  const cv = run({ ...reviewBase, cards: [{ ...card, testPlan: { ...card.testPlan, quality: clean } }] })
+  ok(cv.text().includes('Board checks ✓') && !findButton(cv.root, 'Send findings to agent'), 'a clean report offers nothing to send')
+  ok(run({ ...reviewBase, cards: [{ ...card, qualityChecking: true }] }).text().includes('running the project\'s own checks'), 'a running check says so')
+}
+
 // 8b. A merge that has landed but is NOT committed.
 //
 // The whole reason merge() stops early: the work is on the user's branch, in

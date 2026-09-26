@@ -222,6 +222,28 @@
           "default": "resume",
           "markdownDescription": "What the board does when an account runs into its usage limit. The limit is tracked by the extension, whichever company's agent is running."
         },
+        "agentsKanban.qualityGate": {
+          "type": "string",
+          "enum": ["check", "require", "off"],
+          "enumDescriptions": [
+            "When a card reaches review, the board runs its own checks and shows them on the test plan: the project's lint, typecheck and the tests related to the change (a failure that is also on the base branch is marked pre-existing), proof that new tests fail without the change and pass with it, and a mutation probe of the changed lines. Agents get a run_checks tool to run the same checks first.",
+            "As check, and an agent cannot move a card to review while a lint, typecheck or test failure caused by its change remains.",
+            "No quality checks, and no run_checks tool."
+          ],
+          "default": "check",
+          "markdownDescription": "The board's own quality checks of an agent's change \u2014 independent of the tests the agent wrote for itself."
+        },
+        "agentsKanban.checks": {
+          "type": "object",
+          "default": {},
+          "properties": {
+            "lint": { "type": "string", "description": "Lint command (default: the project's lint script, pint, ruff, go vet)." },
+            "typecheck": { "type": "string", "description": "Typecheck command (default: a typecheck script, phpstan, mypy)." },
+            "test": { "type": "string", "description": "Whole test suite (default: the test script, php artisan test, pytest, go test)." },
+            "testFile": { "type": "string", "description": "Run chosen test files; {files} is replaced with them. Needed for the proof and the mutation probe when the runner is not detected." }
+          },
+          "markdownDescription": "Override the commands the board's quality checks run. Each is run in the card's worktree."
+        },
         "agentsKanban.autoVerify": {
           "type": "string",
           "enum": ["check", "require", "off"],

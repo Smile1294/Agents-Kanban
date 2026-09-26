@@ -95,6 +95,8 @@ import {
 // happening wherever an implementation happens to be imported first.
 import './agent/runtimes/index.ts'
 import { parseLimitMode, type LimitReading, type ParkedRecord } from './agent/limits.ts'
+import { detectChecks, qualitySummary, qualityText, runQuality, type ChecksConfig } from './run/quality.ts'
+import type { QualityMode } from './agent/manager.ts'
 import {
   allRuntimes, DEFAULT_RUNTIME, getRuntime, parseRuntimeId,
   type Meter, type RuntimeId, type RuntimeStatus,
@@ -3128,6 +3130,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   /** Cards whose auto-check is running right now, for the card to say so. */
   const autoChecking = new Set<string>()
+  /** Cards whose quality checks are running right now. */
+  const qualityChecking = new Set<string>()
+  const qualityMode = (): QualityMode => {
+    const v = cfg().get<string>('qualityGate')
+    return v === 'off' || v === 'require' ? v : 'check'
+  }
+  /** The user's own check commands, parsed — a setting is another program's output. */
+  const checksConfig = (): ChecksConfig => {
+    const raw = cfg().get<unknown>('checks')
+    const r = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+    const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
+    return {
+      ...(str(r.lint) ? { lint: str(r.lint)! } : {}),
+      ...(str(r.typecheck) ? { typecheck: str(r.typecheck)! } : {}),
+      ...(str(r.test) ? { test: str(r.test)! } : {}),
+      ...(str(r.testFile) && str(r.testFile)!.includes('{files}') ? { testFile: str(r.testFile)! } : {}),
+    }
+  }
+  const checkWorktree = async (worktree: string, base: string, fast: boolean) =>
+    runQuality({ worktree, base, checks: await detectChecks(worktree, checksConfig()), fast })
+
+  /**
+   * The board's quality checks of a card that reached review, in the
+   * background, onto its test plan — the FULL run, with the proof and the
+   * mutation probe (the review gate, if on, already ran the fast half).
+   */
+  async function runCardQuality(key: string, dir: string | undefined, base: string | undefined): Promise<void> {
+    const w = ws
+    if (!w?.worktrees || !dir || qualityChecking.has(key)) return
+    qualityChecking.add(key)
+    refreshAll()
+    try {
+      const report = await checkWorktree(dir, base ?? 'HEAD', false)
+      const card = await w.store.card(key)
+      if (!card.testPlan || !isReviewColumn(w.board, card.phase)) return
+      await w.store.setTestPlan(key, { ...card.testPlan, quality: report })
+      log.info(`Quality checks for ${key}: ${report.ok ? 'passed' : 'FAILED'} — ${qualitySummary(report)}`)
+      if (!report.ok) {
+        const failed = report.checks.filter((c) => !c.ok && !c.preExisting).map((c) => c.name).join(', ')
+        const pick = await vscode.window.showWarningMessage(
+          `A card in review breaks the project's own checks (${failed}).`, 'Open card', 'Send failure to agent',
+        )
+        if (pick === 'Open card') { BoardPanel.show(context.extensionUri, host); mode = 'chat'; host.select(key); refreshAll() }
+        if (pick === 'Send failure to agent') await host.sendQuality?.(key)
+      }
+    } finally {
+      qualityChecking.delete(key)
+      refreshAll()
+    }
+  }
   /** Live browser panes, one per surface: the stop function of each watch. */
   const browserViews = new Map<string, () => void>()
   async function runCardAutoCheck(key: string, dir: string | undefined, base: string | undefined): Promise<void> {
@@ -3199,6 +3251,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Read on every meter reading, so a changed cap applies to the turn in flight.
         spendCapUsd: () => cfg().get<number>('maxSpendPerMessageUsd') || undefined,
         autoVerify: () => autoVerifyMode(),
+        quality: { mode: qualityMode, run: checkWorktree },
         // Read at every decision, so changing it applies at once — including
         // to a resume that is already scheduled.
         limitMode: () => parseLimitMode(cfg().get<string>('usageLimits')),
@@ -3397,9 +3450,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // The board's own check of the work — part of the flow, not up to the
         // agent (`run/autocheck.ts`). In the background: it starts an app and
         // a browser, which is seconds, and the move itself is already done.
-        if (autoVerifyMode() !== 'off') {
-          runCardAutoCheck(movedKey, agent.worktreePath, agent.base)
+        // Then the quality checks — after, not beside: both start processes in
+        // the same worktree, and a test suite beside a dev server fights it
+        // for ports and databases.
+        const browserCheck = autoVerifyMode() !== 'off'
+          ? runCardAutoCheck(movedKey, agent.worktreePath, agent.base)
             .catch((e: unknown) => log.error(`Auto-check failed to run: ${String(e)}`))
+          : Promise.resolve()
+        if (qualityMode() !== 'off') {
+          browserCheck.then(() => runCardQuality(movedKey, agent.worktreePath, agent.base))
+            .catch((e: unknown) => log.error(`Quality checks failed to run: ${String(e)}`))
         }
         void rollUpToParent(movedKey).then((rolled) => {
           if (cfg().get<boolean>('notifyOnReview') === false) return
@@ -3798,6 +3858,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(testPlan ? { testPlan } : {}),
         ...(reviewDrafts.count(key) ? { reviewComments: reviewDrafts.count(key) } : {}),
         ...(autoChecking.has(key) ? { autoChecking: true } : {}),
+        ...(qualityChecking.has(key) ? { qualityChecking: true } : {}),
         // A run that just parked is still in the live list until released;
         // one that is running again has ended the park, whatever the sidecar
         // says in the moment before its clear lands.
@@ -3836,6 +3897,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(s.testPlan ? { testPlan: s.testPlan } : {}),
         ...(reviewDrafts.count(s.id) ? { reviewComments: reviewDrafts.count(s.id) } : {}),
         ...(autoChecking.has(s.id) ? { autoChecking: true } : {}),
+        ...(qualityChecking.has(s.id) ? { qualityChecking: true } : {}),
         ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
         ...(s.parked ? { parked: uiParked(s.parked) } : {}),
         ...agentBadge(s.id),
@@ -4851,6 +4913,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!ac || ac.ok) return
       const review = ws?.board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
       await this.sendMessage(key, autoCheckPrompt(ac, review))
+    },
+
+    /** Send the board's quality findings to the agent, as one message. */
+    async sendQuality(key) {
+      const card = await requireWs().store.card(key)
+      const qr = card.testPlan?.quality
+      if (!qr) return
+      const review = ws?.board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
+      await this.sendMessage(key,
+        'The board ran its own checks of your work when you moved to review. This is what it found:\n\n' +
+        qualityText(qr) + `\n\nWhen it is fixed, run \`run_checks\` again and move back to "${review}".`)
+    },
+
+    /** Run the quality checks again, by hand. */
+    async runQuality(key) {
+      const a = ws?.manager?.byKey(key)
+      const stored = a ? undefined : await ws?.store.worktreeMeta(key)
+      await runCardQuality(a?.sessionId ?? key, a?.worktreePath ?? stored?.worktree, a?.base ?? stored?.base)
     },
 
     /** Run the board's check again, by hand. */

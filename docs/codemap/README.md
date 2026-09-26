@@ -117,7 +117,7 @@ Codex — a different process); a **provider** is the backend behind Claude Code
 | [providers-models.md](providers-models.md) | `src/agent/providers.ts`, `models.ts`, `endpoint.ts`, `probe.ts` | Bedrock/Vertex/gateways, environment variables, the model picker, endpoint catalogues, the connection test |
 | [orchestration.md](orchestration.md) | `src/agent/routing.ts`, `spawn-policy.ts`, `src/board/decomposition.ts`, `src/board/subtasks.ts` | splitting, subtasks, the dial, routing a piece to another agent, the roll-up |
 | [scheduling.md](scheduling.md) | `src/board/schedules.ts` | scheduled runs, catch-up, the `schedule_*` tools |
-| [git-worktrees.md](git-worktrees.md) | `src/git/*`, `src/run/recipe.ts` | worktrees, diffs, commit, merge, conflicts, the ignore rule, the Run button |
+| [git-worktrees.md](git-worktrees.md) | `src/git/*`, `src/run/*` | worktrees, diffs, commit, merge, conflicts, the ignore rule, the Run button, the board's own review-time checks (browser, quality) |
 | [remote.md](remote.md) | `src/remote/*`, `remote-contract.json`, `server/**` | the relay mirror and its contract, the headless board — the relay SITE lives in the sibling repo agents-kanban-relay |
 | [build-and-test.md](build-and-test.md) | `scripts/**`, `test/**`, `smoke.mjs`, `esbuild.mjs`, `tsconfig.json`, `.vscodeignore`, `.vscode/**` | the gates, the harness, the bundle, packaging, F5 |
 

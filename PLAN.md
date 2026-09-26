@@ -415,6 +415,14 @@ Working:
   wall-clock check within a minute, and a resume that fails offline retries in
   five minutes. See
   [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §4d.
+- **The board checks the work itself, not only the agent.** At review (and on
+  demand through `run_checks`) it runs the project's own lint, typecheck and
+  related tests. A failure the base branch shares is pre-existing, not the
+  agent's. It PROVES whether new tests fail without the change, and
+  mutation-probes the changed lines for behaviour no test pins down.
+  `agentsKanban.qualityGate: require` refuses the review move while the change
+  breaks a check. This is built from the research on what raises acceptance;
+  see [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §4e.
 - **Draw on an image before sending it** — numbered boxes and arrows, pen,
   labels; flattened into the image, and the message says the marks are yours.
   A sent message's images can be shown again ("Show" on its row).

@@ -164,6 +164,8 @@ between mousedown and mouseup never clicks). The view keeps the last
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `renderQuality(c, p)` on the test plan: one row per check with its state (pre-existing muted, flaky marked), the proof count and the unproven files, the mutation score and survivors, a large-diff line, what was not checked; Send findings to agent / Check again. Overview badge `✓/✖ checks`; a failing report puts the card in Needs you. `.quality*` in board.css.
+
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · the limits strip says "could not be reached when the board resumed — trying again" for an `offline` reading.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `renderParked(c, true)` names the background agents the limit stopped (`parked.stoppedTasks`).

@@ -1648,3 +1648,22 @@ mark.hl {
 .parked-title { font-size: 0.8em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .parked-why { flex: 1 1 100%; font-size: 0.8em; color: var(--muted); overflow-wrap: anywhere; }
 .parked-acts { display: flex; gap: 6px; flex: 1 1 auto; flex-wrap: wrap; justify-content: flex-end; }
+
+/* ---- The board's quality checks (run/quality.ts) ------------------------
+   One row per check, with its number. Pre-existing failures are muted, not
+   red: they are the base branch's, and drawing them as this change's would be
+   the board blaming the agent for main. */
+.quality { margin: 6px 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--radius); display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.quality.bad { border-color: color-mix(in srgb, var(--vscode-errorForeground) 55%, transparent); }
+.quality-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-weight: 600; }
+.quality-meta { font-weight: normal; color: var(--muted); font-size: 0.85em; }
+.quality-row { display: flex; gap: 6px; align-items: baseline; min-width: 0; font-size: 0.9em; }
+.quality-mark { flex: 0 0 1.2em; text-align: center; }
+.quality-name { flex: 0 0 5.5em; color: var(--muted); }
+.quality-state { min-width: 0; overflow-wrap: anywhere; }
+.quality-row.bad .quality-mark, .quality-row.bad .quality-state { color: var(--vscode-errorForeground); }
+.quality-row.warn .quality-mark { color: var(--vscode-editorWarning-foreground); }
+.quality-row.pre { color: var(--muted); }
+.quality-line { font-size: 0.85em; padding-left: 1.8em; overflow-wrap: anywhere; font-family: var(--vscode-editor-font-family, monospace); }
+.quality-line.muted { color: var(--muted); font-family: inherit; }
+.quality-line.warn { color: var(--vscode-editorWarning-foreground); font-family: inherit; }

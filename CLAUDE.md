@@ -777,6 +777,19 @@ run, since each session needs a worktree.
   saved on every change and `stopAll()` must not clear the saved copy (it is
   the restart it exists for); and it never stores image bytes or a provider's
   environment, which carries keys.
+- **The board judges a change with execution the agent does not steer.**
+  The research is blunt: tests an agent writes for its own fix barely move
+  outcomes, the patch and the test share their errors, and refining against
+  your own test raises overfitting. What helps is the project's EXISTING checks,
+  proof that a test fails without the change, and mutation. So `run/quality.ts`
+  runs those, and three things are load-bearing. `ok` is the project's checks
+  ONLY: the proof and the mutation score are evidence shown with their numbers,
+  never a bar, because a refactor's tests rightly pass before and after and a
+  score an agent is refused on is a score it games. "Pre-existing" needs the
+  base branch to fail AND no new failure line naming a changed file, because the
+  exit code alone blamed main for the agent's bug. And every base-branch and
+  mutant run happens in a throwaway `git worktree` under the OS temp directory,
+  never in the agent's worktree or the user's checkout.
 
 ## Testing conventions
 

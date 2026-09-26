@@ -6,12 +6,14 @@ paths:
   - src/run/recipe.ts
   - src/run/app.ts
   - src/run/autocheck.ts
+  - src/run/quality.ts
 tests:
   - src/git/__tests__/worktree.test.ts
   - src/git/__tests__/lock.test.ts
   - src/run/__tests__/recipe.test.ts
   - src/run/__tests__/app.test.ts
   - src/run/__tests__/autocheck.test.ts
+  - src/run/__tests__/quality.test.ts
 last_verified: 2026-09-07
 ---
 # Git worktrees, review and merge
@@ -83,6 +85,27 @@ returns a URL it cannot justify: a plausible `localhost:8000` belonging to the
 main checkout shows the OLD code and reads as "the change did nothing". Test:
 `recipe.test.ts`.
 
+**`src/run/quality.ts`**. The board's QUALITY checks, independent of the
+agent (research: docs/HARNESS-REVIEW.md §4e). `detectChecks(dir, cfg)` →
+`ProjectChecks` (lint, typecheck, whole suite, and `testFiles(files)` for the
+runner — vitest, jest, mocha, `node --test`, artisan/pest/phpunit, pytest, go;
+`agentsKanban.checks` wins). `relatedTests` by STEM (`cart.ts` ↔
+`cart.test.ts`/`test_cart.py`/`CartTest.php`). `sandbox(worktree, ref,
+overlay)` — a throwaway `git worktree` under the OS temp dir with overlay files
+copied in and `node_modules`/`vendor`/`.venv` symlinked; never the agent's
+worktree or the user's checkout. `runQuality(opts)` never throws: (1) each
+check in the worktree; a failed test re-run once (`flaky`); a failure checked
+on a base sandbox and `preExisting` only if base fails too AND no new failure
+line names a changed file (`introducedLines` — the exit code alone blamed main
+for the agent's bug); (2) PROOF — each new/changed test file run on base with
+only the tests overlaid (must fail) and on the branch (must pass); (3) MUTATION
+— `mutantsFor` (spaced operators, strings blanked, comments skipped) on
+`changedLines`, `spread` over lines, run against the covering tests in a HEAD
+sandbox with the working changes overlaid, after checking those tests pass
+unmutated; (4) diff size (`LARGE_LINES`/`LARGE_FILES`). `ok` is (1) only.
+`fast` skips (2) and (3). `qualityText` (what the agent reads — names
+survivors, forbids gaming tests) and `qualitySummary`.
+
 ## How it works
 
 See [flows.md](flows.md) *Handing work back, and the merge*. The state machine
@@ -127,6 +150,8 @@ frames. Worktree cleanup is offered at `complete`, never automatic.
   are serving.
 
 ## Recent changes
+
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `src/run/quality.ts` — the board's quality checks: the project's own lint/typecheck/related tests with flaky re-run and base-branch `preExisting` (output-compared, `introducedLines`), the fail-before/pass-after PROOF of new tests in a base sandbox, the mutation probe on changed lines, diff size; `quality.test.ts` against real git and `node --test`, each gate shown to fail.
 
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · a fresh worktree is SET UP before it runs: `PrepareStep` / `prepareFor` (the main checkout's `.env`, else `.env.example` + `key:generate`; `composer install` without `vendor/`; the lockfile's install without `node_modules/` — `npm install --no-package-lock` when none is committed, or the review move would commit one; the worktree's OWN SQLite created and migrated, a shared database never); Laravel also starts `php artisan queue:listen --tries=1` unless `QUEUE_CONNECTION` is sync/null, and `APP_URL` is the chosen port; `runPrepare` in `app.ts` runs it into the app's log. `runAutoCheck` takes `paths` (the pages the agent visited, the plan's local links) and records `pages`. Verified on a real Laravel 13 worktree: setup, Vite, the queue worker processing a dispatched job in the worktree, artisan serve.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/run/autocheck.ts` — the board's OWN check at review time: `uiFilesIn` (what a browser shows), `e2eScript` (`test:e2e`, `e2e`, `test:browser`, `playwright`…), `runAutoCheck` (start/reuse the app, open it in a context of its own, record load errors and a screenshot, run the suite with `BASE_URL`/`PLAYWRIGHT_BASE_URL`, never throw), `autoCheckPrompt`. `autocheck.test.ts` against real processes and Chromium.

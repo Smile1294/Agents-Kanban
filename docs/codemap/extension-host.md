@@ -320,6 +320,8 @@ bar is handed back to `agentsKanban.sideBarHome`.
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `agentsKanban.qualityGate` (check/require/off) and `agentsKanban.checks` (parsed by `checksConfig`); `checkWorktree` feeds the manager's `quality`; `runCardQuality` runs the FULL checks after a card reaches review, AFTER the browser check (both start processes in the worktree), stamps `testPlan.quality`, and warns with Send to agent when it fails; `sendQuality`/`runQuality` host methods and dispatch; `CardState.qualityChecking`.
+
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `queueStore` on workspace state (`agentsKanban.queue`); `rebuild()` makes the manager and calls `restoreQueue()` when a saved queue exists; the 60s heartbeat calls `manager.checkDue()`; `UiLimit.source`.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · the `agentsKanban.usageLimits` enum (`resume`/`pause`/`off`) replaces the `resumeAfterLimit` boolean, passed as `limitMode` (read at every decision); `uiParked` carries `stoppedTasks` to the card.

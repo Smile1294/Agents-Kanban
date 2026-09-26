@@ -21,7 +21,7 @@
 import { z } from 'zod'
 import type { SessionStore } from '../sessions/store.ts'
 import { isHumanOnly, isReviewColumn, isStartedColumn, type BoardConfig } from '../board/config.ts'
-import { normaliseTestPlan, normaliseTitle } from '../sessions/meta.ts'
+import { normaliseTestPlan, normaliseTitle, type QualityReport } from '../sessions/meta.ts'
 import { describeWhen, parseScheduleDraft, type Schedule, type ScheduleDraft } from '../board/schedules.ts'
 import { loadSdk } from './sdk.ts'
 import { describeSpawnAgents, type SpawnAgent } from './routing.ts'
@@ -229,6 +229,20 @@ export interface BoardToolContext {
    * turn to do it.
    */
   usage?: () => string
+  /**
+   * The board's quality checks on this run's worktree (`run/quality.ts`): the
+   * project's own lint, typecheck and related tests, the fail-before/pass-after
+   * proof of new tests, and the mutation probe — as the text the agent reads.
+   * Absent when the host has quality checks off.
+   */
+  runChecks?: () => Promise<string>
+  /**
+   * `qualityGate: require` — the fast half of the checks, run on the move into
+   * review. A `refusal` stops the move; a `report` is stamped on the test plan
+   * either way. Host-side, like the knowledge check: a brief can ask, only code
+   * can refuse.
+   */
+  qualityGate?: () => Promise<{ refusal?: string; report?: QualityReport }>
 }
 
 type Content = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -351,6 +365,7 @@ export function buildBoardTools(
       if (plan) {
         delete plan.verified
         delete plan.autoCheck
+        delete plan.quality
         const seen = ctx.harness?.ledger()
         if (seen) plan.verified = seen
       }
@@ -370,6 +385,13 @@ export function buildBoardTools(
       if (isReviewColumn(board, args.phase) && ctx.browserGate) {
         const refusal = await ctx.browserGate()
         if (refusal) return err(refusal)
+      }
+      // `qualityGate: require`: the project's own checks must not be broken BY
+      // THIS CHANGE (a failure also on the base branch does not count).
+      if (isReviewColumn(board, args.phase) && ctx.qualityGate) {
+        const gate = await ctx.qualityGate()
+        if (gate.refusal) return err(gate.refusal)
+        if (gate.report && plan) plan.quality = gate.report
       }
       // Knowledge files move with the code. Checked BEFORE anything is written,
       // so a refusal leaves the card exactly where it was, and host-side, so it
@@ -835,9 +857,34 @@ export function buildBoardTools(
     { annotations: { readOnlyHint: true }, searchHint: 'usage limit quota rate limit' },
   )
 
+  const runChecks = tool(
+    'run_checks',
+    [
+      'Run the BOARD\'s own checks on your worktree — the same ones it runs when',
+      'you move to review, and the ones the user sees on the card:',
+      '  - the project\'s own lint, typecheck and the tests related to your change',
+      '    (a failure that also happens on the base branch is marked pre-existing);',
+      '  - PROOF that your new tests test the change: each new or edited test file',
+      '    is run on the base branch WITHOUT your change (it must fail) and with it',
+      '    (it must pass);',
+      '  - a MUTATION probe: your changed lines are deliberately broken one at a',
+      '    time; a break no test catches is a behaviour nothing pins down.',
+      '',
+      'Takes a while (it runs the tests several times). Run it before moving to',
+      'review, fix what it reports, and do not weaken or special-case tests to',
+      'make it pass — the report is shown to the user as it is.',
+    ].join('\n'),
+    {},
+    async () => {
+      if (!ctx.runChecks) return err('Quality checks are off on this board (agentsKanban.qualityGate).')
+      return ok(await ctx.runChecks())
+    },
+    { annotations: { readOnlyHint: true }, searchHint: 'tests lint typecheck quality mutation' },
+  )
+
   return [
     setPhase, setTitle, setTags, listBoard, splitTask, notifyUser,
-    listSchedules, createSchedule, deleteSchedule, runSchedule, usageStatus,
+    listSchedules, createSchedule, deleteSchedule, runSchedule, usageStatus, runChecks,
     // The app and browser tools. Built whatever the context, like the
     // schedule tools, so the auto-allow list derived below covers them; a
     // context without a harness answers each call with the reason.

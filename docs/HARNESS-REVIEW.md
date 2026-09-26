@@ -301,6 +301,52 @@ A second real run launched one background agent ("Sleep twenty seconds") and end
 
 **Not verified live.** A real subscription limit was not hit during this work, so the `rejected` path has been tested on the recorded shape, not on a live refusal. The first real one will show whether Claude Code reports it as a result error, as a synthetic answer (`LIMIT_ANSWER`), or both. All three are handled.
 
+## 4e. Sixth round — what measurably raises acceptance and cuts bugs, and the checks built from it
+
+Asked for: "research-based features that really prove the acceptance rate of code and fewer bugs — proper testing". arXiv could not be fetched from this environment, so the figures below come from search excerpts and abstracts.
+
+**What the research says** (September 2026):
+
+| Finding | Source |
+|---|---|
+| Agent-written tests for their own fix barely help. Claude Opus 4.5 wrote a test in ~83% of tasks and resolved 2.6 points more than GPT-5.2, which almost never did (74.4% vs 71.8%). Encouraging or suppressing tests left 83.2% of outcomes unchanged. | [Rethinking the Value of Agent-Generated Tests](https://arxiv.org/abs/2602.07900) |
+| When one trajectory writes both the patch and the test, their errors agree and create false confidence. Fixed, independently written tests are what help. | [ExecCritic](https://arxiv.org/abs/2609.09133) |
+| Refining a patch until it passes its test raises overfitting: 14 of 22 newly-passing patches failed hidden tests. | [Investigating Test Overfitting on SWE-bench](https://arxiv.org/abs/2511.16858) |
+| Reusing the project's EXISTING regression tests: +8.0–12.9% relative resolution across Agentless, SWE-agent and Trae. | [Can Old Tests Do New Tricks](https://arxiv.org/abs/2510.18270) (FSE 2026) |
+| On agentic PRs, each failed CI check cuts merge odds by ~15%. Unmerged PRs are larger and touch more files. | [Why Are Agentic PRs Merged or Rejected](https://arxiv.org/abs/2605.22534), [Where Do AI Coding Agents Fail](https://arxiv.org/abs/2601.15195) |
+| Feeding static-analysis results back to the model: security issues >40% → 13%, reliability warnings >50% → 11%. | [Static Analysis as a Feedback Loop](https://arxiv.org/abs/2508.14419) |
+| A reproduction test proven to fail before the fix and pass after: +8.0–8.9 points on SWE-bench Pro. | [SWE-Doctor](https://arxiv.org/html/2607.00990), [SWT-Bench](https://arxiv.org/abs/2406.12952) |
+| Mutation-guided tests at Meta: engineers accepted 73%. | [Mutation-Guided LLM-based Test Generation at Meta](https://arxiv.org/abs/2501.12862) (FSE 2025) |
+| The dominant failure is a confident, plausible and wrong patch. Given an already-fixed bug, most models edit it anyway (action bias). | [Confident and Wrong](https://arxiv.org/abs/2603.25764) |
+| Passing tests and an LLM reviewer both missed patches that kept or introduced vulnerabilities. | [When Passing Tests Hides Vulnerabilities](https://arxiv.org/abs/2609.10548) |
+
+**The conclusion that shaped the build:** the board should not ask the agent for more tests. It should check the work itself, with execution the agent does not steer, and prove whether the agent's tests test anything.
+
+**Built** (`src/run/quality.ts`, setting `agentsKanban.qualityGate`):
+1. **The project's own checks.** Lint, typecheck, and the tests related to the change, found by name. The whole suite runs when the related tests cannot be found. A failing test is re-run once; a pass then is marked *flaky*, not failed. A failure is re-run on the base branch. It is marked *pre-existing* only if the base also fails **and** no new failure line names a file the change touched. The exit code alone blamed main for the agent's bug, and the test caught that.
+2. **Proof.** Each new or edited test file runs on the base branch with only the tests copied in; it must fail there and pass on the change. A test that passes without the change is named: "it does not test what changed".
+3. **Mutation probe.** The changed lines are deliberately broken one at a time, up to 8, spread across lines: `>`→`>=`, `&&`→`||`, `true`→`false`, `===`→`!==`, and so on. Each break runs against the tests that cover that file. A break nobody catches is named by file, line and edit; it is the next test to write.
+4. **Diff size.** Changes over 400 lines or 15 files are flagged.
+5. **Where it runs.**
+   - Agents get `run_checks` (auto-allowed) to iterate before handing back.
+   - At review the board runs the full check in the background and puts it on the test plan: one row per check with numbers, the proof, the mutation score and survivors, plus **Send findings to agent** and **Check again**.
+   - `require` refuses the move into review while a lint, typecheck or test failure caused by the change remains. That is the fast half only; the proof and probe are evidence, never a bar, because a number an agent is refused on becomes a number it games.
+6. **The brief**, one line per finding: reproduce first and watch the test fail; if nothing is broken, change nothing; keep the diff small; run `run_checks`; never weaken, skip or special-case a test.
+
+**Everything runs in sandboxes.** The base branch and the mutants run in throwaway `git worktree`s under the OS temp directory, with `node_modules`/`vendor`/`.venv` symlinked in. The agent's worktree and the user's checkout are never touched, and the test checks both.
+
+**Verified with a real agent** (Claude Sonnet 4.6, `qualityGate: require`, a boundary bug: "an order of exactly 50.00 is charged shipping"):
+- It said "I'll write the failing test first", saw it fail, fixed `>` → `>=`, and called `run_checks` on its own.
+- The gate let it into review with the report on the plan.
+- The board's full check: tests ✓, the new test **proven** (fails on main, passes on the change), mutants 1/1 caught (the boundary test catches `>=`→`>`).
+- 3-line diff, 63 seconds, $0.30.
+- The first attempt stalled on an unanswered Bash permission prompt. Even then the board reported the half-done state correctly: the new test fails without the change, but also fails with it.
+
+**Not built yet, and next by the same evidence:**
+- A reviewer on a *different* model (Phase 8), with the caveat that LLM reviewers missed security flaws.
+- A security scanner (Semgrep/Bandit) as a fourth check.
+- PR/CI feedback (Phase 9).
+
 ## 5. What comparable harnesses have (research, September 2026)
 
 Sources were read directly where the network allowed; cursor.com,

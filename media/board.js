@@ -1528,6 +1528,7 @@
     if (a && a.kind === 'queued') return 'queued'
     // Known broken by the board's own check: not "ready to test".
     if (cat === 'review' && c.testPlan && c.testPlan.autoCheck && !c.testPlan.autoCheck.ok) return 'needs'
+    if (cat === 'review' && c.testPlan && c.testPlan.quality && !c.testPlan.quality.ok) return 'needs'
     if (cat === 'review') return 'test'
     if (cat === 'completed' || cat === 'done' || (col && col.humanOnly && cat !== 'review')) return 'done'
     return 'planned'
@@ -1599,6 +1600,8 @@
     if (v) side.append(el('span', 'ov-badge' + (v.consoleErrors ? ' bad' : ''), '🌐 ' + v.consoleErrors + (v.consoleErrors === 1 ? ' error' : ' errors')))
     const ac = c.testPlan && c.testPlan.autoCheck
     if (ac) side.append(el('span', 'ov-badge' + (ac.ok ? '' : ' bad'), ac.ok ? '✓ auto-check' : '✖ auto-check'))
+    const qr = c.testPlan && c.testPlan.quality
+    if (qr) side.append(el('span', 'ov-badge' + (qr.ok ? '' : ' bad'), qr.ok ? '✓ checks' : '✖ checks'))
     if (c.reviewComments) side.append(el('span', 'ov-badge', '💬 ' + c.reviewComments))
     side.append(el('span', 'ov-age', ago(c.updated)))
     side.append(kebab(c))
@@ -1621,6 +1624,8 @@
     if (c.stalled) return 'stopped without handing its work back'
     if (c.autoChecking) return 'the board is checking it in its own browser…'
     if (c.testPlan && c.testPlan.autoCheck && !c.testPlan.autoCheck.ok) return 'failed the board\'s auto-check'
+    if (c.qualityChecking) return 'the board is running the project\'s own checks…'
+    if (c.testPlan && c.testPlan.quality && !c.testPlan.quality.ok) return 'breaks the project\'s own checks'
     if (c.testPlan && c.testPlan.summary) return c.testPlan.summary
     if (a && a.kind === 'done') return a.summary ? String(a.summary).slice(0, 140) : 'finished its turn'
     return c.branch ? '⎇ ' + c.branch.replace(/^task\//, '') : 'not started'
@@ -1882,6 +1887,76 @@
     else if (c.interrupted) n.append(renderInterrupted(c, false))
     else if (c.stalled) n.append(renderStalled(c))
     return n
+  }
+
+  /* The board's QUALITY checks (run/quality.ts): the project's own checks,
+     the proof that new tests test the change, and the mutation probe. Every
+     line carries its number — "tests ✓" alone could not say how much was
+     checked — and a failure the base branch shares is labelled pre-existing,
+     never drawn as this change's. */
+  function renderQuality(c, p) {
+    const r = p.quality
+    if (c.qualityChecking) return el('div', 'testplan-auto running', '🔬 The board is running the project\'s own checks on this change…')
+    if (!r) return null
+    const box = el('div', 'quality' + (r.ok ? '' : ' bad'))
+    const head = el('div', 'quality-head')
+    head.append(el('span', null, '🔬 Board checks ' + (r.ok ? '✓' : '✖')))
+    const secs = Math.round((r.durationMs || 0) / 1000)
+    head.append(el('span', 'quality-meta', r.diff.files + (r.diff.files === 1 ? ' file' : ' files') + ' · +' + r.diff.added + ' −' + r.diff.removed + (secs ? ' · ' + secs + 's' : '')))
+    box.append(head)
+    for (const ch of r.checks || []) {
+      const state = ch.ok ? (ch.flaky ? 'passed on a re-run — flaky' : 'passed') : ch.preExisting ? 'fails on the base branch too — pre-existing' : ch.timedOut ? 'timed out' : 'FAILED'
+      const row = el('div', 'quality-row' + (ch.ok ? '' : ch.preExisting ? ' pre' : ' bad'))
+      row.append(el('span', 'quality-mark', ch.ok ? (ch.flaky ? '≈' : '✓') : ch.preExisting ? '○' : '✖'))
+      row.append(el('span', 'quality-name', ch.name))
+      row.append(el('span', 'quality-state', state))
+      row.title = ch.command
+      box.append(row)
+      if (!ch.ok && !ch.preExisting && ch.tail && ch.tail.length) box.append(el('pre', 'testplan-auto-tail', ch.tail.slice(-8).join('\n')))
+    }
+    if (r.proof && r.proof.tests && r.proof.tests.length) {
+      const proven = r.proof.tests.filter((t) => t.failsBefore && t.passesAfter).length
+      const row = el('div', 'quality-row' + (proven === r.proof.tests.length ? '' : ' warn'))
+      row.append(el('span', 'quality-mark', proven === r.proof.tests.length ? '✓' : '!'))
+      row.append(el('span', 'quality-name', 'proof'))
+      row.append(el('span', 'quality-state', proven + ' of ' + r.proof.tests.length + ' new test files fail without the change and pass with it'))
+      row.title = 'Run on the base branch with only the tests copied in, then on this change'
+      box.append(row)
+      for (const t of r.proof.tests) {
+        if (t.failsBefore && t.passesAfter) continue
+        box.append(el('div', 'quality-line', t.file + ': ' + (!t.failsBefore ? 'passes without the change — it does not test what changed' : 'fails with the change')))
+      }
+    } else if (r.proof && r.proof.note) {
+      box.append(el('div', 'quality-line muted', 'proof: ' + r.proof.note))
+    }
+    const m = r.mutation
+    if (m && m.total) {
+      const row = el('div', 'quality-row' + (m.survivors.length ? ' warn' : ''))
+      row.append(el('span', 'quality-mark', m.survivors.length ? '!' : '✓'))
+      row.append(el('span', 'quality-name', 'mutants'))
+      row.append(el('span', 'quality-state', m.killed + ' of ' + m.total + ' deliberate breaks to the changed lines were caught by a test'))
+      box.append(row)
+      for (const sv of m.survivors.slice(0, 5)) {
+        box.append(el('div', 'quality-line', 'not caught: ' + sv.file + ':' + sv.line + '  ' + sv.from + ' → ' + sv.to))
+      }
+    }
+    if (m && m.uncovered && m.uncovered.length) box.append(el('div', 'quality-line', 'no test file for: ' + m.uncovered.join(', ')))
+    if (m && m.note && !m.total) box.append(el('div', 'quality-line muted', 'mutants: ' + m.note))
+    if (r.diff.large) box.append(el('div', 'quality-line warn', 'A large change — larger agent changes are reviewed worse and merged less.'))
+    for (const sk of r.skipped || []) box.append(el('div', 'quality-line muted', 'not checked: ' + sk))
+    const acts = el('div', 'testplan-links')
+    const findings = !r.ok || (m && m.survivors && m.survivors.length) || (r.proof && r.proof.tests && r.proof.tests.some((t) => !t.failsBefore || !t.passesAfter))
+    if (findings) {
+      const send = el('button', r.ok ? null : 'primary', 'Send findings to agent')
+      send.title = 'Resume the agent with exactly what the checks found'
+      send.onclick = () => post('sendQuality', { id: c.key })
+      acts.append(send)
+    }
+    const again = el('button', null, 'Check again')
+    again.onclick = () => post('runQuality', { id: c.key })
+    acts.append(again)
+    box.append(acts)
+    return box
   }
 
   /* A run that ENDED and left the card where it started.
@@ -2861,6 +2936,9 @@
       acts.append(again)
       body.append(acts)
     }
+
+    const qBox = renderQuality(c, p)
+    if (qBox) body.append(qBox)
 
     const v = p.verified
     if (v && typeof v.pages === 'number') {

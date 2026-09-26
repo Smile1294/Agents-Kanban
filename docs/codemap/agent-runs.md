@@ -280,6 +280,8 @@ started column while the title is still the guess.
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · quality checks: `ManagerOptions.quality` (`mode` = `agentsKanban.qualityGate`, `run`); `boardContext` wires `runChecks` (full) and `qualityGate` (`require` only, the FAST half, refusal carries `qualityText`); `qualityBrief(mode)` in the brief (reproduce first, abstain when nothing is broken, small diffs, `run_checks`, never game a test); `run_checks` board tool (auto-allowed, read-only); `set_phase` drops an agent-written `quality` and stamps the gate's report.
+
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · resilience: `checkDue()` (wall-clock wake, for a timer that slept), the queue persisted across restarts (`queueStore`, `saveQueue`, `restoreQueue`, `parseSavedQueue`, `LaunchOptions.restored`), and an offline failure of a board-started resume re-parks for a retry (`isOfflineError`, `offlineReading`, `LimitReading.source: 'offline'`).
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `agentsKanban.usageLimits` (`resume`/`pause`/`off`, `ManagerOptions.limitMode`) replaces `resumeAfterLimit`; `park()` records the background agents still running (`AgentRun.backgroundTasks()` → `ParkedRecord.stoppedTasks`) and the resume names them (`resumePrompt`); `AgentSession` routes `rate_limit_event` and `api_retry` BEFORE the subagent early-return, so a subagent's 429 retry reaches the tracker.

@@ -875,6 +875,49 @@ ok(!clashesWith(agents.get('run-1')!, 'sess-A'), 'an agent does not clash with i
      'and a session that cannot split is not told about spawn models either')
 }
 
+// --- the quality paragraph: each line is a research finding -------------------
+{
+  const on = buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, true, undefined, false, false, false, 'check')
+  ok(on.includes('- Fixing a bug: first write a test that reproduces it and run it to watch it FAIL, then fix it.'),
+     'with checks on, the brief says to reproduce FIRST — a test proven to fail before the fix is what moves outcomes')
+  ok(on.includes('- If the bug does not reproduce, or is already fixed, say so and change nothing. An edit nobody needed is a bug of its own.'),
+     'and that changing nothing is an answer — agents edit correct code when told a bug exists')
+  ok(on.includes('`run_checks`') && on.includes('- Never weaken, skip or special-case a test to get a green result. The report goes to the user as it is.'),
+     'it names run_checks, and forbids gaming the tests')
+  ok(!on.includes('REFUSED while a lint'), 'under "check" nothing is refused')
+  ok(buildBrief(DEFAULT_BOARD, 'T', 'task/x', undefined, true, undefined, false, false, false, 'require').includes('Moving to review is REFUSED while a lint, typecheck or test failure caused by this change remains'),
+     'under "require" the refusal is said up front')
+  ok(!buildBrief(DEFAULT_BOARD, 'T', 'task/x').includes('run_checks'), 'with checks off the brief says nothing about them')
+}
+
+// `qualityGate: require` through the manager: the fast half, and only then.
+{
+  let qmode: 'off' | 'check' | 'require' = 'require'
+  const runs: boolean[] = []
+  let result = { ok: false, at: 1, durationMs: 1, diff: { files: 1, added: 1, removed: 0, large: false },
+    checks: [{ name: 'tests' as const, command: 'npm test', ok: false, tail: ['1 failing'], durationMs: 1 }] }
+  const mgr = new AgentManager({
+    store: {} as never, worktrees: {} as never, board: DEFAULT_BOARD, defaults: {}, permissionMode: 'acceptEdits', maxConcurrent: 3,
+    quality: { mode: () => qmode, run: async (_w, _b, fast) => { runs.push(fast); return result } },
+  })
+  const agent: RunningAgent = {
+    runId: 'run-q', runtime: 'claude', title: 'Q', state: { kind: 'working' }, worktreePath: '/tmp/wt', branch: 'task/q', base: 'main',
+    live: [], history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
+  }
+  const ctx = (mgr as unknown as { boardContext: (a: RunningAgent) => { qualityGate?: () => Promise<{ refusal?: string; report?: unknown }>; runChecks?: () => Promise<string> } }).boardContext(agent)
+  const refused = await ctx.qualityGate!()
+  ok(/requires them to pass before review/.test(refused.refusal ?? '') && /1 failing/.test(refused.refusal ?? '') && runs.at(-1) === true,
+     'under "require" a failing change is refused with the output, from the FAST half of the checks')
+  result = { ...result, ok: true, checks: [{ ...result.checks[0]!, ok: true }] }
+  ok(!!(await ctx.qualityGate!()).report, 'a passing one carries its report to the plan')
+  qmode = 'check'
+  const n = runs.length
+  ok(Object.keys(await ctx.qualityGate!()).length === 0 && runs.length === n, 'under "check" the gate runs nothing and refuses nothing')
+  ok(/Board checks/.test(await ctx.runChecks!()) && runs.at(-1) === false, 'run_checks runs the FULL checks, proof and probe included')
+  qmode = 'off'
+  ok(/off on this board/.test(await ctx.runChecks!()), 'and says so when they are off')
+}
+
 // --- the tools' side of a run is actually wired up ---------------------------
 //
 // `autoVerify: require`: a change to files a browser shows cannot reach review

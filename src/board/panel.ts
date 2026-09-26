@@ -210,6 +210,8 @@ export interface UiCard {
   reviewComments?: number
   /** The board's own review-time check is running for this card. */
   autoChecking?: boolean
+  /** The board's quality checks (`run/quality.ts`) are running for this card. */
+  qualityChecking?: boolean
   /**
    * When a run was cut off by the extension host going away — a reload, a
    * reinstall, a crash. The process is gone and cannot be re-attached; the
@@ -604,6 +606,9 @@ export interface BoardHost {
    *  ONE surface, as `browserFrame` messages, until turned off. */
   watchBrowser?(id: string, on: boolean, sink: StateSink, reply: (m: object) => void): void
   runAutoCheck(id: string): Promise<void>
+  /** Send the quality findings to the agent; run the checks again by hand. */
+  sendQuality?(id: string): Promise<void>
+  runQuality?(id: string): Promise<void>
   /** A card parked at its account's limit: resume it now (the user deciding
    *  to try), or keep it parked without the automatic resume. */
   resumeParked?(id: string): Promise<void>
@@ -995,6 +1000,8 @@ async function routeBoardMessage(
     case 'sendReview': if (id()) await host.sendReview(id()); break
     case 'sendAutoCheck': if (id()) await host.sendAutoCheck(id()); break
     case 'runAutoCheck': if (id()) await host.runAutoCheck(id()); break
+    case 'sendQuality': if (id()) await host.sendQuality?.(id()); break
+    case 'runQuality': if (id()) await host.runQuality?.(id()); break
     case 'resumeParked': if (id()) await host.resumeParked?.(id()); break
     case 'holdParked': if (id()) await host.holdParked?.(id()); break
     case 'discardReview': if (id()) await host.discardReview(id()); break

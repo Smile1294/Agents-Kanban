@@ -34,6 +34,8 @@ import {
 import { knowledgeCheck, loadCodemap } from '../board/codemap.ts'
 import { dropCheckpoints, takeCheckpoint } from '../git/checkpoints.ts'
 import { uiFilesIn } from '../run/autocheck.ts'
+import { qualityText } from '../run/quality.ts'
+import type { QualityReport } from '../sessions/meta.ts'
 import { bindHarness, harnessBrief, type Harness, type HarnessDeps } from './harness.ts'
 import {
   accountKey, limitFromErrorText, limitFromPlanMeter, limitFromRetry, LimitTracker, MAX_AUTO_RESUMES,
@@ -119,6 +121,16 @@ export interface ManagerOptions {
   spendCapUsd?: () => number | undefined
   /** `agentsKanban.autoVerify`, read at the move. Only `require` gates it. */
   autoVerify?: () => 'off' | 'check' | 'require'
+  /**
+   * The board's quality checks (`run/quality.ts`): `mode` is
+   * `agentsKanban.qualityGate`, read at every use; `run` checks one worktree
+   * against its base (`fast` skips the proof and the mutation probe). Absent
+   * means no `run_checks` tool and no gate.
+   */
+  quality?: {
+    mode: () => QualityMode
+    run: (worktree: string, base: string, fast: boolean) => Promise<QualityReport>
+  }
   /** `agentsKanban.usageLimits`, read at every decision — park, hold, wake —
    *  so a change applies at once. Absent is `resume`. See `LimitMode`. */
   limitMode?: () => LimitMode
@@ -1285,6 +1297,14 @@ export class AgentManager extends EventEmitter {
         ? { harness: (agent.harness ??= bindHarness(this.opts.harness, () => agent.worktreePath, agent.runId)) }
         : {}),
       ...(this.opts.harness && this.opts.autoVerify ? { browserGate: () => this.browserGate(agent) } : {}),
+      ...(this.opts.quality ? {
+        runChecks: async () => {
+          if (this.opts.quality!.mode() === 'off') return 'Quality checks are off on this board (agentsKanban.qualityGate).'
+          if (!agent.worktreePath) return 'This session has no worktree to check yet.'
+          return qualityText(await this.opts.quality!.run(agent.worktreePath, agent.base ?? 'HEAD', false))
+        },
+        qualityGate: () => this.qualityGate(agent),
+      } : {}),
     }
   }
 
@@ -1902,6 +1922,7 @@ export class AgentManager extends EventEmitter {
       appendSystemPrompt: buildBrief(
         this.opts.board, title, wt.branch, policyFor(level), canSplit, spawnAgents,
         agent.knowledgeFiles === true, !!this.opts.harness, this.opts.autoVerify?.() === 'require',
+        this.opts.quality?.mode() ?? 'off',
       ),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
@@ -2096,6 +2117,22 @@ export class AgentManager extends EventEmitter {
       'and this board requires checking them before review (agentsKanban.autoVerify: require). ' +
       'Run app_start, then browser_open, use it (browser_act), look at it (browser_snapshot, or browser_screenshot for ' +
       'appearance), fix any console errors, and move again. The board records what you checked on the test plan.'
+  }
+
+  /**
+   * `qualityGate: require` — the project's own lint, typecheck and related
+   * tests must not be broken BY THIS CHANGE before it reaches review. The fast
+   * half only: the agent's tool call is waiting, and the proof and the probe
+   * are evidence to show, not a bar to refuse on.
+   */
+  private async qualityGate(agent: RunningAgent): Promise<{ refusal?: string; report?: QualityReport }> {
+    if (this.opts.quality?.mode() !== 'require' || !agent.worktreePath) return {}
+    const report = await this.opts.quality.run(agent.worktreePath, agent.base ?? 'HEAD', true)
+    if (report.ok) return { report }
+    return {
+      refusal: 'This change breaks the project\'s own checks, and this board requires them to pass before review ' +
+        '(agentsKanban.qualityGate: require). Fix it, then move again.\n\n' + qualityText(report),
+    }
   }
 
   /** Stop a message's work that has spent past the cap. The session stays
@@ -2513,6 +2550,33 @@ function clock(at: number): string {
   return d.toDateString() === new Date().toDateString() ? t : `${d.toLocaleDateString('en-GB', { weekday: 'short' })} ${t}`
 }
 
+export type QualityMode = 'off' | 'check' | 'require'
+
+/**
+ * How the work is judged, when the board checks it (`run/quality.ts`). Each
+ * line is one research finding turned into an instruction (docs/HARNESS-REVIEW.md
+ * §4e): reproduce first, because a test PROVEN to fail before the fix is what
+ * moves outcomes; abstain when nothing is broken, because agents edit correct
+ * code when told a bug exists; small diffs, because large agentic PRs are
+ * merged less; and never game a test, because refining against your own test
+ * is exactly how patches overfit.
+ */
+export function qualityBrief(mode: QualityMode): string[] {
+  if (mode === 'off') return []
+  return [
+    'How your work is judged: the board checks it itself and shows the user the result.',
+    '- Fixing a bug: first write a test that reproduces it and run it to watch it FAIL, then fix it.',
+    '- If the bug does not reproduce, or is already fixed, say so and change nothing. An edit nobody needed is a bug of its own.',
+    '- Keep the change to what the task needs. Large diffs are reviewed worse and merged less; if it is really several changes, split it.',
+    '- Call `run_checks` before moving to review and fix what it reports: the project\'s own lint, typecheck and related tests, proof on the base branch that your new tests fail without your change, and a mutation probe that finds changed lines no test pins down. Add tests for those.',
+    '- Never weaken, skip or special-case a test to get a green result. The report goes to the user as it is.',
+    ...(mode === 'require'
+      ? [`- Moving to review is REFUSED while a lint, typecheck or test failure caused by this change remains (a failure also on the base branch does not count).`]
+      : []),
+    '',
+  ]
+}
+
 /** Appended to the Claude Code system prompt. Tells the agent it owns a card. */
 /**
  * @param policy how eagerly this session should split. Its `aim` sentence
@@ -2547,6 +2611,8 @@ export function buildBrief(
   harness = false,
   /** `autoVerify: require` — said up front, so the agent does not learn it from a refusal. */
   browserRequired = false,
+  /** `agentsKanban.qualityGate`. The paragraph appears only when checks run. */
+  quality: QualityMode = 'off',
 ): string {
   const started = board.columns.find((c) => c.category === 'started')?.id ?? 'implementing'
   const review = board.columns.find((c) => c.category === 'review')?.id ?? 'validating'
@@ -2583,6 +2649,7 @@ export function buildBrief(
     'Use `set_tags` once you know what this work touches, so it can be found later.',
     '',
     ...(harness ? harnessBrief(browserRequired) : []),
+    ...qualityBrief(quality),
     'That card name was taken from the first line of the request, so it is often',
     'not what the work turns out to be. Once you know, call `set_title` with six',
     'words or fewer. It renames the CARD only — your branch and worktree keep the',

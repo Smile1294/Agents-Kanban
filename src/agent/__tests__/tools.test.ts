@@ -46,7 +46,8 @@ const ctxFor = (over: Partial<BoardToolContext> = {}): BoardToolContext => ({
 // Every board tool the agent is handed must also be one it may call without
 // stopping. This is the assertion that would have caught the shipped bug.
 const names = boardToolNames(DEFAULT_BOARD, tool)
-ok(names.length === 17, `seventeen board tools are auto-allowed — six card tools, usage_status and ten app/browser tools (${names.join(', ')})`)
+ok(names.length === 18, `eighteen board tools are auto-allowed — six card tools, usage_status, run_checks and ten app/browser tools (${names.join(', ')})`)
+ok(names.includes(boardToolName('run_checks')), 'run_checks is auto-allowed — an agent that must ask before checking its work will not check it')
 ok(names.includes(boardToolName('usage_status')), 'usage_status is auto-allowed — reading your own budget is not worth a click')
 for (const t of ['app_start', 'app_logs', 'browser_open', 'browser_snapshot', 'browser_screenshot', 'browser_act', 'browser_console']) {
   ok(names.includes(boardToolName(t)), `${t} is auto-allowed — an agent that must ask before every click cannot verify anything`)
@@ -368,6 +369,42 @@ const byName = (list: ReturnType<typeof buildBoardTools>, name: string) => list.
   phase = 'validating'
   await call({ phase: 'implementing', howToTest: { summary: 's', steps: ['x'] } })
   ok(cleared === 0, 'and a move that supplies a NEW plan keeps it rather than clearing it')
+}
+
+// `qualityGate: require`: the move into review is refused while the change
+// breaks the project's own checks, and a passing report is stamped on the
+// plan — never one the agent wrote into howToTest itself.
+{
+  let phase = 'implementing'
+  const stored: unknown[] = []
+  let gate: { refusal?: string; report?: unknown } = { refusal: 'This change breaks the project\'s own checks: tests FAILED' }
+  const ctxQ = ctxFor({
+    store: {
+      get: async () => ({ phase, tags: [] }),
+      card: async () => ({ phase, tags: [] }),
+      childrenOf: async () => [],
+      setPhase: async (_id: string, p: string) => { phase = p },
+      setTags: async () => {}, setTestPlan: async (_id: string, pl: unknown) => { stored.push(pl) },
+      list: async () => [],
+    } as never,
+    qualityGate: async () => gate as never,
+    runChecks: async () => 'Board checks: no failure this change is responsible for.',
+  })
+  const tools = buildBoardTools(DEFAULT_BOARD, ctxQ, tool)
+  const handler = (name: string) => (byName(tools, name) as unknown as { handler: (x: unknown, e: unknown) => Promise<{ content: Array<{ text: string }>; isError?: boolean }> }).handler
+  const faked = { ok: true, at: 1, durationMs: 0, diff: { files: 0, added: 0, removed: 0, large: false }, checks: [] }
+  const refused = await handler('set_phase')({ phase: 'validating', howToTest: { summary: 's', steps: ['x'], quality: faked } }, {})
+  ok(refused.isError === true && /breaks the project/.test(refused.content[0]!.text) && phase === 'implementing',
+     'a change that breaks the checks is refused, and the card stays where it was')
+  const real = { ...faked, durationMs: 42, checks: [{ name: 'tests', command: 'npm test', ok: true, tail: [], durationMs: 42 }] }
+  gate = { report: real }
+  await handler('set_phase')({ phase: 'validating', howToTest: { summary: 's', steps: ['x'], quality: faked } }, {})
+  const plan = stored.at(-1) as { quality?: { durationMs: number } } | undefined
+  ok(phase === 'validating' && plan?.quality?.durationMs === 42, 'once it passes, the move goes through with the HOST\'s report on the plan, not the agent\'s')
+  const rc = await handler('run_checks')({}, {})
+  ok(/no failure this change is responsible for/.test(rc.content[0]!.text), 'run_checks returns the host\'s report')
+  const off = await (byName(buildBoardTools(DEFAULT_BOARD, ctxFor(), tool), 'run_checks') as unknown as { handler: (x: unknown, e: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }> }).handler({}, {})
+  ok(off.isError === true && /off on this board/.test(off.content[0]!.text), 'with no checks configured it says so')
 }
 
 // The move into review commits the worktree, so the user's Merge button always

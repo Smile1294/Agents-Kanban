@@ -582,6 +582,10 @@ for (const msg of [
   { type: 'resumeParked', id: 'nope' },
   { type: 'holdParked', id: 'nope' },
   { type: 'resumeParked' },
+  // The quality checks' two buttons, for a card with no report or no worktree.
+  { type: 'sendQuality', id: 'nope' },
+  { type: 'runQuality', id: 'nope' },
+  { type: 'runQuality' },
   // The live browser pane, for a card with no browser, and switched off again.
   { type: 'watchBrowser', id: 'nope', on: true },
   { type: 'watchBrowser', id: 'nope', on: false },
