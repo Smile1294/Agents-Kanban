@@ -68,6 +68,8 @@ export interface SessionEvents {
   /** A session flag we asked for that the CLI could not honour. See
    *  `checkFlagSettings`: the request path itself never refuses anything. */
   flagWarning: (message: string) => void
+  /** The account's usage limit, raw — see `limit` in runtime.ts. */
+  limit: (raw: unknown, retry?: boolean) => void
   done: (summary: string, costUsd?: number) => void
   error: (message: string) => void
 }
@@ -653,12 +655,23 @@ export class AgentSession extends EventEmitter implements AgentRun {
           this.checkFlagSettings(msg as unknown as { tools?: unknown })
         }
         this.trackTask(msg as unknown as Record<string, unknown>)
+        // The CLI retrying a 429 by itself: the account is being throttled, and
+        // the host shows it, but the turn may yet succeed — so a warning only.
+        if ('subtype' in msg && msg.subtype === 'api_retry') this.emit('limit', msg, true)
         // After a compaction there is no assistant message, so the meter would
         // stay pinned at the pre-compaction figure. Reset it explicitly.
         if ('subtype' in msg && msg.subtype === 'compact_boundary') {
           this.lastContextTokens = 0
           this.emit('usage', 0, this.contextWindow)
         }
+        break
+      }
+      // Once per turn on a subscription: every window's utilisation and, when
+      // `rejected`, when the account comes back. Raw to the manager, which
+      // owns the account's reading (`agent/limits.ts`) — this process cannot
+      // run a turn once it is limited, so the waiting is not its to do.
+      case 'rate_limit_event': {
+        this.emit('limit', (msg as { rate_limit_info?: unknown }).rate_limit_info)
         break
       }
       case 'stream_event': {

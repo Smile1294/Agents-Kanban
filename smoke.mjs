@@ -578,6 +578,10 @@ for (const msg of [
   { type: 'sendAutoCheck', id: 'nope' },
   { type: 'runAutoCheck', id: 'nope' },
   { type: 'runAutoCheck' },
+  // A parked card's two buttons, for a card that is not parked, or no card.
+  { type: 'resumeParked', id: 'nope' },
+  { type: 'holdParked', id: 'nope' },
+  { type: 'resumeParked' },
   // The live browser pane, for a card with no browser, and switched off again.
   { type: 'watchBrowser', id: 'nope', on: true },
   { type: 'watchBrowser', id: 'nope', on: false },

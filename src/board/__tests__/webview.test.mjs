@@ -740,6 +740,33 @@ ok(reviewed.posted.some((m) => m.type === 'merge' && m.id === 'abc-123' && m.int
      'a stalled timestamp moving inside its minute does NOT rebuild the tree')
 }
 
+// 8a'. A card PARKED at its account's usage limit, and the limits strip.
+//
+// Parked is not stalled and not failed: it is waiting for a time, and the time
+// is what the card must show — with Resume (the user deciding to try) and
+// Don't resume. The strip draws each window's fill as a number, because a bar
+// that is merely green cannot say how close to the edge it is.
+{
+  const until = Date.now() + 64 * 60000
+  const parkedCard = { ...CARD, worktree: '/tmp/w', agent: { kind: 'error', message: 'Claude AI usage limit reached', contextTokens: 0 },
+    parked: { until, reason: '5-hour limit reached', auto: true, attempts: 0 }, stalled: Date.now() }
+  const limits = [{ account: 'claude|', label: 'Claude Code', status: 'limited', resetsAt: until, windows: [{ name: 'five_hour', used: 1 }, { name: 'seven_day', used: 0.44 }], at: Date.now(), parked: 1 }]
+  const v = run({ ...base, cards: [parkedCard], limits })
+  const t = v.text()
+  ok(/Resumes \d\d:\d\d \(in 1h 4m\)/.test(t), `a parked card says WHEN it resumes, as a time and a countdown (${/Resumes[^)]*\)/.exec(t)?.[0] ?? 'MISSING'})`)
+  ok(!t.includes('Stopped') && !t.includes('usage limit reached\n'), 'and not "stopped", nor the raw error its run ended on')
+  ok(/at its usage limit — back/.test(t) && t.includes('5-hour 100%') && t.includes('7-day 44%') && t.includes('1 card resumes then'),
+     'the strip names the account, its windows as numbers, and how many cards wait on it')
+  findButton(v.root, 'Resume now')?.onclick({ stopPropagation() {}, preventDefault() {} })
+  findButton(v.root, "Don't resume")?.onclick({ stopPropagation() {}, preventDefault() {} })
+  ok(v.posted.some((m) => m.type === 'resumeParked' && m.id === 'abc-123') && v.posted.some((m) => m.type === 'holdParked' && m.id === 'abc-123'),
+     'Resume now and Don\'t resume post for that card')
+  const off = run({ ...base, cards: [{ ...parkedCard, parked: { ...parkedCard.parked, auto: false, attempts: 3, estimated: true } }] }).text()
+  ok(/Usage limit · back ~/.test(off) && !off.includes("Don't resume"), 'with auto-resume off it says "back", marks a guessed time with ~, and offers only Resume')
+  ok(!run({ ...base, limits: [{ ...limits[0], status: 'ok', windows: [] }] }).root.querySelector('.limits'),
+     'no reading worth drawing, no strip')
+}
+
 // 8b. A merge that has landed but is NOT committed.
 //
 // The whole reason merge() stops early: the work is on the user's branch, in

@@ -755,6 +755,20 @@ run, since each session needs a worktree.
   `waiting` counts as busy everywhere `working` does (slot, status bar,
   Interrupt/Stop); and a grace timer finishes the run when only a follow-up is
   owed and none comes. `background-turns.test.ts` feeds the recorded frames.
+- **An account's usage limit is the HOST's to wait out, and it is per
+  ACCOUNT.** A limited agent cannot run a turn, so `agent/limits.ts` turns every
+  vendor's signal — Claude Code's `rate_limit_event` (`resetsAt` is SECONDS;
+  `unifiedWindows` is undeclared and read anyway), Codex's plan meter, any
+  failed turn's text — into one reading per `<runtime>|<profile>`. Four things
+  are load-bearing. Only a turn the limit REFUSED is parked: a plan meter at
+  100% on a finished turn holds new work but resuming it would invent a
+  cut-off, and an answer that merely DISCUSSES rate limiting is work
+  (`LIMIT_ANSWER` matches the opening only). Holding is per account in
+  `drain()`, never a queue-head check, or one limited account blocks
+  everybody. A reset the vendor did not state is a back-off marked
+  `estimated` and drawn with `~`. And automatic resumes stop at
+  `MAX_AUTO_RESUMES` — a wrong reset time must not become a loop that bills a
+  turn an hour — while the user's Resume is never bounded.
 
 ## Testing conventions
 

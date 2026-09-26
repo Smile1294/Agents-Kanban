@@ -33,11 +33,21 @@ const ctxFor = (over: Partial<BoardToolContext> = {}): BoardToolContext => ({
   ...over,
 })
 
+// --- usage_status reads the host's reading, and says so when there is none ----
+{
+  const find = (c: BoardToolContext) => buildBoardTools(DEFAULT_BOARD, c, tool).find((t) => t.name === 'usage_status')!
+  const none = await find(ctxFor()).handler({} as never, {}) as { content: Array<{ text: string }> }
+  ok(/no usage reading/i.test(none.content[0]!.text), 'with no reading, usage_status says so rather than inventing one')
+  const some = await find(ctxFor({ usage: () => 'Your account (claude|): AT ITS LIMIT until 15:02.' })).handler({} as never, {}) as { content: Array<{ text: string }> }
+  ok(some.content[0]!.text.includes('AT ITS LIMIT until 15:02'), 'with one, it returns the host\'s sentence')
+}
+
 // --- the drift guard ---------------------------------------------------------
 // Every board tool the agent is handed must also be one it may call without
 // stopping. This is the assertion that would have caught the shipped bug.
 const names = boardToolNames(DEFAULT_BOARD, tool)
-ok(names.length === 16, `sixteen board tools are auto-allowed — six card tools and ten app/browser tools (${names.join(', ')})`)
+ok(names.length === 17, `seventeen board tools are auto-allowed — six card tools, usage_status and ten app/browser tools (${names.join(', ')})`)
+ok(names.includes(boardToolName('usage_status')), 'usage_status is auto-allowed — reading your own budget is not worth a click')
 for (const t of ['app_start', 'app_logs', 'browser_open', 'browser_snapshot', 'browser_screenshot', 'browser_act', 'browser_console']) {
   ok(names.includes(boardToolName(t)), `${t} is auto-allowed — an agent that must ask before every click cannot verify anything`)
 }

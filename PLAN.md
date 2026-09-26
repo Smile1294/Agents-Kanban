@@ -399,6 +399,16 @@ Working:
   the user), actions, eval, and console/network errors reported with each step.
   Loopback only unless the user widens it. See
   [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §3.
+- **Agents wait out an account's usage limit, and the board wakes them.** The
+  HOST tracks every account (`<runtime>|<profile>`) from whatever the vendor
+  sends — Claude Code's `rate_limit_event` (every window's fill and reset),
+  Codex's plan meter, or any vendor's error text ("resets 3pm (Europe/Prague)",
+  "try again in 20s", `429`). A run the limit refused is parked on its card
+  with the reset time (in the sidecar, so a restart re-arms it), new work for
+  that account waits in the queue while other accounts keep running, and the
+  board resumes parked cards when the limit resets — at most three times into
+  the same limit. `usage_status` lets an agent read its budget. See
+  [docs/HARNESS-REVIEW.md](docs/HARNESS-REVIEW.md) §4d.
 - **Draw on an image before sending it** — numbered boxes and arrows, pen,
   labels; flattened into the image, and the message says the marks are yours.
   A sent message's images can be shown again ("Show" on its row).

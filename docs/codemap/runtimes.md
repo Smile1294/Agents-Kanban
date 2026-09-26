@@ -183,6 +183,7 @@ once came back with empty transcripts that way). The settings page asks
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `AgentRunEvents.limit?(raw, retry?)` — the account's usage limit, raw (Claude Code's `rate_limit_info`, or a 429 `api_retry`); optional to emit, since a plan-meter runtime reports through `meter` and every runtime's failed turns are read for limit text.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `RuntimeCapabilities.messageIds` (Claude Code: true) and an optional `messageId` on `AgentRun.run`/`send`.
 - 2026-09-07 · task/S5kc3 · area file created from the codebase audit.
 - 2026-09-07 · task/S116g8 · dead-code sweep: `_resetSdkCache` (sdk.ts) and `_clearRuntimes` (runtime.ts) test hooks deleted — no test imported either; `RpcEvents` in jsonrpc.ts de-exported — zero references outside the module.

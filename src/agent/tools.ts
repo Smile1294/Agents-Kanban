@@ -222,6 +222,13 @@ export interface BoardToolContext {
   /** Refuse the move into review with this sentence, or undefined to allow
    *  it. Set by the host under `autoVerify: require`. */
   browserGate?: () => Promise<string | undefined>
+  /**
+   * The host's reading of this run's ACCOUNT usage limit, and every other
+   * account the board knows, as sentences (`agent/limits.ts`). Read-only: the
+   * pausing and resuming is the host's, because a limited agent cannot run a
+   * turn to do it.
+   */
+  usage?: () => string
 }
 
 type Content = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -810,9 +817,27 @@ export function buildBoardTools(
     },
   )
 
+  const usageStatus = tool(
+    'usage_status',
+    [
+      'How much of your ACCOUNT\'s usage allowance is left — the rolling windows',
+      '(for example 5-hour and 7-day) and how full each is, and whether the',
+      'account is at its limit and when it resets. Also lists the other accounts',
+      'this board runs agents on.',
+      '',
+      'Read-only, and you do not need to act on a limit: if the account runs out',
+      'mid-turn, the board pauses this card and resumes it by itself when the',
+      'limit resets. Useful before starting something long (splitting into',
+      'subtasks, a big refactor) when a window is nearly full.',
+    ].join('\n'),
+    {},
+    async () => ok(ctx.usage?.() ?? 'This board has no usage reading for your account yet — it arrives with the first turn.'),
+    { annotations: { readOnlyHint: true }, searchHint: 'usage limit quota rate limit' },
+  )
+
   return [
     setPhase, setTitle, setTags, listBoard, splitTask, notifyUser,
-    listSchedules, createSchedule, deleteSchedule, runSchedule,
+    listSchedules, createSchedule, deleteSchedule, runSchedule, usageStatus,
     // The app and browser tools. Built whatever the context, like the
     // schedule tools, so the auto-allow list derived below covers them; a
     // context without a harness answers each call with the reason.

@@ -16,6 +16,7 @@ import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { MODEL_WINDOWS } from './usage.ts'
 import { parseRuntimeId, type RuntimeId } from '../agent/runtime.ts'
+import { parseParked, type ParkedRecord } from '../agent/limits.ts'
 import {
   parseOrchestrationLevel,
   type DecompositionRecord, type OrchestrationLevel, type ProposalRule,
@@ -470,6 +471,13 @@ export interface SessionMeta {
    */
   /** `null` in a PATCH clears it — see `normalise()`. */
   switchedFrom?: string | null
+  /**
+   * Parked at its ACCOUNT's usage limit: when the account is expected back and
+   * whether the board resumes it by itself (`agent/limits.ts`). In the sidecar
+   * so a restart re-arms the timer instead of forgetting the card was waiting.
+   * `null` in a PATCH clears it — any resume ends the park.
+   */
+  parked?: ParkedRecord | null
   /** Per-session overrides; unset means fall through to the workspace default. */
   model?: string
   effort?: EffortLevel
@@ -529,6 +537,7 @@ export function parseMeta(v: unknown): SessionMeta | undefined {
     ...(parseDecomposition(m.decomposition) ? { decomposition: parseDecomposition(m.decomposition)! } : {}),
     ...(typeof m.provider === 'string' ? { provider: m.provider } : {}),
     ...(typeof m.switchedFrom === 'string' ? { switchedFrom: m.switchedFrom } : {}),
+    ...(parseParked(m.parked) ? { parked: parseParked(m.parked)! } : {}),
     ...(typeof m.model === 'string' ? { model: m.model } : {}),
     // Closed unions, so a value from an older build cannot reach the picker.
     ...(EFFORT_LEVELS.some((e) => e.key === m.effort) ? { effort: m.effort as EffortLevel } : {}),
@@ -549,6 +558,7 @@ export function normalise(m: SessionMeta): SessionMeta {
   // Same convention, one field: `null` in a patch clears the switch warning
   // once the launch it warned about has happened.
   if (out.switchedFrom === null) delete out.switchedFrom
+  if (out.parked === null) delete out.parked
   return out
 }
 

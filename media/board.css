@@ -1597,3 +1597,54 @@ mark.hl {
 .browser-pane-action { padding: 4px 8px; color: var(--faint); font-size: 0.85em; font-family: var(--vscode-editor-font-family); }
 .browser-pane-empty { padding: 16px; color: var(--faint); font-size: 0.9em; }
 .browser-pane-empty.hidden { display: none; }
+
+/* ---- Usage limits (agent/limits.ts) -------------------------------------
+   The strip is quiet while nothing is limited — it is a readout, not an alarm
+   — and the fill is a NUMBER per window. A limited account turns it amber: the
+   board is not broken, it is waiting for a time, and the time is shown. */
+.limits {
+  margin: 6px 14px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.85em;
+  color: var(--muted);
+  min-width: 0;
+}
+.limits.limited {
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--vscode-editorWarning-foreground) 45%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 8%, transparent);
+}
+.limit-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.limit-name { color: var(--vscode-foreground); font-weight: 600; }
+.limit-row.status-limited .limit-back { color: var(--vscode-editorWarning-foreground); }
+.limit-row.status-warning .limit-icon { color: var(--vscode-editorWarning-foreground); }
+.limit-back, .limit-parked { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.limit-window { font-variant-numeric: tabular-nums; }
+.limit-window.high { color: var(--vscode-editorWarning-foreground); }
+.limit-window.full { color: var(--vscode-errorForeground); font-weight: 600; }
+.limit-age { margin-left: auto; font-size: 0.9em; }
+
+/* A card parked at its account's limit. Same shape as .stalled — it answers
+   the same question, "why is nothing running here?" — in the warning colour,
+   because it WILL do something by itself at the time shown. */
+.parked {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  border: 1px dashed color-mix(in srgb, var(--vscode-editorWarning-foreground) 55%, transparent);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 7%, transparent);
+  min-width: 0;
+}
+.parked.full { margin: 8px 14px 0; }
+.parked-head { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 7.5em; }
+.parked-icon { color: var(--vscode-editorWarning-foreground); flex: 0 0 auto; }
+.parked-title { font-size: 0.8em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.parked-why { flex: 1 1 100%; font-size: 0.8em; color: var(--muted); overflow-wrap: anywhere; }
+.parked-acts { display: flex; gap: 6px; flex: 1 1 auto; flex-wrap: wrap; justify-content: flex-end; }

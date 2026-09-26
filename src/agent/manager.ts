@@ -36,6 +36,10 @@ import { dropCheckpoints, takeCheckpoint } from '../git/checkpoints.ts'
 import { uiFilesIn } from '../run/autocheck.ts'
 import { bindHarness, harnessBrief, type Harness, type HarnessDeps } from './harness.ts'
 import {
+  accountKey, limitFromErrorText, limitFromPlanMeter, limitFromRetry, LimitTracker, MAX_AUTO_RESUMES,
+  parseClaudeRateLimit, parseParked, RESUME_PROMPT, windowName, type LimitReading, type ParkedRecord,
+} from './limits.ts'
+import {
   agentKeyOf, describeSpawnAgents, resolveRoute,
   type PieceRoute, type SpawnAgent, type SpawnCatalogue,
 } from './routing.ts'
@@ -114,6 +118,14 @@ export interface ManagerOptions {
   spendCapUsd?: () => number | undefined
   /** `agentsKanban.autoVerify`, read at the move. Only `require` gates it. */
   autoVerify?: () => 'off' | 'check' | 'require'
+  /** `agentsKanban.resumeAfterLimit`, read when the limit lifts. Absent is on. */
+  resumeAfterLimit?: () => boolean
+  /**
+   * A parked session's OWN backend, for the automatic resume — the host's
+   * `sessionProviderFor`. Without it a card parked on one profile would resume
+   * on whichever profile is active when its account comes back.
+   */
+  providerFor?: (key: string) => Promise<LaunchOptions['providerFor']>
   worktrees: WorktreeService
   board: BoardConfig
   defaults: AgentDefaults
@@ -401,6 +413,9 @@ export interface LaunchOptions {
    * right answer for a session that never recorded a provider.
    */
   providerFor?: { profile: ProviderProfile; env: ProviderEnv }
+  /** The user pressed Resume on a parked card: start it even though its
+   *  account is limited. Set by `start()`, never by a caller. */
+  ignoreLimit?: boolean
 }
 
 export interface RunningAgent {
@@ -414,6 +429,12 @@ export interface RunningAgent {
   spendMark?: number
   /** The cap already stopped this message's work; do not stop it twice. */
   capped?: boolean
+  /** This run was stopped by its account's usage limit: when it ends, the
+   *  card is parked until the limit resets rather than left looking stalled. */
+  limitHit?: LimitReading
+  /** Set on a run the board resumed by itself after a limit: how many such
+   *  resumes in a row. A limit hit again carries the count on. */
+  resumeAttempt?: number
   /** Which agent program is running this. Fixed for the life of the session:
    *  the transcript, the model ids and the login all belong to it. */
   runtime: RuntimeId
@@ -533,6 +554,15 @@ export class AgentManager extends EventEmitter {
   private readonly agents = new Map<string, RunningAgent>()
   private readonly queue: Array<{ runId: string; prompt: string; opts: LaunchOptions }> = []
   private counter = 0
+  /** Every account's usage-limit reading. Host-side on purpose — see limits.ts. */
+  readonly limits = new LimitTracker()
+  /** One timer per limited account: when it fires, the account is lifted,
+   *  held runs drain and parked cards resume. */
+  private readonly wakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** Sessions about to be resumed by the board, and the attempt number. */
+  private readonly pendingResume = new Map<string, number>()
+  /** Sessions the user asked to resume despite the limit. */
+  private readonly forcing = new Set<string>()
 
   constructor(opts: ManagerOptions) {
     super()
@@ -648,6 +678,9 @@ export class AgentManager extends EventEmitter {
       ...opts,
       chosen: launchSettings(opts, this.opts.defaults),
       orchestration: opts.orchestration ?? this.opts.defaults.orchestration ?? DEFAULT_ORCHESTRATION,
+      // Frozen with the rest, so a forced resume that waits for a SLOT is not
+      // then held by the limit it was forced past.
+      ...(opts.resume && this.forcing.has(opts.resume) ? { ignoreLimit: true } : {}),
       runtime: opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME,
       // The BACKEND, frozen with the rest. A resumed session already brings its
       // own and a routed subtask brings the one its route named; anything else
@@ -659,7 +692,8 @@ export class AgentManager extends EventEmitter {
         ? {}
         : { providerFor: { profile: this.opts.provider, env: this.opts.providerEnv ?? { set: {}, clear: [] } } }),
     }
-    if (this.activeCount >= this.opts.maxConcurrent) {
+    const held = this.heldUntil(opts, Date.now())
+    if (this.activeCount >= this.opts.maxConcurrent || held) {
       this.queue.push({ runId, prompt, opts })
       /* A queued run gets a CARD, and that is the whole fix for two separate
          reported failures.
@@ -678,7 +712,14 @@ export class AgentManager extends EventEmitter {
         title: opts.title ?? titleFrom(prompt),
         state: { kind: 'queued', since: Date.now() },
         worktreePath: '', branch: '',
-        live: [{ kind: 'prompt', at: Date.now(), text: prompt, ...(opts.images?.length ? { images: opts.images.length } : {}) }],
+        live: [
+          { kind: 'prompt', at: Date.now(), text: prompt, ...(opts.images?.length ? { images: opts.images.length } : {}) },
+          // Held by the account, not by the slot count: SAY which, and until when.
+          ...(held ? [{
+            kind: 'notice' as const, at: Date.now(), urgency: 'info' as const,
+            message: `Waiting: this account is at its usage limit until ${clock(held)}. The board starts this when it resets.`,
+          }] : []),
+        ],
         history: [], contextTokens: 0, priorUsd: 0, startedAt: Date.now(),
         ...(opts.parent ? { parent: opts.parent } : {}),
         // A queued card already knows its backend, so the composer describes
@@ -1160,6 +1201,7 @@ export class AgentManager extends EventEmitter {
       // `sessionTitle`, which the tools test pins). This file supplies only the
       // host callbacks.
       onScheduleList: this.opts.schedules ? async () => this.opts.schedules!.list() : undefined,
+      usage: () => this.describeUsage(agent),
       onScheduleCreate: this.opts.schedules
         ? async (draft, createdBy) => this.opts.schedules!.create(draft, createdBy)
         : undefined,
@@ -1225,6 +1267,11 @@ export class AgentManager extends EventEmitter {
     // nothing left to warn about. Cleared HERE and not only in `durablePatch`
     // (which rides the `sessionId` event): a resume keeps the id it already
     // has, so that event may never fire again.
+    // Any resume of a parked card — the board's own or the user's — is the
+    // park ending. `null` clears it (see `normalise()`).
+    if (opts.resume && prior?.parked) {
+      void this.opts.store.patch(opts.resume, { parked: null }).catch(() => {})
+    }
     if (opts.resume && prior?.switchedFrom) {
       void this.opts.store.patch(opts.resume, { switchedFrom: null }).catch(() => {})
     }
@@ -1281,7 +1328,9 @@ export class AgentManager extends EventEmitter {
       startedAt: Date.now(),
       ...(opts.resume ? { sessionId: opts.resume } : {}),
       ...(opts.parent ? { parent: opts.parent } : {}),
+      ...(opts.resume && this.pendingResume.has(opts.resume) ? { resumeAttempt: this.pendingResume.get(opts.resume)! } : {}),
     }
+    if (opts.resume) this.pendingResume.delete(opts.resume)
     this.agents.set(runId, agent)
     // Written under the RUN id, before Claude Code has assigned a session id.
     // A subtask that is only joined to its parent once the id arrives spends
@@ -1554,8 +1603,18 @@ export class AgentManager extends EventEmitter {
     session.on('meter', (raw: unknown) => {
       if (this.settleMeter(agent, raw, 'meter')) {
         this.checkSpendCap(agent)
+        // A plan meter IS a limit reading. It holds the account's new runs when
+        // full, but never parks this one: a turn that finished was not cut off.
+        const plan = limitFromPlanMeter(agent.meter, Date.now())
+        if (plan) this.recordLimit(this.accountOf(agent), plan)
         this.touch()
       }
+    })
+    session.on('limit', (raw: unknown, retry?: boolean) => {
+      const r = retry ? limitFromRetry(raw, Date.now()) : parseClaudeRateLimit(raw, Date.now())
+      if (!r) return
+      const now = this.recordLimit(this.accountOf(agent), r)
+      if (now.status === 'limited') agent.limitHit = now
     })
     /* The agent committed. Declared in both event interfaces, emitted by both
        runtimes, and listened for by NOTHING — so the Changes panel kept showing
@@ -1614,6 +1673,14 @@ export class AgentManager extends EventEmitter {
       void this.drain()
     }
     session.on('done', (summary: string, meter?: unknown, turnUsd?: unknown) => {
+      // A limit message can come back AS the answer (a synthetic assistant
+      // turn). Only its opening is trusted — an answer ABOUT rate limiting is
+      // ordinary work, and parking it would resume a finished turn.
+      if (!agent.limitHit && LIMIT_ANSWER.test(summary.trim())) {
+        const r = limitFromErrorText(summary, Date.now())
+        if (r) agent.limitHit = this.recordLimit(this.accountOf(agent), r)
+      }
+      if (agent.limitHit) void this.park(agent)
       // The final settle of the session meter, then this TURN's dollars — two
       // different scopes that used to share one argument slot. `costUsd` is the
       // turn, which is what the transcript row and the agent row show; it is
@@ -1631,12 +1698,24 @@ export class AgentManager extends EventEmitter {
     })
     session.on('error', (message: string) => {
       agent.live.push({ kind: 'error', at: Date.now(), message })
+      // Any vendor's failed turn is read for a limit — the one signal every
+      // runtime, gateway and model shares.
+      const r = limitFromErrorText(message, Date.now())
+      if (r) agent.limitHit = this.recordLimit(this.accountOf(agent), r)
+      if (agent.limitHit) void this.park(agent)
       // A run that failed before Claude Code ever gave it a session id never got
       // as far as working. Its worktree is a dead checkout and a dead branch
       // that nothing references, and they accumulate in the worktree directory with
       // every failed start. Reclaim it — but only once it is provably empty.
       if (!agent.sessionId) void this.discardIfUntouched(agent)
       finish()
+      // A FIRST turn refused by the limit has no session to park and resume —
+      // but the request is still wanted. It goes back in the queue, which now
+      // holds it until the account resets, rather than dying as a red card.
+      if (!agent.sessionId && agent.limitHit && !opts.resume) {
+        this.agents.delete(runId)
+        void this.start(prompt, opts).catch(() => {})
+      }
     })
 
     const first = agent.live[0]
@@ -1883,8 +1962,13 @@ export class AgentManager extends EventEmitter {
     // agent behind, with a real worktree, a real branch and a real CLI, against
     // a workspace that was being disposed — and no card anywhere to stop it.
     if (this.stopped) return
-    while (this.queue.length && this.activeCount < this.opts.maxConcurrent) {
-      const next = this.queue.shift()!
+    while (this.activeCount < this.opts.maxConcurrent) {
+      // The first entry whose ACCOUNT can run. One limited account must not
+      // hold up another account's work behind it.
+      const now = Date.now()
+      const i = this.queue.findIndex((q) => !this.heldUntil(q.opts, now))
+      if (i < 0) break
+      const next = this.queue.splice(i, 1)[0]!
       // `launch()` never throws; it reports. See the catch there — there is one
       // place that knows how to describe a failed launch, not two.
       await this.launch(next.runId, next.prompt, next.opts)
@@ -2045,8 +2129,201 @@ export class AgentManager extends EventEmitter {
     // to survive the host anyway; leaving entries there only gave a late drain
     // something to find.
     this.queue.length = 0
+    for (const t of this.wakeTimers.values()) clearTimeout(t)
+    this.wakeTimers.clear()
     for (const a of [...this.agents.values()]) this.halt(a)
   }
+
+  // -------------------------------------------------------------------------
+  // Usage limits (agent/limits.ts)
+  // -------------------------------------------------------------------------
+
+  /** The account a live run spends. */
+  accountOf(a: Pick<RunningAgent, 'runtime' | 'provider'>): string {
+    return accountKey(a.runtime, a.provider)
+  }
+
+  /** The account a QUEUED run will spend — resolved the way `startRun()`
+   *  resolves it, from what `start()` froze. */
+  private accountForLaunch(opts: LaunchOptions): string {
+    const runtime = opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME
+    const profiles = getRuntime(runtime)?.capabilities.providerProfiles
+    return accountKey(runtime, profiles ? (opts.providerFor?.profile.id ?? this.opts.provider?.id ?? '') : '')
+  }
+
+  /** `usage_status`: this run's account first, then the rest, as sentences. */
+  describeUsage(agent: Pick<RunningAgent, 'runtime' | 'provider'>): string {
+    const mine = this.accountOf(agent)
+    const all = this.limits.all().sort(([a], [b]) => (a === mine ? -1 : b === mine ? 1 : a.localeCompare(b)))
+    if (!all.length) return 'No usage reading yet for any account — it arrives with the first turn of a run.'
+    return all.map(([account, r]) => {
+      const who = account === mine ? `Your account (${account})` : `Account ${account}`
+      const windows = r.windows.filter((w) => w.used !== undefined)
+        .map((w) => `${windowName(w.name)} ${Math.round(w.used! * 100)}% used${w.resetsAt ? `, resets ${clock(w.resetsAt)}` : ''}`)
+      const state = r.status === 'limited'
+        ? `AT ITS LIMIT until ${r.estimated ? 'about ' : ''}${clock(r.resetsAt ?? 0)}${r.detail ? ` (${r.detail})` : ''}`
+        : r.status === 'warning' ? `near its limit${r.detail ? ` (${r.detail})` : ''}` : 'available'
+      return `${who}: ${state}.${windows.length ? ` ${windows.join('; ')}.` : ''} Read ${Math.max(0, Math.round((Date.now() - r.at) / 60000))}m ago.`
+    }).join('\n')
+  }
+
+  /** When a run's account holds it, or undefined when it may start. A resume
+   *  the USER forced is never held: pressing Resume is deciding to try. */
+  private heldUntil(opts: LaunchOptions, now: number): number | undefined {
+    if (opts.ignoreLimit) return undefined
+    return this.limits.limitedUntil(this.accountForLaunch(opts), now)
+  }
+
+  /** Take a reading for an account; schedule its wake when it is limited. */
+  recordLimit(account: string, r: LimitReading): LimitReading {
+    const was = this.limits.limitedUntil(account, Date.now())
+    const now = this.limits.record(account, r)
+    if (now.status === 'limited') this.scheduleWake(account)
+    else if (was) {
+      // A request went through before the timer: the account is back early.
+      clearTimeout(this.wakeTimers.get(account))
+      this.wakeTimers.delete(account)
+      void this.wake(account)
+    }
+    this.emit('limit', account, now)
+    this.touch()
+    return now
+  }
+
+  /** How long after a stated reset to wait before trying: a reset is not
+   *  always to the second, and resuming into the tail of a limit costs an
+   *  attempt. */
+  static WAKE_GRACE_MS = 60_000
+
+  private scheduleWake(account: string): void {
+    const until = this.limits.limitedUntil(account, Date.now())
+    if (!until || this.stopped) return
+    clearTimeout(this.wakeTimers.get(account))
+    // setTimeout overflows past ~24.8 days and fires AT ONCE; a 7-day window
+    // fits, but the cap is what makes an absurd reset harmless.
+    const delay = Math.min(Math.max(until - Date.now() + AgentManager.WAKE_GRACE_MS, 1000), 2 ** 31 - 1)
+    const t = setTimeout(() => { this.wakeTimers.delete(account); void this.wake(account) }, delay)
+    t.unref?.()
+    this.wakeTimers.set(account, t)
+  }
+
+  /** The account's reset time came: lift it, start what it held, resume what
+   *  it parked. */
+  async wake(account: string): Promise<void> {
+    if (this.stopped) return
+    const until = this.limits.limitedUntil(account, Date.now())
+    // A later reading moved the reset past this timer (or past the setTimeout
+    // cap): wait for that one instead.
+    if (until && until > Date.now() + 1000) { this.scheduleWake(account); return }
+    this.limits.lift(account, Date.now())
+    this.emit('limit', account, this.limits.get(account))
+    this.touch()
+    void this.drain()
+    await this.resumeParked({ account }).catch((e) => this.opts.log?.(`Resume after limit failed: ${e}`))
+  }
+
+  /**
+   * Park a run its account's limit stopped: record it on the card (so it
+   * survives a restart), say so, and let the account's timer resume it.
+   */
+  private async park(agent: RunningAgent): Promise<void> {
+    const key = agent.sessionId
+    const r = agent.limitHit
+    if (!key || !r) return
+    const attempts = agent.resumeAttempt ?? 0
+    const auto = (this.opts.resumeAfterLimit?.() ?? true) && attempts < MAX_AUTO_RESUMES
+    const until = r.resetsAt ?? Date.now() + 15 * 60_000
+    const parked: ParkedRecord = {
+      until, account: this.accountOf(agent), attempts, auto,
+      reason: r.detail ?? 'usage limit reached',
+      ...(r.estimated ? { estimated: true } : {}),
+    }
+    const when = `${r.estimated ? 'about ' : ''}${clock(until)}`
+    const message = auto
+      ? `Paused at the account's usage limit (${parked.reason}). The board resumes this session at ${when}.`
+      : attempts >= MAX_AUTO_RESUMES
+        ? `Paused at the account's usage limit again — ${attempts} automatic resumes ran straight into it, so the board has stopped resuming by itself. Expected back at ${when}; press Resume when you want it to carry on.`
+        : `Paused at the account's usage limit (${parked.reason}). Expected back at ${when}; automatic resume is off (agentsKanban.resumeAfterLimit).`
+    agent.live.push({ kind: 'notice', at: Date.now(), urgency: 'blocked', message })
+    this.emit('notice', agent, { key, message: `"${agent.title}": ${message}`, urgency: 'info' })
+    await this.opts.store.patch(key, { parked }).catch((e) => this.opts.log?.(`Could not park ${key}: ${e}`))
+    this.scheduleWake(parked.account)
+    this.touch()
+  }
+
+  /**
+   * Resume parked sessions: the ones an account's wake releases, or ONE the
+   * user asked for (`force`, which ignores the setting and the attempt count —
+   * pressing Resume is the user deciding to spend).
+   */
+  async resumeParked(filter: { account?: string; key?: string }, force = false): Promise<string[]> {
+    const metas = await this.opts.store.allMeta()
+    const resumed: string[] = []
+    for (const [key, m] of Object.entries(metas)) {
+      const p = m.parked
+      if (!p || (filter.key && key !== filter.key) || (filter.account && p.account !== filter.account)) continue
+      if (!force && (!p.auto || !(this.opts.resumeAfterLimit?.() ?? true))) continue
+      if (!force && this.limits.limitedUntil(p.account, Date.now())) continue
+      const live = this.byKey(key)
+      if (live && this.sessions.has(live.runId)) continue
+      this.pendingResume.set(key, force ? 0 : p.attempts + 1)
+      if (force) this.forcing.add(key)
+      try {
+        await this.send(key, RESUME_PROMPT, [], await this.opts.providerFor?.(key))
+      } finally {
+        this.forcing.delete(key)
+      }
+      resumed.push(key)
+    }
+    return resumed
+  }
+
+  /** Keep the card parked but stop the board resuming it by itself. */
+  async holdParked(key: string): Promise<void> {
+    const p = (await this.opts.store.allMeta())[key]?.parked
+    if (p) await this.opts.store.patch(key, { parked: { ...p, auto: false } })
+    this.touch()
+  }
+
+  /**
+   * After a restart: every parked card's account is limited until its
+   * recorded time, and its timer is set again. A time already past wakes
+   * shortly — the reset happened while the editor was closed.
+   */
+  async restoreParked(): Promise<number> {
+    const metas = await this.opts.store.allMeta()
+    let n = 0
+    const now = Date.now()
+    for (const m of Object.values(metas)) {
+      const p = parseParked(m.parked)
+      if (!p) continue
+      n++
+      if (p.until > now && !this.limits.limitedUntil(p.account, now)) {
+        this.limits.record(p.account, {
+          status: 'limited', resetsAt: p.until, windows: [], source: 'restored', at: now,
+          detail: p.reason, ...(p.estimated ? { estimated: true } : {}),
+        })
+      }
+      if (p.until > now) this.scheduleWake(p.account)
+      else if (!this.wakeTimers.has(p.account)) {
+        const t = setTimeout(() => { this.wakeTimers.delete(p.account); void this.wake(p.account) }, 5000)
+        t.unref?.()
+        this.wakeTimers.set(p.account, t)
+      }
+    }
+    if (n) this.touch()
+    return n
+  }
+}
+
+/** A turn whose ANSWER is a limit message, by its opening. */
+const LIMIT_ANSWER = /^(claude ai usage limit reached|you['’]ve hit your (usage )?limit|you['’]ve reached your (usage )?limit|usage limit reached|rate limit (reached|exceeded)|\d+-hour limit reached)/i
+
+/** "15:02", or "Mon 15:02" when it is not today. */
+function clock(at: number): string {
+  const d = new Date(at)
+  const t = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return d.toDateString() === new Date().toDateString() ? t : `${d.toLocaleDateString('en-GB', { weekday: 'short' })} ${t}`
 }
 
 /** Appended to the Claude Code system prompt. Tells the agent it owns a card. */

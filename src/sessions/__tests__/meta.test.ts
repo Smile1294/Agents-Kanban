@@ -272,6 +272,17 @@ await meta.update('s-reload', { contextWindow: 200_000, running: 1_700_000_000_0
 await meta.update('s-reload', { running: 0 })
 ok(!(await new MetaStore(dir, root).get('s-reload')).running, 'and zero clears it, through a reload too')
 
+// Parked at a usage limit: READ BACK through a fresh store, or a restart would
+// forget the card was waiting and never re-arm its timer.
+await meta.update('s-parked', { parked: { until: 1_790_439_600_000, account: 'claude|', reason: '5-hour limit reached', attempts: 1, auto: true } })
+{
+  const back = (await new MetaStore(dir, root).get('s-parked')).parked
+  ok(back?.until === 1_790_439_600_000 && back.account === 'claude|' && back.attempts === 1 && back.auto === true,
+     `a parked card survives a reload with its wake time and attempt count (${JSON.stringify(back)})`)
+}
+await meta.update('s-parked', { parked: null })
+ok(!(await new MetaStore(dir, root).get('s-parked')).parked, 'and null clears it, through a reload too')
+
 // `runtime` was the mirror image of the `contextWindow` bug and worse: it was
 // PARSED here from the day it was added and nothing anywhere ever wrote it. So
 // `store.runtimeOf()` returned undefined for every session, and every finished

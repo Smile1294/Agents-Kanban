@@ -187,6 +187,7 @@ without one.
 
 ## Recent changes
 
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `smoke.mjs` sends `resumeParked`/`holdParked` for a card that is not parked, and with no id.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · smoke sweeps forged `watchBrowser` messages; `layout.test.mjs` measures the chat beside the browser pane.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · both vscode stubs gain the Comments API (`comments.createCommentController`, `Range`, `MarkdownString`, `CommentMode`, `CommentThreadCollapsibleState`; the harness records controllers on `ctl.commentControllers`) and `workspace.textDocuments`; smoke drives a review comment through the real bundle.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `test/dom.mjs` takes `protocol` to be served from http(s) like a relay page; `check-contract.mjs` also pins `media/board.js` `REMOTE_MSG_MAX_BYTES` to `msgMaxBytes`; the smoke sweep sends forged `sentImages`.

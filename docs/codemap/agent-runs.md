@@ -10,6 +10,7 @@ paths:
   - src/agent/dictation.ts
   - src/agent/harness.ts
   - src/agent/browser.ts
+  - src/agent/limits.ts
   - src/board-mcp.ts
 tests:
   - src/agent/__tests__/manager.test.ts
@@ -22,6 +23,8 @@ tests:
   - src/agent/__tests__/dictation.test.ts
   - src/agent/__tests__/harness.test.ts
   - src/agent/__tests__/browser.test.ts
+  - src/agent/__tests__/limits.test.ts
+  - src/agent/__tests__/limit-resume.test.ts
 last_verified: 2026-09-07
 ---
 # Agent runs — what is running
@@ -150,6 +153,43 @@ Test: `images.test.ts`.
 three different fixes), `verdict`, `builtinDictationAvailable`. Nothing leaves
 the machine. Test: `dictation.test.ts` (the pure half).
 
+**`src/agent/limits.ts`**. An ACCOUNT's usage limit (`<runtime>|<profile>`,
+`accountKey`), tracked by the host whichever vendor is behind it. Pure; every
+function takes `now`. Three signals to one `LimitReading` (`ok`/`warning`/
+`limited`, `resetsAt` in ms, `estimated`, `windows` with `used` 0..1):
+`parseClaudeRateLimit` (Claude Code's `rate_limit_event` — `resetsAt` is Unix
+SECONDS, `unifiedWindows` is undeclared in `sdk.d.ts` and read anyway),
+`limitFromPlanMeter` (Codex's plan meter; full window = limited), and
+`limitFromErrorText` for any vendor's failed turn (epoch, ISO, duration and
+clock-time-in-a-named-zone reset shapes via `resetTimeIn`; context-window and
+overloaded errors are NOT limits). `limitFromRetry`: a 429 `api_retry` is a
+warning only. `LimitTracker` keeps one reading per account, backs off
+15m×2ⁿ (cap 2h) when no reset is stated and marks it `estimated`, never lets a
+vaguer report shorten a stated reset, and clears on any non-limited reading.
+`ParkedRecord`/`parseParked` is the sidecar shape; `MAX_AUTO_RESUMES = 3`;
+`RESUME_PROMPT` allows "it was already finished". Tests: `limits.test.ts`
+(pure, including the real probed frame), `limit-resume.test.ts` (the real
+manager: park, hold, wake, resume, the attempt bound, restart).
+
+**Limits in the manager.** `session.on('limit')` (Claude frames), `'meter'`
+(plan) and `'error'` (text) feed `recordLimit(account, r)`, which schedules one
+`wakeTimers` entry per limited account at `resetsAt + WAKE_GRACE_MS`. A run
+whose OWN turn was refused (`limitHit`: a rejected frame, a limit error, or an
+answer that OPENS like a limit message — `LIMIT_ANSWER`; an answer that merely
+discusses rate limiting is ordinary work) is `park()`ed on `done`/`error`:
+`SessionMeta.parked`, a notice on the card, the timer. A first turn with no
+session id is re-queued instead. `start()` and `drain()` hold any run whose
+account is limited (`heldUntil`) — per account, so one limited account never
+blocks another's queue; `ignoreLimit` (set by `start()` for a user-forced
+resume) is the only way past. `wake()` lifts, drains, and `resumeParked()`s
+every parked card of that account whose record says `auto` (the setting is
+read then) via `send()` with the host's `providerFor(key)`; each resume carries
+its attempt number (`pendingResume` → `RunningAgent.resumeAttempt`), and the
+third resume into the limit parks with `auto: false`. Any resume clears the
+park (`parked: null`, in `launchInner`, like `switchedFrom`).
+`restoreParked()` re-arms the tracker and timers from the sidecar after a
+restart. `describeUsage()` is `usage_status`'s text.
+
 ## How it works
 
 See [flows.md](flows.md) *A run*. The parts worth holding in your head: a run is
@@ -210,6 +250,10 @@ started column while the title is still the guess.
   transport; `board-mcp.js` holds no logic.
 - An attachment goes to the model, never to a file.
 - A question is not a permission request: the answer goes in `updatedInput`.
+- Usage limits are the HOST's: a limited agent cannot run a turn to wait. A
+  plan meter at 100% holds the account but never parks a run that finished;
+  only a turn the limit refused parks. Automatic resumes are bounded
+  (`MAX_AUTO_RESUMES`); the user's Resume is not.
 
 ## Open work
 
@@ -220,6 +264,8 @@ started column while the title is still the guess.
 - Nothing re-runs a parent once its subtasks land.
 
 ## Recent changes
+
+- 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · account usage limits, host-side and vendor-neutral: `limits.ts` (Claude `rate_limit_event`, Codex plan meter, any vendor's error text → one reading per `<runtime>|<profile>`), `AgentSession` emits `limit` for `rate_limit_event` and a 429 `api_retry`; the manager parks a refused run (`SessionMeta.parked`), holds that account's new runs in the queue, wakes on a per-account timer and resumes parked cards (`resumeAfterLimit`, 3-attempt bound), re-arms from the sidecar (`restoreParked`); read-only, auto-allowed `usage_status` board tool.
 
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `BrowserPool.watch(match, fn)` — a CDP screencast of every matching tab (including later ones), frames at most `FRAME_INTERVAL_MS` apart with the last always delivered, each carrying the last action; the ledger records every visited URL (`urls`); the brief asks for an e2e test when the project has a suite.
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `autoVerify: require` — `browserGate` in the board context refuses the move into review when the diff touches UI files (`uiFilesIn`), the board can start the app, and the run's ledger opened no page; `set_phase` asks it before the knowledge check; `harnessBrief(required)` says so up front, and every brief says the board runs its own check at review; `set_phase` drops an agent-written `autoCheck` like `verified`.

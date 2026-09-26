@@ -228,6 +228,13 @@ export interface UiCard {
    * `interrupted` — see `stalledSince`.
    */
   stalled?: number
+  /**
+   * Waiting on its ACCOUNT's usage limit (`agent/limits.ts`): when it is
+   * expected back, whether the board resumes it by itself, and the vendor's
+   * words. Suppresses `stalled` — it did not stop without saying why, the
+   * limit stopped it, and the card says so.
+   */
+  parked?: { until: number; reason: string; auto: boolean; attempts: number; estimated?: boolean }
   /** Background agents this session spawned, summarised for the card. Present
    *  only when it spawned any. `orphaned` is the one worth scanning for: it
    *  means agents that cannot still be working, which used to look identical to
@@ -276,9 +283,28 @@ export interface UiCard {
   }
 }
 
+/** One account's usage-limit reading, for the strip above the board. */
+export interface UiLimit {
+  /** `<runtime>|<profile>`. */
+  account: string
+  /** "Claude Code", "Claude Code · DeepSeek", "Codex". */
+  label: string
+  status: 'ok' | 'warning' | 'limited'
+  resetsAt?: number
+  estimated?: boolean
+  windows: Array<{ name: string; used?: number; resetsAt?: number }>
+  detail?: string
+  /** When this was read — its AGE is drawn, so a stale reading looks stale. */
+  at: number
+  /** Cards parked on it. */
+  parked: number
+}
+
 export interface UiState {
   /** Everything waiting on the user, blocking first (`board/attention.ts`). */
   attention?: import('./attention.ts').AttentionItem[]
+  /** Every account the board has a limit reading for. Absent when none. */
+  limits?: UiLimit[]
   ready: boolean
   /** No folder is open, so there is nothing to show yet. */
   noWorkspace?: boolean
@@ -576,6 +602,10 @@ export interface BoardHost {
    *  ONE surface, as `browserFrame` messages, until turned off. */
   watchBrowser?(id: string, on: boolean, sink: StateSink, reply: (m: object) => void): void
   runAutoCheck(id: string): Promise<void>
+  /** A card parked at its account's limit: resume it now (the user deciding
+   *  to try), or keep it parked without the automatic resume. */
+  resumeParked?(id: string): Promise<void>
+  holdParked?(id: string): Promise<void>
   discardReview(id: string): Promise<void>
   move(key: string, phase: string): Promise<void>
   stop(key: string): Promise<void>
@@ -963,6 +993,8 @@ async function routeBoardMessage(
     case 'sendReview': if (id()) await host.sendReview(id()); break
     case 'sendAutoCheck': if (id()) await host.sendAutoCheck(id()); break
     case 'runAutoCheck': if (id()) await host.runAutoCheck(id()); break
+    case 'resumeParked': if (id()) await host.resumeParked?.(id()); break
+    case 'holdParked': if (id()) await host.holdParked?.(id()); break
     case 'discardReview': if (id()) await host.discardReview(id()); break
     case 'moreTranscript': await host.loadOlderTranscript(id()); await refresh(); break
     case 'openHit': {

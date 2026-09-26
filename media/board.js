@@ -729,6 +729,13 @@
       // The attention strip is chrome; its ages are drawn by ago(), so they
       // enter at minute resolution like every other age here.
       (s.attention || []).map((i) => [i.key, i.kind, i.why, Math.floor((i.since || 0) / 60000)]),
+      // Usage limits: fill as whole percents, times as minutes — and, while
+      // anything is limited, the current MINUTE, because "back in 42m" is a
+      // countdown that changes on screen with nothing else changing.
+      (s.limits || []).map((l) => [l.account, l.status, l.parked, !!l.estimated, Math.floor((l.resetsAt || 0) / 60000),
+        (l.windows || []).map((w) => Math.round((w.used == null ? -0.01 : w.used) * 100))]),
+      (s.limits || []).some((l) => l.status === 'limited') || (s.cards || []).some((c) => c.parked)
+        ? Math.floor(Date.now() / 60000) : 0,
     ])
   }
 
@@ -1367,6 +1374,90 @@
     return Math.round(h / 24) + 'd ago'
   }
 
+  /** "15:02 (in 1h 4m)", "~15:02 …" when the time is a guess. */
+  function backAt(t, estimated) {
+    if (!t) return 'soon'
+    const d = new Date(t)
+    const hhmm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+    const today = d.toDateString() === new Date().toDateString()
+    const day = today ? '' : d.toLocaleDateString(undefined, { weekday: 'short' }) + ' '
+    const mins = Math.max(0, Math.round((t - Date.now()) / 60000))
+    const rel = mins < 1 ? 'any moment' : mins < 60 ? 'in ' + mins + 'm'
+      : 'in ' + Math.floor(mins / 60) + 'h' + (mins % 60 ? ' ' + (mins % 60) + 'm' : '')
+    return (estimated ? '~' : '') + day + hhmm + ' (' + rel + ')'
+  }
+
+  /** `five_hour` → "5-hour". */
+  const WINDOW_NAMES = { five_hour: '5-hour', seven_day: '7-day', seven_day_opus: '7-day Opus', seven_day_sonnet: '7-day Sonnet' }
+  const windowLabel = (n) => WINDOW_NAMES[n] || String(n).replace(/_/g, ' ')
+
+  /**
+   * Every account's usage limit — whichever company's agent is spending it.
+   * The FILL is drawn as a number, per window, because a bar that is merely
+   * "green" cannot say how close to the edge it is. Hidden when the board has
+   * no reading at all: a strip of dashes would be a signal about nothing.
+   */
+  function renderLimits() {
+    const list = (s.limits || []).filter((l) => l.status !== 'ok' || (l.windows || []).some((w) => w.used != null))
+    if (!list.length) return null
+    const box = el('div', 'limits' + (list.some((l) => l.status === 'limited') ? ' limited' : ''))
+    for (const l of list) {
+      const row = el('div', 'limit-row status-' + l.status)
+      row.append(el('span', 'limit-icon', l.status === 'limited' ? '⏸' : l.status === 'warning' ? '⚠' : '◔'))
+      row.append(el('span', 'limit-name', l.label))
+      if (l.status === 'limited') {
+        const t = el('span', 'limit-back', 'at its usage limit — back ' + backAt(l.resetsAt, l.estimated))
+        t.title = (l.detail || '') + (l.estimated ? '\nThe vendor did not say when; this is the board\'s back-off guess.' : '')
+        row.append(t)
+        if (l.parked) row.append(el('span', 'limit-parked', l.parked + (l.parked === 1 ? ' card resumes' : ' cards resume') + ' then'))
+      } else if (l.status === 'warning' && l.detail) {
+        row.append(el('span', 'limit-back', l.detail))
+      }
+      for (const w of l.windows || []) {
+        if (w.used == null) continue
+        const pct = Math.round(w.used * 100)
+        const chip = el('span', 'limit-window' + (pct >= 100 ? ' full' : pct >= 80 ? ' high' : ''), windowLabel(w.name) + ' ' + pct + '%')
+        if (w.resetsAt) chip.title = windowLabel(w.name) + ' window resets ' + backAt(w.resetsAt)
+        row.append(chip)
+      }
+      row.append(el('span', 'limit-age', ago(l.at)))
+      box.append(row)
+    }
+    return box
+  }
+
+  /* A card whose ACCOUNT ran out. Not stalled (it did not stop without saying
+     why) and not failed (nothing is wrong with the work): it is waiting for a
+     time, and the time is the number shown. Resume is the user deciding to
+     try now; "Don't resume" keeps it parked and stops the automatic turn. */
+  function renderParked(c, full) {
+    const p = c.parked
+    const box = el('div', 'parked' + (full ? ' full' : ''))
+    const head = el('div', 'parked-head')
+    head.append(el('span', 'parked-icon', '⏸'))
+    const title = el('span', 'parked-title', (p.auto ? 'Resumes ' : 'Usage limit · back ') + backAt(p.until, p.estimated))
+    title.title = 'Paused at the account\'s usage limit: ' + p.reason +
+      (p.auto ? '\nThe board resumes this session by itself when the limit resets.'
+        : p.attempts >= 3 ? '\nIt ran straight into the limit ' + p.attempts + ' times, so the board stopped resuming it by itself.'
+          : '\nAutomatic resume is off for this card.')
+    head.append(title)
+    box.append(head)
+    if (full) box.append(el('div', 'parked-why', p.reason))
+    const acts = el('div', 'parked-acts')
+    const go = el('button', p.auto ? null : 'primary', 'Resume now')
+    go.title = 'Resume the session now, even though the limit may not have reset yet'
+    go.onclick = (e) => { stop(e); post('resumeParked', { id: c.key }) }
+    acts.append(go)
+    if (p.auto) {
+      const hold = el('button', null, 'Don\'t resume')
+      hold.title = 'Keep it parked; do not start a turn by itself when the limit resets'
+      hold.onclick = (e) => { stop(e); post('holdParked', { id: c.key }) }
+      acts.append(hold)
+    }
+    box.append(acts)
+    return box
+  }
+
   // ---------------------------------------------------------------- kanban
 
   /**
@@ -1422,6 +1513,8 @@
     const a = c.agent
     const col = s.columns.find((x) => x.id === c.phase)
     const cat = col ? col.category : ''
+    // Waiting for a time, not for the user — ahead of the error its run ended on.
+    if (c.parked) return 'queued'
     if (a && (a.kind === 'needsInput' || a.kind === 'error')) return 'needs'
     if (!a && (c.interrupted || c.stalled)) return 'needs'
     if (a && (a.kind === 'working' || a.kind === 'starting' || a.kind === 'waiting')) return 'running'
@@ -1511,7 +1604,12 @@
     const a = c.agent
     if (a && a.kind === 'needsInput') return a.question ? 'asks: ' + String(a.question).slice(0, 120) : 'is waiting for your answer'
     if (a && a.kind === 'error') return 'failed: ' + String(a.message || 'the run ended with an error').split('\n')[0].slice(0, 120)
-    if (a && a.kind === 'queued') return 'waiting for a free agent slot'
+    if (c.parked) return 'waiting for the account\'s usage limit — ' + (c.parked.auto ? 'resumes ' : 'back ') + backAt(c.parked.until, c.parked.estimated)
+    if (a && a.kind === 'queued') {
+      return (s.limits || []).some((l) => l.status === 'limited')
+        ? 'waiting for a free agent slot, or for its account\'s usage limit to reset'
+        : 'waiting for a free agent slot'
+    }
     if (c.interrupted) return 'cut off ' + ago(c.interrupted) + ' when the editor closed'
     if (c.stalled) return 'stopped without handing its work back'
     if (c.autoChecking) return 'the board is checking it in its own browser…'
@@ -1524,6 +1622,8 @@
   function renderKanban() {
     const main = el('main', 'main')
     main.append(renderToolbar())
+    const limits = renderLimits()
+    if (limits) main.append(limits)
     const needs = overviewOn() ? null : renderAttention(false)
     if (needs) main.append(needs)
     if (overviewOn()) {
@@ -1770,7 +1870,8 @@
         : c.agents.total + ' background agents were spawned by this session'
       n.append(b)
     }
-    if (a) n.append(renderAgentStrip(c, a))
+    if (c.parked) n.append(renderParked(c, false))
+    else if (a) n.append(renderAgentStrip(c, a))
     else if (c.interrupted) n.append(renderInterrupted(c, false))
     else if (c.stalled) n.append(renderStalled(c))
     return n
@@ -2326,7 +2427,8 @@
     // A parent's own transcript is short — it read, decided, and split. What
     // matters on its page is the subtasks, so they go first, where the test
     // plan would be on an ordinary card. They ARE its test plan.
-    if (c && c.interrupted && !c.agent) main.append(renderInterrupted(c, true))
+    if (c && c.parked) main.append(renderParked(c, true))
+    else if (c && c.interrupted && !c.agent) main.append(renderInterrupted(c, true))
     if (c && c.subtasks && c.subtasks.length) main.append(renderSubtasks(c))
     if (c && c.testPlan) main.append(renderTestPlan(c))
     if (c && c.reviewComments) main.append(renderReviewDrafts(c))

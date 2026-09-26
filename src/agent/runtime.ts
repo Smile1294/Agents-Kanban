@@ -383,6 +383,14 @@ export interface RunEvents {
   provider: (resolved: string | undefined, label: string | undefined) => void
   flagWarning: (message: string) => void
   /**
+   * What the runtime said about the ACCOUNT's usage limit, raw: Claude Code's
+   * `rate_limit_info`, or an `api_retry` frame on a 429 (`retry: true`). The
+   * manager normalises it (`agent/limits.ts`). Optional to emit — a runtime
+   * whose meter is a plan window reports through `meter`, and every runtime's
+   * failed turns are read for limit text on `error`.
+   */
+  limit?: (raw: unknown, retry?: boolean) => void
+  /**
    * The turn ended.
    *
    * Three arguments, and the split between the last two is the whole point.

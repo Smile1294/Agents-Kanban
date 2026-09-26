@@ -14,6 +14,7 @@ import { CLEAR_TEST_PLAN, MetaStore, type SessionMeta, type TestPlan } from './m
 import { emptyTotals, summariseUsage, type ModelBook, type UsageMessage, type UsageTotals } from './usage.ts'
 import { allRuntimes, getRuntime, type HistoricSession, type Meter, type RuntimeHistory, type RuntimeId } from '../agent/runtime.ts'
 import { claudeHome, sessionFileFor } from './checkpoints.ts'
+import type { ParkedRecord } from '../agent/limits.ts'
 
 export interface BoardSession {
   id: string
@@ -50,6 +51,8 @@ export interface BoardSession {
    *  that performs the switch; the composer's re-read warning lives exactly
    *  as long as the re-read is still in the future. */
   switchedFrom?: string
+  /** Waiting on its account's usage limit. See SessionMeta.parked. */
+  parked?: ParkedRecord
 }
 
 /**
@@ -459,6 +462,7 @@ export class SessionStore {
         ...(m.thinking ? { thinking: m.thinking } : {}),
         ...(m.provider ? { provider: m.provider } : {}),
         ...(m.switchedFrom ? { switchedFrom: m.switchedFrom } : {}),
+        ...(m.parked ? { parked: m.parked } : {}),
         ...(m.runtime ? { runtime: m.runtime } : {}),
       })
     }
@@ -492,6 +496,7 @@ export class SessionStore {
         ...(m?.effort ? { effort: m.effort } : {}),
         ...(m?.provider ? { provider: m.provider } : {}),
         ...(m?.switchedFrom ? { switchedFrom: m.switchedFrom } : {}),
+        ...(m?.parked ? { parked: m.parked } : {}),
       })
     }
 

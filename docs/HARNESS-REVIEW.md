@@ -247,6 +247,38 @@ It edited before reproducing rather than after.
 
 **The honest limit.** A page-load check catches crashes, console errors and failed requests, not a wrong number: it passed on the unfixed page too. Behaviour is caught by the agent's own browser testing and by the project's e2e suite, which the board runs at review. So the brief now asks for an e2e test when a suite exists.
 
+## 4d. Fifth round — account usage limits, tracked by the board
+
+Asked for: "agents keep track of the account's session limit and set timers for when to wake up and continue — VS Code based rather than the agent, so it works no matter which company the model is from."
+
+**Why the host.** A limited agent cannot run a turn to decide anything. A prompt telling it to watch its budget is a request, not a mechanism. The host sees every frame from every runtime, so it keeps one reading per ACCOUNT: `<runtime>|<profile>`, the same pair the agent picker uses.
+
+**Signals** (`src/agent/limits.ts`), most specific first:
+
+| Source | What it gives | Notes |
+|---|---|---|
+| Claude Code `rate_limit_event` | status, the window's reset, and `unifiedWindows` with every window's utilisation | Probed on a real CLI: `five_hour 0.33`, `seven_day 0.44`. `resetsAt` is Unix **seconds**. `unifiedWindows` is not in `sdk.d.ts`. One per turn. |
+| Claude Code `api_retry` with status 429 | the CLI is retrying by itself | A warning, never a park. |
+| Codex plan meter | `usedPercent` and reset per window | A full window holds the account's new runs. It never parks a turn that finished. |
+| Any vendor's failed turn | the error text | Reset time read as an epoch, an ISO time, a duration ("try again in 1 hour 23 minutes", "retry in 32.5s") or a clock time in a named zone ("resets 3pm (Europe/Prague)"). Context-window and "overloaded" errors are **not** limits. |
+
+When no reset time is stated, the board backs off: 15m, doubling, capped at 2h. The time is shown with `~` because it is a guess.
+
+**What happens**:
+- **The refused run is parked.** `SessionMeta.parked` records the reset time, the reason, the account, the attempt count and whether to auto-resume. The card says "Resumes 15:02 (in 1h 4m)", with *Resume now* and *Don't resume*. A first turn with no session to resume goes back in the queue instead of becoming a red card.
+- **The account's new work is held.** `start()` and `drain()` skip any run whose account is limited. This is per account: a Codex task still starts while Claude is out. The queued card says what it is waiting for.
+- **Wake-up.** One timer per account fires at the reset plus 60s. It lifts the limit, drains the queue, and resumes each parked card with a prompt that allows "it was already finished". A resume into the same limit counts as an attempt; after three the board stops resuming by itself. The user's *Resume now* is not bounded.
+- **After a restart**, `restoreParked()` rebuilds each account's limit from the sidecar and re-arms its timer. A reset that passed while the editor was closed wakes about five seconds after activation.
+- **What you see:** a strip above the board with each account's windows as numbers ("5-hour 97% · 7-day 44%"), turning amber when limited, with the reset time and how many cards resume then. The status bar shows `Usage limit · back 15:02` when nothing else needs you.
+- **What the agent sees:** `usage_status`, a read-only, auto-allowed board tool that returns the same reading as sentences.
+- **Setting:** `agentsKanban.resumeAfterLimit` (default on). With it off, cards are still parked and show the time. You press Resume.
+
+**Tests.** `limits.test.ts` is pure parsing, run on the real probed frame, and passes in two time zones. `limit-resume.test.ts` drives the real manager and a real git repo through park → hold → another account unaffected → first turn re-queued → wake → resume → attempt bound → setting off → restart re-arm. Breaking `park()` or the wake timer turns it red, and so does removing the parked view from `webview.test.mjs`.
+
+**Verified live, for the part that can be.** A real Claude Code 2.1.283 turn went through the real `AgentManager`. One `rate_limit_event` reached the tracker as `claude|` with "five_hour 40%, seven_day 45%" and both reset times, and `usage_status` answered "Your account (claude|): available. 5-hour 40% used, resets 16:20; 7-day 45% used, resets 20:00."
+
+**Not verified live.** A real subscription limit was not hit during this work, so the `rejected` path has been tested on the recorded shape, not on a live refusal. The first real one will show whether Claude Code reports it as a result error, as a synthetic answer (`LIMIT_ANSWER`), or both. All three are handled.
+
 ## 5. What comparable harnesses have (research, September 2026)
 
 Sources were read directly where the network allowed; cursor.com,

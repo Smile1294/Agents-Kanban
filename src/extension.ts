@@ -22,7 +22,7 @@ import {
   BoardPanel, BoardViewProvider, _resetBoardFocus, applyBoardFocus, boardFocusApplied,
   dispatchBoardMessage, setBoardFocusMode, showSideBarView, toUiAgent,
   type BoardHost, type FocusMode, type SearchAnswer, type SearchRow,
-  type UiCard, type UiState,
+  type UiCard, type UiLimit, type UiState,
 } from './board/panel.ts'
 import {
   Watches, carriesModels, drawsTranscript, isLocalSink, remoteSink,
@@ -94,6 +94,7 @@ import {
 // See agent/runtimes/index.ts for why registration is explicit rather than
 // happening wherever an implementation happens to be imported first.
 import './agent/runtimes/index.ts'
+import type { LimitReading, ParkedRecord } from './agent/limits.ts'
 import {
   allRuntimes, DEFAULT_RUNTIME, getRuntime, parseRuntimeId,
   type Meter, type RuntimeId, type RuntimeStatus,
@@ -286,6 +287,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
      run that had already printed "Finished". */
   /** The last board pass's attention list, for the status bar. */
   let lastAttention: AttentionItem[] = []
+  /** The last pass's limit readings, for the status bar. */
+  let lastLimits: UiLimit[] = []
+  /** "Claude Code · DeepSeek" for `claude|dsk`. */
+  const accountLabel = (account: string): string => {
+    const [rt, profile] = account.split('|')
+    const runtimeLabel = getRuntime(parseRuntimeId(rt) ?? DEFAULT_RUNTIME)?.label ?? rt ?? 'agent'
+    const p = profile ? providers.find((x) => x.id === profile) : undefined
+    return p?.label ? `${runtimeLabel} · ${p.label}` : runtimeLabel
+  }
+  const uiParked = (p: ParkedRecord) => ({
+    until: p.until, reason: p.reason, auto: p.auto, attempts: p.attempts, ...(p.estimated ? { estimated: true } : {}),
+  })
   const isLive = (a: { state: { kind: string } }) =>
     ['starting', 'working', 'needsInput', 'waiting'].includes(a.state.kind)
   /** A run that has ENDED and has a session file to show for it. Its chat is
@@ -1701,7 +1714,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // one-minute delay on a schedule whose hour has passed is invisible next to
   // the catch-up that already happened at activation.
   const scheduleTimer = setInterval(
-    () => { void fireDueSchedules().catch((e) => log.error(`Schedule check failed: ${String(e)}`)) },
+    () => {
+      void fireDueSchedules().catch((e) => log.error(`Schedule check failed: ${String(e)}`))
+      // A card counting down to its account's reset is a readout that moves
+      // while nothing streams; the minute it is drawn at is this tick.
+      if (lastLimits.some((l) => l.status === 'limited')) refreshAll()
+    },
     60_000,
   )
   context.subscriptions.push({ dispose: () => clearInterval(scheduleTimer) })
@@ -2886,6 +2904,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // never.
     applyModelBook()
     commands = await listSlashCommands(root).catch(() => [])
+    // Cards parked at a usage limit before the restart: the manager is lazy,
+    // so it is made here only when there is one — its timer has to be armed
+    // again or the card waits forever for a wake nobody scheduled.
+    if (repoRoot) {
+      const metas = await ws.store.allMeta().catch(() => ({} as Record<string, SessionMeta>))
+      if (Object.values(metas).some((m) => m.parked)) {
+        const n = await ensureManager().restoreParked().catch((e) => { log.warn(`Could not re-arm parked cards: ${String(e)}`); return 0 })
+        if (n) log.info(`${n} card(s) parked at a usage limit; their resume timers are set again.`)
+      }
+    }
     log.info(
       `Agents Kanban ready. Folder: ${root}  Repo: ${repoRoot ?? '(none)'}  ` +
       `Slash commands: ${commands.length}`,
@@ -3158,6 +3186,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Read on every meter reading, so a changed cap applies to the turn in flight.
         spendCapUsd: () => cfg().get<number>('maxSpendPerMessageUsd') || undefined,
         autoVerify: () => autoVerifyMode(),
+        // Read when the limit lifts, so turning it off stops a pending resume.
+        resumeAfterLimit: () => cfg().get<boolean>('resumeAfterLimit') !== false,
+        providerFor: (key) => sessionProviderFor(key),
         worktrees: w.worktrees,
         board: w.board,
         defaults: { model, effort, thinking, ultracode, fastMode, runtime },
@@ -3288,6 +3319,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         log: (m: string) => log.warn(m),
       })
       w.manager.on('change', () => refreshAll())
+      w.manager.on('limit', (account: string, r: LimitReading | undefined) => {
+        if (r?.status === 'limited') {
+          log.warn(`${accountLabel(account)}: usage limit — ${r.detail ?? 'limited'}; expected back ${r.estimated ? 'about ' : ''}${new Date(r.resetsAt ?? 0).toLocaleString()}`)
+        }
+      })
       // Where the tokens actually went. Checked once per run against the
       // profile that was requested: a disagreement means something outranked
       // the profile — a managed settings file, an apiKeyHelper, an env block in
@@ -3742,6 +3778,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(testPlan ? { testPlan } : {}),
         ...(reviewDrafts.count(key) ? { reviewComments: reviewDrafts.count(key) } : {}),
         ...(autoChecking.has(key) ? { autoChecking: true } : {}),
+        // A run that just parked is still in the live list until released;
+        // one that is running again has ended the park, whatever the sidecar
+        // says in the moment before its clear lands.
+        ...(m?.parked && ['done', 'error', 'idle'].includes(a.state.kind) ? { parked: uiParked(m.parked) } : {}),
         ...(a.queued?.length ? { queued: a.queued } : {}),
         ...agentBadge(a.sessionId),
         agent: toUiAgent(a),
@@ -3777,12 +3817,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(reviewDrafts.count(s.id) ? { reviewComments: reviewDrafts.count(s.id) } : {}),
         ...(autoChecking.has(s.id) ? { autoChecking: true } : {}),
         ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
+        ...(s.parked ? { parked: uiParked(s.parked) } : {}),
         ...agentBadge(s.id),
         // Only reachable in THIS loop, and that is the point: these are the
         // sessions with no live agent. A card in a started column with
         // nothing running is an agent that stopped without handing the work
         // back, and it used to draw identically to one still working.
         ...(() => {
+          // Parked is not stalled: the limit stopped it, and the card says so.
+          if (s.parked) return {}
           const at = stalledSince(ws.board, {
             phase: s.phase, updated: s.updated, archived: s.archived,
             ...(s.worktree ? { worktree: s.worktree } : {}),
@@ -3802,6 +3845,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const attention = attentionFor(cards, ws.board)
     // Read by the status bar, which the paint path refreshes after each pass.
     lastAttention = attention
+    // Every account's usage-limit reading, with how many cards wait on it.
+    const parkedOn = new Map<string, number>()
+    for (const m of Object.values(metas)) if (m.parked) parkedOn.set(m.parked.account, (parkedOn.get(m.parked.account) ?? 0) + 1)
+    const limits: UiLimit[] = (ws.manager?.limits.all() ?? []).map(([account, r]) => ({
+      account, label: accountLabel(account), status: r.status, windows: r.windows, at: r.at,
+      parked: parkedOn.get(account) ?? 0,
+      ...(r.resetsAt ? { resetsAt: r.resetsAt } : {}),
+      ...(r.estimated ? { estimated: true } : {}),
+      ...(r.detail ? { detail: r.detail } : {}),
+    }))
+    lastLimits = limits
 
     /* Board-level: the same three levels whatever is selected. The RESOLVED
        level is per session, so it is set in the slice. */
@@ -3818,6 +3872,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       live,
       olderHidden: aged.hidden,
       attention,
+      limits,
     }
   }
 
@@ -4203,6 +4258,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return {
       ready: true, mode: watch.mode, columns: ws.board.columns, cards, composer, showArchived,
       ...(pass.attention?.length ? { attention: pass.attention } : {}),
+      ...(pass.limits?.length ? { limits: pass.limits } : {}),
       ...(pass.olderHidden ? { olderHidden: pass.olderHidden } : {}),
       ...(showOlder ? { showOlder: true } : {}),
       ...(ws.repoRoot ? {} : { noRepo: true }),
@@ -4782,6 +4838,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const a = ws?.manager?.byKey(key)
       const stored = a ? undefined : await ws?.store.worktreeMeta(key)
       await runCardAutoCheck(a?.sessionId ?? key, a?.worktreePath ?? stored?.worktree, a?.base ?? stored?.base)
+    },
+
+    /** Resume a parked card now — the user deciding to try, past the limit. */
+    async resumeParked(key) {
+      const started = await ws?.manager?.resumeParked({ key }, true) ?? []
+      if (started.length) selectHere(key)
+      refreshAll()
+    },
+
+    /** Keep a parked card parked, without the automatic resume. */
+    async holdParked(key) {
+      await ws?.manager?.holdParked(key)
+      refreshAll()
     },
 
     async discardReview(key) {
@@ -6012,14 +6081,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // The board's own list when a pass has built one — it also knows about
     // stalled, cut-off and ready-to-test cards, which the live list cannot.
     const needs = attentionSummary(lastAttention)
+    // An account at its limit is the one reason nothing is moving that the
+    // counts below cannot show: "0 running" reads as idle, not as waiting.
+    const limited = lastLimits.filter((l) => l.status === 'limited' && l.resetsAt)
+    const back = limited.length ? Math.min(...limited.map((l) => l.resetsAt!)) : 0
+    const hhmm = (t: number) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     statusItem.text = needs
       ? `$(bell) ${needs}`
+      : limited.length
+      ? `$(watch) Usage limit · back ${limited.some((l) => l.estimated) ? '~' : ''}${hhmm(back)}`
       : waiting
       ? `$(kanban) ${waiting} waiting on you`
       : running
         ? `$(kanban) ${running} running`
         : '$(kanban) Agents Kanban'
-    statusItem.tooltip = 'Open the Agents Kanban board  (Ctrl+Alt+K)'
+    statusItem.tooltip = [
+      ...limited.map((l) => `${l.label}: usage limit, back ${l.estimated ? 'about ' : ''}${hhmm(l.resetsAt!)}${l.parked ? ` — ${l.parked} card(s) resume then` : ''}`),
+      'Open the Agents Kanban board  (Ctrl+Alt+K)',
+    ].join('\n')
     statusItem.show()
   }
   refreshStatus()
