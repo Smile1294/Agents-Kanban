@@ -617,6 +617,8 @@ button[disabled] { cursor: default; }
    `layout.test.mjs` measures exactly that. */
 .cloud-pick { cursor: pointer; user-select: none; }
 .cloud-pick input { margin: 0; width: 13px; height: 13px; flex: none; accent-color: var(--run); cursor: pointer; }
+/* A login that cannot go: still a box, still tickable, visibly not ready. */
+.cloud-pick.unavailable { opacity: 0.7; border-style: dashed; }
 .cloud-pick.on {
   color: var(--vscode-foreground);
   background: color-mix(in srgb, var(--run) 18%, transparent);

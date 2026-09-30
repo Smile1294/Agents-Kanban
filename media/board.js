@@ -1150,6 +1150,13 @@
     const nw = el('button', 'control-btn', '+ New session')
     nw.onclick = () => post('newSessionPrompt')
     box.append(nw)
+    // The same, on Anthropic's cloud — offered where the composer's box is.
+    if (s.composer && s.composer.cloud) {
+      const cw = el('button', 'control-btn', '☁ New cloud session')
+      cw.title = 'Start a session that runs on Anthropic\'s cloud instead of this machine'
+      cw.onclick = () => post('newSessionPrompt', { cloud: true })
+      box.append(cw)
+    }
 
     // The sessions, as a list you can jump from — never as columns.
     if (s.cards.length) {
@@ -3430,10 +3437,16 @@
         meta: a.detail,
       })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }]),
       undefined, undefined, undefined, '🤖'))
-      /* "Run in the cloud": a NEW session only, and only when the host says
-         this agent's login can — a claude.ai subscription on Anthropic. Absent
-         otherwise, never greyed; the settings page says why. */
-      if (!c && s.composer.cloud) bar.append(cloudToggle(s.composer.cloud))
+      /* "Run in the cloud": on every NEW session of an agent that can go
+         there. Drawn while the login is still being checked, and when it said
+         no — hiding it until a yes came back meant there was no button to
+         find. A tick on a login that cannot go says why, right beside it; the
+         host refuses the start with the same reason. */
+      if (!c && s.composer.cloud) {
+        bar.append(cloudToggle(s.composer.cloud))
+        const offer = s.composer.cloud
+        if (cloudPick && offer.state === 'no') bar.append(noteChip('Cloud needs a claude.ai subscription login: ' + offer.reason))
+      }
     }
     /* HOW EAGERLY this card should break its work into subtasks.
        Per card, beside the model, because it is a judgement about THIS piece of
@@ -4012,8 +4025,9 @@
   }
 
   /* "Run in the cloud" — a real checkbox, in a chip of the bar's one height.
-     `offer` is the host's `composer.cloud`: it exists only when THIS agent's
-     login can start a cloud session, so there is no disabled state to draw. */
+     `offer` is the host's `composer.cloud`: `checking`, `ok` (with the plan)
+     or `no` (with the reason). It is never disabled — a box that cannot be
+     ticked explains nothing; ticked on a `no`, the bar says why. */
   function cloudToggle(offer) {
     const box = el('label', 'cloud-pick ctl' + (cloudPick ? ' on' : ''))
     const input = el('input', 'cloud-pick-box')
@@ -4023,7 +4037,10 @@
     box.append(input)
     box.append(el('span', 'ctl-ico', '☁'))
     box.append(el('span', 'ctl-label', 'Run in the cloud'))
-    box.title = 'Run this session on Anthropic\'s cloud instead of this machine' +
+    if (offer && offer.state === 'no') box.classList.add('unavailable')
+    box.title = (offer && offer.state === 'checking' ? 'Checking whether this login can start cloud sessions… ' : '') +
+      (offer && offer.state === 'no' ? 'This login cannot start cloud sessions: ' + offer.reason + ' ' : '') +
+      'Run this session on Anthropic\'s cloud instead of this machine' +
       (offer && offer.plan ? ', on your ' + offer.plan + ' plan' : '') + '. ' +
       'The repository is uploaded from here as a git bundle, so no GitHub is needed, and the session keeps ' +
       'going when this machine sleeps. It runs on the model its cloud environment picks. If Claude Code ' +

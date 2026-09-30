@@ -464,9 +464,10 @@ Working:
   all. A Codex card moves itself, writes a test plan and splits like any other,
   through the same board tools served over a socket. See
   [docs/RUNTIMES.md](docs/RUNTIMES.md)
-- **"Run in the cloud" on a new chat, for a claude.ai subscription.** The box
-  appears only when that agent's own login is a claude.ai subscription on
-  Anthropic; otherwise it is absent, and the settings page says why. The card's
+- **"Run in the cloud" on a new chat, for a claude.ai subscription.** The box is
+  on every new Claude Code chat (and the side bar has "☁ New cloud session",
+  the palette **Agents Kanban: New Cloud Session**); it works when that agent's
+  own login is a claude.ai subscription on Anthropic, and otherwise says why. The card's
   worktree is uploaded as a git bundle (`CCR_FORCE_BUNDLE=1`), so no GitHub is
   needed and the cloud starts from the card's own unpushed commit. Where the
   CLI streams cloud sessions to an editor (a server-side gate), the chat IS the

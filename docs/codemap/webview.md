@@ -74,8 +74,10 @@ anything held in the DOM dies with it. Main functions:
   `renderSlashMenu`), dictation (`insertDictation`), attachments
   (`renderAttachments`, `addImageFiles` — downscaled to 1568 px on the long edge
   before sending), the meter (`renderMeter`). "Run in the cloud":
-  `cloudToggle(offer)` — a real checkbox in a `label.ctl`, drawn only when the
-  host sends `composer.cloud` (never greyed), its tick in the module-level
+  `cloudToggle(offer)` — a real checkbox in a `label.ctl`, drawn whenever the
+  host sends `composer.cloud` — while the login is `checking` and when it said
+  `no` too (dashed, `.unavailable`; ticked, a note chip says why), because a box
+  shown only on a yes was a feature nobody could find — its tick in the module-level
   `cloudPick` (and in `chromeSig()`, or the fast path would keep the old bar);
   ticked, the model, effort, thinking, split and flag controls step aside (the
   CLI drops them on the way to the cloud) and `newSession` carries
@@ -181,6 +183,8 @@ between mousedown and mouseup never clicks). The view keeps the last
   after it is sent (the transcript records only the count).
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · the "Run in the cloud" box is on every new Claude Code session with its login state (`checking` / `ok` / `no` + reason) instead of appearing only on a yes — there was no button to find; side bar "☁ New cloud session" and `agentsKanban.newCloudSession`.
 
 - 2026-09-30 · claude/admiring-lamport-vyma1q · "Run in the cloud": `cloudToggle`/`cloudPick` on a new session's bar, `cloudChip` + "Open on claude.ai" on a cloud card's bar, `renderCloudStrip` / `renderCloudBanner`, the `☁ cloud` tag and chip, the overview section, no Run app/Merge/Browser on a cloud card; `.cloud-*` in board.css; `cloudRow` on the settings page. Gates: `cloud-view.test.mjs`, and `layout.test.mjs` measures the checkbox chip at the one control height and ticks it with a real click on its label.
 

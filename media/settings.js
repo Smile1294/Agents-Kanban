@@ -200,9 +200,8 @@ function modelsRow(card) {
   return wrap
 }
 
-/* "Run in the cloud" on a new chat. The composer leaves the box OUT when this
-   login cannot use it — never greyed — so the reason has to be somewhere, and
-   it is here. Three answers, three fixes: nothing to do, the board's own
+/* "Run in the cloud" on a new chat — the composer's box, as this login answers
+   it. Three answers, three fixes: nothing to do, the board's own
    setting, or the login (the host's sentence names which, and what to run). */
 function cloudRow(card) {
   const c = card.cloud

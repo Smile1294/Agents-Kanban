@@ -46,7 +46,7 @@ console.log('\n— the box, on the new-session screen')
   const none = renderBoardWith(src, base)
   ok(!byClass(none.root, 'cloud-pick').length, 'not drawn when the host does not offer it — never greyed out')
 
-  const v = renderBoardWith(src, { ...base, composer: { ...COMPOSER, cloud: { plan: 'max' } } })
+  const v = renderBoardWith(src, { ...base, composer: { ...COMPOSER, cloud: { state: 'ok', plan: 'max' } } })
   const pick = byClass(v.root, 'cloud-pick')[0]
   ok(!!pick, 'drawn when the host offers it')
   ok(pick?.tagName === 'label' && !!input(v.root), 'as a real checkbox inside a label, so the whole chip is the target')
@@ -58,7 +58,7 @@ console.log('\n— the box, on the new-session screen')
   box.checked = true
   box.onchange()
   ok(input(v.root)?.checked === true, 'the tick survives the repaint it causes')
-  v.deliver({ ...base, composer: { ...COMPOSER, cloud: { plan: 'max' } } })
+  v.deliver({ ...base, composer: { ...COMPOSER, cloud: { state: 'ok', plan: 'max' } } })
   ok(input(v.root)?.checked === true, 'and the next state frame — it lives outside the DOM')
   ok(!v.text().includes('Opus 5'), 'ticked, the model picker steps aside: the CLI drops the model on the way to the cloud')
   ok(!v.text().includes('Balanced'), 'so does the split dial: a cloud session has no board tools to split with')
@@ -81,6 +81,38 @@ console.log('\n— the box, on the new-session screen')
   ok(v.text().includes('Opus 5'), 'with the model picker back')
 }
 
+console.log('\n— the box is there before the login answers, and when it says no')
+{
+  const checking = renderBoardWith(src, { ...base, composer: { ...COMPOSER, cloud: { state: 'checking' } } })
+  ok(byClass(checking.root, 'cloud-pick').length === 1, 'drawn while the login is still being checked — never a missing button')
+  ok(/Checking/.test(byClass(checking.root, 'cloud-pick')[0]?.title || ''), 'and its title says it is checking')
+
+  const reason = 'Claude Code is using an API key (ANTHROPIC_API_KEY).'
+  const no = renderBoardWith(src, { ...base, composer: { ...COMPOSER, cloud: { state: 'no', reason } } })
+  const pick = byClass(no.root, 'cloud-pick')[0]
+  ok(!!pick && String(pick.className).includes('unavailable'), 'drawn on a login that cannot go, marked as not ready')
+  ok(!no.text().includes(reason), 'the reason is not shouted at someone who never asked')
+  const box = input(no.root)
+  box.checked = true
+  box.onchange()
+  ok(no.text().includes(reason), 'ticked, the bar says why it cannot go')
+  type(no, 'try it')
+  sendButton(no.root).onclick()
+  ok(no.posted.filter((m) => m.type === 'newSession').pop()?.cloud === true,
+    'and starting still asks the host, which refuses in a modal with the same reason')
+}
+
+console.log('\n— the side bar offers a cloud session too')
+{
+  const side = renderBoardWith(src, { ...base, mode: 'kanban', composer: { ...COMPOSER, cloud: { state: 'ok' } } }, { layout: 'control' })
+  const btn = walk(side.root).find((n) => n.tagName === 'button' && /New cloud session/.test(n.textContent))
+  ok(!!btn, 'a "☁ New cloud session" button next to "+ New session"')
+  btn?.onclick?.()
+  ok(side.posted.some((m) => m.type === 'newSessionPrompt' && m.cloud === true), 'which asks the host for a task to run in the cloud')
+  const none = renderBoardWith(src, { ...base, mode: 'kanban', composer: { ...COMPOSER } }, { layout: 'control' })
+  ok(!walk(none.root).some((n) => n.tagName === 'button' && /New cloud session/.test(n.textContent)), 'and is absent where the agent cannot go at all')
+}
+
 console.log('\n— a card in the cloud, detached')
 {
   const card = {
@@ -90,7 +122,7 @@ console.log('\n— a card in the cloud, detached')
   }
   const v = renderBoardWith(src, {
     ...base, cards: [card], selectedKey: card.key,
-    composer: { ...COMPOSER, cloud: { plan: 'max' }, cloudCard: { via: 'detached' } },
+    composer: { ...COMPOSER, cloud: { state: 'ok', plan: 'max' }, cloudCard: { via: 'detached' } },
     transcript: [
       { kind: 'prompt', at: Date.now(), text: 'Fix the flaky auth test' },
       { kind: 'notice', at: Date.now(), urgency: 'info', message: "Running on Anthropic's cloud (https://claude.ai/code/x). The board cannot read its replies." },

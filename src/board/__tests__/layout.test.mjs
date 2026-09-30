@@ -410,7 +410,7 @@ try {
   await fresh.setContent(page$({
     ...chatState, selectedKey: undefined, transcript: [],
     composer: {
-      ...chatState.composer, contextTokens: 0, meter: undefined, cloud: { plan: 'max' },
+      ...chatState.composer, contextTokens: 0, meter: undefined, cloud: { state: 'ok', plan: 'max' },
       agent: 'claude|inherit',
       agents: [{ key: 'claude|inherit', label: 'Claude Code', detail: 'Anthropic', runtime: 'claude', provider: 'inherit' }],
     },

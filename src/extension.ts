@@ -109,6 +109,9 @@ import {
 import { claudeVersion, compareVersions, parseCliVersion, replacedInPlace, updateClaudeCode } from './agent/cli-update.ts'
 import { isCloudUrl, type CloudEligibility } from './agent/cloud.ts'
 
+/** What the composer's "Run in the cloud" box knows about this login. */
+type CloudOffer = { state: 'checking' } | { state: 'ok'; plan?: string } | { state: 'no'; reason: string }
+
 type AgentPermissionMode = AgentOptions['permissionMode']
 
 /** How often the board may repaint while an agent streams. Ten times a second
@@ -1455,19 +1458,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return ask
   }
 
-  /** The composer's half: draw the box only on a known yes, and start asking
-   *  when nothing is known. Pure apart from that kick, which is deduplicated,
-   *  so it is safe on the render path. */
-  function cloudOffer(rt: RuntimeId, profileId: string): { cloud?: { plan?: string } } {
+  /** The composer's half. The box is DRAWN whenever this agent can run in the
+   *  cloud at all and the setting is on — hiding it until a background login
+   *  check came back yes left people with no way to find the feature ("there
+   *  is literally no button"). What the check knows rides along: `checking`,
+   *  `ok` (with the plan) or `no` (with the reason, which the view shows the
+   *  moment the box is ticked). The host still gates the start itself. Pure
+   *  apart from the deduplicated kick, so it is safe on the render path. */
+  function cloudOffer(rt: RuntimeId, profileId: string): { cloud?: CloudOffer } {
     if (!cloudOn() || !getRuntime(rt)?.capabilities.cloud) return {}
     const known = cloudLogins.get(agentKey(rt, profileId))
     if (!known) {
       if (!cloudAsking.has(agentKey(rt, profileId))) {
         askCloud(rt, profileId).then(() => refreshAll(), (e: unknown) => log.error(`Cloud login check failed: ${String(e)}`))
       }
-      return {}
+      return { cloud: { state: 'checking' } }
     }
-    return known.answer.ok ? { cloud: known.answer.plan ? { plan: known.answer.plan } : {} } : {}
+    return known.answer.ok
+      ? { cloud: { state: 'ok', ...(known.answer.plan ? { plan: known.answer.plan } : {}) } }
+      : { cloud: { state: 'no', reason: known.answer.reason } }
   }
 
   /** The settings page's line about the same box: the composer leaves it OUT
@@ -3784,9 +3793,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       agent: agentKey(runtime, active.id),
       agents: agentChoices(),
       agentLocked: false,
-      /* The "Run in the cloud" box, for a NEW session: present only when this
-         agent's own login said yes — a claude.ai subscription on Anthropic.
-         ABSENT otherwise, like effort on Haiku; why is on the settings page.
+      /* The "Run in the cloud" box, for a NEW session of an agent that can go
+         to the cloud, with what its login said (see `cloudOffer`).
          A selected session drops it (the slice) and says where IT runs. */
       ...cloudOffer(runtime, active.id),
       cloudCard: undefined as undefined | { via?: 'live' | 'detached'; pending?: boolean },
@@ -4784,13 +4792,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return transcribeUpload(voiceConfig(), mediaType, data)
     },
 
-    async newSessionPrompt() {
+    async newSessionPrompt(where) {
       const text = await vscode.window.showInputBox({
-        prompt: 'What should the agent do?', ignoreFocusOut: true,
+        prompt: where?.cloud ? 'What should the agent do on Anthropic\'s cloud?' : 'What should the agent do?',
+        ignoreFocusOut: true,
       })
       if (!text?.trim()) return
       enterBoard()
-      await this.newSession(text)
+      await this.newSession(text, undefined, undefined, where?.cloud ? { cloud: true } : undefined)
     },
 
     async toggleFocus() {
@@ -6453,6 +6462,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         prompt: 'What should the agent do?', ignoreFocusOut: true,
       })
       if (text?.trim()) { BoardPanel.show(context.extensionUri, host); await host.newSession(text) }
+    }),
+    // "Run in the cloud" from the palette and the view's title bar, so the
+    // feature is reachable without finding the box on the composer.
+    vscode.commands.registerCommand('agentsKanban.newCloudSession', async () => {
+      const text = await vscode.window.showInputBox({
+        prompt: 'What should the agent do on Anthropic\'s cloud?', ignoreFocusOut: true,
+      })
+      if (text?.trim()) { BoardPanel.show(context.extensionUri, host); await host.newSession(text, undefined, undefined, { cloud: true }) }
     }),
     vscode.commands.registerCommand('agentsKanban.init', () => host.init()),
     vscode.commands.registerCommand('agentsKanban.openSettings', () => openSettings()),

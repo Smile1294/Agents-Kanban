@@ -701,7 +701,8 @@ export interface BoardHost {
   /** Open the board on one session's transcript. */
   openSession(key: string): Promise<void>
   /** Ask for a prompt, then start a session. */
-  newSessionPrompt(): Promise<void>
+  /** `where.cloud`: ask for a task to run on Anthropic's cloud. */
+  newSessionPrompt(where?: { cloud?: boolean }): Promise<void>
   /** Open the provider quick pick. Reached from the last entry of the composer's
    *  provider menu, which is how a FIRST provider gets configured — a picker
    *  that could only choose between profiles that already exist would leave the
@@ -981,7 +982,7 @@ async function routeBoardMessage(
       await host.closeBoard()
       break
     case 'openSession': await host.openSession(id()); await refresh(); break
-    case 'newSessionPrompt': await host.newSessionPrompt(); break
+    case 'newSessionPrompt': await host.newSessionPrompt(msg.cloud === true ? { cloud: true } : undefined); break
     case 'selectProvider':
       if (editorOnly('Choose a provider in the editor.')) break
       await host.selectProvider()

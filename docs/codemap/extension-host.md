@@ -52,8 +52,11 @@ declared in `package.json`, and the smoke gate asserts the two agree): `openBoar
 `onStartupFinished`. Cloud sessions live here too: `askCloud(rt, profile)`
 asks that agent's login in the environment a session would get (deduplicated,
 cached in `cloudLogins` per `<runtime>|<profile>`, cleared when profiles or the
-provider change), `cloudOffer()` puts `composer.cloud` on a NEW session's bar
-only on a known yes (and starts the ask when nothing is known), `cloudRow()` is
+provider change), `cloudOffer()` puts `composer.cloud` on EVERY new session's bar
+for an agent that can go there — `checking`, `ok` (plan) or `no` (reason) — and
+starts the ask when nothing is known (hiding the box until a yes came back left
+people with no button at all); `agentsKanban.newCloudSession` and the side
+bar's "☁ New cloud session" reach the same gate; `cloudRow()` is
 the settings page's line about the same answer, and `newSession(…, {cloud})`
 re-checks it HOST-side — the setting, the capability, a git repository, the
 login — and refuses with a MODAL, never a toast. A selected cloud card gets
@@ -335,6 +338,8 @@ bar is handed back to `agentsKanban.sideBarHome`.
   description no longer promises one.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · the "Run in the cloud" box is on every new Claude Code session with its login state (`checking` / `ok` / `no` + reason) instead of appearing only on a yes — there was no button to find; side bar "☁ New cloud session" and `agentsKanban.newCloudSession`.
 
 - 2026-09-30 · claude/admiring-lamport-vyma1q · cloud sessions: `agentsKanban.cloudSessions`; the login ask (`askCloud`, `cloudLogins`), `composer.cloud` / `composer.cloudCard`, the host-side modal gate in `newSession`, `cloudLink`/`openCloud` (`BoardHost` + the `openCloud` message), `UiCard.cloud`, `RuntimeAgentCard.cloud` on the settings page, and a cloud card's remove dialog.
 

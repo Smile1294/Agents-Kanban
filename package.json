@@ -79,6 +79,11 @@
         "icon": "$(add)"
       },
       {
+        "command": "agentsKanban.newCloudSession",
+        "title": "Agents Kanban: New Cloud Session (Anthropic)",
+        "icon": "$(cloud-upload)"
+      },
+      {
         "command": "agentsKanban.archiveSession",
         "title": "Agents Kanban: Archive Session",
         "icon": "$(archive)"
@@ -521,6 +526,11 @@
         {
           "command": "agentsKanban.newSession",
           "when": "view == agentsKanban.board",
+          "group": "navigation"
+        },
+        {
+          "command": "agentsKanban.newCloudSession",
+          "when": "view == agentsKanban.board && config.agentsKanban.cloudSessions",
           "group": "navigation"
         }
       ]
