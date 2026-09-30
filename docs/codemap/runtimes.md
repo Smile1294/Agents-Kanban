@@ -247,9 +247,11 @@ once came back with empty transcripts that way). The settings page asks
   was off wherever this was built, so what the board has seen of it is the
   stand-in. The detached path cannot bring a cloud session's changes back to
   the card's worktree without GitHub; Windows has no `script(1)` for it; the
-  BSD `script` form is untested on a real Mac.
+  macOS form is tested against a stand-in `script`, after the first real Mac run failed on a socket stdin.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · macOS: `ptyInvocation('darwin')` puts `cat` in front of BSD `script` — it tcgetattr()s stdin and survives only ENOTTY, and a Node piped stdin is a socketpair ("Operation not supported on socket", the first real Mac run) — spawns it detached as a process group, and signals the group when `script` ends so an open stdin cannot keep it alive. Tested against a stand-in `script` that refuses a socket the way macOS's does.
 
 - 2026-09-30 · claude/admiring-lamport-vyma1q · `cloudEligibility` fixed: the CLI reports a claude.ai subscription as `subscriptionType` and OMITS `tokenSource`, so requiring `tokenSource === 'claude.ai'` refused every subscriber ("not signed in"). A reported plan with no API key in use is now the line.
 

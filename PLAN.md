@@ -746,7 +746,7 @@ on runtime identity), but three things are honest gaps rather than decisions:
 - **A detached card cannot stop its cloud session.** Interrupt and Stop end the
   local CLI; the session itself is stopped on claude.ai.
 - **Windows cannot use the detached path** (no `script(1)`), and the macOS
-  form has not been run on a Mac.
+  form's fix for the first real Mac failure is tested only against a stand-in.
 
 ### Orchestration: what is left after `split_task`
 

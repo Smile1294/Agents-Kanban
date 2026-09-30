@@ -292,7 +292,11 @@ export class CloudRun extends EventEmitter implements AgentRun {
         }, s.envClear ?? []),
         // stdin stays OPEN: `script` ends the session when its input does.
         stdio: ['pipe', 'pipe', 'pipe'],
+        // Its own process group where the command is a wrapper shell, so a
+        // stop reaches everything it started (see `ptyInvocation`).
+        ...(inv.group ? { detached: true } : {}),
       })
+      if (inv.group) this.groups.add(child)
       this.child = child
       const done = (r: ReturnType<typeof readCloudCreate>) => {
         if (settled) return
@@ -437,10 +441,19 @@ export class CloudRun extends EventEmitter implements AgentRun {
     this.emit('error', message)
   }
 
+  /** Children spawned as a process-group leader — signalled as a group. */
+  private readonly groups = new WeakSet<ChildProcess>()
+
   private kill(child: ChildProcess): void {
     if (child.exitCode !== null || child.signalCode !== null) return
-    child.kill('SIGTERM')
-    const hard = setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL') }, 3000)
+    const signal = (sig: NodeJS.Signals) => {
+      if (this.groups.has(child) && child.pid) {
+        try { process.kill(-child.pid, sig); return } catch { /* the group is gone; fall through */ }
+      }
+      child.kill(sig)
+    }
+    signal('SIGTERM')
+    const hard = setTimeout(() => { if (child.exitCode === null) signal('SIGKILL') }, 3000)
     hard.unref?.()
   }
 

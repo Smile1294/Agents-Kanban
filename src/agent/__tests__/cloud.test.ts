@@ -147,7 +147,9 @@ console.log('\n— the commands')
   ok(shellQuote(`it's`) === `'it'\\''s'`, 'a quote inside a quote')
   ok(ptyInvocation('win32', ['claude']) === undefined, 'Windows has no script(1), and the answer says so')
   const mac = ptyInvocation('darwin', ['/usr/local/bin/claude', '--cloud=x y'])!
-  ok(mac.command === 'script' && mac.args.slice(-2).join('|') === '/usr/local/bin/claude|--cloud=x y', 'BSD script gets the argv untouched, after a shell that sets the width')
+  ok(mac.command === '/bin/sh' && /cat \| \{ script -q \/dev\/null/.test(mac.args[1] ?? '') &&
+    mac.args.slice(-2).join('|') === '/usr/local/bin/claude|--cloud=x y',
+    'BSD script reads a real pipe (cat in front) and gets the argv untouched, after a shell that sets the width')
 
   ok(isCloudUrl(`https://claude.ai/code/${ID}?from=cli&m=0`), 'a claude.ai session link is openable')
   ok(!isCloudUrl('javascript:alert(1)') && !isCloudUrl('http://claude.ai/code/x') && !isCloudUrl('https://evil.example/code/x'),
@@ -225,6 +227,66 @@ process.stdout.write('Resume with: claude --teleport ${ID}\\n')
     ok(!pwned, 'and nothing in it ran')
     const r = readCloudCreate(out.text, true)
     ok(r.kind === 'created' && r.id === ID, `and what it printed reads as a created session (${r.kind}, exit ${out.code})`)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+console.log('\n— the BSD invocation, against a script(1) that behaves like macOS\'s')
+{
+  /* macOS `script` tcgetattr()s its stdin and survives only ENOTTY; a Node
+     piped stdin is a socketpair, which fails with ENOTSUP. This stand-in
+     refuses a socket exactly as the real one did on a Mac — "script:
+     tcgetattr/ioctl: Operation not supported on socket" — accepts a FIFO or
+     /dev/null, and then runs the command it was given the way BSD
+     `script -q /dev/null cmd…` does. No terminal here, so the width is not
+     checked; the argv and the refusal are. */
+  const dir = await mkdtemp(path.join(tmpdir(), 'ak-bsd-'))
+  try {
+    const bin = path.join(dir, 'bin')
+    await import('node:fs/promises').then((f) => f.mkdir(bin))
+    await writeFile(path.join(bin, 'script'), `#!/bin/sh
+if [ -S /dev/stdin ]; then echo "script: tcgetattr/ioctl: Operation not supported on socket" >&2; exit 1; fi
+[ "$1" = "-q" ] && shift
+[ "$1" = "/dev/null" ] && shift
+exec "$@"
+`)
+    await chmod(path.join(bin, 'script'), 0o755)
+    const seen = path.join(dir, 'argv.json')
+    const fake = path.join(dir, 'claude')
+    await writeFile(fake, `#!/usr/bin/env node
+require('node:fs').writeFileSync(${JSON.stringify(seen)}, JSON.stringify(process.argv.slice(2)))
+process.stdout.write('Created cloud session: T\\nView: https://claude.ai/code/${ID}\\nResume with: claude --teleport ${ID}\\n')
+`)
+    await chmod(fake, 0o755)
+    const task = `fix it's "quoted" $(touch ${path.join(dir, 'pwned')}) \`id\`\nsecond line`
+    const run = (inv: { command: string; args: string[]; group?: true }) => new Promise<{ text: string; code: number | null }>((resolve) => {
+      // stdio 'pipe' — a socketpair, exactly what the board hands it — and
+      // detached where the board detaches it.
+      const p = spawn(inv.command, inv.args, {
+        stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+        ...(inv.group ? { detached: true } : {}),
+      })
+      let text = ''
+      p.stdout.on('data', (b: Buffer) => { text += b.toString('utf8') })
+      p.stderr.on('data', (b: Buffer) => { text += b.toString('utf8') })
+      p.on('close', (code) => resolve({ text, code }))
+      // stdin is left OPEN, as the board leaves it: the wrapper must end
+      // when the CLI does, not when its input does.
+      const t = setTimeout(() => { p.kill('SIGKILL'); text += '[still running after 5s]' }, 5000)
+      p.on('close', () => clearTimeout(t))
+    })
+    const direct = await run({ command: 'script', args: ['-q', '/dev/null', fake, `--cloud=${task}`] })
+    ok(/Operation not supported on socket/.test(direct.text), 'the stand-in fails the way the Mac did when script reads the socket itself')
+    const inv = ptyInvocation('darwin', [fake, ...cloudCreateArgs(task)])!
+    ok(inv.group === true, 'the wrapper is stopped as a process group')
+    const out = await run(inv)
+    ok(!/not supported on socket/.test(out.text), `through the invocation, script reads a real pipe and starts (${JSON.stringify(out.text.slice(0, 80))})`)
+    ok(!/still running/.test(out.text), 'and the wrapper ends when the CLI does, with its input still open')
+    const argv = await readFile(seen, 'utf8').then((t) => JSON.parse(t) as string[], () => [] as string[])
+    ok(argv[0] === `--cloud=${task}`, 'the task still arrives as ONE untouched argument')
+    ok(!(await readFile(path.join(dir, 'pwned')).then(() => true, () => false)), 'and nothing in it ran')
+    ok(readCloudCreate(out.text, true).kind === 'created', 'and what it printed reads as a created session')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

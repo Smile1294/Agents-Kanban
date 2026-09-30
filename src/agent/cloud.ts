@@ -369,16 +369,33 @@ export function shellQuote(arg: string): string {
 export function ptyInvocation(
   platform: string,
   argv: readonly string[],
-): { command: string; args: string[] } | undefined {
+): { command: string; args: string[]; group?: true } | undefined {
   if (platform === 'win32') return undefined
   if (platform === 'linux') {
     const line = `stty cols 200 rows 50 2>/dev/null; exec ${argv.map(shellQuote).join(' ')}`
     return { command: 'script', args: ['-q', '-e', '-f', '-c', line, '/dev/null'] }
   }
-  // macOS and the BSDs.
+  /* macOS and the BSDs. Their `script` checks its STDIN with tcgetattr and
+     tolerates exactly one failure, ENOTTY; any other is fatal. Node hands a
+     child a SOCKETPAIR for a piped stdin, which fails with ENOTSUP instead —
+     "script: tcgetattr/ioctl: Operation not supported on socket", the first
+     thing a real Mac said. So `cat` sits in front and `script` reads a real
+     pipe (ENOTTY, fine), and stdin still stays open: BSD `script` writes an
+     EOF into the session when its input ends. `group`, because the process
+     spawned is the shell, and stopping it must stop `cat` and `script` too.
+     The inner line travels as a positional parameter, so nothing is quoted
+     twice. And when `script` ends, the wrapper's own group is signalled:
+     otherwise `cat`, still waiting on the open stdin, keeps the pipeline
+     alive after Claude Code has exited, and an error reads as a ten-minute
+     hang. `-$$` is the wrapper's group only because it is spawned detached;
+     without that it names no group and the kill does nothing. */
   return {
-    command: 'script',
-    args: ['-q', '/dev/null', '/bin/sh', '-c', 'stty cols 200 rows 50 2>/dev/null; exec "$@"', 'sh', ...argv],
+    command: '/bin/sh',
+    args: [
+      '-c', 'inner=$1; shift; cat | { script -q /dev/null /bin/sh -c "$inner" sh "$@"; kill -s TERM -- -$$ 2>/dev/null; }',
+      'sh', 'stty cols 200 rows 50 2>/dev/null; exec "$@"', ...argv,
+    ],
+    group: true,
   }
 }
 

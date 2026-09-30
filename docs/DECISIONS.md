@@ -3397,5 +3397,6 @@ press.
   are hidden on a cloud card rather than shown over a worktree its work is not
   in.
 - **Detached cloud sessions need `script(1)`.** There is none on Windows, where
-  the card says so and names the command to run by hand. The BSD form for macOS
-  has not been run on a Mac.
+  the card says so and names the command to run by hand. On macOS the first
+  real run failed (BSD `script` refuses a socket as stdin); the fix is tested
+  against a stand-in that refuses it the same way, not yet re-run on a Mac.
