@@ -17,6 +17,7 @@ import * as path from 'node:path'
 import { MODEL_WINDOWS } from './usage.ts'
 import { parseRuntimeId, type RuntimeId } from '../agent/runtime.ts'
 import { parseParked, type ParkedRecord } from '../agent/limits.ts'
+import { parseCloud, type CloudRecord } from '../agent/cloud.ts'
 import {
   parseOrchestrationLevel,
   type DecompositionRecord, type OrchestrationLevel, type ProposalRule,
@@ -576,6 +577,15 @@ export interface SessionMeta {
    * `null` in a PATCH clears it — any resume ends the park.
    */
   parked?: ParkedRecord | null
+  /**
+   * This session runs on Anthropic's cloud (`agent/cloud.ts`): its id, its
+   * link, how the board is attached, its title and every message the board
+   * delivered to it. For a DETACHED session this record IS the card — there
+   * is no transcript under `~/.claude/projects` for Claude Code's index to
+   * list — so `store.list()` builds the card from it, and it is read back in
+   * `parseMeta` like every other field that has to survive.
+   */
+  cloud?: CloudRecord
   /** Per-session overrides; unset means fall through to the workspace default. */
   model?: string
   effort?: EffortLevel
@@ -636,6 +646,7 @@ export function parseMeta(v: unknown): SessionMeta | undefined {
     ...(typeof m.provider === 'string' ? { provider: m.provider } : {}),
     ...(typeof m.switchedFrom === 'string' ? { switchedFrom: m.switchedFrom } : {}),
     ...(parseParked(m.parked) ? { parked: parseParked(m.parked)! } : {}),
+    ...(parseCloud(m.cloud) ? { cloud: parseCloud(m.cloud)! } : {}),
     ...(typeof m.model === 'string' ? { model: m.model } : {}),
     // Closed unions, so a value from an older build cannot reach the picker.
     ...(EFFORT_LEVELS.some((e) => e.key === m.effort) ? { effort: m.effort as EffortLevel } : {}),

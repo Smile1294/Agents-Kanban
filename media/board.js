@@ -190,6 +190,12 @@
    *  duplicate. Shown under the composer until the next attach or send, since
    *  a paste that silently does nothing reads as a broken paste. */
   let attachNote = ''
+  /** The new-session composer's "Run in the cloud" box. Module-level for the
+   *  reason `draft` is: render() rebuilds the composer several times a second
+   *  while any agent works, and a tick living in the DOM would be undone by the
+   *  next frame. Sent only while the host still OFFERS the box
+   *  (`composer.cloud`); the host checks the login again either way. */
+  let cloudPick = false
   /** The open annotation editor, or null. Module-level and mounted on
    *  `document.body`, OUTSIDE `#root`: render() replaces the root several times
    *  a second while an agent works, and a canvas rebuilt mid-stroke takes the
@@ -718,6 +724,8 @@
       view.mode, view.selectedKey, !!s.ready, !!s.noWorkspace, !!s.noRepo,
       !!s.focused, !!s.boardOpen, !!s.showArchived, s.busy || '',
       s.olderHidden || 0, !!s.showOlder, picked.size,
+      // The cloud tick changes which pickers the bar draws.
+      cloudPick,
       // Ages are DRAWN by ago(), so they enter at minute resolution for the
       // same reason `updated` does — a live agent rewrites its transcript
       // constantly, and raw milliseconds would differ on every frame.
@@ -1326,6 +1334,7 @@
     const sub = el('div', 'rail-item-sub')
     sub.append(el('span', null, ago(c.updated)))
     sub.append(phaseChip(c.phase))
+    if (c.cloud) sub.append(el('span', 'chip cloud', '☁ cloud'))
     if (c.archived) sub.append(el('span', 'chip', 'archived'))
     row.append(sub)
     return row
@@ -1526,6 +1535,8 @@
     if (!a && (c.interrupted || c.stalled)) return 'needs'
     if (a && (a.kind === 'working' || a.kind === 'starting' || a.kind === 'waiting')) return 'running'
     if (a && a.kind === 'queued') return 'queued'
+    // Not "running" — nothing here can say it is — and not "not started".
+    if (c.cloud && cat !== 'review' && cat !== 'done') return 'cloud'
     // Known broken by the board's own check: not "ready to test".
     if (cat === 'review' && c.testPlan && c.testPlan.autoCheck && !c.testPlan.autoCheck.ok) return 'needs'
     if (cat === 'review' && c.testPlan && c.testPlan.quality && !c.testPlan.quality.ok) return 'needs'
@@ -1536,6 +1547,7 @@
   const SECTIONS = [
     { id: 'needs', name: 'Needs you', icon: '🔔', open: true },
     { id: 'running', name: 'Running now', icon: '⚙', open: true },
+    { id: 'cloud', name: 'On Anthropic\'s cloud', icon: '☁', open: true },
     { id: 'test', name: 'Ready to test', icon: '🧪', open: true },
     { id: 'queued', name: 'Queued', icon: '⏳', open: true },
     { id: 'planned', name: 'Not started / idle', icon: '📋', open: false },
@@ -1622,6 +1634,11 @@
     }
     if (c.interrupted) return 'cut off ' + ago(c.interrupted) + ' when the editor closed'
     if (c.stalled) return 'stopped without handing its work back'
+    if (c.cloud && !a) {
+      return c.cloud.via === 'live'
+        ? 'runs on Anthropic\'s cloud — its conversation is kept there'
+        : 'runs on Anthropic\'s cloud — follow it on claude.ai'
+    }
     if (c.autoChecking) return 'the board is checking it in its own browser…'
     if (c.testPlan && c.testPlan.autoCheck && !c.testPlan.autoCheck.ok) return 'failed the board\'s auto-check'
     if (c.qualityChecking) return 'the board is running the project\'s own checks…'
@@ -1866,6 +1883,13 @@
     }
 
     const meta = el('div', 'meta')
+    // Where it runs, before the branch: a cloud card's branch is the local
+    // one it was UPLOADED from, and its work is not on it.
+    if (c.cloud) {
+      const tag = el('span', 'cloud-tag', '☁ cloud')
+      tag.title = 'Runs on Anthropic\'s cloud, not on this machine'
+      meta.append(tag)
+    }
     if (c.branch) meta.append(el('span', 'branch', '⎇ ' + c.branch.replace(/^task\//, '')))
     meta.append(el('span', 'spacer'))
     meta.append(el('span', null, ago(c.updated)))
@@ -1886,7 +1910,45 @@
     else if (a) n.append(renderAgentStrip(c, a))
     else if (c.interrupted) n.append(renderInterrupted(c, false))
     else if (c.stalled) n.append(renderStalled(c))
+    else if (c.cloud) n.append(renderCloudStrip(c))
     return n
+  }
+
+  /* The chat page's statement of where a cloud session is and how much the
+     board can see of it — the three cases are three different truths. */
+  function renderCloudBanner(c) {
+    const b = el('div', 'cloud-banner')
+    const text = c.cloud.pending
+      ? '☁ Starting on Anthropic\'s cloud: Claude Code is uploading this repository as a git bundle and ' +
+        'creating the session.'
+      : c.cloud.via === 'live'
+        ? '☁ Running on Anthropic\'s cloud, streamed here by Claude Code. Its changes are made in the cloud, ' +
+          'not in this worktree.'
+        : '☁ Running on Anthropic\'s cloud. This Claude Code does not stream cloud sessions to an editor for ' +
+          'your account, so the board can send it messages but cannot read its replies — those, and its ' +
+          'changes, are on claude.ai. Without GitHub its changes stay in the session.'
+    b.append(el('span', 'cloud-banner-text', text))
+    if (!c.cloud.pending) {
+      const open = el('button', 'primary', 'Open on claude.ai')
+      open.onclick = () => post('openCloud', { id: c.key })
+      b.append(open)
+    }
+    return b
+  }
+
+  /* A cloud card with nothing running HERE. It says where the work is and
+     how much the board can see of it — never a spinner, which would claim a
+     liveness nobody on this machine can observe. */
+  function renderCloudStrip(c) {
+    const strip = el('div', 'cloud-strip')
+    strip.append(el('span', 'cloud-strip-text', c.cloud.via === 'live'
+      ? '☁ On Anthropic\'s cloud — the conversation is kept there'
+      : '☁ On Anthropic\'s cloud — replies and changes are on claude.ai'))
+    const open = el('button', 'ctl ctl-xs', 'Open')
+    open.title = 'Open this session on claude.ai'
+    open.onclick = (e) => { stop(e); post('openCloud', { id: c.key }) }
+    strip.append(open)
+    return strip
   }
 
   /* The board's QUALITY checks (run/quality.ts): the project's own checks,
@@ -2468,7 +2530,10 @@
       // Starting the app is the next thing you do after reading a test plan,
       // so it lives where you are already looking rather than in a menu. Only
       // for a session that HAS a worktree: there is nothing to serve otherwise.
-      if (c.worktree) {
+      // Nor for one in the CLOUD: its worktree is the checkout it was uploaded
+      // FROM, unchanged, so running, merging or watching it would be showing
+      // the old code as though it were the session's.
+      if (c.worktree && !c.cloud) {
         const run = el('button', 'run-app', '▶ Run app')
         run.title = 'Start this worktree\'s app and open it in your browser'
         run.onclick = () => post('run', { id: c.key })
@@ -2487,7 +2552,7 @@
         head.append(merge)
       }
       // The live browser: the agent's page as it tests, beside the chat.
-      if (c.worktree) {
+      if (c.worktree && !c.cloud) {
         const bb = el('button', browserOn() ? 'on' : null, '🖥 Browser')
         bb.title = browserOn() ? 'Hide the live browser' : 'Watch the agent\'s browser live, beside the chat'
         bb.onclick = () => {
@@ -2525,7 +2590,10 @@
        card is open. */
     if (sliceIsOurs() && s.backgroundAgents && s.backgroundAgents.length) main.append(renderBackgroundAgents())
     if (s.pendingMerge) main.append(renderPendingMerge())
-    if (c && c.worktree && sliceIsOurs()) main.append(renderReview(c))
+    // A cloud session's changes are made in the cloud; the local worktree's
+    // Changes panel would say "nothing changed" about work that did happen.
+    if (c && c.cloud) main.append(renderCloudBanner(c))
+    else if (c && c.worktree && sliceIsOurs()) main.append(renderReview(c))
 
     syncKey = c ? c.key : null
     const scroll = el('div', 'transcript-scroll')
@@ -3271,11 +3339,23 @@
     // The fast path appends the readouts here when they appear mid-turn.
     syncBarNode = bar
     bar.append(el('span', 'agent-badge ctl ctl-static', 'AGENT'))
+    /* A session on Anthropic's CLOUD runs on whatever its cloud environment
+       picks: the CLI drops the model, effort and permission flags on the way
+       there. Every picker below would be a control that cannot take effect, so
+       they DISAPPEAR for it — the rule that hides effort on Haiku — and the bar
+       says where the session is instead. */
+    const cloudCard = c && s.composer.cloudCard
+    const local = !cloudCard
+    /* And a NEW session with the cloud box ticked: the CLI forwards its
+       permission mode to the cloud, and drops the model — so the model
+       pickers step aside for it too, and the permission picker stays. */
+    const cloudNew = !c && !!s.composer.cloud && cloudPick
+    const modelControls = local && !cloudNew
     /* The menu carries the CLI's own one-liner for each model. That is what
        makes "Default (recommended) — Opus 5 with 1M context" a choice rather
        than a list of ids, and it costs nothing: the description arrived with
        the model list. */
-    bar.append(picker('model', modelLabel(s.composer.model), s.composer.models.map((m) => ({
+    if (modelControls) bar.append(picker('model', modelLabel(s.composer.model), s.composer.models.map((m) => ({
       value: m.id,
       label: m.label,
       /* Everything known about the model, on its own line: the id (which is
@@ -3296,8 +3376,8 @@
        model differs from the one it was on — the next turn re-reads it all
        at the new model's input price. Rendered beside the picker that
        triggered it, in the same amber used for the provider note. */
-    if (s.composer.modelSwitchNote) bar.append(noteChip(s.composer.modelSwitchNote))
-    if (s.composer.imageLoadNote) bar.append(noteChip(s.composer.imageLoadNote))
+    if (modelControls && s.composer.modelSwitchNote) bar.append(noteChip(s.composer.modelSwitchNote))
+    if (local && s.composer.imageLoadNote) bar.append(noteChip(s.composer.imageLoadNote))
     /* WHAT THIS SESSION RUNS ON: one entry per agent-and-backend combination.
        This was two pickers — an agent picker and, before that, a backend
        picker — and splitting them made the user do the cross product in their
@@ -3318,7 +3398,16 @@
        same-runtime combinations are offered: a backend change moves
        environment, an agent change would move the transcript, and one of
        those is not a thing. */
-    if (s.composer.agentLocked) {
+    if (cloudCard) {
+      bar.append(cloudChip(cloudCard))
+      const open = el('button', 'cloud-open ctl', 'Open on claude.ai')
+      open.title = cloudCard.via === 'live'
+        ? 'Open this session on claude.ai — the same conversation, from any device'
+        : 'Its replies and its changes are on claude.ai; the board can only deliver messages to it'
+      open.disabled = !!cloudCard.pending
+      open.onclick = (e) => { stop(e); post('openCloud', { id: c.key }) }
+      bar.append(open)
+    } else if (s.composer.agentLocked) {
       const rtEntry = (s.composer.runtimes || []).find((r) => r.id === s.composer.runtime)
       const chip = el('span', 'picker static ctl ctl-static')
       chip.append(el('span', 'ctl-ico', '🤖'))
@@ -3341,6 +3430,10 @@
         meta: a.detail,
       })).concat([{ command: 'openSettings', label: '⚙  Agents, backends and logins…' }]),
       undefined, undefined, undefined, '🤖'))
+      /* "Run in the cloud": a NEW session only, and only when the host says
+         this agent's login can — a claude.ai subscription on Anthropic. Absent
+         otherwise, never greyed; the settings page says why. */
+      if (!c && s.composer.cloud) bar.append(cloudToggle(s.composer.cloud))
     }
     /* HOW EAGERLY this card should break its work into subtasks.
        Per card, beside the model, because it is a judgement about THIS piece of
@@ -3352,8 +3445,9 @@
        Minimal — neither of those is a rule the dial can move.
        HIDDEN, never greyed, where it cannot take effect: a workspace with no
        git repository has no `split_task` at all, and a control that is visible
-       and inert is the thing this board has a rule about. */
-    if (s.composer.orchestrationLevels && s.composer.orchestrationLevels.length) {
+       and inert is the thing this board has a rule about. So does a session
+       in the cloud, which never has the board's tools. */
+    if (modelControls && s.composer.orchestrationLevels && s.composer.orchestrationLevels.length) {
       bar.append(picker(
         'orchestration',
         orchestrationLabel(),
@@ -3371,11 +3465,11 @@
        an On/Off toggle — two controls that could not say no, which is the same
        class of bug as a spinner over a wedged process. Hidden rather than
        greyed out: "why is this disabled" has no answer worth reading. */
-    if (s.composer.efforts.length) {
+    if (modelControls && s.composer.efforts.length) {
       bar.append(picker('effort', effortLabel(),
         s.composer.efforts.map((e) => ({ value: e.key, label: e.label })), view.selectedKey))
     }
-    if (s.composer.thinkingSupported !== false) {
+    if (modelControls && s.composer.thinkingSupported !== false) {
       bar.append(picker('thinking', 'Extended: ' + (s.composer.thinking === 'disabled' ? 'Off' : 'On'), [
         { value: 'enabled', label: 'Extended: On' },
         { value: 'disabled', label: 'Extended: Off' },
@@ -3387,13 +3481,13 @@
        key — so the capability gate is the only check available before the run.
        It replaces the effort picker rather than sitting beside it: ultracode
        IS xhigh, and two controls arguing over one value is worse than one. */
-    if (s.composer.ultracodeSupported) {
+    if (modelControls && s.composer.ultracodeSupported) {
       bar.append(picker('ultracode', 'Ultracode: ' + (s.composer.ultracode ? 'On' : 'Off'), [
         { value: 'off', label: 'Ultracode: Off' },
         { value: 'on', label: 'Ultracode: On — xhigh effort, and it orchestrates workflows' },
       ], undefined, undefined, s.composer.ultracode ? 'on' : 'off', '⚡'))
     }
-    if (s.composer.fastModeSupported) {
+    if (modelControls && s.composer.fastModeSupported) {
       bar.append(picker('fastMode', 'Fast: ' + (s.composer.fastMode ? 'On' : 'Off'), [
         { value: 'off', label: 'Fast mode: Off' },
         { value: 'on', label: 'Fast mode: On — same model, faster output' },
@@ -3402,13 +3496,15 @@
     // Changeable mid-run: the SDK applies it to a live session, not just the next.
     const modes = s.composer.permissionModes || []
     const cur = modes.find((m) => m.key === s.composer.permissionMode)
-    bar.append(picker(
-      'permissionMode',
-      cur ? cur.label : 'Ask',
-      modes.map((m) => ({ value: m.key, label: m.label + ' — ' + m.detail })),
-      c ? c.key : undefined,
-      undefined, undefined, '🔑',
-    ))
+    if (local) {
+      bar.append(picker(
+        'permissionMode',
+        cur ? cur.label : 'Ask',
+        modes.map((m) => ({ value: m.key, label: m.label + ' — ' + m.detail })),
+        c ? c.key : undefined,
+        undefined, undefined, '🔑',
+      ))
+    }
     /* The provider warning, and the reason this feature is trustworthy rather
        than decorative. Two cases reach here: a profile missing a required field
        (no session can start on it), and a LIVE RUN whose CLI reported a
@@ -3416,7 +3512,7 @@
        matters — a managed settings file or an apiKeyHelper outranks anything we
        put in the environment, and without this the bar would keep naming the
        provider we requested while somebody else's account was billed. */
-    if (s.composer.providerNote) bar.append(noteChip(s.composer.providerNote))
+    if (local && s.composer.providerNote) bar.append(noteChip(s.composer.providerNote))
     bar.append(el('div', 'spacer'))
     /* Context fill and spend, and they STAY. Both used to come only from a
        live run, so restarting VS Code — or opening a session that finished
@@ -3454,7 +3550,11 @@
     const row = el('div', 'composer')
     const ta = el('textarea')
     composerInput = ta
-    ta.placeholder = c ? 'Reply… (Enter to send, Shift+Enter for a new line)' : 'What should the agent do? (Enter to start)'
+    ta.placeholder = cloudCard && cloudCard.via !== 'live'
+      ? 'Message the cloud session… (its reply is on claude.ai)'
+      : c ? 'Reply… (Enter to send, Shift+Enter for a new line)'
+      : cloudNew ? 'What should the agent do in the cloud? (Enter to start)'
+      : 'What should the agent do? (Enter to start)'
     ta.value = draft
     ta.rows = 1
     if (composerH) ta.style.height = composerH + 'px'
@@ -3623,7 +3723,7 @@
     }
 
     const send = el('button', 'primary send ctl ctl-lg ctl-icon', '➤')
-    send.title = c ? 'Send' : 'Start session'
+    send.title = c ? 'Send' : cloudNew ? 'Start the session on Anthropic\'s cloud' : 'Start session'
     send.onclick = submit
     function submit() {
       const text = draft.trim()
@@ -3637,7 +3737,11 @@
       // numbered, which is what lets "#2 is misaligned" land on a place.
       const said = annotationHint(attachments)
       const sent = said ? (text ? text + '\n\n' + said : said) : text
-      const outgoing = c ? { type: 'send', id: c.key, text: sent, images } : { type: 'newSession', text: sent, images }
+      // `cloud: true` only while the host still offers the box: a tick left
+      // over from before a backend switch must not ride along. The host
+      // checks the login again regardless.
+      const where = !c && cloudNew ? { cloud: true } : {}
+      const outgoing = c ? { type: 'send', id: c.key, text: sent, images } : { type: 'newSession', text: sent, images, ...where }
       if (overRemoteCap(outgoing)) {
         attachNote = 'Too large to send from this page in one message (' +
           (JSON.stringify(outgoing).length / 1e6).toFixed(1) + 'MB, the limit is 4MB) — remove an image, or send them one at a time.'
@@ -3648,7 +3752,7 @@
       attachments = []
       attachNote = ''
       if (c) post('send', { id: c.key, text: sent, images })
-      else post('newSession', { text: sent, images })
+      else post('newSession', { text: sent, images, ...where })
       render()
     }
     row.append(ta)
@@ -3904,6 +4008,45 @@
     n.append(el('span', 'ctl-ico', '⚠'))
     n.append(el('span', 'ctl-label', text))
     n.title = text
+    return n
+  }
+
+  /* "Run in the cloud" — a real checkbox, in a chip of the bar's one height.
+     `offer` is the host's `composer.cloud`: it exists only when THIS agent's
+     login can start a cloud session, so there is no disabled state to draw. */
+  function cloudToggle(offer) {
+    const box = el('label', 'cloud-pick ctl' + (cloudPick ? ' on' : ''))
+    const input = el('input', 'cloud-pick-box')
+    input.type = 'checkbox'
+    input.checked = cloudPick
+    input.onchange = () => { cloudPick = !!input.checked; render() }
+    box.append(input)
+    box.append(el('span', 'ctl-ico', '☁'))
+    box.append(el('span', 'ctl-label', 'Run in the cloud'))
+    box.title = 'Run this session on Anthropic\'s cloud instead of this machine' +
+      (offer && offer.plan ? ', on your ' + offer.plan + ' plan' : '') + '. ' +
+      'The repository is uploaded from here as a git bundle, so no GitHub is needed, and the session keeps ' +
+      'going when this machine sleeps. It runs on the model its cloud environment picks. If Claude Code ' +
+      'can stream it here, the chat works as usual; if not, the board delivers your messages and the ' +
+      'replies are on claude.ai.'
+    return box
+  }
+
+  /* Where a selected cloud session is, and how much of it the board can see —
+     the readout that replaces the pickers for it. */
+  function cloudChip(card) {
+    const n = el('span', 'cloud-chip ctl ctl-static' + (card.via === 'detached' ? ' detached' : ''))
+    n.append(el('span', 'ctl-ico', '☁'))
+    const text = card.pending ? 'Starting on Anthropic\'s cloud…'
+      : card.via === 'live' ? 'Anthropic cloud · streamed here'
+      : 'Anthropic cloud · replies on claude.ai'
+    n.append(el('span', 'ctl-label', text))
+    n.title = card.pending
+      ? 'Claude Code is uploading the repository and creating the session.'
+      : card.via === 'live'
+        ? 'This session runs on Anthropic\'s cloud, and Claude Code streams it to the board.'
+        : 'This session runs on Anthropic\'s cloud. This Claude Code does not stream cloud sessions to an ' +
+          'editor for your account, so the board can deliver messages but cannot read the replies.'
     return n
   }
 

@@ -36,8 +36,9 @@ can answer, and the rule that knowledge files move with the code.
 true) and `humanOnly` on `complete`. `AgentState` — `idle | queued | starting |
 working | waiting | needsInput | done | error`, volatile, never persisted.
 Helpers: `columnById`, `isHumanOnly`, `isReviewColumn`, `isStartedColumn`,
-`isSettledColumn`, `stalledSince(card, agents, board, now)` (a started column
-with no live agent → the time it stalled, never alongside `interrupted`),
+`isSettledColumn`, `stalledSince(board, card)` (a started column
+with no live agent → the time it stalled, never alongside `interrupted`, and
+never for a card on Anthropic's cloud — nothing was going to run here),
 `splitByAge(sessions, days, now)` (returns `shown` and a `hidden` COUNT). Test:
 `config.test.ts`, which opens by asserting the approval boundary for every
 column.
@@ -126,6 +127,8 @@ repository → nothing is required, so the extension stays generic.
   `set_phase` description no longer claims one exists.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · `stalledSince` takes `cloud` and never reports a cloud card as stalled: its agent runs elsewhere, and the stalled card's resume button would start it on this machine.
 
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `attentionFor` ranks a review card whose `autoCheck` failed as `failed` ("failed the board's auto-check"), not "ready to test".
 - 2026-09-25 · claude/self-checkout-harness-overview-cvpkyy · `src/board/attention.ts` — `attentionFor(cards, board)`: every card waiting on the user (a question or permission, a failed run, an interrupted one, a stalled one, work ready to test with no unsent review comments), blocking first then oldest; `attentionSummary` for the status bar. Derived from the cards, never stored. Test: `attention.test.ts`.

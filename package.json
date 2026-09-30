@@ -424,6 +424,11 @@
           "default": true,
           "markdownDescription": "Ask the backend which models it can actually run, instead of using a built-in list. For a custom endpoint (`kind: gateway`) that means the ENDPOINT itself, over `GET <baseUrl>/v1/models` \u2014 not the `claude` CLI, whose answer is about Claude Code however `ANTHROPIC_BASE_URL` is pointed, which is how a DeepSeek profile came to offer `sonnet` and `haiku`. It is also where the context window and per-token price shown beside each model come from, and so where the spend figure on a non-Anthropic session comes from. For every other backend it is the `claude` CLI. This is what puts newly released models \u2014 and the ones your provider serves \u2014 in the picker without waiting for an extension update, and it is where the per-model effort levels and extended-thinking support come from. The answer is cached per provider; refresh it with **Agents Kanban: Refresh Model List**. Turn this off to use the built-in list only."
         },
+        "agentsKanban.cloudSessions": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Offer **Run in the cloud** when starting a session: the session runs on Anthropic's cloud (Claude Code on the web) instead of this machine, started through your own `claude` CLI with `claude --cloud`. Offered only when Claude Code is signed in with a **claude.ai subscription** (`claude auth login`) on Anthropic's own backend — not with an API key, a `setup-token` token, Bedrock, Vertex or a gateway. Your repository is uploaded as a git bundle, so **no GitHub is needed**; the flip side is that without GitHub its changes stay in the cloud session. When your account lets Claude Code stream a cloud session to an editor, the chat works as it does locally; otherwise the board creates the session, delivers your messages to it, and links to claude.ai for the replies. The board never reads your Claude login itself. Turn this off to hide the checkbox."
+        },
         "agentsKanban.runtime": {
           "type": "string",
           "enum": [

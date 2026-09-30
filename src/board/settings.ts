@@ -188,6 +188,15 @@ export interface RuntimeAgentCard {
    * absent when none is known, and then the page claims nothing about it.
    */
   cliUpdate?: { newer?: string }
+  /**
+   * Whether a new chat can "Run in the cloud", as the composer would offer it.
+   * Here because that box is ABSENT when it cannot be used, never greyed out,
+   * and an absent control needs one place that says why. Only on a runtime
+   * that can run in the cloud at all; `off` is this board's own setting,
+   * otherwise it is the login's answer in the active backend's environment —
+   * absent when there is no answer yet, since the login row already says why.
+   */
+  cloud?: { state: 'available'; plan?: string } | { state: 'unavailable'; reason: string } | { state: 'off' }
 }
 
 export interface ProviderCard {

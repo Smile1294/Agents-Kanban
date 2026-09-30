@@ -15,6 +15,7 @@ tests:
   - src/board/__tests__/settings-spawn.test.mjs
   - src/board/__tests__/settings-schedule.test.mjs
   - src/board/__tests__/theme.test.mjs
+  - src/board/__tests__/cloud-view.test.mjs
   - smoke.mjs
 ---
 # The webview
@@ -72,7 +73,21 @@ anything held in the DOM dies with it. Main functions:
   `renderMentionMenu`, `chooseMention`), slash commands (`slashMatches`,
   `renderSlashMenu`), dictation (`insertDictation`), attachments
   (`renderAttachments`, `addImageFiles` — downscaled to 1568 px on the long edge
-  before sending), the meter (`renderMeter`).
+  before sending), the meter (`renderMeter`). "Run in the cloud":
+  `cloudToggle(offer)` — a real checkbox in a `label.ctl`, drawn only when the
+  host sends `composer.cloud` (never greyed), its tick in the module-level
+  `cloudPick` (and in `chromeSig()`, or the fast path would keep the old bar);
+  ticked, the model, effort, thinking, split and flag controls step aside (the
+  CLI drops them on the way to the cloud) and `newSession` carries
+  `cloud: true` — never when the offer has since gone. A cloud card's bar is
+  `cloudChip(card)` plus "Open on claude.ai" (`openCloud` by KEY: the page never
+  hands the host a URL), with no model or permission picker.
+- Cloud cards: `renderCloudStrip` on the kanban card (where its work is, one
+  Open button), `renderCloudBanner` at the top of its chat in place of
+  `renderReview` (how much the board can see — streamed here, or "cannot read
+  its replies" — and that without GitHub its changes stay in the session); the
+  `☁ cloud` tag and rail chip; no Run app, Merge or Browser (its work is not in
+  the worktree); the overview's "On Anthropic's cloud" section.
 - Panels: `renderAskQuestions` / `renderAskPermission`, `renderReview`,
   `renderTestPlan`, `renderPendingMerge`, `renderStalled`, `renderInterrupted`,
   `renderSubtasks`, `renderBackgroundAgents`, `renderQueued`, `renderStreaming`,
@@ -93,13 +108,16 @@ the label. Every colour is `var(--vscode-*)`. Sections in order: rail, toolbar,
 kanban, chat, subtasks, composer bar and controls, menus, background agents,
 multi-select, stalled runs, uncommitted merge, review, how-to-test,
 notices/queue/slash, dictation mic, @-mention picker, taking the window, side
-bar control, transcript search.
+bar control, transcript search. The cloud rules (`.cloud-pick`, `.cloud-chip`,
+`.cloud-tag`, `.cloud-strip`, `.cloud-banner`) sit after `.provider-note`.
 
 **`media/settings.js`** (~1070 lines), a top-level script. State: `expanded`,
 `catalogueOpen` / `catalogueFilter` (431 models on OpenRouter — the filter is
 the only way to find one), `schedDraft` / `schedEditingId`, `state`, `error`.
 `runtimeCard` with `loginRow` (FOUR login states, four different rows),
-`backendRow`, `modelsRow`, `missingRow`; `providerSection` + `providerModels`
+`cloudRow` (whether a new chat can "Run in the cloud" — the composer leaves the
+box OUT when it cannot, so this is where the reason is), `backendRow`,
+`modelsRow`, `missingRow`; `providerSection` + `providerModels`
 (the "offered" tick and the separate "allowed for spawned agents" tick);
 `schedForm` / `schedRow` / `scheduledSection`; `dictationSection`;
 `remoteSection` — whose pairing-code field carries a **Generate** button
@@ -163,6 +181,8 @@ between mousedown and mouseup never clicks). The view keeps the last
   after it is sent (the transcript records only the count).
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · "Run in the cloud": `cloudToggle`/`cloudPick` on a new session's bar, `cloudChip` + "Open on claude.ai" on a cloud card's bar, `renderCloudStrip` / `renderCloudBanner`, the `☁ cloud` tag and chip, the overview section, no Run app/Merge/Browser on a cloud card; `.cloud-*` in board.css; `cloudRow` on the settings page. Gates: `cloud-view.test.mjs`, and `layout.test.mjs` measures the checkbox chip at the one control height and ticks it with a real click on its label.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `renderQuality(c, p)` on the test plan: one row per check with its state (pre-existing muted, flaky marked), the proof count and the unproven files, the mutation score and survivors, a large-diff line, what was not checked; Send findings to agent / Check again. Overview badge `✓/✖ checks`; a failing report puts the card in Needs you. `.quality*` in board.css.
 

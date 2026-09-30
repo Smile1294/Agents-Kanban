@@ -25,6 +25,7 @@ tests:
   - src/agent/__tests__/browser.test.ts
   - src/agent/__tests__/limits.test.ts
   - src/agent/__tests__/limit-resume.test.ts
+  - src/agent/__tests__/cloud-launch.test.ts
 last_verified: 2026-09-07
 ---
 # Agent runs — what is running
@@ -59,14 +60,33 @@ does NOT — that is the event being recorded), `answerPermission`, `list`,
 `byKey` (run id or session id), `followKey`, `durablePatch` (what the sidecar
 records at launch), `boardContext()` (every host callback the tools get — the
 wiring is asserted in `manager.test.ts`), `buildBrief()`, `titleFrom()` (a card
-title from a prompt, no model call), `MAX_SUBTASKS = 4`. Tests: `manager.test.ts`,
-`route-launch.test.ts` (the real `start → launch → startRun` chain against a
-real git repo with a fake runtime).
+title from a prompt, no model call), `MAX_SUBTASKS = 4`. A CLOUD session
+(`LaunchOptions.cloud`, or a resumed card whose sidecar has a `cloud` record)
+is a `RunningAgent.cloud` from the moment it is asked for — the queued card
+too, and the saved queue keeps it — and `startRun()` hands the runtime
+`RunSpec.cloud` with NO brief and NO board tools (the in-process server cannot
+be reached from Anthropic's machines), refusing a runtime without
+`capabilities.cloud` rather than starting the card here. No message ids (its
+transcript is not in this machine's store), no model/effort/thinking in
+`durablePatch` (the CLI drops `--model` on the way), no rename, and a follow-up
+to a card that never reached the cloud is refused, not resumed locally.
+`recordCloud()` puts the run's `cloud` events on the card and into the sidecar.
+`cloudSeen` keeps what the board saw of a CONNECTED cloud session (its streamed
+replies and tool rows) between runs, in memory and bounded, because with no
+transcript on this machine it is the only copy: a follow-up's `history` comes
+from it rather than from a store that holds only the prompts.
+Tests: `manager.test.ts`, `route-launch.test.ts` (the real `start → launch →
+startRun` chain against a real git repo with a fake runtime),
+`cloud-launch.test.ts` (the same chain for a cloud card: the spec, the record,
+a follow-up, the refusals, a restart).
 
 **`src/agent/session.ts`** (~1140 lines). `AgentSession` implements `AgentRun`
 for Claude Code: `run(prompt, images)` builds `Options` (`includePartialMessages`,
 `forwardSubagentText`, `enableFileCheckpointing`, `resume`, `permissionMode`,
-`mcpServers: {board}`, `canUseTool: decide`, `settings` for the flags) and
+`mcpServers: {board}` when there is a board server — optional, a cloud run has
+none — `canUseTool: decide`, `settings` for the flags, and `extraArgs` /
+`onStderr` for a caller that adds CLI flags and reads its stderr, which is how
+`CloudRun` passes `--cloud` and spots the link) and
 iterates `query()`; `handle(msg)` is the whole stream parser (`system/init` →
 `sessionId`; `stream_event` → `partial`; `assistant` → text / thinking / tool
 rows, usage per response, routed on `parent_tool_use_id` into the Task's
@@ -257,7 +277,14 @@ started column while the title is still the guess.
 - `startRun()` has no branch on runtime identity — the test of the abstraction.
 - Everything a run is decided ON is frozen when it is asked for.
 - `stop()` clears the `running` mark; `stopAll()` does not; `0` clears, never
-  `undefined`.
+  `undefined`. `finish()` clears it only AFTER the card's registration
+  (`registered`: adopt the key, then the durable patch that WRITES the mark)
+  has landed — a run ending in the same breath as its id otherwise had the mark
+  written back after it was cleared, and every restart called a cleanly
+  finished card "Interrupted". `cloud-launch.test.ts` failed on it before.
+- A card the user asked to run in the cloud never runs on this machine: an
+  incapable runtime is refused, and a follow-up to a card that never reached
+  the cloud is refused rather than resumed here.
 - Two live runs must never become one card: a duplicate session id is refused.
 - A turn ending is not the run ending while background agents are live; a
   repeated `init` with the same id is not re-announced.
@@ -279,6 +306,8 @@ started column while the title is still the guess.
 - Nothing re-runs a parent once its subtasks land.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · cloud sessions: `LaunchOptions.cloud`, `RunningAgent.cloud`, `SavedQueueEntry.cloud`; `startRun()` passes `RunSpec.cloud` with no brief and no board tools; `recordCloud()`; `cloudSeen` (a connected session's rows carried into its follow-up); `AgentSession`'s `boardServer` optional plus `extraArgs`/`onStderr`. Fixed a race it exposed: `finish()` cleared the running mark before the id's durable patch wrote it back (`registered`).
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · faster, correct browser: `BrowserPool.settle()` (requests the action started, then DOM quiet via MutationObserver, capped; `light` for fill/hover/check) replaces a post-action `networkidle` that was a no-op after load — the agent saw the page BEFORE its own click; `REFS_SCRIPT` tags controls `[eN]` (`data-ak-ref`) and `locate()` accepts `e12`/`[e12]`/`ref=e12`; `open` returns the Controls list; `steps(key, list)` runs a batch and reports once — `changeBlock` (~ changed, + appeared, − gone, "The page did not change"), where the page is, new controls; `warm()` from `app_start`; `reducedMotion` + `CALM_CSS` (1ms, not 0, so end events fire); `TRACKERS` aborted and not reported. Harness: `browser_act` takes `steps`, `wait` takes `text`, descriptions and brief teach refs and batches.
 

@@ -608,6 +608,54 @@ button[disabled] { cursor: default; }
   border-color: color-mix(in srgb, var(--warn) 45%, transparent);
 }
 
+/* ---------------------------------------------- Anthropic's cloud
+
+   "Run in the cloud" is a real checkbox inside a chip of the bar's ONE height
+   — a <label>, so the whole chip is the click target. The native box is
+   pinned at 13px with no margin: its default margin is what would make this
+   the one chip on the bar that is taller than its neighbours, and
+   `layout.test.mjs` measures exactly that. */
+.cloud-pick { cursor: pointer; user-select: none; }
+.cloud-pick input { margin: 0; width: 13px; height: 13px; flex: none; accent-color: var(--run); cursor: pointer; }
+.cloud-pick.on {
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--run) 18%, transparent);
+  border-color: var(--run);
+}
+/* Where a selected cloud session is: a readout, in the link colour, amber-free
+   — nothing is wrong, the session is simply somewhere else. `detached` is
+   muted, because the board can see less of it. */
+.cloud-chip {
+  max-width: 34ch;
+  border-radius: 999px;
+  color: var(--vscode-textLink-foreground, var(--run));
+  background: color-mix(in srgb, var(--run) 10%, transparent);
+  border-color: color-mix(in srgb, var(--run) 40%, transparent);
+}
+.cloud-chip.detached { color: var(--vscode-foreground); }
+.cloud-tag { color: var(--vscode-textLink-foreground, var(--run)); font-size: 0.85em; white-space: nowrap; }
+.chip.cloud { color: var(--vscode-textLink-foreground, var(--run)); }
+/* The card's line when nothing runs HERE — deliberately not the running
+   strip: no spinner, no age, because there is no frame on this machine to
+   take the age of. */
+.cloud-strip {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 6px; padding: 5px 8px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--run) 35%, transparent);
+  background: color-mix(in srgb, var(--run) 7%, transparent);
+  min-width: 0;
+}
+.cloud-strip-text { flex: 1 1 auto; min-width: 7.5em; font-size: 0.8em; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.cloud-banner {
+  margin: 8px 12px 0; padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--run) 35%, transparent);
+  background: color-mix(in srgb, var(--run) 7%, transparent);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.cloud-banner-text { flex: 1 1 18em; min-width: 0; font-size: 0.9em; line-height: 1.4; }
+
 /* ---------------------------------------------- composer bar & controls */
 
 .composer-wrap { border-top: 1px solid var(--line); }

@@ -398,6 +398,61 @@ try {
      `and is an em dash, never a zero (${JSON.stringify(unknownReadouts.spend?.text)})`)
   await unknown.close()
 
+  /* "Run in the cloud" is a CHECKBOX inside a label on the new-session bar — a
+     different element from every other control there, and the kind that brings
+     its own baseline and margins. So it is measured with the rest, and then
+     TICKED the way a person ticks it: a click on the words, which the browser
+     turns into a change on the box. The stub DOM can only call the handler,
+     so this is the one place the gesture itself is exercised. */
+  const fresh = await browser.newPage({ viewport: { width: 900, height: 800 } })
+  const freshErrors = []
+  fresh.on('pageerror', (e) => freshErrors.push(String(e)))
+  await fresh.setContent(page$({
+    ...chatState, selectedKey: undefined, transcript: [],
+    composer: {
+      ...chatState.composer, contextTokens: 0, meter: undefined, cloud: { plan: 'max' },
+      agent: 'claude|inherit',
+      agents: [{ key: 'claude|inherit', label: 'Claude Code', detail: 'Anthropic', runtime: 'claude', provider: 'inherit' }],
+    },
+  }))
+  await fresh.waitForSelector('.cloud-pick', { timeout: 5000 })
+  const measureCloud = () => {
+    const bar = document.querySelector('.composer-bar')
+    const pick = bar.querySelector('.cloud-pick')
+    const box = pick?.querySelector('input')
+    const pr = pick?.getBoundingClientRect()
+    const br = box?.getBoundingClientRect()
+    return {
+      overflow: Math.round(bar.scrollWidth - bar.clientWidth),
+      heights: [...bar.querySelectorAll('.ctl')]
+        .filter((n) => getComputedStyle(n).display !== 'none')
+        .map((n) => Math.round(n.getBoundingClientRect().height)),
+      pick: pr ? Math.round(pr.height) : 0,
+      boxInside: !!(pr && br && br.top >= pr.top - 0.5 && br.bottom <= pr.bottom + 0.5 && br.left >= pr.left - 0.5),
+      checked: !!box?.checked,
+      on: !!pick?.classList.contains('on'),
+      modelPicker: bar.textContent.includes('Opus 5'),
+      placeholder: document.querySelector('textarea')?.placeholder ?? '',
+    }
+  }
+  const before = await fresh.evaluate(measureCloud)
+  // The chip's OWN height joins the set: were it to lose the shared class it
+  // would drop out of `heights` and the set would still be one.
+  ok(before.pick > 0 && new Set([...before.heights, before.pick]).size === 1,
+     `the cloud box is on the bar at the one control height (${[...new Set([...before.heights, before.pick])].join('/')}px)`)
+  ok(before.boxInside, 'with its checkbox inside the chip, not hanging out of it')
+  ok(before.overflow <= 1, `and the bar does not scroll for it (${before.overflow}px)`)
+  ok(!before.checked && before.modelPicker, 'unticked, with the model picker beside it')
+  await fresh.click('.cloud-pick .ctl-label')
+  const after = await fresh.evaluate(measureCloud)
+  ok(after.checked && after.on, 'a click on its words ticks it — the label is the target, as it looks')
+  ok(!after.modelPicker, 'and the model picker steps aside once it is ticked')
+  ok(/in the cloud/.test(after.placeholder), `the prompt says where it will run (${JSON.stringify(after.placeholder)})`)
+  ok(new Set([...after.heights, after.pick]).size === 1,
+     `still one control height, ticked (${[...new Set([...after.heights, after.pick])].join('/')}px)`)
+  ok(freshErrors.length === 0, `the new-session bar renders without throwing (${freshErrors.join('; ') || 'clean'})`)
+  await fresh.close()
+
   /* --- a repaint must not move a scrolled column -------------------------------
      An agent at work produces a state message every few hundred milliseconds,
      and the column body is the scroll container. Two rules, and they are

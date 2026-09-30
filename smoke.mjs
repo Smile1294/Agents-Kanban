@@ -25,6 +25,11 @@ const ok = (cond, msg) => { console.log(cond ? '  ok:' : 'FAIL:', msg); if (!con
 const manifest = JSON.parse(await fs.readFile(path.join(repoRoot, 'package.json'), 'utf8'))
 const repo = await makeRepo('ck-smoke-')
 const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-storage-'))
+/* The cloud card's worktree — its own, because a card is found by its worktree
+   (review comments are filed that way) and sharing the seeded card's would
+   file them under the wrong one. Real, so "never stalled" is asserted about a
+   card that HAS a worktree rather than passing because it has none. */
+const cloudWorktree = await fs.mkdtemp(path.join(os.tmpdir(), 'ck-cloud-wt-'))
 
 // One session that HAS a worktree — the repo itself, a real checkout with a
 // README in it. The board never lists it (Claude Code has no transcript for it),
@@ -55,6 +60,9 @@ process.env.CLAUDE_CONFIG_DIR = claudeHome
 const STORED_SESSION = '11111111-2222-3333-4444-555555555555'
 /** A card that records the agent, backend and model it was launched with. */
 const ON_GATEWAY = '5c5c5c5c-0000-4000-8000-00000000feed'
+/** A session on Anthropic's cloud that the CLI created and detached from:
+ *  NOTHING of it under the seeded Claude store, only its sidecar record. */
+const IN_CLOUD = 'session_01SmokeCloudCard000001'
 const STORED_USAGE = {
   input_tokens: 100,
   output_tokens: 1000,
@@ -142,6 +150,18 @@ await fs.writeFile(
       phase: 'implementing', tags: [], archived: false, pinned: false, activity: [],
       runtime: 'claude', provider: 'litellm', model: 'deepseek-v4-pro', effort: 'low',
     },
+    /* What `durablePatch` and `recordCloud` leave for a detached cloud card —
+       and the card's ONLY existence: Claude Code's index has never heard of it,
+       so if the host builds its cards from that index alone this one is gone. */
+    [IN_CLOUD]: {
+      phase: 'implementing', tags: [], archived: false, pinned: false, activity: [],
+      runtime: 'claude', worktree: cloudWorktree, branch: 'task/cloud', base: 'main', running: 0,
+      cloud: {
+        id: IN_CLOUD, url: `https://claude.ai/code/${IN_CLOUD}?from=cli&m=0`, via: 'detached',
+        createdAt: Date.now() - 60_000, title: 'Smoke: fix the auth test in the cloud',
+        log: [{ at: Date.now() - 60_000, text: 'Fix the flaky auth test', ok: true }],
+      },
+    },
   }),
 )
 
@@ -156,6 +176,12 @@ const ctl = {
     // what the view contract is checked against. The discovery mapping itself
     // is pure and covered by src/agent/__tests__/models.test.ts.
     discoverModels: false,
+    // Offering "Run in the cloud" asks the CLI which account it is signed in
+    // to — a spawned `claude`, for the same reason discovery is off. What the
+    // gate CAN check without one is below: the setting reaches the host, a
+    // page asking for a cloud session is refused with a modal, and a seeded
+    // cloud card renders through the real board.js.
+    cloudSessions: false,
   },
 }
 const stub = makeVscodeStub(ctl)
@@ -2011,6 +2037,80 @@ console.log('Successfully updated from ' + from + ' to version ' + st.next)
 // `maxConcurrentAgents: 0` is how a hermetic test reaches `getState()`'s LIVE
 // card branch at all: `start()` queues instead of launching, and a queued run
 // is registered as a real agent with no CLI anywhere near it.
+// --------------------------------------------------- 7. Anthropic's cloud
+//
+// A session the CLI created on Anthropic's cloud and detached from leaves
+// NOTHING on this machine — the seeded Claude store has never heard of it.
+// So every layer that builds a card from Claude Code's index alone loses it:
+// the store's list, the host's pass, the view. This is that whole seam, plus
+// the host's own gate on the way in, which no page may talk past.
+console.log('\n— a session on Anthropic\'s cloud')
+{
+  await send({ type: 'setMode', mode: 'kanban' })
+  await send({ type: 'select', id: '' })
+  await send({ type: 'ready' })
+  const st = latestState()
+  const card = (st.cards ?? []).find((c) => c.key === IN_CLOUD)
+  ok(!!card, 'a cloud session with nothing on this machine is on the board, from its record alone')
+  ok(card?.title === 'Smoke: fix the auth test in the cloud', `under its own title (${card?.title})`)
+  ok(card?.cloud?.via === 'detached', 'marked as on the cloud, and detached')
+  ok(!card?.stalled && !card?.interrupted, 'never "stopped" in Implementing: nothing was going to run here')
+  ok(st.composer.cloud === undefined, 'with cloud sessions off, the new-session composer offers no box')
+  try {
+    const view = await renderBoard(st, { layout: 'full' })
+    ok(view.text().includes('☁ cloud') && !view.text().includes('stopped without'), 'the real view tags it, and does not call it stalled')
+  } catch (e) {
+    ok(false, `the view threw on a cloud card — ${e.message}`)
+  }
+
+  await send({ type: 'setMode', mode: 'chat' })
+  await send({ type: 'select', id: IN_CLOUD })
+  await send({ type: 'ready' })
+  const open = latestState()
+  ok((open.transcript ?? []).some((e) => e.kind === 'prompt' && e.text === 'Fix the flaky auth test'),
+    'opening it shows what was sent to it')
+  ok((open.transcript ?? []).some((e) => e.kind === 'notice' && /cannot read its replies/.test(e.message)),
+    'and says the replies are on claude.ai, rather than showing a chat nobody answered')
+  ok(open.composer.cloudCard?.via === 'detached' && open.composer.cloud === undefined,
+    'the bar describes where it runs, and the new-session box is not on it')
+  ok(open.composer.meter?.kind === 'unknown', `its meter is unknown, never $0.00 (${JSON.stringify(open.composer.meter)})`)
+  try {
+    const view = await renderBoard(open, { layout: 'full' })
+    const text = view.text()
+    ok(text.includes('Open on claude.ai'), 'the real view offers the session on claude.ai')
+    ok(!text.includes('▶ Run app') && !text.includes('Merge'), 'and no Run app or Merge over the worktree it was uploaded from')
+  } catch (e) {
+    ok(false, `the view threw on a cloud chat — ${e.message}`)
+  }
+
+  // The link is opened from the HOST's record, whatever the page sends.
+  const opened = stub.calls.length
+  await send({ type: 'openCloud', id: IN_CLOUD, url: 'javascript:alert(1)' })
+  const shown = stub.calls.slice(opened).find((c) => c.startsWith('openExternal:'))
+  ok(!!shown && shown.includes(`https://claude.ai/code/${IN_CLOUD}`), `openCloud opens the recorded claude.ai link (${shown ?? 'nothing'})`)
+  // And a card with no link yet still ANSWERS the click — in a modal, with
+  // nothing opened. Before, the message stopped at the missing link and the
+  // button did nothing at all.
+  const pressed = stub.calls.length
+  await send({ type: 'openCloud', id: 'session_01SmokeNoLinkYet00001' })
+  const answer = stub.calls.slice(pressed)
+  ok(answer.some((c) => c.startsWith('infomodal:This session has no claude.ai link yet')),
+    'Open on a card with no link yet says so, in a modal')
+  ok(!answer.some((c) => c.startsWith('openExternal:')), 'and opens nothing')
+
+  // A page asking for a cloud session is checked by the HOST. With the setting
+  // off the answer is a refusal the user cannot miss, and nothing starts.
+  const cardsBefore = (latestState().cards ?? []).length
+  await send({ type: 'newSession', text: 'run this in the cloud', cloud: true })
+  ok(stub.calls.some((c) => c.startsWith('errmodal:Agents Kanban cannot start this session in the cloud: cloud sessions are turned off')),
+    'a page asking for a cloud session with the setting off is refused, in a modal')
+  await send({ type: 'ready' })
+  ok((latestState().cards ?? []).length === cardsBefore, 'and no card is started — least of all on this machine')
+  await send({ type: 'select', id: '' })
+  await send({ type: 'setMode', mode: 'kanban' })
+  await send({ type: 'ready' })
+}
+
 console.log('\n— a live card does not restamp itself on every repaint')
 {
   ctl.config.maxConcurrentAgents = 0
@@ -2043,7 +2143,7 @@ console.log('\n— a live card does not restamp itself on every repaint')
 // exactly this race), and if a directory still will not go, say so and leave it
 // rather than fail a run whose assertions all held.
 await Promise.resolve(ext.deactivate())
-for (const dir of [claudeHome, repo, storage]) {
+for (const dir of [claudeHome, repo, storage, cloudWorktree]) {
   try {
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   } catch (e) {

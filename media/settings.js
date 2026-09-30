@@ -200,6 +200,31 @@ function modelsRow(card) {
   return wrap
 }
 
+/* "Run in the cloud" on a new chat. The composer leaves the box OUT when this
+   login cannot use it — never greyed — so the reason has to be somewhere, and
+   it is here. Three answers, three fixes: nothing to do, the board's own
+   setting, or the login (the host's sentence names which, and what to run). */
+function cloudRow(card) {
+  const c = card.cloud
+  if (!c) return undefined
+  const row = el('div', 'status-row cloud-status')
+  if (c.state === 'available') {
+    row.appendChild(el('span', 'dot ok'))
+    row.appendChild(el('span', 'status-text',
+      'Cloud sessions: available' + (c.plan ? ' on the ' + c.plan + ' plan' : '') +
+      ' — tick “Run in the cloud” when starting a new chat. The repository is uploaded; no GitHub needed.'))
+  } else if (c.state === 'off') {
+    row.appendChild(el('span', 'dot idle'))
+    row.appendChild(el('span', 'status-text muted', 'Cloud sessions: turned off on this board'))
+    row.appendChild(el('code', 'fix', 'agentsKanban.cloudSessions'))
+  } else {
+    row.appendChild(el('span', 'dot idle'))
+    row.appendChild(el('span', 'status-text', 'Cloud sessions: not available.'))
+    row.appendChild(el('span', 'muted small', c.reason || ''))
+  }
+  return row
+}
+
 function runtimeCard(card) {
   const box = el('section', 'agent-card')
   if (card.id === state.defaultRuntime) box.classList.add('is-default')
@@ -226,6 +251,8 @@ function runtimeCard(card) {
   const backend = backendRow(card)
   if (backend) box.appendChild(backend)
   box.appendChild(loginRow(card))
+  const cloud = cloudRow(card)
+  if (cloud) box.appendChild(cloud)
   const where = whereRow(card)
   if (where) box.appendChild(where)
 

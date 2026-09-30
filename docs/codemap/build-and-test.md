@@ -103,8 +103,9 @@ names), `loadBundle(vscode)` (patches `Module._resolveFilename` so `'vscode'`
 resolves to the stub), `makeContext(storage)` (real Maps for `globalState`,
 `workspaceState`, `secrets` — a stub that swallowed writes let "the key went
 into settings.json" pass), `makeRepo(prefix)`, `repoRoot`. Toasts and dialogs
-land in `calls` as `info:` / `warn:` / `modal:` lines, so "a refusal on a clicked
-path is modal" is checkable; `ctl.extensions` seeds `vscode.extensions`
+land in `calls` as `info:` / `warn:` / `modal:` lines — and a MODAL error or
+notice as `errmodal:` / `infomodal:` — so "a refusal on a clicked path is
+modal" is checkable; `ctl.extensions` seeds `vscode.extensions`
 (VS Code's Claude Code extension version is the board's staleness signal).
 Deliberately incomplete: a missing API fails smoke exactly as it fails
 activation.
@@ -137,7 +138,13 @@ contract (the REAL state through the REAL `board.js`; an interrupted run; what
 the side bar is sent; a burst of events is one repaint); providers (a profile
 goes to settings, its credential to SecretStorage — both stores, both
 directions; the composer fields the view reads); a live card does not restamp
-itself on every repaint; schedules round-trip; teardown that retries and never
+itself on every repaint; a session on Anthropic's cloud (a seeded sidecar-only
+card with its own worktree: listed, never stalled, its transcript and unknown
+meter, no Run app or Merge, "Open on claude.ai" opening the RECORDED link and
+not one the page sent — and answering in a modal when there is no link yet —
+and a cloud start refused with a modal while
+`cloudSessions` is off — smoke keeps it off, since the login check spawns a
+CLI); schedules round-trip; teardown that retries and never
 overturns the verdict. `latestState()` folds `composer.models` forward as the
 view does, because the host omits the list when unchanged.
 
@@ -186,6 +193,8 @@ without one.
   a dependency added later is covered the day it is added.)
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · `test/harness.mjs` records a modal `showErrorMessage` / `showInformationMessage` as `errmodal:` / `infomodal:`; `smoke.mjs` seeds a cloud card (sidecar only, own worktree) and asserts its listing, chat, bar, the recorded link, the no-link modal and the modal refusal, with `cloudSessions: false` so the hermetic run spawns no CLI.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `smoke.mjs` sends `sendQuality`/`runQuality` for a card with no report and no worktree.
 

@@ -46,6 +46,7 @@ import {
   agentKeyOf, describeSpawnAgents, resolveRoute,
   type PieceRoute, type SpawnAgent, type SpawnCatalogue,
 } from './routing.ts'
+import type { CloudUpdate } from './cloud.ts'
 
 /** What a session runs on, per turn. The workspace default for a new session,
  *  and — through `LaunchOptions.chosen` — the per-run choice that outranks it. */
@@ -352,6 +353,10 @@ export function durablePatch(a: {
  */
 export const MAX_SUBTASKS = 4
 
+/** How many rows of a connected cloud session the board holds between runs
+ *  (`cloudSeen`) — the chat's own window (`TRANSCRIPT_LIMIT`). */
+const CLOUD_SEEN_LIMIT = 400
+
 /** What an agent proposes when it splits a task up. */
 export interface SubtaskSpec {
   title: string
@@ -440,6 +445,13 @@ export interface LaunchOptions {
   /** Brought back from the saved queue after a restart (`restoreQueue`): when
    *  it was first queued, and how many images could not be kept. */
   restored?: { queuedAt: number; imagesDropped: number }
+  /**
+   * Run this NEW session on the vendor's cloud instead of this machine
+   * (`agent/cloud.ts`). Chosen per session on the composer and gated by the
+   * HOST on the login before it gets here. A resumed session needs no flag: it
+   * is in the cloud because its sidecar says so, and it stays there.
+   */
+  cloud?: boolean
 }
 
 /**
@@ -460,6 +472,9 @@ export interface SavedQueueEntry {
   orchestration?: OrchestrationLevel
   chosen?: RunSettings
   images?: number
+  /** Queued to start on the cloud. Kept, or a restart would quietly run on
+   *  this machine what the user asked to run somewhere else. */
+  cloud?: true
 }
 
 /** Read the saved queue back. Parsed, never cast: it outlives the extension
@@ -493,6 +508,7 @@ export function parseSavedQueue(raw: unknown): SavedQueueEntry[] {
       ...(parseOrchestrationLevel(m.orchestration) ? { orchestration: parseOrchestrationLevel(m.orchestration)! } : {}),
       ...(chosen && Object.keys(chosen).length ? { chosen } : {}),
       ...(typeof m.images === 'number' && m.images > 0 ? { images: Math.floor(m.images) } : {}),
+      ...(m.cloud === true ? { cloud: true as const } : {}),
     })
   }
   return out
@@ -621,6 +637,13 @@ export interface RunningAgent {
    *  from the prompt. It is what stops `set_phase` asking for a name a second
    *  time, and what keeps the ask off a title somebody chose on purpose. */
   titleChosen?: boolean
+  /**
+   * This session runs on the vendor's cloud, not here. Present from the moment
+   * the run is ASKED for, empty until the run learns the session's id and link
+   * — so the card says "cloud" while it is still uploading, rather than
+   * looking like a local run until then.
+   */
+  cloud?: { id?: string; url?: string; via?: 'live' | 'detached' }
 }
 
 export class AgentManager extends EventEmitter {
@@ -643,6 +666,16 @@ export class AgentManager extends EventEmitter {
   private readonly pendingResume = new Map<string, number>()
   /** Sessions the user asked to resume despite the limit. */
   private readonly forcing = new Set<string>()
+  /**
+   * What this board SAW of a CONNECTED cloud session, by session id — the
+   * streamed replies and tool rows, not only the prompts. The session keeps
+   * its transcript on Anthropic's side, not under `~/.claude/projects`, so
+   * between one run and the next this is the only copy on this machine:
+   * without it every follow-up opened on a chat holding the prompts and
+   * nothing the agent said. In memory and bounded; after a restart the card
+   * has its record and its link, and its transcript says so.
+   */
+  private readonly cloudSeen = new Map<string, Entry[]>()
 
   constructor(opts: ManagerOptions) {
     super()
@@ -807,6 +840,9 @@ export class AgentManager extends EventEmitter {
         // the session rather than the workspace while it waits — and `split()`
         // can read a queued parent's whole agent.
         ...(opts.providerFor ? { provider: opts.providerFor.profile.id } : {}),
+        // And where it will run: a card waiting to go to the cloud must not
+        // look like one waiting to run here.
+        ...(opts.cloud ? { cloud: {} } : {}),
       })
       this.saveQueue()
       this.touch()
@@ -1128,8 +1164,9 @@ export class AgentManager extends EventEmitter {
         // The transcript row records HOW MANY images went with the message, not
         // the images themselves: this array is serialised to the webview on
         // every repaint, and a few megabytes of base64 per frame is exactly the
-        // per-token cost this board has a postmortem about.
-        const id = this.messageIdFor(live.runtime)
+        // per-token cost this board has a postmortem about. No id (and so no
+        // checkpoint) for a cloud session — see `firstId` in `launchInner`.
+        const id = live.cloud ? undefined : this.messageIdFor(live.runtime)
         // A new message is a new allowance under the spend cap.
         live.spendMark = live.meter?.kind === 'usd' ? live.meter.spentUsd : live.priorUsd
         live.capped = false
@@ -1163,11 +1200,22 @@ export class AgentManager extends EventEmitter {
         return
       }
     }
+    // A card that was going to the cloud and never got there has no session to
+    // continue, and the resume below would start it HERE — the one place the
+    // user said not to. Said, not attempted.
+    if (live?.cloud && !live.cloud.id) {
+      this.emit('warning', `"${live.title}" never reached the cloud, so there is no session to send this to. Start a new one.`)
+      return
+    }
     // The previous run for this session has finished. Drop its card before
     // starting the resumed one, or the board renders two entries under the same
     // key — one stale, one live, indistinguishable.
     for (const a of [...this.agents.values()]) {
-      if (a.sessionId === key && !this.sessions.has(a.runId)) this.agents.delete(a.runId)
+      if (a.sessionId === key && !this.sessions.has(a.runId)) {
+        // Its rows go with the card, unless they are the only copy there is.
+        if (a.cloud?.via === 'live') this.cloudSeen.set(key, [...a.history, ...a.live].slice(-CLOUD_SEEN_LIMIT))
+        this.agents.delete(a.runId)
+      }
     }
     const existing = await this.opts.store.get(key)
     await this.start(text, {
@@ -1383,8 +1431,13 @@ export class AgentManager extends EventEmitter {
     // run to the same transcript as it goes, so without a boundary the chat view
     // renders the live entries AND their on-disk copies. Read ONCE, here: it is
     // a prefix of a file that only ever grows, so it cannot go out of date.
+    // A connected cloud session with no transcript here has only what this
+    // board saw of it — see `cloudSeen`.
+    const seen = opts.resume && prior?.cloud?.via === 'live' && await this.opts.store.cloudOnly(opts.resume)
+      ? this.cloudSeen.get(opts.resume)
+      : undefined
     const history = opts.resume
-      ? await this.opts.store.transcript(opts.resume).catch(() => [] as Entry[])
+      ? seen ?? await this.opts.store.transcript(opts.resume).catch(() => [] as Entry[])
       : []
 
     // What the session had already spent before this run, captured on the same
@@ -1402,9 +1455,16 @@ export class AgentManager extends EventEmitter {
     const runtime: RuntimeId =
       (opts.resume ? prior?.runtime : undefined) ?? opts.runtime ?? this.opts.defaults.runtime ?? DEFAULT_RUNTIME
 
+    // WHERE it runs. A resumed session stays wherever it already was — its
+    // conversation lives there — so this is read off the card, never the flag.
+    const cloudPrior = opts.resume ? prior?.cloud : undefined
+    const inCloud = !!opts.cloud || !!cloudPrior
+
     // The first message's transcript id, chosen HERE so the row carries its
-    // fork anchor from the moment it is drawn (see `messageIdFor`).
-    const firstId = this.messageIdFor(runtime)
+    // fork anchor from the moment it is drawn (see `messageIdFor`). None for a
+    // cloud session: its transcript is not in this machine's store, so a fork
+    // at that id would be a button that forks at nothing.
+    const firstId = inCloud ? undefined : this.messageIdFor(runtime)
     const agent: RunningAgent = {
       runId, runtime, title, history, priorUsd,
       state: { kind: 'starting' },
@@ -1420,6 +1480,9 @@ export class AgentManager extends EventEmitter {
       ...(opts.resume ? { sessionId: opts.resume } : {}),
       ...(opts.parent ? { parent: opts.parent } : {}),
       ...(opts.resume && this.pendingResume.has(opts.resume) ? { resumeAttempt: this.pendingResume.get(opts.resume)! } : {}),
+      ...(inCloud
+        ? { cloud: cloudPrior ? { id: cloudPrior.id, url: cloudPrior.url, via: cloudPrior.via } : {} }
+        : {}),
     }
     if (opts.resume) this.pendingResume.delete(opts.resume)
     // Said on the card it launches as too, not only while it waited: a queued
@@ -1475,6 +1538,14 @@ export class AgentManager extends EventEmitter {
     }
     this.sessions.set(runId, session)
 
+    /* The card's registration once its id arrives — adopt the key, then write
+       the durable patch, which includes the RUNNING mark. `finish()` clears
+       that mark, and must clear it AFTER this has landed: a run that ends in
+       the same breath as its id (a cloud session the CLI creates and detaches
+       from does exactly that) otherwise clears the mark first and has it
+       written back a moment later — and every restart after that calls the
+       card "Interrupted" about a run that ended cleanly. */
+    let registered: Promise<unknown> = Promise.resolve()
     session.on('sessionId', (id: string) => {
       // Two live runs cannot be the same card. If an id arrives that another
       // running agent already holds, adopting it would merge them: one card for
@@ -1535,7 +1606,7 @@ export class AgentManager extends EventEmitter {
       const previousKey = agent.runId
       agent.sessionId = id
       // Register the card now that Claude Code has given us an identity for it.
-      void this.opts.store.adoptKey(previousKey, id).then(() => this.opts.store.patch(id, durablePatch({
+      registered = this.opts.store.adoptKey(previousKey, id).then(() => this.opts.store.patch(id, durablePatch({
         startedPhase: prior?.phase ?? this.opts.board.columns.find((c) => c.category === 'started')?.id,
         runtime,
         worktree: wt,
@@ -1547,13 +1618,20 @@ export class AgentManager extends EventEmitter {
         ...(opts.providerFor?.profile ?? this.opts.provider
           ? { provider: (opts.providerFor?.profile ?? this.opts.provider)!.id }
           : {}),
-        ...(chosen.model ? { model: chosen.model } : {}),
-        ...(chosen.effort ? { effort: chosen.effort } : {}),
-        ...(chosen.thinking ? { thinking: chosen.thinking } : {}),
+        // Not for a cloud session: a session the CLI created and detached from
+        // runs on the model its cloud environment picks — the CLI drops
+        // `--model` there — so recording the picker's choice would be the card
+        // naming a model it is not on.
+        ...(chosen.model && !agent.cloud ? { model: chosen.model } : {}),
+        ...(chosen.effort && !agent.cloud ? { effort: chosen.effort } : {}),
+        ...(chosen.thinking && !agent.cloud ? { thinking: chosen.thinking } : {}),
       })))
         // `agent.title`, not the launch-time `title`: `set_title` may have already
-        // renamed the card during the window before this id existed.
-        .then(() => this.opts.store.rename(id, agent.title))
+        // renamed the card during the window before this id existed. A cloud
+        // card's title travels in its `cloud` record instead: there is no
+        // local session file for Claude Code to rename, and retrying one that
+        // will never appear costs seconds and ends in a warning.
+        .then(() => agent.cloud ? undefined : this.opts.store.rename(id, agent.title))
         .catch((e) => {
           // Never silent: a failed rename leaves the card under Claude Code's
           // own summary, and a failed patch leaves it with no worktree link at
@@ -1623,6 +1701,10 @@ export class AgentManager extends EventEmitter {
     // A flag the CLI could not honour. Surfaced like any other warning, because
     // the alternative is a toggle sitting there looking on while doing nothing.
     session.on('flagWarning', (message: string) => { this.emit('warning', message) })
+    // Where a cloud session is, and every message delivered to it — onto the
+    // card, because a detached one leaves nothing on this machine to rebuild
+    // the card from after the process is gone.
+    session.on('cloud', (u: CloudUpdate) => this.recordCloud(agent, u))
 
     session.on('provider', (resolved: string | undefined, label: string | undefined) => {
       const a = this.agents.get(runId)
@@ -1759,7 +1841,9 @@ export class AgentManager extends EventEmitter {
       void agent.harness?.dispose().catch(() => {})
       // This run reached the end under its own power, so it was not cut off.
       // Zero, not undefined: a patch drops undefined and the mark would stay.
-      if (agent.sessionId) void this.opts.store.patch(agent.sessionId, { running: 0 }).catch(() => {})
+      // After the registration, which writes the mark — see `registered`.
+      const sid = agent.sessionId
+      if (sid) void registered.then(() => this.opts.store.patch(sid, { running: 0 })).catch(() => {})
       this.touch()
       // A finished agent has left changes in its worktree; the host reloads the
       // review panel rather than making the user press Refresh to find out.
@@ -1864,13 +1948,28 @@ export class AgentManager extends EventEmitter {
       )
     }
 
+    /* WHERE it runs — a capability, not a name. A card the user asked to run
+       in the cloud is refused rather than started here: running it on this
+       machine is the one outcome they said they did not want. */
+    const cloud = agent.cloud
+    if (cloud && !rt.capabilities.cloud) {
+      throw new Error(`${rt.label} cannot run a session in the cloud, so this card was not started. ` +
+        'Start it again without "Run in the cloud", or on Claude Code.')
+    }
+
     // Does this worktree carry a knowledge base? Decided once per launch and
     // remembered on the card: the brief and the `set_phase` description state
     // the rule only where it applies, while the gate itself re-reads the folder
     // at check time so an area file added mid-run counts.
-    agent.knowledgeFiles = (await loadCodemap(wt.path)).length > 0
+    agent.knowledgeFiles = cloud ? false : (await loadCodemap(wt.path)).length > 0
 
-    const boardTools = await this.boardToolsFor(rt.capabilities.boardTools, runId, agent, title, rt.label)
+    /* No board tools and no brief for a cloud session. The tools are an
+       in-process server in THIS extension host; a session running on
+       Anthropic's machines cannot call them, and a brief that tells it to move
+       its own card with a tool it does not have spends its first turn finding
+       that out. It gets the task exactly as typed, and the card is moved by
+       the user. */
+    const boardTools = cloud ? undefined : await this.boardToolsFor(rt.capabilities.boardTools, runId, agent, title, rt.label)
 
     // Provider profiles steer the backend of a runtime whose backend IS
     // environment on the child process. Handing them to one that authenticates
@@ -1919,11 +2018,15 @@ export class AgentManager extends EventEmitter {
       cwd: wt.path,
       permissionMode: this.opts.permissionMode,
       executable: location.command,
-      appendSystemPrompt: buildBrief(
-        this.opts.board, title, wt.branch, policyFor(level), canSplit, spawnAgents,
-        agent.knowledgeFiles === true, !!this.opts.harness, this.opts.autoVerify?.() === 'require',
-        this.opts.quality?.mode() ?? 'off',
-      ),
+      ...(cloud
+        ? { cloud: { ...(cloud.id ? { id: cloud.id } : {}), title: agent.title } }
+        : {
+            appendSystemPrompt: buildBrief(
+              this.opts.board, title, wt.branch, policyFor(level), canSplit, spawnAgents,
+              agent.knowledgeFiles === true, !!this.opts.harness, this.opts.autoVerify?.() === 'require',
+              this.opts.quality?.mode() ?? 'off',
+            ),
+          }),
       ...(opts.resume ? { resume: opts.resume } : {}),
       ...(boardTools ? { boardTools } : {}),
       ...(this.opts.log ? { log: this.opts.log } : {}),
@@ -2019,6 +2122,31 @@ export class AgentManager extends EventEmitter {
       ? { ...m, spentUsd: m.spentUsd + agent.priorUsd }
       : m
     return true
+  }
+
+  /**
+   * What a cloud run just learned — its session's id and link, a message
+   * delivered — onto the live card at once and into the sidecar, where a
+   * DETACHED card lives on after its process: nothing under
+   * `~/.claude/projects` knows it exists. Keyed like everything else, by
+   * `sessionId ?? runId`; the run announces the id before the record, so the
+   * record lands under the id.
+   */
+  private recordCloud(agent: RunningAgent, u: CloudUpdate): void {
+    agent.cloud = {
+      id: agent.cloud?.id ?? u.id,
+      url: agent.cloud?.id && agent.cloud.id !== u.id ? agent.cloud.url : u.url,
+      via: agent.cloud?.via === 'live' || u.via === 'live' ? 'live' : 'detached',
+    }
+    for (const message of u.notices ?? []) {
+      agent.live.push({ kind: 'notice', at: Date.now(), urgency: 'info', message })
+    }
+    const key = agent.sessionId ?? agent.runId
+    void this.opts.store.recordCloud(key, u).catch((e) => {
+      this.emit('warning', `Could not remember where "${agent.title}" runs in the cloud: ${e instanceof Error ? e.message : String(e)}. ` +
+        `Its link is ${u.url}.`)
+    })
+    this.touch()
   }
 
   /** Remove a worktree only if nothing was ever done in it. Anything else —
@@ -2494,6 +2622,7 @@ export class AgentManager extends EventEmitter {
         ...(o.orchestration ? { orchestration: o.orchestration } : {}),
         ...(o.chosen ? { chosen: o.chosen } : {}),
         ...(o.images?.length ? { images: o.images.length } : {}),
+        ...(o.cloud ? { cloud: true as const } : {}),
       }
     })
     try {
@@ -2523,6 +2652,7 @@ export class AgentManager extends EventEmitter {
         ...(providerFor ? { providerFor } : {}),
         ...(e.orchestration ? { orchestration: e.orchestration } : {}),
         ...(e.chosen ? { chosen: e.chosen } : {}),
+        ...(e.cloud ? { cloud: true } : {}),
         restored: { queuedAt: e.queuedAt, imagesDropped: e.images ?? 0 },
       }).catch((err) => this.opts.log?.(`Could not restore a queued run: ${err}`))
     }

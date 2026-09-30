@@ -17,6 +17,7 @@ tests:
   - src/sessions/__tests__/search.test.ts
   - src/sessions/__tests__/checkpoints.test.ts
   - src/sessions/__tests__/commands.test.ts
+  - src/sessions/__tests__/cloud-store.test.ts
 last_verified: 2026-09-08
 ---
 # Sessions — what is on disk
@@ -70,6 +71,24 @@ a throwaway `CLAUDE_CONFIG_DIR`, including the project directory encoding
 session in the real on-disk shape; both halves of the compaction guard go red
 when reverted.
 
+A card on Anthropic's CLOUD (`BoardSession.cloud`) is read from the sidecar
+alone when Claude Code's index does not list its id — a detached cloud session
+leaves nothing under `~/.claude/projects`, and without that second pass in
+`list()` the card vanished with the process that made it. `cloudOnly(id)` is
+the test every reader applies: `transcript`/`fullTranscript`/`transcriptTotal`
+come from `cloudTranscript(record)` (the prompts it was handed, a notice
+saying where the replies are, failed deliveries), `meter` is `unknown` and
+`usage` empty (never `$0.00`), `rename` writes the record's title, and
+`delete` removes the CARD and says the session itself is still on claude.ai.
+`recordCloud(key, update)` merges a run's `cloud` event (`mergeCloud`: the
+first id wins). `cloudOnly` is public because the manager and the host ask it
+about a CONNECTED session too: whether the CLI also writes one of those under
+`~/.claude/projects` has never been observed, so when the index does list it,
+it reads like any other session, and when it does not, what the board saw
+while it streamed is the only copy of its replies (`AgentManager.cloudSeen`).
+Test: `cloud-store.test.ts` — nothing seeded in the Claude store, read back
+through a FRESH `MetaStore`.
+
 **`src/sessions/meta.ts`**. `MetaStore` — the sidecar in `globalStorageUri`,
 keyed by workspace root: `get`, `getAll`, `update`, `rename`, `remove`;
 `recover()` and `mergePreviousInstalls()` fold in what sibling storage
@@ -78,7 +97,10 @@ unknown ids, once per source (`.recovered.json`). `SessionMeta`: `phase`,
 `tags`, `archived`, `pinned`, `worktree`, `branch`, `base`, `testPlan`,
 `title`, `model`, `effort`, `thinking`, `runtime` (PARSED, never cast),
 `provider`, `switchedFrom`, `orchestration`, `decomposition`, `scope`,
-`running` (the mark a killed run leaves), `contextWindow`, `parent`, `fanout`.
+`running` (the mark a killed run leaves), `contextWindow`, `parent`, `fanout`,
+`cloud` (a `CloudRecord` from `agent/cloud.ts` — where the session runs on
+Anthropic's cloud and what was delivered to it; parsed by `parseCloud`, which
+drops a record with no valid id and never keeps a link that is not claude.ai's).
 `parseMeta` / `normalise` / `emptyMeta`; `MODELS` + `windowLabel` (the built-in
 picker list — the FALLBACK, and `context` is derived from `MODEL_WINDOWS`);
 `TestPlan` / `normaliseTestPlan` / `guessLinkKind` / `targetIsClean`;
@@ -190,6 +212,8 @@ from `run-…` to the session id when `system/init` arrives, and
 - Commit rows in the transcript: `committed` is emitted and heard, no entry kind.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · `SessionMeta.cloud` (parsed by `parseCloud`); `SessionStore` lists a cloud card from the sidecar when Claude Code's index has no such session and answers every reader for it (`cloudOnly`), plus `recordCloud`.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `TestPlan.quality` (`QualityReport`, `QualityCheck`) parsed through `parseQuality` in `normaliseTestPlan`; `quality.test.ts` round-trips a real report.
 

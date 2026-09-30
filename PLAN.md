@@ -464,6 +464,17 @@ Working:
   all. A Codex card moves itself, writes a test plan and splits like any other,
   through the same board tools served over a socket. See
   [docs/RUNTIMES.md](docs/RUNTIMES.md)
+- **"Run in the cloud" on a new chat, for a claude.ai subscription.** The box
+  appears only when that agent's own login is a claude.ai subscription on
+  Anthropic; otherwise it is absent, and the settings page says why. The card's
+  worktree is uploaded as a git bundle (`CCR_FORCE_BUNDLE=1`), so no GitHub is
+  needed and the cloud starts from the card's own unpushed commit. Where the
+  CLI streams cloud sessions to an editor (a server-side gate), the chat IS the
+  live session. Where it does not, the board creates the session, delivers
+  follow-ups, and says plainly that the replies are on claude.ai, one click
+  away. It never reads the claude.ai login itself, which Anthropic's terms
+  forbid; everything goes through the `claude` binary. See
+  [docs/DECISIONS.md](docs/DECISIONS.md) "A cloud session goes through the CLI".
 - **A meter that does not pretend to be dollars.** A subscription session is
   billed nothing per request, so its readout is the rate-limit window it is
   actually spending — `13% of 5h · Plus` — rather than `$0.00`. `Meter` is a
@@ -720,6 +731,21 @@ on runtime identity), but three things are honest gaps rather than decisions:
 - **One app-server per session.** A single shared server could host every thread
   (`thread/start` takes a `cwd`), which would be cheaper; per-session matches the
   existing lifecycle exactly, so it is where this starts.
+
+### Cloud sessions: what is not done
+
+- **The connected path has never met a real account.** The CLI's gate was off
+  wherever this was built, so the live-chat half is proven only against a
+  stand-in (`claude-cloud.test.ts`). **Run one on an account that has it**, and
+  check whether the CLI also writes the session under `~/.claude/projects`.
+  Until then, what the board saw of it is kept in memory only.
+- **No way back without GitHub.** A detached session's changes stay in the
+  cloud session. Bringing them to the card's worktree needs something the CLI
+  does not offer for a bundle-seeded session.
+- **A detached card cannot stop its cloud session.** Interrupt and Stop end the
+  local CLI; the session itself is stopped on claude.ai.
+- **Windows cannot use the detached path** (no `script(1)`), and the macOS
+  form has not been run on a Mac.
 
 ### Orchestration: what is left after `split_task`
 

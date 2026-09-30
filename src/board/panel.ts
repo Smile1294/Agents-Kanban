@@ -242,6 +242,14 @@ export interface UiCard {
    *  means agents that cannot still be working, which used to look identical to
    *  agents hard at work. */
   agents?: { total: number; running: number; orphaned: number }
+  /**
+   * This session runs on Anthropic's cloud (`agent/cloud.ts`). `via` says how
+   * much the board can see: `live`, the CLI streamed it here; `detached`, it
+   * was created and left, and its replies are on claude.ai. `pending` while it
+   * is still being created. Never stalled and never offered a fork: nothing
+   * here stopped, and its transcript is not in this machine's store.
+   */
+  cloud?: { via?: 'live' | 'detached'; pending?: boolean }
   /** Follow-ups typed while this turn is still running. */
   queued?: string[]
   agent?: {
@@ -596,7 +604,16 @@ export interface BoardHost {
    * The sink is what makes it per surface.
    */
   select(id: string | undefined, sink?: StateSink): void
-  newSession(prompt: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
+  /** `where.cloud`: the composer's "Run in the cloud" box. A REQUEST — the
+   *  host checks the login itself before anything starts, because the page
+   *  that ticked it renders another program's output and a stale page can
+   *  tick a box the current login cannot honour. */
+  newSession(prompt: string, images?: AttachedImage[], chosen?: RunSettings, where?: { cloud?: boolean }): Promise<void>
+  /** The claude.ai link of a card's cloud session, from the HOST's record —
+   *  never a URL the page sends — or undefined. */
+  cloudLink?(key: string): Promise<string | undefined>
+  /** Open that link in the browser. */
+  openCloud?(key: string): Promise<void>
   sendMessage(id: string, text: string, images?: AttachedImage[], chosen?: RunSettings): Promise<void>
   /** Send a card's review comments to its agent as one message. */
   sendReview(id: string): Promise<void>
@@ -853,8 +870,25 @@ async function routeBoardMessage(
     case 'setMode': host.setMode(msg.mode === 'chat' ? 'chat' : 'kanban', sink); refresh(); break
     case 'select': host.select(msg.id ? String(msg.id) : undefined, sink); await refresh(); break
     case 'newSession':
-      await host.newSession(String(msg.text ?? ''), readImages(msg.images))
+      await host.newSession(
+        String(msg.text ?? ''), readImages(msg.images), undefined,
+        // `=== true`, not truthiness: a request to run somewhere else must be
+        // said, never inferred from whatever a page happened to send.
+        msg.cloud === true ? { cloud: true } : undefined,
+      )
       break
+    case 'openCloud': {
+      // Opened from the HOST's record of the card, never from a URL in the
+      // message. On a phone the link is toasted instead, to tap there. With no
+      // link yet the host still answers — a click must never do nothing.
+      const url = await host.cloudLink?.(id())
+      const phone = url
+        ? `This session is on claude.ai: ${url}`
+        : 'This session has no claude.ai link yet — Claude Code is still creating it.'
+      if (editorOnly(phone, url)) break
+      await host.openCloud?.(id())
+      break
+    }
     case 'send':
       await host.sendMessage(id(), String(msg.text ?? ''), readImages(msg.images))
       break

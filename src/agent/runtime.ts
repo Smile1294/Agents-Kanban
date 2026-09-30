@@ -46,6 +46,7 @@ import type { AttachedImage } from './images.ts'
 import type { ModelBook } from '../sessions/usage.ts'
 import type { EffortLevel, ThinkingMode } from '../sessions/meta.ts'
 import type { ProviderEnv, ProviderProfile } from './providers.ts'
+import type { CloudEligibility, CloudUpdate } from './cloud.ts'
 
 /** Runtimes the board knows how to drive.
  *
@@ -133,6 +134,14 @@ export interface RuntimeCapabilities {
    * fork at an id the runtime never heard of.
    */
   messageIds?: boolean
+  /**
+   * A session can run on the VENDOR'S cloud instead of this machine — for
+   * Claude Code, Anthropic's (Claude Code on the web), started through the CLI
+   * (`agent/cloud.ts`). Whether a given LOGIN may is a separate, per-account
+   * answer: `LoginState`'s `cloud`. Absent means no such concept, and the
+   * composer's checkbox is not drawn.
+   */
+  cloud?: boolean
 }
 
 /** Where a runtime's executable was found, and what it says it is. */
@@ -157,7 +166,13 @@ export type LoginState =
    *  a plan, an organisation. `via` distinguishes a subscription login from an
    *  API key, which is the difference between two BILLING METERS and therefore
    *  decides which meter the board may show. */
-  | { kind: 'signedIn'; account?: string; plan?: string; via: 'subscription' | 'apiKey' | 'cloud' }
+  | {
+      kind: 'signedIn'; account?: string; plan?: string; via: 'subscription' | 'apiKey' | 'cloud'
+      /** Whether this login may start a session on the vendor's cloud, and if
+       *  not, why — a sentence naming the fix. Only from a runtime with
+       *  `capabilities.cloud`; absent otherwise. */
+      cloud?: CloudEligibility
+    }
   /** Installed, reachable, and nobody is logged in. Name the command that fixes
    *  it — this string is shown as the action on the settings page. */
   | { kind: 'signedOut'; fix: string }
@@ -391,6 +406,14 @@ export interface RunEvents {
    */
   limit?: (raw: unknown, retry?: boolean) => void
   /**
+   * Where a CLOUD session is, and what the board handed it: emitted by a run
+   * started with `RunSpec.cloud` whenever it learns the session's id and link,
+   * and for every message it delivers. The manager keeps it on the card
+   * (`SessionMeta.cloud`), because a session the CLI created and detached from
+   * leaves nothing at all on this machine to rebuild the card from.
+   */
+  cloud?: (update: CloudUpdate) => void
+  /**
    * The turn ended.
    *
    * Three arguments, and the split between the last two is the whole point.
@@ -528,7 +551,22 @@ export interface RunSpec {
    *  in-process SDK MCP server; Codex gets the same definitions over stdio.
    *  See `board-mcp.ts`. */
   boardTools?: BoardToolBridge
+  /**
+   * Run on the vendor's cloud instead of this machine. Only handed to a runtime
+   * whose `capabilities.cloud` is set — the manager refuses otherwise rather
+   * than starting it here, which is the one outcome the user asked not to have.
+   * `cwd` is still the worktree: it is what gets uploaded.
+   */
+  cloud?: CloudTarget
   log?: (message: string) => void
+}
+
+/** Which cloud session a run is about. */
+export interface CloudTarget {
+  /** The session to continue. Absent means create one. */
+  id?: string
+  /** The card's title, so the session carries the same name on the web. */
+  title?: string
 }
 
 /**

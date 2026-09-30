@@ -85,6 +85,10 @@ ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED }) === un
    'a session with no worktree never ran, so there is nothing it failed to hand back')
 ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED, worktree: '/w', archived: true }) === undefined,
    'an archived card is not nagging anybody')
+// On Anthropic's cloud nothing was ever going to run HERE, so "no live agent" is
+// its normal state — and the stalled card's button would resume it locally.
+ok(stalledSince(DEFAULT_BOARD, { phase: 'implementing', updated: ENDED, worktree: '/w', cloud: true }) === undefined,
+   'a cloud card is never stalled: its agent runs somewhere else')
 // A renamed board must work the same: the rule is the CATEGORY, never the id.
 const renamed: BoardConfig = {
   ...DEFAULT_BOARD,

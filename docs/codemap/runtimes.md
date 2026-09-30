@@ -1,6 +1,6 @@
 ---
 name: runtimes
-description: Which agent program runs a session — the AgentRuntime contract and registry, Claude Code behind it, Codex over app-server JSON-RPC and its on-disk store, the meter union, finding the CLI, asking it questions without a turn, install and login status
+description: Which agent program runs a session — the AgentRuntime contract and registry, Claude Code behind it (on this machine or on Anthropic's cloud), Codex over app-server JSON-RPC and its on-disk store, the meter union, finding the CLI, asking it questions without a turn, install and login status
 paths:
   - src/agent/runtime.ts
   - src/agent/runtimes/*.ts
@@ -9,15 +9,18 @@ paths:
   - src/agent/connect.ts
   - src/agent/cli-update.ts
   - src/agent/status.ts
+  - src/agent/cloud.ts
   - src/sessions/codex-store.ts
 tests:
   - src/agent/__tests__/cli-update.test.ts
+  - src/agent/__tests__/cloud.test.ts
+  - src/agent/__tests__/claude-cloud.test.ts
   - src/agent/__tests__/codex.test.ts
   - src/agent/__tests__/executable.test.ts
   - src/agent/__tests__/status.test.ts
   - src/agent/__tests__/route-launch.test.ts
   - src/sessions/__tests__/codex-store.test.ts
-last_verified: 2026-09-07
+last_verified: 2026-09-30
 ---
 # Runtimes — which agent program
 
@@ -40,8 +43,15 @@ out"), `models(loc)`, `builtinModels()`, `start(spec: RunSpec)` → `AgentRun`,
 `history: RuntimeHistory`. `RunSpec` — everything a launch hands over (`taskId`,
 `cwd`, `permissionMode`, `executable`, `appendSystemPrompt`, `resume`,
 `boardTools`, provider env + `envClear`, `modelBook`, `model`, `effort`,
-`thinking`, `ultracode`, `fastMode`). `AgentRun` — the live-session interface
-both sessions implement, with the event names meaning the same things.
+`thinking`, `ultracode`, `fastMode`, and `cloud?: CloudTarget` — run it on
+Anthropic's cloud, continuing `id` when set). `AgentRun` — the live-session
+interface both sessions implement, with the event names meaning the same
+things; `cloud?(update)` is the one event only a cloud run emits (where it is,
+what was delivered). `capabilities.cloud` says a runtime can run a session on
+its vendor's cloud at all, and a signed-in `LoginState` carries
+`cloud?: CloudEligibility` — whether THIS login may. Where a session runs is
+deliberately NOT a runtime: it is the same program, protocol, login and model
+ids, so it is a capability and a `RunSpec` field.
 `Meter` — `{kind:'usd', spentUsd, priced} | {kind:'plan', usedPercent,
 windowMinutes, resetsAt?, plan?} | {kind:'unknown'}`, `parseMeter` (defensive),
 `NO_SPEND`. `RuntimeHistory` (`list`, `transcript`, `usage`, `meter`, optional
@@ -59,7 +69,54 @@ a `--version` fast path) — the model list is compiled into the CLI, so that
 number is what answers "why is the new model missing?"; `login` → `accountInfo()`
 under `withSilentQuery` (it once hung forever on a gateway that dropped
 packets); `models` → the built-in list (discovery lives in `models.ts`);
-`start` → `new AgentSession(spec)`; `capabilities.boardTools = 'inProcess'`.
+`start` → `new AgentSession(spec)`, or `new CloudRun(spec)` when `spec.cloud`
+is set; `capabilities.boardTools = 'inProcess'`, `cloud: true`. `login` reads
+`via` off the CLI's own fields (`apiProvider`, then `apiKeySource`) — it used
+to call a Console API key a "subscription" — and answers the cloud question
+with `cloudEligibility(info)`.
+
+**`src/agent/cloud.ts`**. Running a session on Anthropic's cloud (Claude Code
+on the web) through the unmodified `claude` binary and NOTHING else — the
+header carries the CLI's capability table (2.1.285, read out of its bundle) and
+the terms sentence that rules out the shortcut: "developers may not collect,
+store, or intermediate Claude.ai credentials or session tokens", so nothing
+here reads `~/.claude/.credentials.json` or the keychain, and nothing calls
+claude.ai. Pure, no process spawned. `CLOUD_ENV` (`CCR_FORCE_BUNDLE=1`: the CLI
+uploads the worktree as a git bundle, so no GitHub is needed and the cloud
+starts from the card's own unpushed commit), `cloudEligibility(accountInfo)`
+(a claude.ai login on first-party only; a setup token, an API key, a cloud
+provider each refused with its own sentence), `connectedRefusal(message)` (the
+three sentences that mean "use the fallback" — anything else is a failure to
+show), `readCloudCreate(raw, exited)` over a PTY's output (`screenText` first:
+Ink draws the gap between words with `ESC[nG`), `readCloudSend`,
+`explainCloudError` (appends the fix), `cloudCreateArgs` (`--cloud=<task>` in
+ONE argv element, so a task starting with `-` is not a flag; `--permission-mode`
+only for a mode the cloud accepts; never `--model`, which the CLI drops there),
+`cloudSendArgs`, `ptyInvocation(platform, argv)` (`script(1)`, GNU and BSD
+forms, `stty cols 200` so nothing wraps; `undefined` on Windows), `shellQuote`,
+and the sidecar's `CloudRecord` with `parseCloud` (a stored URL that is not
+claude.ai's is replaced, never opened), `mergeCloud` (the FIRST id wins) and
+`cloudTranscript` (what a detached card's chat shows: the prompts it was
+handed, a notice saying where the replies are, a failed delivery as an error).
+Test: `cloud.test.ts` — real PTY captures of the CLI's no-login error and trust
+prompt, and a real `script` run proving a task full of quotes, `$(…)` and
+backticks arrives verbatim and runs nothing.
+
+**`src/agent/runtimes/claude-cloud.ts`**. `CloudRun`, a cloud session behind
+the same `AgentRun` a local one is. CONNECTED first: an ordinary
+`AgentSession` started with `--cloud` (`extraArgs`, no `resume`, no board
+tools, no model — the composer offers none for a cloud session), whose frames
+are the live chat when the account has the CLI's connected-sessions gate.
+DETACHED only when the CLI refuses with one of the
+three `connectedRefusal` sentences, and only before anything was heard:
+`claude --cloud "<task>"` inside `script(1)`, then follow-ups through
+`claude -p --cloud <id>`, one delivery per run. A message typed during the
+connected attempt is HELD until the session answers (`goLive`), so a decline
+does not lose it. `interrupt()` and `stop()` end a detached create with a
+sentence that says the session may exist anyway; `stop()` never emits an error
+(that re-entered the manager's `finish()`). Test: `claude-cloud.test.ts` — the
+real SDK and the real PTY spawning a stand-in `claude` that answers the way
+2.1.285 does, per mode (created, archived, trust prompt, no login, slow).
 
 **`src/agent/runtimes/codex.ts`** (~1210 lines). Codex driven natively over
 `codex app-server` JSON-RPC — no proxy, because a ChatGPT subscription cannot be
@@ -173,6 +230,12 @@ once came back with empty transcripts that way). The settings page asks
 - An unanswered permission request is a wedged agent: every branch answers.
 - `RuntimeHistory.delete` is optional and a foreign delete is verified against
   that runtime's OWN listing.
+- A cloud session goes through the `claude` binary only. The board never reads
+  the claude.ai login or calls claude.ai itself — Anthropic's terms forbid
+  intermediating that token, whatever the convenience.
+- The detached fallback runs ONLY on the CLI's three refusal sentences and only
+  before the session was heard from. A connected run that fails halfway is a
+  failure to show, never a reason to start a second session.
 
 ## Open work
 
@@ -180,8 +243,15 @@ once came back with empty transcripts that way). The settings page asks
   spellings because nothing local can prove which the live CLI uses.
 - Images do not reach a Codex session.
 - One app-server per session (a shared one could host every thread).
+- Cloud: the CONNECTED path has never run against a real account — the gate
+  was off wherever this was built, so what the board has seen of it is the
+  stand-in. The detached path cannot bring a cloud session's changes back to
+  the card's worktree without GitHub; Windows has no `script(1)` for it; the
+  BSD `script` form is untested on a real Mac.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · cloud sessions: `cloud.ts` (pure: eligibility, the CLI's refusals and output, the PTY command, the sidecar record) and `runtimes/claude-cloud.ts` (`CloudRun` — connected through `AgentSession --cloud`, detached through `claude --cloud` in `script(1)` plus `claude -p --cloud <id>`); `RunSpec.cloud`, `capabilities.cloud`, `LoginState.cloud`, `RunEvents.cloud`; Claude's `login()` stopped calling an API key a subscription.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `AgentRun.backgroundTasks?()` — background agents still running, by description; read when a usage limit ends the run, since they die with its process. Claude Code implements it from `liveTasks`; Codex has none.
 

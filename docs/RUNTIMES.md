@@ -50,6 +50,25 @@ configured: if `codex login` has been run on this machine, Codex sessions work.
 | Meter | dollars, priced per response | **percentage of a rate-limit window** |
 | Images in the composer | yes, inline | no — Codex takes files by path, and this board writes nothing to your repo |
 | Extended-thinking toggle | yes | no — reasoning depth is the effort picker |
+| Run on the vendor's cloud | yes, with a claude.ai subscription ([below](#where-a-session-runs-is-not-a-runtime)) | no |
+
+---
+
+## Where a session runs is not a runtime
+
+A Claude Code session can run on Anthropic's cloud (Claude Code on the web)
+instead of this machine: the "Run in the cloud" box on a new chat. It is the
+SAME program, protocol, login and model ids, so it is not a third runtime. It
+is `capabilities.cloud` on the runtime, `RunSpec.cloud` on the launch, and
+`CloudRun` (`src/agent/runtimes/claude-cloud.ts`) behind the ordinary `AgentRun`
+contract, so the manager and the chat have no branch for it. Who may use it is
+the runtime's own login (`LoginState.cloud`): a claude.ai subscription on
+first-party, never an API key. The board reaches the cloud only through the
+`claude` binary, because Anthropic's terms forbid a third party from handling
+the claude.ai token. The CLI's two modes (streamed, or created and detached)
+and what each lets the board see are in
+[DECISIONS.md](DECISIONS.md) "A cloud session goes through the CLI". A runtime
+without the capability refuses a cloud card rather than starting it here.
 
 ---
 

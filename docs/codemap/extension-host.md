@@ -49,13 +49,26 @@ declared in `package.json`, and the smoke gate asserts the two agree): `openBoar
 `toggleFocus`, `newSession`, `init`, `openSettings`, `selectProvider`,
 `addProvider`, `testProvider`, `refreshModels`, `updateClaudeCode`, `stopTask`,
 `archiveSession`, `deleteSession`, `openWorktree`. Activation is
-`onStartupFinished`. Test:
+`onStartupFinished`. Cloud sessions live here too: `askCloud(rt, profile)`
+asks that agent's login in the environment a session would get (deduplicated,
+cached in `cloudLogins` per `<runtime>|<profile>`, cleared when profiles or the
+provider change), `cloudOffer()` puts `composer.cloud` on a NEW session's bar
+only on a known yes (and starts the ask when nothing is known), `cloudRow()` is
+the settings page's line about the same answer, and `newSession(…, {cloud})`
+re-checks it HOST-side — the setting, the capability, a git repository, the
+login — and refuses with a MODAL, never a toast. A selected cloud card gets
+`composer.cloudCard` instead; `cloudLink`/`openCloud` open only a link that
+passes `isCloudUrl`, and a press with no link yet is answered in a modal (the
+`openCloud` case in `dispatchBoardMessage` must reach the host either way); removing a cloud card says the session stays on
+claude.ai; an ENDED connected run with no transcript on this machine keeps its
+own rows on screen (they are the only copy). Test:
 `smoke.mjs` only — it activates the BUILT bundle against `test/harness.mjs`.
 
 **`src/board/panel.ts`**. The webview surface in two places and two modes.
 Exports `BoardHost` (the ~50-method host contract — the best index of what the
 board can do), `UiState` / `UiCard` (the wire shape), `BoardPanel` (editor,
-`static show`, `postCurrent`, `onClosed`, `onLeft`), `BoardViewProvider` (side
+`static show`, `postCurrent`, `onClosed`, `onLeft`), `UiCard.cloud`
+(`via`, `pending` — where a card runs), `BoardViewProvider` (side
 bar, `viewType = 'agentsKanban.board'`), `applyBoardFocus` / `setBoardFocusMode`
 / `FocusMode`, `showSideBarView`, `toUiAgent`, `readImages`, `summarise`. Also
 load-bearing: `dispatchBoardMessage()` — the `switch (msg.type)` shared by BOTH
@@ -101,7 +114,8 @@ called `isRemoteDialog` any more. `makeRelayDialogSink` is the relay sink: it po
 **`src/board/settings.ts`**. The settings TAB (an editor webview with
 `retainContextWhenHidden`): `SettingsState`, `SettingsMessage`, `parseMessage`
 (the defensive read of the page's messages), `SettingsPanel` (`refreshIfOpen`),
-the row state types (`RuntimeAgentCard`, `ProviderCard`, `ProviderModelChoice`,
+the row state types (`RuntimeAgentCard` — including `cloud`, whether a new
+chat can "Run in the cloud" and why not, `ProviderCard`, `ProviderModelChoice`,
 `ScheduleRowState`, `VoiceRowState`, `RemoteState`). Tests:
 `settings-view.test.mjs`, `settings-spawn.test.mjs`, `settings-schedule.test.mjs`
 (the page in a stub DOM); host side in `smoke.mjs` §providers.
@@ -127,7 +141,9 @@ commands in it, so it must not run before someone has said they trust it; the
 that NAMES A BINARY carries `scope: "machine"` — `claudeExecutable`,
 `codexExecutable`, `whisperPath`, `ffmpegPath` — because the default scope is
 `window`, which lets a repository's own `.vscode/settings.json` choose the
-executable we spawn. Test: `smoke.mjs` §manifest (declared ↔ registered, the
+executable we spawn. `agentsKanban.cloudSessions` (default on) is the board's
+own switch for "Run in the cloud"; its description says what the CLI uploads
+and what it cannot bring back without GitHub. Test: `smoke.mjs` §manifest (declared ↔ registered, the
 machine-scope rule by NAME SHAPE so a fifth cannot arrive on the old default,
 and the trust declaration), `test/package.test.mjs`.
 
@@ -319,6 +335,8 @@ bar is handed back to `agentsKanban.sideBarHome`.
   description no longer promises one.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · cloud sessions: `agentsKanban.cloudSessions`; the login ask (`askCloud`, `cloudLogins`), `composer.cloud` / `composer.cloudCard`, the host-side modal gate in `newSession`, `cloudLink`/`openCloud` (`BoardHost` + the `openCloud` message), `UiCard.cloud`, `RuntimeAgentCard.cloud` on the settings page, and a cloud card's remove dialog.
 
 - 2026-09-26 · claude/self-checkout-harness-overview-cvpkyy · `agentsKanban.qualityGate` (check/require/off) and `agentsKanban.checks` (parsed by `checksConfig`); `checkWorktree` feeds the manager's `quality`; `runCardQuality` runs the FULL checks after a card reaches review, AFTER the browser check (both start processes in the worktree), stamps `testPlan.quality`, and warns with Send to agent when it fails; `sendQuality`/`runQuality` host methods and dispatch; `CardState.qualityChecking`.
 

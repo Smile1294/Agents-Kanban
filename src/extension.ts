@@ -67,7 +67,7 @@ import {
 } from './agent/endpoint.ts'
 import {
   collectRuntimeStatus, SettingsPanel,
-  type ScheduleRowState, type SettingsHost, type SettingsMessage,
+  type RuntimeAgentCard, type ScheduleRowState, type SettingsHost, type SettingsMessage,
   type SettingsState,
 } from './board/settings.ts'
 import {
@@ -107,6 +107,7 @@ import {
   type ModelCatalogue, type ModelChoice,
 } from './agent/models.ts'
 import { claudeVersion, compareVersions, parseCliVersion, replacedInPlace, updateClaudeCode } from './agent/cli-update.ts'
+import { isCloudUrl, type CloudEligibility } from './agent/cloud.ts'
 
 type AgentPermissionMode = AgentOptions['permissionMode']
 
@@ -1109,6 +1110,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const out = list.filter((p) => p.id !== INHERIT_PROFILE.id)
     await cfg().update('providers', out, vscode.ConfigurationTarget.Global)
     providers = parseProfiles(out)
+    // A profile's credential is part of the answer to "may this login start a
+    // cloud session", so every cached answer is asked again.
+    cloudLogins.clear()
     await refreshProviderEnv()
     /* Rebuilt BEFORE the model is re-checked against it, and that order is the
        whole point of doing it here.
@@ -1397,6 +1401,87 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * have not looked for is the same mistake as showing a state we did not read.
    */
   const installedRuntimes = new Map<RuntimeId, boolean>()
+
+  /**
+   * Whether each agent may start a session on Anthropic's cloud, by agent key
+   * (`<runtime>|<profile>`), as ITS OWN login answered — the composer's
+   * "Run in the cloud" box is drawn from this and nothing else.
+   *
+   * Per agent key and not per runtime, because the answer is about the
+   * ENVIRONMENT a session gets: the same `claude` signed in to claude.ai is
+   * eligible on the inherit profile and not on a gateway profile that sets its
+   * own key. Absent means NOT ASKED, and the box is not drawn until it has
+   * been: offering a checkbox the login may not be able to honour, and
+   * refusing only after the user has typed a task, is the worse order. Asking
+   * spawns a CLI handshake (~0.5s, no tokens), so it happens once per key per
+   * window, in the background, never on the render path.
+   */
+  const cloudLogins = new Map<string, { at: number; answer: CloudEligibility }>()
+  const cloudAsking = new Map<string, Promise<CloudEligibility>>()
+  const cloudOn = (): boolean => cfg().get<boolean>('cloudSessions') !== false
+
+  /** Ask one agent's login, deduplicated. Resolves to a refusal rather than
+   *  throwing: "could not tell" is an answer the send path can say out loud. */
+  function askCloud(rt: RuntimeId, profileId: string): Promise<CloudEligibility> {
+    const key = agentKey(rt, profileId)
+    const inFlight = cloudAsking.get(key)
+    if (inFlight) return inFlight
+    const ask = (async (): Promise<CloudEligibility> => {
+      const r = getRuntime(rt)
+      if (!r?.capabilities.cloud) return { ok: false, reason: `${r?.label ?? rt} cannot run sessions in the cloud.` }
+      const loc = await r.detect(configuredPathFor(rt))
+      if (!loc) return { ok: false, reason: `${r.label} is not installed on this machine.` }
+      // The environment a session on this agent would get — the question is
+      // about THAT login, not about `claude` on its own.
+      const profile = providers.find((p) => p.id === profileId) ?? INHERIT_PROFILE
+      const secret = profile.hasCredential
+        ? await context.secrets.get(credentialKey(profile.id)).then((v) => v ?? undefined, () => undefined)
+        : undefined
+      const login = await r.login(loc, envForProfile(profile, secret, process.env))
+      if (login.kind === 'signedIn') {
+        return login.cloud ?? { ok: false, reason: `${r.label} did not say whether this login can start cloud sessions.` }
+      }
+      if (login.kind === 'signedOut') return { ok: false, reason: `${r.label} is signed out. ${login.fix}` }
+      if (login.kind === 'notInstalled') return { ok: false, reason: `${r.label} is not installed on this machine.` }
+      return { ok: false, reason: `Could not tell whether ${r.label} is signed in: ${login.reason}` }
+    })()
+      .catch((e: unknown): CloudEligibility => ({ ok: false, reason: `Could not ask Claude Code who it is signed in as: ${e instanceof Error ? e.message : String(e)}` }))
+      .then((answer) => {
+        cloudLogins.set(key, { at: Date.now(), answer })
+        cloudAsking.delete(key)
+        return answer
+      })
+    cloudAsking.set(key, ask)
+    return ask
+  }
+
+  /** The composer's half: draw the box only on a known yes, and start asking
+   *  when nothing is known. Pure apart from that kick, which is deduplicated,
+   *  so it is safe on the render path. */
+  function cloudOffer(rt: RuntimeId, profileId: string): { cloud?: { plan?: string } } {
+    if (!cloudOn() || !getRuntime(rt)?.capabilities.cloud) return {}
+    const known = cloudLogins.get(agentKey(rt, profileId))
+    if (!known) {
+      if (!cloudAsking.has(agentKey(rt, profileId))) {
+        askCloud(rt, profileId).then(() => refreshAll(), (e: unknown) => log.error(`Cloud login check failed: ${String(e)}`))
+      }
+      return {}
+    }
+    return known.answer.ok ? { cloud: known.answer.plan ? { plan: known.answer.plan } : {} } : {}
+  }
+
+  /** The settings page's line about the same box: the composer leaves it OUT
+   *  when it cannot be used, so this is where the reason is. It reads the
+   *  answer the composer reads, falling back to the status check's. */
+  function cloudRow(rt: RuntimeId, status?: RuntimeStatus): Pick<RuntimeAgentCard, 'cloud'> {
+    if (!cloudOn()) return { cloud: { state: 'off' } }
+    const answer = cloudLogins.get(agentKey(rt, currentProvider().id))?.answer
+      ?? (status?.login.kind === 'signedIn' ? status.login.cloud : undefined)
+    if (!answer) return {}
+    return answer.ok
+      ? { cloud: { state: 'available', ...(answer.plan ? { plan: answer.plan } : {}) } }
+      : { cloud: { state: 'unavailable', reason: answer.reason } }
+  }
 
   /** Look for each agent's executable. Backgrounded at activation, never
    *  awaited: it shells out to `which` and, for Codex, a `--version`. */
@@ -2265,6 +2350,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       for (const r of runtimeStatuses) {
         // The full check outranks the cheap one: same question, better answer.
         installedRuntimes.set(r.id, r.login.kind !== 'notInstalled')
+        // It asked the login in the active profile's environment, so it has
+        // answered the cloud question for that agent too.
+        if (r.login.kind === 'signedIn' && r.login.cloud) {
+          cloudLogins.set(agentKey(r.id, currentProvider().id), { at: r.at, answer: r.login.cloud })
+        }
         if (r.login.kind === 'notInstalled') log.info(`${r.label} is not installed.`)
         else if (r.login.kind === 'signedOut') log.warn(`${r.label} is installed but signed out.`)
       }
@@ -2319,6 +2409,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             ...(rt.id === 'claude' && status?.location
               ? { cliUpdate: installed && newer && compareVersions(newer, installed) > 0 ? { newer } : {} }
               : {}),
+            ...(rt.capabilities.cloud ? cloudRow(rt.id, status) : {}),
           }
         }),
         activeProvider: providerId,
@@ -3693,6 +3784,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       agent: agentKey(runtime, active.id),
       agents: agentChoices(),
       agentLocked: false,
+      /* The "Run in the cloud" box, for a NEW session: present only when this
+         agent's own login said yes — a claude.ai subscription on Anthropic.
+         ABSENT otherwise, like effort on Haiku; why is on the settings page.
+         A selected session drops it (the slice) and says where IT runs. */
+      ...cloudOffer(runtime, active.id),
+      cloudCard: undefined as undefined | { via?: 'live' | 'detached'; pending?: boolean },
       // Set only when the selected session is a live run whose backend is
       // still switchable: the note says the one thing that choice changes
       // while the process is running.
@@ -3865,6 +3962,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(m?.parked && ['done', 'error', 'idle'].includes(a.state.kind) ? { parked: uiParked(m.parked) } : {}),
         ...(a.queued?.length ? { queued: a.queued } : {}),
         ...agentBadge(a.sessionId),
+        ...(a.cloud
+          ? { cloud: { ...(a.cloud.via ? { via: a.cloud.via } : {}), ...(!a.cloud.id ? { pending: true } : {}) } }
+          : {}),
         agent: toUiAgent(a),
       })
     }
@@ -3901,6 +4001,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
         ...(s.parked ? { parked: uiParked(s.parked) } : {}),
         ...agentBadge(s.id),
+        ...(s.cloud ? { cloud: { via: s.cloud.via } } : {}),
         // Only reachable in THIS loop, and that is the point: these are the
         // sessions with no live agent. A card in a started column with
         // nothing running is an agent that stopped without handing the work
@@ -3912,6 +4013,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             phase: s.phase, updated: s.updated, archived: s.archived,
             ...(s.worktree ? { worktree: s.worktree } : {}),
             ...(cutOff.has(s.id) ? { interrupted: cutOff.get(s.id)! } : {}),
+            // On Anthropic's cloud nothing was ever going to run here.
+            ...(s.cloud ? { cloud: true } : {}),
           })
           return at ? { stalled: at } : {}
         })(),
@@ -4124,7 +4227,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // captured at launch, so "more above" cannot become true mid-run —
         // and for runtimes whose transcript has no limit the comparison is
         // equal and it reads false on its own.
-        if (wantsSession) {
+        if (wantsSession && run?.cloud?.via === 'live' && await ws.store.cloudOnly(selectedKey)) {
+          // A CONNECTED cloud session with no transcript on this machine: the
+          // run's own rows are the only copy of its replies here, so the chat
+          // keeps them when the turn ends instead of emptying to the prompts.
+          transcript = [...run.history, ...run.live]
+        } else if (wantsSession) {
           transcript = await ws.store.transcript(selectedKey, transcriptWindows.get(selectedKey))
           const total = await ws.store.transcriptTotal(selectedKey)
           transcriptMore = transcript.length < total
@@ -4231,6 +4339,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       composer.thinkingSupported = thinkingFor(cat.choices, composer.model)
       composer.ultracodeSupported = ultracodeFor(cat.choices, composer.model)
       composer.fastModeSupported = fastModeFor(cat.choices, composer.model)
+    }
+
+    /* WHERE THE SELECTED SESSION RUNS. The "Run in the cloud" box is a choice
+       about a session that does not exist yet, so it belongs to the
+       new-session screen and nowhere else. A card that IS in the cloud says
+       so instead — and the view drops the model, effort and permission
+       pickers for it, because a detached session runs on whatever its cloud
+       environment picks, and a picker there would be a control that cannot
+       take effect. From the live run first (it may not have an id yet), then
+       the card's record. */
+    if (selectedKey) {
+      delete composer.cloud
+      const cloudOf = ws.manager?.byKey(selectedKey)?.cloud ?? metas[selectedKey]?.cloud
+      if (cloudOf) {
+        composer.cloudCard = {
+          ...(cloudOf.via ? { via: cloudOf.via } : {}),
+          ...(!cloudOf.id ? { pending: true } : {}),
+        }
+      }
     }
 
     /* THE MODEL-SWITCH WARNING.
@@ -4833,10 +4960,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ws?.manager?.setDefaults({ model, effort, thinking, ultracode, fastMode, runtime })
     },
 
-    async newSession(prompt, images, chosen) {
+    async newSession(prompt, images, chosen, where) {
       const { images: ok, dropped } = sanitiseImages(images ?? [])
       if (!prompt.trim() && !ok.length) return
       if (dropped.length) reportDroppedImages(dropped)
+      /* "Run in the cloud" is checked HERE, whatever the page drew. The page
+         renders another program's output and can be stale — a login changed
+         since it painted, a phone left open for an hour — and the answer
+         decides whether the user's code is uploaded to somebody else's
+         machine. A cached yes is enough; anything else is asked now. Modal,
+         because the user clicked: a refusal they can miss is no refusal. */
+      if (where?.cloud) {
+        const why = !cloudOn()
+          ? 'cloud sessions are turned off on this board (agentsKanban.cloudSessions).'
+          : !getRuntime(runtime)?.capabilities.cloud
+            ? `${getRuntime(runtime)?.label ?? runtime} cannot run sessions in the cloud — pick Claude Code.`
+            : !ws?.repoRoot
+              ? 'a cloud session is started from a git repository, and this folder is not one.'
+              : await (async () => {
+                  const known = cloudLogins.get(agentKey(runtime, currentProvider().id))?.answer
+                  const answer = known?.ok ? known : await askCloud(runtime, currentProvider().id)
+                  return answer.ok ? undefined : answer.reason
+                })()
+        if (why) {
+          log.warn(`Not starting a cloud session: ${why}`)
+          await vscode.window.showErrorMessage(`Agents Kanban cannot start this session in the cloud: ${why}`, { modal: true })
+          refreshAll()
+          return
+        }
+      }
       // Refuse rather than improvise. A half-configured provider does not fail
       // here, it fails at the first API call with a message from somebody
       // else's system — after a worktree has been created and a card has
@@ -4859,12 +5011,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const mgr = ensureManager()
       mgr.setProvider(currentProvider(), providerEnv)
       log.info(
-        `Starting session: ${prompt.slice(0, 80)}` +
+        `Starting ${where?.cloud ? 'a cloud ' : ''}session: ${prompt.slice(0, 80)}` +
         (ok.length ? ` (+${describeImages(ok.length)})` : ''),
       )
       selectHere(await mgr.start(prompt, {
         ...(ok.length ? { images: ok } : {}),
         ...(chosen ? { chosen } : {}),
+        ...(where?.cloud ? { cloud: true } : {}),
       }))
       mode = 'chat'
       refreshAll()
@@ -5478,18 +5631,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const id = w.manager?.byKey(key)?.sessionId ?? key
       const card = await w.store.get(id)
       const choice = await vscode.window.showWarningMessage(
-        `Delete "${card?.title ?? id}" permanently?`,
+        card?.cloud ? `Remove "${card.title}" from the board?` : `Delete "${card?.title ?? id}" permanently?`,
         {
           modal: true,
-          detail:
-            'The transcript is removed from Claude Code as well. If a Claude Code ' +
-            'window currently has this session open, close it first — it writes its ' +
-            'own state back afterwards and the session reappears in its history. ' +
-            'The git worktree and its branch are left alone.',
+          // A cloud card's session is Anthropic's, not this board's: the dialog
+          // must not promise a deletion it will not perform.
+          detail: card?.cloud
+            ? 'This session runs on Anthropic\'s cloud. Removing the card does NOT delete the session — it ' +
+              `stays on claude.ai (${card.cloud.url}), where it can be archived or deleted. ` +
+              'The local worktree and its branch are left alone.'
+            : 'The transcript is removed from Claude Code as well. If a Claude Code ' +
+              'window currently has this session open, close it first — it writes its ' +
+              'own state back afterwards and the session reappears in its history. ' +
+              'The git worktree and its branch are left alone.',
         },
-        'Delete',
+        card?.cloud ? 'Remove' : 'Delete',
       )
-      if (choice !== 'Delete') return
+      if (card?.cloud ? choice !== 'Remove' : choice !== 'Delete') return
       w.manager?.stop(key)
       if (!id.startsWith('run-')) {
         // Say so when the promise in that dialog was not kept, rather than
@@ -5620,6 +5778,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           'vscode.diff', left, right, `${path.basename(file)} — ${wt.base} ↔ ${wt.branch}`, beside,
         )
       })
+    },
+
+    /** The card's cloud session link, from the host's own record — the live
+     *  run's, else the sidecar's — and only if it is claude.ai's. */
+    async cloudLink(key) {
+      const url = ws?.manager?.byKey(key)?.cloud?.url ?? (await ws?.store.allMeta())?.[key]?.cloud?.url
+      return url && isCloudUrl(url) ? url : undefined
+    },
+
+    async openCloud(key) {
+      const url = await this.cloudLink?.(key)
+      if (!url) {
+        // Modal: the user pressed a button, and a toast they can miss is the
+        // "I pressed it and nothing happened" report.
+        await vscode.window.showInformationMessage(
+          'This session has no claude.ai link yet — Claude Code is still creating it.', { modal: true })
+        return
+      }
+      await vscode.env.openExternal(vscode.Uri.parse(url, true))
     },
 
     /** A test-plan link, made to actually do the thing it says.
@@ -6322,6 +6499,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // re-parses AND re-resolves rather than only re-reading the list.
       if (e.affectsConfiguration('agentsKanban.providers') || e.affectsConfiguration('agentsKanban.provider')) {
         providers = parseProfiles(cfg().get<unknown[]>('providers'))
+        cloudLogins.clear()
         /* An EXPLICIT edit of `agentsKanban.provider` wins, and it used not to.
            The new value was read only inside `if (!providers.some(p => p.id ===
            providerId))` — only when the currently active id had DISAPPEARED

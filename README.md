@@ -32,6 +32,11 @@ part.
 - **Run on your own backend.** Anthropic, Bedrock, Vertex, Foundry, an LLM
   gateway, or a local model. Credentials go to VS Code's secret storage, never
   to `settings.json`. See [docs/PROVIDERS.md](docs/PROVIDERS.md).
+- **Run a session in Anthropic's cloud.** On a claude.ai subscription, tick
+  **Run in the cloud** on a new chat: the card's worktree is uploaded (no GitHub
+  needed) and the session runs on Anthropic's machines. The chat streams it
+  where Claude Code allows that for your account; otherwise the card sends your
+  messages and links to the replies on claude.ai.
 - **Interrupt, queue follow-ups, change permissions mid-run.**
 - **Subagents, attached screenshots, ultracode, fast mode.**
 - **One task becomes several.** An agent that finds its brief is really two
@@ -170,6 +175,7 @@ and let it go.
 | `agentsKanban.discoverModels` | Ask the backend for its model list instead of using the built-in one (default on). Claude Code's list is compiled into the CLI, so a newer model needs a newer `claude` — the model menu names the version that answered, and **Agents Kanban: Update Claude Code** runs its updater (the board switches the CLI's own auto-update off for every run) |
 | `agentsKanban.notifyOnReview` / `statusBar` | The notification when a card reaches review; the status-bar item |
 | `agentsKanban.sideBarHome` / `closeOnClickAway` | Which view the left side bar returns to; whether clicking away closes the board |
+| `agentsKanban.cloudSessions` | Offer **Run in the cloud** on a new chat when the agent's login is a claude.ai subscription (default on) |
 | `agentsKanban.claudeExecutable` / `codexExecutable` | Paths to the CLIs when they are not on `PATH` |
 | `agentsKanban.whisperPath` / `whisperModel` / `ffmpegPath` / `recordDevice` | Local dictation |
 

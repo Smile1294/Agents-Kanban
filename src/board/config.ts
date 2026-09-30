@@ -146,7 +146,10 @@ export function isStartedColumn(board: BoardConfig, id: StatusId): boolean {
  * Deliberately NOT reported for `interrupted` sessions — that is a louder and
  * different fact (the host went away, the process is gone) and a card must not
  * claim two things at once. Nor for a session with no worktree: it never ran,
- * so there is nothing it failed to hand back.
+ * so there is nothing it failed to hand back. Nor for one on Anthropic's CLOUD:
+ * no agent was ever going to be running HERE, so "nothing is running" is its
+ * normal state, not evidence that something stopped — and offering to resume
+ * it would start a local turn for a session whose conversation is elsewhere.
  */
 export function stalledSince(
   board: BoardConfig,
@@ -157,9 +160,10 @@ export function stalledSince(
     running?: boolean
     interrupted?: number
     archived?: boolean
+    cloud?: boolean
   },
 ): number | undefined {
-  if (s.running || s.interrupted || s.archived || !s.worktree) return undefined
+  if (s.running || s.interrupted || s.archived || s.cloud || !s.worktree) return undefined
   if (!isStartedColumn(board, s.phase)) return undefined
   return s.updated
 }

@@ -23,6 +23,8 @@ import { AgentSession, agentEnv } from '../session.ts'
 import { resolveClaudeExecutable, type Options } from '../sdk.ts'
 import { withSilentQuery } from '../connect.ts'
 import { claudeVersion } from '../cli-update.ts'
+import { cloudEligibility } from '../cloud.ts'
+import { CloudRun } from './claude-cloud.ts'
 import { MODELS } from '../../sessions/meta.ts'
 import { MODEL_WINDOWS } from '../../sessions/usage.ts'
 import type { ProviderEnv } from '../providers.ts'
@@ -70,6 +72,8 @@ export const claudeRuntime: AgentRuntime = {
     durableHistory: true,
     boardTools: 'inProcess',
     messageIds: true,
+    // Claude Code on the web, through the CLI's `--cloud`. See agent/cloud.ts.
+    cloud: true,
   },
 
   /** Where the CLI is, and WHICH VERSION it is. The version is not decoration:
@@ -122,17 +126,29 @@ export const claudeRuntime: AgentRuntime = {
       const email = typeof info.emailAddress === 'string' ? info.emailAddress
         : typeof info.email === 'string' ? info.email : undefined
       const providerId = typeof info.apiProvider === 'string' ? info.apiProvider : undefined
+      const keySource = typeof info.apiKeySource === 'string' ? info.apiKeySource : undefined
+      const plan = typeof info.subscriptionType === 'string' && info.subscriptionType ? info.subscriptionType : undefined
       return {
         kind: 'signedIn',
-        // `firstParty` is a subscription or a Console key; the cloud backends
-        // authenticate through their own credential chains, which is a
-        // different thing to tell the user about.
-        via: providerId && providerId !== 'firstParty' ? 'cloud' : 'subscription',
+        // The cloud backends authenticate through their own credential
+        // chains. On first-party, `apiKeySource` is what tells a Console key
+        // from a subscription: this used to call every first-party login a
+        // subscription, so a machine on ANTHROPIC_API_KEY was shown as
+        // "(subscription)" — two different bills under one word.
+        via: providerId && providerId !== 'firstParty' ? 'cloud'
+          : keySource && keySource !== 'none' ? 'apiKey'
+          : 'subscription',
         ...(email ? { account: email } : {}),
-        /* `apiProvider` used to be reported as the PLAN, which is how the raw
-           string `firstParty` came to be printed on the settings page next to
-           an email address. It is not a plan, it is somebody else's word for a
+        /* The plan is `subscriptionType` — `max`, `pro`, `team`. `apiProvider`
+           used to be reported as the PLAN, which is how the raw string
+           `firstParty` came to be printed on the settings page next to an
+           email address. It is not a plan, it is somebody else's word for a
            backend — and the backend is named properly on its own row now. */
+        ...(plan ? { plan } : {}),
+        // Whether THIS login may start a session on Anthropic's cloud, and if
+        // not, the fix — asked in the session's own environment, so a gateway
+        // profile's key is judged as that key.
+        cloud: cloudEligibility(info),
       }
     } catch (e) {
       return { kind: 'unknown', reason: e instanceof Error ? e.message : String(e) }
@@ -165,6 +181,9 @@ export const claudeRuntime: AgentRuntime = {
         'or set `agentsKanban.claudePath` to where it lives.',
       )
     }
+    // Where it runs, not what runs it: still Claude Code, still this CLI —
+    // the session is simply on Anthropic's machines rather than this one.
+    if (spec.cloud) return new CloudRun({ ...spec, cloud: spec.cloud })
     return new AgentSession({
       taskId: spec.taskId,
       cwd: spec.cwd,

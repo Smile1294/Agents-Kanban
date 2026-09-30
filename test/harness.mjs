@@ -315,8 +315,19 @@ export function makeVscodeStub(ctl) {
         ctl.statusItem = item
         return item
       },
-      showErrorMessage: (m) => { errors.push('showErrorMessage: ' + m); return Promise.resolve(undefined) },
-      showInformationMessage: (m) => { calls.push('info:' + m); return Promise.resolve(undefined) },
+      showErrorMessage: (m, opts) => {
+        errors.push('showErrorMessage: ' + m)
+        // Modal recorded too, as for warnings: a refusal of something the user
+        // CLICKED must be one, and only a recorded flag lets a test see it not be.
+        if (opts && typeof opts === 'object' && opts.modal) calls.push('errmodal:' + m)
+        return Promise.resolve(undefined)
+      },
+      showInformationMessage: (m, ...rest) => {
+        calls.push('info:' + m)
+        // Modal recorded too: an answer to a click must be one.
+        if (rest[0] && typeof rest[0] === 'object' && rest[0].modal) calls.push('infomodal:' + m)
+        return Promise.resolve(undefined)
+      },
       // Recorded with whether it was MODAL, because "a refusal on a path the
       // user clicked is modal, never a toast" is a rule a test has to be able
       // to see broken.

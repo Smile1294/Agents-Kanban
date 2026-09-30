@@ -15,6 +15,7 @@ import { emptyTotals, summariseUsage, type ModelBook, type UsageMessage, type Us
 import { allRuntimes, getRuntime, type HistoricSession, type Meter, type RuntimeHistory, type RuntimeId } from '../agent/runtime.ts'
 import { claudeHome, sessionFileFor } from './checkpoints.ts'
 import type { ParkedRecord } from '../agent/limits.ts'
+import { cloudTranscript, mergeCloud, type CloudRecord, type CloudUpdate } from '../agent/cloud.ts'
 
 export interface BoardSession {
   id: string
@@ -53,6 +54,8 @@ export interface BoardSession {
   switchedFrom?: string
   /** Waiting on its account's usage limit. See SessionMeta.parked. */
   parked?: ParkedRecord
+  /** Runs on Anthropic's cloud. See SessionMeta.cloud. */
+  cloud?: CloudRecord
 }
 
 /**
@@ -464,6 +467,7 @@ export class SessionStore {
         ...(m.switchedFrom ? { switchedFrom: m.switchedFrom } : {}),
         ...(m.parked ? { parked: m.parked } : {}),
         ...(m.runtime ? { runtime: m.runtime } : {}),
+        ...(m.cloud ? { cloud: m.cloud } : {}),
       })
     }
 
@@ -500,7 +504,68 @@ export class SessionStore {
       })
     }
 
+    /* Sessions on Anthropic's cloud that nothing on this machine knows about.
+       A DETACHED one was created by the CLI and left: there is no transcript
+       for Claude Code's index to list, so without this pass the card vanished
+       the moment its process ended — the rule about numbers that depend on a
+       process being alive, broken by the card itself. Its sidecar record is
+       the only thing that knows it exists. */
+    const listed = new Set(out.map((s) => s.id))
+    for (const [id, m] of Object.entries(metas)) {
+      if (!m.cloud || listed.has(id)) continue
+      if (m.archived && !opts.includeArchived) continue
+      const last = m.cloud.log[m.cloud.log.length - 1]
+      out.push({
+        id,
+        runtime: m.runtime ?? 'claude',
+        title: m.cloud.title || m.cloud.log[0]?.text.split('\n')[0]?.slice(0, 80) || 'Cloud session',
+        phase: m.phase,
+        tags: m.tags,
+        archived: m.archived,
+        pinned: m.pinned,
+        // When the board last handed it something — the only moment this
+        // machine can vouch for. What it has done since is on claude.ai.
+        updated: Math.max(last?.at ?? 0, m.cloud.createdAt),
+        created: m.cloud.createdAt,
+        ...(m.worktree ? { worktree: m.worktree } : {}),
+        ...(m.branch ? { branch: m.branch } : {}),
+        ...(m.base ? { base: m.base } : {}),
+        ...(m.parent ? { parent: m.parent } : {}),
+        ...(m.running ? { running: m.running } : {}),
+        ...(m.testPlan ? { testPlan: m.testPlan } : {}),
+        ...(m.provider ? { provider: m.provider } : {}),
+        ...(m.parked ? { parked: m.parked } : {}),
+        cloud: m.cloud,
+      })
+    }
+
     return out.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.updated - a.updated)
+  }
+
+  /**
+   * The cloud record of a session with nothing on this machine, or undefined.
+   *
+   * "Nothing on this machine" is the Claude Code index not listing it — the
+   * same cached scan every repaint already does. A session the CLI streamed
+   * here AND recorded locally is an ordinary Claude Code session with a cloud
+   * record beside it, and reads its real transcript. Public because the
+   * manager and the host ask the same question about a CONNECTED session's
+   * streamed rows, which are the only copy of its replies when this is true.
+   */
+  async cloudOnly(id: string): Promise<CloudRecord | undefined> {
+    const m = (await this.meta.getAll())[id]
+    if (!m?.cloud) return undefined
+    const local = (await this.infos()).some((i) => i.sessionId === id)
+    return local ? undefined : m.cloud
+  }
+
+  /** Fold what a cloud run learned into its card's record. One read and one
+   *  write through the sidecar's own queue, so two deliveries in a row both
+   *  land in the log. */
+  async recordCloud(key: string, u: CloudUpdate): Promise<void> {
+    const prev = (await this.meta.getAll())[key]?.cloud
+    await this.meta.update(key, { cloud: mergeCloud(prev, u) }, this.defaultPhase)
+    this.transcripts.delete(key)
   }
 
   /**
@@ -635,6 +700,8 @@ export class SessionStore {
    * opposite direction: there the scope must be widened, here it must be dropped.
    */
   async transcript(id: string, limit = TRANSCRIPT_LIMIT): Promise<Entry[]> {
+    const cloud = await this.cloudOnly(id)
+    if (cloud) return cloudTranscript(cloud).slice(-limit)
     const rt = await this.runtimeOf(id)
     if (rt) return (await rt.transcript(id)) as Entry[]
     return (await this.parse(id, limit)).entries
@@ -656,6 +723,8 @@ export class SessionStore {
    * the hit's index in entries). One unit, end to end, fixes all three.
    */
   async transcriptTotal(id: string): Promise<number> {
+    const cloud = await this.cloudOnly(id)
+    if (cloud) return cloudTranscript(cloud).length
     const rt = await this.runtimeOf(id)
     if (rt) return (await rt.transcript(id)).length
     const now = Date.now()
@@ -719,6 +788,8 @@ export class SessionStore {
   }
 
   async fullTranscript(id: string): Promise<Entry[]> {
+    const cloud = await this.cloudOnly(id)
+    if (cloud) return cloudTranscript(cloud)
     const rt = await this.runtimeOf(id)
     if (rt) return (await rt.transcript(id)) as Entry[]
     return (await this.parse(id, Number.POSITIVE_INFINITY)).entries
@@ -759,6 +830,9 @@ export class SessionStore {
    * that has just spent 13% of a five-hour window. See `Meter`.
    */
   async meter(id: string): Promise<Meter> {
+    // `unknown`, not `$0.00`: a cloud session is spending the account's
+    // allowance on claude.ai, and nothing on this machine can see how much.
+    if (await this.cloudOnly(id)) return { kind: 'unknown' }
     const rt = await this.runtimeOf(id)
     if (rt) return (await rt.usage(id)).meter
     const totals = await this.usage(id)
@@ -774,6 +848,8 @@ export class SessionStore {
    * spend readout with nothing to add up. See `sessions/usage.ts`.
    */
   async usage(id: string): Promise<UsageTotals> {
+    // Nothing to total: the conversation, and its context, are in the cloud.
+    if (await this.cloudOnly(id)) return emptyTotals()
     const rt = await this.runtimeOf(id)
     if (rt) {
       // Context fill and its window are real for every runtime; the token
@@ -1106,6 +1182,16 @@ export class SessionStore {
     // nothing on disk was touched, and the card reappeared on the next scan.
     // A delete that reports a success it did not achieve is worse than one that
     // refuses: the user presses it repeatedly and concludes the board is broken.
+    // A cloud session with nothing here: the card is ours to drop, the session
+    // is Anthropic's. `removed` says exactly that, so the host can tell the
+    // user where the session itself still is rather than implying it is gone.
+    if (await this.cloudOnly(id)) {
+      await this.meta.remove(id)
+      this.invalidate()
+      this.transcripts.delete(id)
+      return { deleted: true, reason: 'The card is gone from the board; the cloud session itself is still on claude.ai, where it can be archived or deleted.' }
+    }
+
     const rt = await this.runtimeOf(id)
     if (rt) return this.deleteForeign(id, rt)
 
@@ -1192,6 +1278,14 @@ export class SessionStore {
     // thing, and inventing one here would be the abstraction leaking.
     const runtime = await this.runtimeOf(id)
     if (runtime) return { renamed: false, reason: 'this agent owns its own session names' }
+    // A detached cloud session has no local file to rename — the same trap
+    // as above, in a different store. Its title lives on the card's record.
+    const cloud = await this.cloudOnly(id)
+    if (cloud) {
+      await this.meta.update(id, { cloud: { ...cloud, title } }, this.defaultPhase)
+      this.invalidate()
+      return { renamed: true }
+    }
     const { renameSession } = await loadSdk()
     await retryWhileMissing(() => renameSession(id, title))
     this.invalidate()

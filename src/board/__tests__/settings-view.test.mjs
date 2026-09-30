@@ -879,5 +879,26 @@ const state = (over = {}) => ({
      'and what the offer tick means — two ticks, two choices, both explained')
 }
 
+// --- "Run in the cloud": the composer leaves the box out, this says why ------
+{
+  const signedIn = { id: 'claude', label: 'Claude Code', at: Date.now(), login: { kind: 'signedIn', via: 'subscription', account: 'a@b.com', plan: 'max' } }
+  const none = await renderSettings(state({ runtimes: [{ ...CLAUDE, status: signedIn }] }))
+  ok(!/Cloud sessions/.test(none.text()), 'no answer yet, no line — the login row already says what is known')
+
+  const yes = await renderSettings(state({ runtimes: [{ ...CLAUDE, status: signedIn, cloud: { state: 'available', plan: 'max' } }] }))
+  ok(/Cloud sessions: available on the max plan/.test(yes.text()), 'a subscription login says the box is there, and on which plan')
+  ok(/no GitHub needed/.test(yes.text()), 'and that the code gets there without GitHub')
+
+  const no = await renderSettings(state({
+    runtimes: [{ ...CLAUDE, status: signedIn, cloud: { state: 'unavailable', reason: 'Claude Code is using an API key (ANTHROPIC_API_KEY). Cloud sessions need a claude.ai subscription login.' } }],
+  }))
+  ok(/Cloud sessions: not available/.test(no.text()), 'an API-key login says the box is missing on purpose')
+  ok(no.text().includes('ANTHROPIC_API_KEY'), 'and names the reason the host gave, not a generic one')
+
+  const off = await renderSettings(state({ runtimes: [{ ...CLAUDE, status: signedIn, cloud: { state: 'off' } }] }))
+  ok(/turned off on this board/.test(off.text()) && off.text().includes('agentsKanban.cloudSessions'),
+    'the board\'s own setting names itself, so it is not mistaken for the login refusing')
+}
+
 console.log(fails ? `\n${fails} failed` : '\nall settings-view tests passed')
 process.exit(fails ? 1 : 0)

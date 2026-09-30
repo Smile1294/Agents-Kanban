@@ -264,8 +264,17 @@ export interface AgentSessionOptions {
   /** The worktree directory. Everything the agent does happens here. */
   cwd: string
   permissionMode: Options['permissionMode']
-  /** The in-process board MCP server from createBoardServer(). */
-  boardServer: NonNullable<Options['mcpServers']>[string]
+  /** The in-process board MCP server from createBoardServer(). Absent for a
+   *  run with no board tools — a cloud session, which the board tracks but
+   *  which cannot move its own card from Anthropic's infrastructure. */
+  boardServer?: NonNullable<Options['mcpServers']>[string]
+  /** CLI flags the SDK has no option for, verbatim (`null` is a bare flag).
+   *  How a cloud run asks for `--cloud`; see `runtimes/claude-cloud.ts`. */
+  extraArgs?: Record<string, string | null>
+  /** Everything the CLI writes to stderr, as it arrives. The SDK keeps only a
+   *  tail for its exit error; a caller that needs to READ it — the cloud run
+   *  looks for the session's claude.ai link there — asks for the stream. */
+  onStderr?: (chunk: string) => void
   /** Fully-qualified board tool names to auto-allow, from boardToolNames().
    *  Never hand-written: see AUTO_ALLOW_BUILTIN. */
   boardTools?: string[]
@@ -454,7 +463,9 @@ export class AgentSession extends EventEmitter implements AgentRun {
       // 'enabled' deliberately sends nothing: omitting the option is what keeps
       // the model on adaptive thinking. Only an explicit opt-out is sent.
       ...(this.opts.thinking === 'disabled' ? { thinking: { type: 'disabled' as const } } : {}),
-      mcpServers: { board: this.opts.boardServer },
+      ...(this.opts.boardServer ? { mcpServers: { board: this.opts.boardServer } } : {}),
+      ...(this.opts.extraArgs ? { extraArgs: this.opts.extraArgs } : {}),
+      ...(this.opts.onStderr ? { stderr: this.opts.onStderr } : {}),
       canUseTool: (toolName, input) => this.decide(toolName, input),
       systemPrompt: {
         type: 'preset',

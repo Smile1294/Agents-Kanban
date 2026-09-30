@@ -298,7 +298,90 @@ the map itself honest — every source file owned by exactly one area, every glo
 matching a tracked file, every path a knowledge file names existing — so the
 map cannot rot while every other test stays green.
 
+### A cloud session goes through the CLI, and the card says how much it can see
+
+The ask: a box on a new chat, "run this in the cloud instead of on my machine",
+for a Claude subscription — still working through the chat — and for a team
+that does not use GitHub.
+
+**Only the `claude` binary, because of one sentence.** Anthropic's legal page
+says developers "may not collect, store, or intermediate Claude.ai credentials
+or session tokens". The CLI reaches claude.ai's session API with the login it
+keeps in `~/.claude/.credentials.json` or the keychain, and reading that token
+and calling the same API from here would be quick. That is exactly what the
+sentence forbids, so the board never reads the login and never calls claude.ai.
+Eligibility comes from `Query.accountInfo()` (`tokenSource: 'claude.ai'` on
+first-party; a setup token, an API key and Bedrock/Vertex are each refused with
+their own sentence), and everything else is a CLI invocation.
+
+**What the CLI allows, read out of 2.1.285's bundle** (the table is in the
+header of `src/agent/cloud.ts`): creating a cloud session and STREAMING it to
+an editor over stream-json is behind a server-side gate ("connected sessions"),
+off for the account this was built on. Without it the CLI refuses with one of
+three sentences. Creating one from a pipe is compiled off. What does work
+without the gate: `claude --cloud "<task>"` on a TTY (it prints the link and
+exits) and `claude -p --cloud <id>` for a follow-up. Reading a cloud session's
+replies back does not work at all: `-p --teleport` checks the branch out and
+then runs a LOCAL turn.
+
+**So `CloudRun` tries connected mode first and falls back only on those three
+sentences.** Connected is an ordinary `AgentSession` with `--cloud`, so the chat,
+tools, permissions and follow-ups are the code a local run already uses. The
+fallback runs the create in `script(1)`, because the CLI checks for a TTY. The
+fallback is triggered by the refusal text and never by "an error", and only
+before the session was heard from. A connected run that fails halfway is a
+failure to show, not a reason to start a second session behind the user's back.
+In DETACHED mode the board can start work and deliver messages but cannot read
+one reply. The card says so ("cannot read its replies", a link, no spinner, no
+stalled badge), because drawing a live chat over a conversation it cannot see
+would be a signal that cannot say "bad".
+
+**No GitHub: `CCR_FORCE_BUNDLE=1` on every cloud run.** The CLI uploads the
+card's own worktree as a git bundle (history plus uncommitted changes to
+tracked files) instead of cloning a remote. For a repository without a GitHub
+remote it is the only way in. For one with a remote it is still correct: a card
+forks from a local branch nobody pushed, and the cloud has to start from the
+same commit a local card would. A bundle is one-way, though. Without GitHub the
+session's changes stay in the session, and the banner says that too.
+
+Smaller decisions, each with a reason:
+
+- No brief and no board tools: the in-process server cannot be reached from
+  Anthropic's machines.
+- No model: the CLI drops `--model` on the detached path, and which path a run
+  takes is only known once the CLI answers. So the composer offers no model for
+  a cloud session and neither path sends one.
+- Permission modes are clamped to what the cloud accepts.
+- The task goes in one argv element (`--cloud=<task>`), so a task starting with
+  `-` is not a flag.
+- A PTY command is quoted, and a test proves `$(…)` in a task runs nothing.
+- A card that never reached the cloud refuses follow-ups instead of resuming
+  them here.
+- A detached card lives in the sidecar alone, since nothing of it is under
+  `~/.claude/projects`, and `SessionStore` lists it from there.
+
+**Trust.** An untrusted folder makes the TTY create stop at the "Quick safety
+check" dialog. The board reads the dialog and says "run `claude` once in the
+repository and trust it". It never answers the dialog itself. A linked worktree
+inherits trust from its repository root, so one answer covers every card.
+
+---
+
 ## Postmortems
+
+### A run that ended in the same breath as its id came back "Interrupted"
+
+Found while building cloud sessions, and older than they are.
+`SessionMeta.running` is written by the durable patch that runs when a session
+id is ADOPTED, and cleared by `finish()`. Both were fire-and-forget. For a run
+that ended right after announcing its id, `running: 0` landed first and the
+adoption's `running: <startedAt>` landed a moment later. The card was fine
+until the next restart, which read the stale mark and called a clean finish
+"Interrupted 9m ago". A cloud session the CLI creates and detaches from does
+this every time, and a very short local turn could as well. The fix orders the
+two writes: the adoption is a promise (`registered`) and `finish()` clears the
+mark after it. `cloud-launch.test.ts` asserts `running === 0` after such a run
+and failed before the fix.
 
 ### "It says completed but nothing came back, and the second one never launched"
 
@@ -3301,3 +3384,17 @@ press.
 - **An attachment is not kept after it is sent.** The bytes go to the model and
   the transcript records only how many there were, so the board cannot show you
   the screenshot you sent an hour ago. Claude Code's own transcript has it.
+- **Cloud sessions: the connected path has never met a real account.** The gate
+  was off wherever this was built. What exists is the stand-in in
+  `claude-cloud.test.ts`, answering in the shapes the 2.1.285 bundle declares.
+  If the CLI writes a connected session under `~/.claude/projects` too, the card
+  reads it like any other. If it does not, what the board saw while it streamed
+  is held in memory (`cloudSeen`) and does not survive a restart.
+- **A detached cloud session's changes cannot come back to the card without
+  GitHub.** A bundle is upload-only, and a session seeded from one can push
+  only where the user's GitHub connection reaches. Merge, Run app and the diff
+  are hidden on a cloud card rather than shown over a worktree its work is not
+  in.
+- **Detached cloud sessions need `script(1)`.** There is none on Windows, where
+  the card says so and names the command to run by hand. The BSD form for macOS
+  has not been run on a Mac.
