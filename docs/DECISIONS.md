@@ -310,8 +310,9 @@ or session tokens". The CLI reaches claude.ai's session API with the login it
 keeps in `~/.claude/.credentials.json` or the keychain, and reading that token
 and calling the same API from here would be quick. That is exactly what the
 sentence forbids, so the board never reads the login and never calls claude.ai.
-Eligibility comes from `Query.accountInfo()` (`tokenSource: 'claude.ai'` on
-first-party; a setup token, an API key and Bedrock/Vertex are each refused with
+Eligibility comes from `Query.accountInfo()` (a reported `subscriptionType`
+and no API key, on first-party — the CLI omits `tokenSource` for a
+subscriber, and requiring it once refused every one of them; a setup token, an API key and Bedrock/Vertex are each refused with
 their own sentence), and everything else is a CLI invocation.
 
 **What the CLI allows, read out of 2.1.285's bundle** (the table is in the

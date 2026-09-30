@@ -88,13 +88,17 @@ export type CloudEligibility =
  * the environment a session would get — so a gateway profile that sets its
  * own key is judged as that key, not as whatever `claude` does on its own.
  *
- * The line is `tokenSource === 'claude.ai'`, and it is narrower than
- * "subscription" on purpose. It is what the CLI's own cloud path requires (it
- * reads the stored claude.ai OAuth login and nothing else), and it excludes a
- * token from `claude setup-token`: that is a subscription credential too, but
- * it is inference-only, and cloud-session control needs a scope it does not
- * carry — so offering the checkbox on it would be a control that cannot work.
- * Each refusal names its own fix, because they are different fixes.
+ * What the CLI actually reports (2.1.285, `accountInfo` as it builds it): for
+ * a claude.ai SUBSCRIPTION login it sets `subscriptionType` ("Claude Pro",
+ * "Claude Max", "Claude Team", "Claude Enterprise", or "Claude API" when the
+ * plan is not known) and deliberately LEAVES OUT `tokenSource`. The first
+ * version of this check required `tokenSource === 'claude.ai'`, a value the
+ * CLI never sends for exactly that login, so every subscriber was told they
+ * were not signed in. So the line is: a plan is reported, and no API key is
+ * in use. `tokenSource === 'claude.ai'` is still accepted (older CLIs), and a
+ * `claude setup-token` token is refused — it is inference-only, and cloud
+ * session control needs a scope it does not carry. Each refusal names its own
+ * fix, because they are different fixes.
  */
 export function cloudEligibility(info: unknown): CloudEligibility {
   if (!info || typeof info !== 'object') {
@@ -111,11 +115,6 @@ export function cloudEligibility(info: unknown): CloudEligibility {
     }
   }
   const token = str(i.tokenSource)
-  if (token === 'claude.ai') {
-    const plan = str(i.subscriptionType)
-    const account = str(i.email) ?? str(i.emailAddress)
-    return { ok: true, ...(plan ? { plan } : {}), ...(account ? { account } : {}) }
-  }
   if (token === 'CLAUDE_CODE_OAUTH_TOKEN' || token === 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR') {
     return {
       ok: false,
@@ -124,11 +123,21 @@ export function cloudEligibility(info: unknown): CloudEligibility {
     }
   }
   const key = str(i.apiKeySource)
-  if ((key && key !== 'none') || (token && token !== 'none')) {
+  if (key && key !== 'none') {
     return {
       ok: false,
-      reason: 'Cloud sessions need a claude.ai subscription login, and this backend signs in with ' +
-        `${key && key !== 'none' ? key : token}.`,
+      reason: `Cloud sessions need a claude.ai subscription login, and Claude Code is using an API key (${key}) here.`,
+    }
+  }
+  const plan = str(i.subscriptionType)
+  if (plan || token === 'claude.ai') {
+    const account = str(i.email) ?? str(i.emailAddress)
+    return { ok: true, ...(plan ? { plan } : {}), ...(account ? { account } : {}) }
+  }
+  if (token && token !== 'none') {
+    return {
+      ok: false,
+      reason: `Cloud sessions need a claude.ai subscription login, and this backend signs in with ${token}.`,
     }
   }
   return { ok: false, reason: 'Claude Code is not signed in to a claude.ai account. Run `claude auth login`.' }

@@ -112,8 +112,16 @@ console.log('\n— the CLI refusing to stream it here')
 
 console.log('\n— who may start one')
 {
+  // EXACTLY what 2.1.285 reports for a claude.ai subscription: a plan, and NO
+  // tokenSource (the CLI omits it for subscribers). The first version required
+  // tokenSource === 'claude.ai' and told every subscriber they were signed out.
+  const sub = cloudEligibility({ subscriptionType: 'Claude Max', email: 'd@example.com', organization: 'Prduct', apiProvider: 'firstParty' })
+  ok(sub.ok && sub.plan === 'Claude Max' && sub.account === 'd@example.com', 'a claude.ai subscription, as the CLI really reports it, can')
+  ok(cloudEligibility({ subscriptionType: 'Claude Team', apiProvider: 'firstParty' }).ok, 'a Team plan can')
   const yes = cloudEligibility({ tokenSource: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max', email: 'd@example.com' })
-  ok(yes.ok && yes.plan === 'max' && yes.account === 'd@example.com', 'a claude.ai login on Anthropic can')
+  ok(yes.ok && yes.plan === 'max' && yes.account === 'd@example.com', 'an older CLI naming claude.ai as the source can too')
+  const both = cloudEligibility({ subscriptionType: 'Claude Pro', apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' })
+  ok(!both.ok && /ANTHROPIC_API_KEY/.test(both.reason), 'a subscription with an API key overriding it cannot — the key is what requests use')
   const token = cloudEligibility({ tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN', apiProvider: 'firstParty' })
   ok(!token.ok && /setup-token/.test(token.reason), 'a setup-token token cannot — it is inference-only — and is told why')
   const key = cloudEligibility({ tokenSource: 'none', apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' })

@@ -84,7 +84,7 @@ here reads `~/.claude/.credentials.json` or the keychain, and nothing calls
 claude.ai. Pure, no process spawned. `CLOUD_ENV` (`CCR_FORCE_BUNDLE=1`: the CLI
 uploads the worktree as a git bundle, so no GitHub is needed and the cloud
 starts from the card's own unpushed commit), `cloudEligibility(accountInfo)`
-(a claude.ai login on first-party only; a setup token, an API key, a cloud
+(a reported plan — the CLI omits `tokenSource` for subscribers — with no API key, on first-party only; a setup token, an API key, a cloud
 provider each refused with its own sentence), `connectedRefusal(message)` (the
 three sentences that mean "use the fallback" — anything else is a failure to
 show), `readCloudCreate(raw, exited)` over a PTY's output (`screenText` first:
@@ -250,6 +250,8 @@ once came back with empty transcripts that way). The settings page asks
   BSD `script` form is untested on a real Mac.
 
 ## Recent changes
+
+- 2026-09-30 · claude/admiring-lamport-vyma1q · `cloudEligibility` fixed: the CLI reports a claude.ai subscription as `subscriptionType` and OMITS `tokenSource`, so requiring `tokenSource === 'claude.ai'` refused every subscriber ("not signed in"). A reported plan with no API key in use is now the line.
 
 - 2026-09-30 · claude/admiring-lamport-vyma1q · cloud sessions: `cloud.ts` (pure: eligibility, the CLI's refusals and output, the PTY command, the sidecar record) and `runtimes/claude-cloud.ts` (`CloudRun` — connected through `AgentSession --cloud`, detached through `claude --cloud` in `script(1)` plus `claude -p --cloud <id>`); `RunSpec.cloud`, `capabilities.cloud`, `LoginState.cloud`, `RunEvents.cloud`; Claude's `login()` stopped calling an API key a subscription.
 
